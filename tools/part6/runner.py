@@ -19,7 +19,7 @@ def alarm(sig, frame):
     raise TO()
 
 signal.signal(signal.SIGALRM, alarm)
-IN, OUT = sys.argv[1], sys.argv[2]
+IN, OUT = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
 sys.path.insert(0, os.getcwd())
 blocks = json.load(open(IN))
 import types
@@ -29,17 +29,55 @@ ns = _main.__dict__
 def scrub(t):   # keep this machine's folders out of the published output
     t = re.sub(r"(/home/claude/upstream/phases|/home/claude/aifs/run|/tmp/claude-0/z2/aiefs/repo/phases)/[^/\s]+/[^/\s\"']+", ".", t)
     return re.sub(r"/(home/claude|tmp/claude-0)(/[^\s\"']*)?", "/path/to/project", t)
+NB = os.environ.get("AIFS_NB") == "1"        # notebook mode: show the last expression's value, keep the figures
+import ast, base64
+NBSKIP = re.compile(r"\binput\(|pip install|openai|anthropic|\.download\(|load_dataset|fetch_openml|serve_forever|app\.run\(", re.I)
+def nb_exec(code, ns):
+    tree = ast.parse(code)
+    last = tree.body[-1] if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+    if last is not None: tree.body = tree.body[:-1]
+    exec(compile(tree, "<lesson>", "exec"), ns)
+    if last is None: return
+    v = eval(compile(ast.Expression(last.value), "<lesson>", "eval"), ns)
+    if v is None: return
+    mod = type(v).__module__ or ""
+    if mod.startswith("matplotlib") or mod.startswith("seaborn"): return
+    if isinstance(v, (list, tuple)) and v and all((type(x).__module__ or "").startswith("matplotlib") for x in v): return
+    if isinstance(v, (list, tuple)) and v and (type(v[0]).__module__ or "").startswith("matplotlib"): return
+    try:
+        import pandas as pd
+        if isinstance(v, (pd.DataFrame, pd.Series)):
+            with pd.option_context("display.max_rows", 12, "display.max_columns", 10, "display.width", 140):
+                print(v.to_string(max_rows=12, max_cols=10) if isinstance(v, pd.DataFrame) else v.to_string(max_rows=12)); return
+    except Exception:
+        pass
+    print(repr(v))
+def grab_figs():
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+    out = []
+    for n in plt.get_fignums()[:4]:
+        b = io.BytesIO(); plt.figure(n).savefig(b, format="png", dpi=80, bbox_inches="tight"); out.append(base64.b64encode(b.getvalue()).decode())
+    plt.close("all"); return out
 res = []
-for code in blocks:
-    if SKIP.search(code) and not code.startswith("#!run\n"):
+for _bi, code in enumerate(blocks):
+    if os.environ.get("AIFS_DEBUG"): print("block", _bi, file=sys.__stderr__, flush=True)
+    if (NBSKIP.search(code) if NB else SKIP.search(code)) and not code.startswith("#!run\n"):
         res.append({"status": "skipped"}); continue
     buf = io.StringIO()
-    signal.alarm(150 if code.startswith("#!run\nimport sys as _s") else 25)   # a lesson's full main() gets longer
+    signal.alarm(600 if NB else 150 if code.startswith("#!run\nimport sys as _s") else 25)   # a lesson's full main() gets longer
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
-            exec(compile(code, "<lesson>", "exec"), ns)
+            if NB:
+                nb_exec(code, ns)
+            else:
+                exec(compile(code, "<lesson>", "exec"), ns)
         signal.alarm(0)
-        res.append({"status": "ok", "out": scrub(buf.getvalue())})
+        r = {"status": "ok", "out": scrub(buf.getvalue())}
+        if NB: r["imgs"] = grab_figs()
+        res.append(r)
     except TO:
         res.append({"status": "timeout", "out": scrub(buf.getvalue())})
     except SystemExit:

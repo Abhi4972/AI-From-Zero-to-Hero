@@ -60,6 +60,8 @@ def body_fixer(base_dir, num, store):
                 k = h(code); store.setdefault("math", {})[k] = (code.strip(), True); return "{{KX:%s}}" % k
             if lang == "figure":
                 return "{{FIG:%s}}" % code.strip().split()[0]
+            if lang == "pyshow":                    # Python shown for reading, never run
+                return "```python\n" + code + "```"
             if lang in ("python", "py"):
                 py_i[0] += 1
                 blocks.append(code)

@@ -1,10 +1,10 @@
 # AI from Zero to Hero
 
-A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects and 60 interview case files: **1,092 lessons in 22 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
+A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects, 60 interview case files and a library of 427 more projects and recipes: **1,519 lessons in 31 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
 
 **Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero/
 
-Everything is on one site: one menu for all 22 phases, one search across every lesson, one progress tracker. No account and no install are needed.
+Everything is on one site: one menu for all 31 phases, one search across every lesson, one progress tracker. No account and no install are needed.
 
 ## What's inside
 
@@ -17,8 +17,9 @@ Everything is on one site: one menu for all 22 phases, one search across every l
 | 5 · Agents | 14 AI Agents: Design and Engineering · 15 Autonomous Agents and Self-Improvement · 16 Multi-Agent Systems and Swarms | 260 |
 | 6 · Serving, Safety & Capstones | 17 LLM Inference, Infrastructure and LLMOps · 18 AI Safety, Alignment and Ethics · 19 Capstone Builds | 161 |
 | 7 · Projects and Case Files | 20 Hands-On AI Projects · 21 Interview Case Files: Debugging AI Systems | 144 |
+| 8 · Project Library | 22 Machine Learning Projects · 23 Build-from-Scratch Projects · 24 RAG and Search Projects · 25 LLM Application Projects · 26 AI Agent Projects · 27 Multi-Agent and MCP Projects · 28 Claude API Recipes · 29 Claude Agent SDK and Managed Agents Recipes · 30 Snowflake AI and Data Samples | 427 |
 
-Each phase lists its lessons in one numbered order, with gentle introductions placed right before the deeper lessons they lead into, followed by its **Cheat sheets** (one-page references). The order lives in `data/blend_src.py` and is applied by `tools/blend.py`. Phase 20 builds 79 small, tested projects stage by stage, from a starter level to frontier systems. Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
+Each phase lists its lessons in one numbered order, with gentle introductions placed right before the deeper lessons they lead into, followed by its **Cheat sheets** (one-page references). The order lives in `data/blend_src.py` and is applied by `tools/blend.py`. Phase 20 builds 79 small, tested projects stage by stage, from a starter level to frontier systems. Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened. Part 8, the Project Library, gathers open-licence projects from other repositories: classic ML projects and build-from-scratch projects that run here with real output, then RAG, app, agent, multi-agent and MCP projects, Claude API recipes and Snowflake samples you run with your own keys. Each page credits its source; see THIRD_PARTY_NOTICES.md. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
 
 ## Using it
 

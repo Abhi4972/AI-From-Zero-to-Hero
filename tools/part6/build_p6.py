@@ -38,6 +38,9 @@ PHASES.update({
          "Real measured incidents to debug the way an interview round asks you to: read the evidence one listing at a time, find the cause, then design the fix."),
 })
 PART_OF = {17: PART, 18: PART, 19: PART, 20: "Projects and Case Files", 21: "Projects and Case Files"}
+import ext, importlib
+for _p, _v in ext.PHASES.items(): PHASES[_p] = _v; PART_OF[_p] = ext.PART
+EXT_MOD = {22: "ext_ml", 23: "ext_scratch", 24: "ext_apps", 25: "ext_apps", 26: "ext_apps", 27: "ext_apps", 28: "ext_recipes", 29: "ext_recipes", 30: "ext_snow"}
 LEVEL_NAMES = {1: "Starter", 2: "Builder", 3: "Engineer", 4: "Systems", 5: "Frontier"}
 DEMOS = json.loads((pathlib.Path("/home/claude/aifs/px/demos.json")).read_text()) if pathlib.Path("/home/claude/aifs/px/demos.json").exists() else {}
 ONLY = [int(x) for x in sys.argv[1:]] or [17, 18, 19]
@@ -69,6 +72,10 @@ def _demo(pid):                         # the reference demo's output: run here,
 for pno, (ph, title, desc) in PHASES.items():
     if pno not in ONLY and pno >= 20: continue
     ch = {"id": f"ph-{pno}", "code": f"{pno}", "title": title, "desc": desc, "lessons": [], "pno": pno}
+    if pno >= 22:
+        for c in importlib.import_module(EXT_MOD[pno]).lessons(pno, store):
+            lessons.append(c); ch["lessons"].append(c)
+        chapters.append(ch); continue
     if pno == 20:
         projs = [json.loads(f.read_text()) for f in sorted((REPO / "projects").glob("*/project.json"))]
         projs = sorted((j for j in projs if j.get("status") == "ready"), key=lambda j: (j.get("level", 9), j["title"].lower()))
@@ -271,8 +278,8 @@ print("interview questions", sum(len(v) for v in QA.values()), "in", len(QA), "l
 
 # ---------------------------------------------------------------- run the Python (small and CPU only; long jobs are marked @@skip)
 def run_lesson(c):
-    if not c["blocks"] or int(c["id"][1:3]) not in ONLY: return c["id"], []
-    key = hashlib.md5((json.dumps(c["blocks"]) + "p6v1").encode()).hexdigest()
+    if not c["blocks"] or int(c["id"][1:3]) not in ONLY or c.get("norun"): return c["id"], []
+    key = hashlib.md5((json.dumps(c["blocks"]) + ("nbv1" if c.get("nb") else "p6v1")).encode()).hexdigest()
     cf_ = CACHE / f"run_{c['id']}_{key}.json"
     if cf_.exists(): return c["id"], json.loads(cf_.read_text())
     ldir = pathlib.Path(c["dir"]); wd = pathlib.Path(f"/home/claude/aifs/run/{ldir.parent.name}/{ldir.name}/code"); wd.mkdir(parents=True, exist_ok=True)
@@ -282,11 +289,14 @@ def run_lesson(c):
             try: link.symlink_to(sib)
             except FileExistsError: pass
     for f in (ldir / "code").glob("*.py"): (wd / f.name).write_text(f.read_text())
+    if c.get("nb"):                        # notebook projects: their data folders and helper packages too
+        for f in (ldir / "code").iterdir():
+            if f.suffix != ".py" and not (wd / f.name).exists(): (wd / f.name).symlink_to(f)
     blocks = [("raise SystemExit  # not run\n" + b) if b.startswith("# AIFS_NORUN") else b for b in c["blocks"]]
     (wd / "blocks.json").write_text(json.dumps(blocks))
     try:
-        subprocess.run([PY, "/home/claude/aifs/runner.py", "blocks.json", "res.json"], cwd=wd, timeout=600, capture_output=True,
-                       env={**os.environ, "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "2",
+        subprocess.run([PY, "/home/claude/aifs/runner.py", "blocks.json", "res.json"], cwd=wd, timeout=1800 if c.get("nb") else 600, capture_output=True,
+                       env={**os.environ, "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "2", **({"AIFS_NB": "1"} if c.get("nb") else {}),
                             **({"PYTHONPATH": "/home/claude/aifs/sitefix"} if "multiprocessing" in "".join(c["blocks"]) else {})})
         res = json.loads((wd / "res.json").read_text())
     except Exception as e:
@@ -295,7 +305,9 @@ def run_lesson(c):
         if b.startswith("# AIFS_NORUN") and i < len(res): res[i] = {"status": "skipped"}
     cf_.write_text(json.dumps(res)); return c["id"], res
 with cf.ThreadPoolExecutor(3) as ex:
-    RUNS = dict(ex.map(run_lesson, lessons))
+    RUNS = dict(ex.map(run_lesson, [c for c in lessons if not c.get("heavy")]))
+for c in lessons:                          # memory-hungry lessons (124M-parameter models) one at a time
+    if c.get("heavy"): RUNS.update([run_lesson(c)])
 stat = {}
 for v in RUNS.values():
     for r in v: stat[r["status"]] = stat.get(r["status"], 0) + 1
