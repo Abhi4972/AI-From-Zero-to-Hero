@@ -42,8 +42,10 @@ def place(a, after):
     pos = h.end()
     for m in re.finditer(r"</p>", a[h.end():end]):
         seg = a[h.end():h.end() + m.end()]
-        if seg.count("<aside") == seg.count("</aside>") and seg.count("<details") == seg.count("</details>") and seg.count("<li") == seg.count("</li>"):
-            pos = h.end() + m.end(); break
+        balanced = all(seg.count("<" + t) == seg.count("</" + t + ">") for t in ("aside", "details", "li", "table", "blockquote", "div"))
+        if not balanced: continue
+        if re.sub(r"<[^>]+>", "", seg[seg.rfind("<p"):]).strip().endswith(":"): continue   # "…defined by:" belongs with its list
+        pos = h.end() + m.end(); break
     return pos
 
 def main(only):
