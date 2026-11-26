@@ -1,0 +1,536 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>Native Sparse Attention (DeepSeek NSA)</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.17</span><span class="chip">60 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1017" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>State the three NSA attention branches and what each one captures.</li>
+<li>Explain why NSA is "natively trainable" where prior sparse-attention methods were inference-only.</li>
+<li>Compute the attention compute savings of NSA versus full attention at 64k context as a function of compression block size and selection top-k.</li>
+<li>Implement the three-branch combination in stdlib Python on a short synthetic sequence and verify the gating weights behave.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 7 · 12 (KV cache, flash-attention), Phase 7 · 15 (attention variants), Phase 10 · 16 (differential attention)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>At 64k tokens, attention eats 70-80% of decode latency. Every open-model lab has a plan to fix it. DeepSeek's NSA (ACL 2025 best paper) is the one that stuck: three parallel attention branches — compressed coarse-grained tokens, selectively retained fine-grained tokens, and sliding windows for local context — combined through a learned gate. It is hardware-aligned (kernel-friendly), natively trainable (works in pre-training, not bolted on at inference), and on 64k decodes it runs faster than FlashAttention while matching or beating full attention qua</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Compressed branch</td>
+<td>"Coarse view"</td>
+<td>Attention over block-averaged keys that provides global context in $O(N/l)$ keys per query</td>
+</tr>
+<tr>
+<td>Selected branch</td>
+<td>"Top-k blocks"</td>
+<td>Fine-grained attention over the <code>k</code> blocks with highest compressed-branch scores</td>
+</tr>
+<tr>
+<td>Sliding window</td>
+<td>"Local context"</td>
+<td>Attention over the last <code>W</code> tokens for short-range patterns</td>
+</tr>
+<tr>
+<td>Native trainability</td>
+<td>"Pre-train with the sparsity on"</td>
+<td>The sparsity pattern is learned during pre-training, not bolted on at inference</td>
+</tr>
+<tr>
+<td>Compression block size l</td>
+<td>"Group size for coarse view"</td>
+<td>How many tokens get merged into one summary; 32-64 typical</td>
+</tr>
+<tr>
+<td>Top-k</td>
+<td>"Blocks to keep"</td>
+<td>Number of compressed blocks whose uncompressed tokens get read; 16 typical</td>
+</tr>
+<tr>
+<td>Sliding window W</td>
+<td>"Local attention radius"</td>
+<td>Typically 512; shorter hurts local coherence, longer wastes compute</td>
+</tr>
+<tr>
+<td>Branch gate</td>
+<td>"How to mix the three"</td>
+<td>Per-position MLP output that weights the three branches' contributions</td>
+</tr>
+<tr>
+<td>Hardware alignment</td>
+<td>"Kernel-friendly sparsity"</td>
+<td>Sparse pattern chosen so that the actual GPU kernel achieves the theoretical speedup</td>
+</tr>
+<tr>
+<td>DSA</td>
+<td>"NSA's successor"</td>
+<td>Deepseek Sparse Attention, the architecture that followed NSA in DeepSeek's lineage</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When a model writes the next token, every attention head reads the keys and values of every earlier token. At 64,000 tokens that reading dominates the time per token. Native Sparse Attention (NSA, DeepSeek, 2025) reads much less: a coarse summary of the whole context (one summary per small block of tokens), the full detail of only the few blocks the summaries say are relevant, and the most recent 512 tokens. A learned gate mixes the three. Because the model is <em>trained</em> with this pattern from the start, it learns to put information where the sparse reader will find it. This lesson runs the lesson's toy, counts exactly what the paper's settings read, tests when block summaries can find a single relevant token, and checks how much of a real dense model's attention an NSA-style selection would keep. No model is trained.</p></div></aside>
+<p>Full attention at sequence length N costs <code>O(N^2)</code> time and <code>O(N)</code> KV cache per layer. At 64k tokens, the compute and memory bandwidth numbers are catastrophic. Measured theoretical estimate from the NSA paper: attention accounts for 70-80% of total decode latency at 64k. Everything downstream — TTFT, tokens/sec, cost per million tokens — is dominated by attention cost.</p>
+<p>Sparse attention is the obvious answer. Prior attempts fall into two buckets. Fixed-pattern sparsity (sliding-window, strided, block-local) throws information away and fails on long-range recall tasks. Inference-time sparsity (KV cache pruning, H2O, StreamingLLM) is applied to a model pre-trained on dense attention and recovers only a fraction of the potential speedup because the model was never asked to route information through the sparse pattern.</p>
+<p>Native Sparse Attention (Yuan et al., DeepSeek + PKU + UW, ACL 2025 best paper, arXiv:2502.11089) does both: a sparsity pattern the model learns during pre-training, implemented as a kernel-aligned algorithm that actually delivers the compute savings at inference. Its production descendant, DeepSeek Sparse Attention (DSA), already runs in DeepSeek-V3.2.</p>
+<h2>Idea 1 · Three parallel branches</h2>
+<p>For each query, NSA runs attention three times, against three different views of the KV cache:</p>
+<ol>
+<li>
+<p><strong>Compressed branch.</strong> Tokens are grouped into blocks of length <code>l</code> = 32 that overlap with a stride of 16, so a new summary starts every 16 tokens. Each block is compressed into a single summary key and value by a small learned MLP with a position encoding inside the block. The query attends over these compressed tokens, getting a coarse-grained view of the whole sequence.</p>
+</li>
+<li>
+<p><strong>Selected branch.</strong> Using attention scores from the compressed branch, the top-k blocks most relevant to the current query are identified. Fine-grained (uncompressed) tokens from those blocks are read and the query attends over all of them. Think of compressed-branch attention as the routing signal for the selection. The paper selects 16 blocks of 64 tokens, of which the first block and the 2 most recent blocks are always included, and all query heads of a GQA group share the same selection (their scores are summed) so the blocks are loaded once per group.</p>
+</li>
+<li>
+<p><strong>Sliding-window branch.</strong> The query attends to the most recent <code>W</code> tokens (typically 512) for local context. This branch captures the structure-heavy short-range patterns (syntax, local coreference) that the other two might miss.</p>
+</li>
+</ol>
+<p>The three branch outputs are combined via a learned per-position gate:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">out</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7306em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cmp</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord text"><span class="mord">out</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cmp</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">sel</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">out</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">sel</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">win</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">out</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">win</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p><code>g_cmp, g_sel, g_win</code> are gate weights from a small MLP on the query. They do not have to sum to 1 — they can weight branches independently.</p>
+<h2>Idea 2 · Why this is "natively trainable"</h2>
+<p>The selection step (top-k blocks) is discrete. Discrete operations break gradient flow. Prior sparse-attention work either skipped backprop through selection (limiting training) or used continuous relaxations that did not give real sparsity at inference.</p>
+<p>NSA sidesteps this: the compressed-branch attention IS a differentiable coarse-grained attention on the whole sequence. The top-k operation just reuses the top attention scores from the compressed branch to pick which fine-grained blocks to load. Gradients reach the compressed-branch scores through the compressed branch's own output, not through the choice of blocks. Inside the chosen blocks, attention over the selected keys and values is ordinary attention, so their contribution to the final output is differentiable too. The <code>top_k</code> index choice itself gets no gradient: it only controls which blocks get loaded from memory.</p>
+<p>This is why NSA can be used in pre-training end to end. The model learns to route information through the three branches jointly, producing a sparse pattern that at inference actually delivers the promised speedup.</p>
+<h2>Idea 3 · Hardware-aligned kernel</h2>
+<p>NSA's kernel is designed for modern GPU memory hierarchies. The kernel loads queries by GQA groups (outer loop), fetches the corresponding sparse KV blocks per group (inner loop), and runs attention on SRAM. Because each query group sees the same selected blocks (selection is per-query-group, not per-query-head), the KV loads are amortized across the group. Arithmetic intensity stays high.</p>
+<p>The paper reports Triton kernels up to 9.0× faster than FlashAttention-2 in the forward pass and 6.0× in the backward pass at 64K tokens, and an expected decoding speedup of up to 11.6× (5,632 instead of 65,536 tokens read per step), growing with sequence length.</p>
+<h2>Idea 4 · The compute budget</h2>
+<p>Let <code>N</code> be sequence length, <code>l</code> the compression block size, <code>k</code> the top-k selection count, <code>w</code> the sliding window, <code>b</code> the selected block size (typically equals <code>l</code>).</p>
+<ul>
+<li>Compressed branch: <code>O(N/l)</code> keys per query, so <code>O(N * N / l)</code> total.</li>
+<li>Selected branch: <code>O(k * b)</code> keys per query, so <code>O(N * k * b)</code>.</li>
+<li>Sliding branch: <code>O(w)</code> keys per query, so <code>O(N * w)</code>.</li>
+</ul>
+<p>Total: <code>O(N * (N/l + k*b + w))</code>.</p>
+<p>With <code>N = 64k, l = 64, k = 16, b = 64, w = 512</code>: per-query cost is <code>1000 + 1024 + 512 = 2536 keys</code>. Full attention is <code>64000 keys</code>. 25x compute reduction.</p>
+<p>With <code>N = 128k, l = 64, k = 16, b = 64, w = 512</code>: per-query cost is <code>2000 + 1024 + 512 = 3536 keys</code>. Full attention is <code>128000 keys</code>. 36x reduction. The benefit grows with sequence length, which is the whole point. (These counts use one summary per 64 tokens. With the paper's overlapping compression, one summary every 16 tokens, the compressed branch reads <code>N/16</code> keys and the reduction at 64K is 11.6×; see the exact computation after Build it.)</p>
+<figure class="xv" data-xv="nsa-reads" aria-label="Step-through: how many keys one NSA query reads at 64K tokens."></figure>
+<h2>Idea 5 · How does it compare</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Differentiable</th>
+<th>Real inference speedup</th>
+<th>Long-range recall</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sliding window only</td>
+<td>yes</td>
+<td>yes</td>
+<td>fails</td>
+</tr>
+<tr>
+<td>Strided / block-sparse</td>
+<td>yes</td>
+<td>yes</td>
+<td>partial</td>
+</tr>
+<tr>
+<td>KV pruning (H2O, StreamingLLM)</td>
+<td>N/A (inference-time)</td>
+<td>yes</td>
+<td>partial</td>
+</tr>
+<tr>
+<td>MoBA (Moonshot)</td>
+<td>partial</td>
+<td>yes</td>
+<td>good</td>
+</tr>
+<tr>
+<td>NSA</td>
+<td>yes (natively)</td>
+<td>yes (up to 11.6× decode, 9× forward at 64k)</td>
+<td>matches full attention</td>
+</tr>
+</tbody>
+</table></div>
+<p>MoBA (Moonshot, arXiv:2502.13189) was published the same week and is simpler: no compressed or sliding branch, just a parameter-free router that scores each block by its mean-pooled key and attends to the top-k blocks plus the current one, the MoE principle applied to attention blocks. Moonshot reports it serving Kimi's long-context requests.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="sliding-window-attention"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>For query <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, each branch <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">cmp</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">sel</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">win</span></span><span class="mclose">}</span></span></span></span> runs ordinary attention over its own keys and values <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1672em;vertical-align:-0.247em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9202em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span></span><span style="top:-3.6023em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-2.453em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9202em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span><span style="top:-3.6023em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-2.453em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3em;vertical-align:-1.25em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7144em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">Attn</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9202em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span></span><span style="top:-3.6023em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7144em;"><span style="top:-2.453em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9202em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span><span style="top:-3.6023em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7144em;"><span style="top:-2.453em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7144em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2497em;vertical-align:-0.3997em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">MLP</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="mord"><span class="delimsizing size1">)</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:-0.0983em;"><span style="top:-2.3003em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">]</span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Compressed keys.</strong> With block length <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span></span> and stride <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2082em;vertical-align:-0.2769em;"></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9313em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span><span style="top:-3.6134em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7823em;"><span style="top:-2.4231em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.1809em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cmp</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal">φ</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mord mathnormal mtight">s</span><span class="mbin mtight">+</span><span class="mord mtight">1</span><span class="mrel mtight">:</span><span class="mord mathnormal mtight">i</span><span class="mord mathnormal mtight">s</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span>, about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">t</span><span class="mord">/</span><span class="mord mathnormal">s</span></span></span></span> of them.</p>
+<p><strong>Selection.</strong> The compressed attention scores <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0281em;vertical-align:-0.2458em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7823em;"><span style="top:-2.4542em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.1809em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cmp</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2458em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1702em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">softmax</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">⊤</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9202em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span></span><span style="top:-3.6023em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span></span></span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7823em;"><span style="top:-2.4542em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.1809em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cmp</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2458em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>, summed over the heads of a GQA group, rank the selection blocks; the top <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> blocks of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span> tokens are read in full.</p>
+<p><strong>Tokens read per step:</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.9781em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2921em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8352em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>.</p>
+<p><strong>Why a block summary can miss a needle.</strong> If one token in a block of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span></span> has score <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> and the others have independent scores of standard deviation 1, the mean-pooled block score has mean <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">m</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span></span> and noise <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1822em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span></span>: a signal-to-noise ratio of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1822em;vertical-align:-0.25em;"></span><span class="mord mathnormal">m</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The paper&#x27;s settings at 64K tokens</div><div class="co-body"><p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">65</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">536</span></span></span></span>:</p>
+<ul>
+<li>Compressed: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">65</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">536/16</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">096</span></span></span></span> summaries.</li>
+<li>Selected: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">16</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">024</span></span></span></span> tokens.</li>
+<li>Window: 512 tokens.</li>
+<li>Total: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">5</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">632</span></span></span></span> tokens read, against <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">65</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">536</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">11.6</span><span class="mord">×</span></span></span></span> fewer, the paper's expected decoding speedup.</li>
+</ul>
+<p>At 128K the compressed branch doubles to 8,192 while the other two stay fixed: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">9</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">728</span></span></span></span> tokens, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">13.5</span><span class="mord">×</span></span></span></span>. The compressed branch grows linearly, so the gain levels off.</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "NSA shrinks the KV cache."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It reads less per step but stores every token (and the summaries on top): any block may be selected later.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Top-k selection makes training impossible."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The block choice gets no gradient, but everything it feeds is ordinary attention, and the compressed branch that ranks the blocks is trained through its own output.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Mean-pooled summaries find any relevant token."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A single token's score is diluted by the block length; small blocks, overlap and a learned compressor exist to counter that (the exact computation, part C).</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Take a dense model never trained with sparsity, SmolLM2-360M, at 4,096 tokens. Keep only the first block, the last 512 tokens and 13 more blocks of 64 chosen from mean-pooled keys: about a third of the context. What share of a typical head's attention survives? (Solution P1.)</p></div></aside>
+<h2>Step 1 · compress tokens into blocks</h2>
+<p><code>code/main.py</code> implements the three branches on a short synthetic sequence and shows:</p>
+<ul>
+<li>The compression MLP (a simple mean-pool baseline is used for pedagogical clarity; the real NSA uses a learned MLP).</li>
+<li>The top-k block selection driven by compressed-branch scores.</li>
+<li>The sliding-window attention on the last <code>w</code> tokens.</li>
+<li>The gated combination.</li>
+<li>A compute-count printout comparing to full attention.</li>
+</ul>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def compress(K, l):
+    n = len(K)
+    n_blocks = (n + l - 1) // l
+    out = []
+    for b in range(n_blocks):
+        start, end = b * l, min((b + 1) * l, n)
+        block = K[start:end]
+        summary = [sum(row[d] for row in block) / len(block) for d in range(len(K[0]))]
+        out.append(summary)
+    return out
+</code></pre></div>
+
+<h2>Step 2 · compressed-branch attention</h2>
+<p>Run softmax attention of the query against the compressed keys. The compressed-branch scores double as the signal for top-k selection.</p>
+<h2>Step 3 · top-k block selection</h2>
+<p>Pick the indices of the <code>k</code> highest-scoring compressed blocks. Load the original uncompressed tokens from those blocks and run attention on them.</p>
+<h2>Step 4 · sliding-window attention</h2>
+<p>Take the last <code>w</code> tokens and run standard attention against them.</p>
+<h2>Step 5 · gate + combine</h2>
+<p>A small MLP on the query produces three gate weights. The final output is a weighted sum of the three branch outputs.</p>
+<h2>Step 6 · compute counting</h2>
+<p>Print the number of keys attended per query for each branch and the total. Compare to <code>N</code> (full attention). On a 1024-token synthetic with <code>l = 32, k = 4, w = 128</code>, NSA sees <code>32 + 128 + 128 = 288</code> keys per query versus 1024 for full attention — 3.5x fewer.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s toy</div><div class="co-body"><p><code>main.py</code>: the three branches on a 1,024-token synthetic sequence with signal in three blocks (mean-pool compression, top-4 selection, a 128-token window, a gate), then key counts at production lengths and a block-size sweep (about a second).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # three-branch toy and key counts; about a second
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+NATIVE SPARSE ATTENTION: DeepSeek NSA (Phase 10, Lesson 17)
+======================================================================
+
+----------------------------------------------------------------------
+Step 1: synthetic N=1024, d=16, signal at blocks [3, 17, 28]
+        config: l=32 (compression block), k=4 (top-k), W=128 (sliding window)
+----------------------------------------------------------------------
+  compressed branch keys : 32
+  selected branch keys   : 128  (blocks [3, 6, 17, 28])
+  sliding window keys    : 128
+  total keys attended    : 288
+  full-attention keys    : 1024  (3.6x more)
+  gate weights (cmp/sel/win): 0.337 / 0.364 / 0.457
+
+  signal blocks retrieved: [3, 17, 28]  (missed: [])
+
+----------------------------------------------------------------------
+Step 2: compute savings at production context lengths
+----------------------------------------------------------------------
+         N    l    k     W    NSA keys   full keys    savings
+      4096   32    8   256         640      4,096       6.4x
+     16384   32   16   512       1,536     16,384      10.7x
+     32768   64   16   512       2,048     32,768      16.0x
+     65536   64   16   512       2,560     65,536      25.6x
+    131072   64   16   512       3,584    131,072      36.6x
+    262144   64   16   512       5,632    262,144      46.5x
+
+----------------------------------------------------------------------
+Step 3: block-size vs top-k sweep (cost at N=65536, W=512)
+----------------------------------------------------------------------
+     l    k      keys   vs full
+    32    8     2,816     23.3x
+    32   16     3,072     21.3x
+    32   32     3,584     18.3x
+    64    8     2,048     32.0x
+…
+(11 more lines)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Step 1.</strong> The query reads 288 of 1,024 keys and the selection finds all three signal blocks (block 6 fills the fourth slot by chance). This is the easy case for block selection: in the synthetic sequence <em>every</em> token of a signal block carries the query's pattern, so averaging a block does not dilute the signal. A single relevant token among 31 others is much harder (the next run, part C). The gate weights come from a random matrix, so 0.34 / 0.36 / 0.46 only show the mechanics: independent sigmoids that need not sum to 1.</p>
+<p><strong>Step 2.</strong> The key counts use one summary per block of <code>l</code> tokens: 25.6× fewer keys at 64K and 36.6× at 128K. The paper's compression uses overlapping blocks with a stride of 16, which gives four times more summaries at the same settings and a reduction of 11.6× at 64K (next run, part A).</p>
+<p><strong>Step 3.</strong> With the selection block equal to the compression block, larger blocks shrink the compressed branch but enlarge every selected block, so the cost has a minimum (32× at <code>l</code> = 64 or 128 with <code>k</code> = 8). Cost is only half the trade: larger blocks also make each summary a blurrier average.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">What NSA reads, stores and can find, computed</div><div class="co-body"><p>A: tokens read per decode step with the paper's settings. B: the KV cache NSA stores against what it reads. C: how often top-k selection over mean-pooled block keys keeps a single relevant token, by block length and logit margin, with the token budget fixed at 1,024.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+print(&quot;A. Tokens read per decode step with the NSA paper's settings&quot;)
+print(&quot;   compression: blocks of 32, stride 16 (overlapping) | selection: 16 blocks of 64 | window 512&quot;)
+print(f&quot;  {'context':&gt;8} {'compressed':&gt;11} {'selected':&gt;9} {'window':&gt;7} {'NSA total':&gt;10} {'full':&gt;8} {'expected speedup':&gt;17}&quot;)
+for N in [8192, 16384, 32768, 65536, 131072, 262144]:
+    cmp_ = N // 16
+    tot = cmp_ + 16 * 64 + 512
+    print(f&quot;  {N:&gt;8,} {cmp_:&gt;11,} {16 * 64:&gt;9,} {512:&gt;7} {tot:&gt;10,} {N:&gt;8,} {N / tot:&gt;16.1f}x&quot;)
+print(&quot;  decoding is memory-bound, so tokens read is the right yardstick; the compressed branch dominates at long context&quot;)
+print()
+
+print(&quot;B. NSA saves memory reads, not memory: KV cache at 128K tokens, 80 layers, 8 KV heads of 128, BF16&quot;)
+per_tok = 80 * 2 * 8 * 128 * 2
+full = 131072 * per_tok
+print(f&quot;  full attention cache          : {full / 2**30:6.1f} GiB&quot;)
+print(f&quot;  NSA: full cache + compressed  : {full * (1 + 1 / 16) / 2**30:6.1f} GiB  (every token is kept: any block may be selected later)&quot;)
+print(f&quot;  read per decode step, full    : {full / 2**30:6.2f} GiB;   NSA: {(8192 + 1024 + 512) * per_tok / 2**30:.2f} GiB&quot;)
+print()
+
+print(&quot;C. Can mean-pooled block keys find one relevant token? N = 8192, d = 64, always 1,024 tokens selected&quot;)
+d, N = 64, 8192
+ls = [1, 16, 32, 64, 128]
+print(&quot;  logit margin of the needle over a typical token (noise logits have std 1)&quot;)
+print(f&quot;  {'margin':&gt;7} &quot; + &quot;&quot;.join(f&quot;{f'block {l}':&gt;10}&quot; for l in ls) + &quot;   (share of 300 trials where the needle is among the selected tokens)&quot;)
+for s in [4, 8, 12, 16, 24]:
+    row = f&quot;  {s:&gt;7} &quot;
+    for l in ls:
+        hits = 0
+        for t in range(300):
+            q = rng.normal(0, 1, d); q *= np.sqrt(d) / np.linalg.norm(q)   # scores q.k/sqrt(d) have std 1
+            K = rng.normal(0, 1, (N, d))
+            pos = rng.integers(0, N)
+            K[pos] = s * q / np.sqrt(d) + rng.normal(0, 0.1, d)            # needle score = s
+            blocks = K.reshape(N // l, l, d).mean(1)                       # the lesson's mean-pool compressor
+            top = np.argsort(blocks @ q)[-(1024 // l):]
+            hits += (pos // l) in top
+        row += f&quot;{hits / 300:&gt;10.0%}&quot;
+    print(row)
+print(f&quot;  chance alone would give {1024 / N:.1%}; block 1 = choosing the 1,024 best single tokens&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. Tokens read per decode step with the NSA paper&#x27;s settings
+   compression: blocks of 32, stride 16 (overlapping) | selection: 16 blocks of 64 | window 512
+   context  compressed  selected  window  NSA total     full  expected speedup
+     8,192         512     1,024     512      2,048    8,192              4.0x
+    16,384       1,024     1,024     512      2,560   16,384              6.4x
+    32,768       2,048     1,024     512      3,584   32,768              9.1x
+    65,536       4,096     1,024     512      5,632   65,536             11.6x
+   131,072       8,192     1,024     512      9,728  131,072             13.5x
+   262,144      16,384     1,024     512     17,920  262,144             14.6x
+  decoding is memory-bound, so tokens read is the right yardstick; the compressed branch dominates at long context
+
+B. NSA saves memory reads, not memory: KV cache at 128K tokens, 80 layers, 8 KV heads of 128, BF16
+  full attention cache          :   40.0 GiB
+  NSA: full cache + compressed  :   42.5 GiB  (every token is kept: any block may be selected later)
+  read per decode step, full    :  40.00 GiB;   NSA: 2.97 GiB
+
+C. Can mean-pooled block keys find one relevant token? N = 8192, d = 64, always 1,024 tokens selected
+  logit margin of the needle over a typical token (noise logits have std 1)
+   margin    block 1  block 16  block 32  block 64 block 128   (share of 300 trials where the needle is among the selected tokens)
+        4       100%       41%       31%       24%       17%
+        8       100%       76%       65%       47%       30%
+       12       100%       98%       83%       62%       45%
+       16       100%      100%       95%       80%       60%
+       24       100%      100%      100%       94%       82%
+  chance alone would give 12.5%; block 1 = choosing the 1,024 best single tokens</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> With the paper's settings, the selected blocks (1,024 tokens) and the window (512) are fixed, and the compressed branch grows as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">t</span><span class="mord">/16</span></span></span></span>. At 64K the total is 5,632 tokens, the 11.6× reduction the paper reports for decoding. At 8K the gain is only 4×, and beyond 128K it levels off near 15× because the compressed branch, still linear in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>, dominates.</p>
+<p><strong>B.</strong> NSA does not save memory. All 128K tokens stay in the cache (40 GiB for this 70B-class configuration), plus 6% for the summaries, because any block might be selected by a later query. What it saves is the amount <em>read</em> per step: about 3 GiB instead of 40 GiB, which is what sets the speed of memory-bound decoding.</p>
+<p><strong>C.</strong> Selecting the 1,024 best <em>single</em> tokens always finds the needle. Selecting blocks by their mean-pooled key finds it far less reliably, and the larger the block the worse: with a logit margin of 8, 76% of the time with blocks of 16 but 30% with blocks of 128. The needle's margin is divided by the block length while the other tokens' noise only shrinks as the square root, so the block's signal-to-noise ratio is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1822em;vertical-align:-0.25em;"></span><span class="mord mathnormal">m</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span></span>. This is why NSA uses small (32), overlapping compression blocks with a <em>learned</em> compressor, why the model must be trained with the sparsity so that it learns keys that stand out after compression, and why DeepSeek's later DSA scores single tokens.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>No released model uses NSA itself. DeepSeek's production descendant is <strong>DeepSeek Sparse Attention (DSA)</strong> in DeepSeek-V3.2-Exp (September 2025) and DeepSeek-V3.2. DSA keeps NSA's idea of choosing what to read but works on single tokens instead of blocks: a small FP8 <em>lightning indexer</em> scores every earlier token, and each query attends to the top 2,048. It was added to an existing dense-attention model by continued training.</p>
+<ul>
+<li><strong>vLLM and SGLang</strong>: support DeepSeek-V3.2 with DSA (vLLM from launch day, 29 September 2025).</li>
+<li><strong>TensorRT-LLM</strong>: optimised DeepSeek-V3.2 kernels for Blackwell GPUs.</li>
+<li><strong>llama.cpp / CPU</strong>: not the target; sparse kernels pay off at long contexts on GPUs.</li>
+</ul>
+<p>When to reach for NSA:</p>
+<ul>
+<li>Pre-training or continued-training run targeting 64k-plus context with a serious compute budget.</li>
+<li>Inference of DeepSeek-V3.2 checkpoints, whose sparse attention (DSA) is built in.</li>
+</ul>
+<p>When not to:</p>
+<ul>
+<li>Serving an existing dense-attention pre-trained model. You cannot retrofit NSA without continued training.</li>
+<li>Context under 16k. The three-branch overhead dominates the savings.</li>
+<li>Batch-1 interactive chat. Latency-sensitive decode benefits, but only at long contexts.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">NSA-style selection applied to a real dense model</div><div class="co-body"><p>SmolLM2-360M at 4,095 tokens (Wikipedia text with a 4-digit code in the middle, as in <a href="#a1016">Lesson 10.16</a>). For the last token, in every one of the 160 GQA groups, keep the first block, the last 512 tokens and 13 more blocks of 64, chosen four ways: by the compressed (mean-pooled key) score as NSA does, by the true attention mass (the best possible), at random, or none. Reported: the share of each head's full attention that falls on the kept tokens. Inference only, about a minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, transformers, datasets
+import transformers.models.llama.modeling_llama as llama
+from transformers import AutoTokenizer, AutoModelForCausalLM
+transformers.logging.disable_progress_bar(); transformers.logging.set_verbosity_error(); datasets.disable_progress_bars()
+name = &quot;HuggingFaceTB/SmolLM2-360M&quot;
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32, attn_implementation=&quot;eager&quot;).eval()
+cfg = model.config
+H, G = cfg.num_attention_heads, cfg.num_key_value_heads
+
+grab = []                                         # per layer: last query, keys (after RoPE), last attention row
+orig = llama.eager_attention_forward
+def spy(module, query, key, value, attention_mask, **kw):
+    out, w = orig(module, query, key, value, attention_mask, **kw)
+    grab.append((query[0, :, -1].clone(), key[0].clone(), w[0, :, -1].clone()))
+    return out, None
+llama.eager_attention_forward = spy
+
+wiki = datasets.load_dataset(&quot;Salesforce/wikitext&quot;, &quot;wikitext-2-raw-v1&quot;, split=&quot;test&quot;)
+filler = tok(&quot; &quot;.join(t.strip() for t in wiki[&quot;text&quot;][:600] if t.strip()))[&quot;input_ids&quot;]
+needle = tok(&quot; The secret code for the vault is 7341.&quot;)[&quot;input_ids&quot;]
+question = tok(&quot; Remember: the secret code for the vault is &quot;)[&quot;input_ids&quot;]
+L, B, W, NSEL = 4096, 64, 512, 16                 # context, selection block, window, blocks (1 initial + 2 local + 13 chosen)
+half = (L - len(needle) - len(question)) // 2
+ids = (filler[:half] + needle + filler[half:2 * half] + question)[:L]
+digits = [half + i for i, t in enumerate(needle) if tok.decode([t]) in &quot;7341&quot;]
+with torch.no_grad():
+    nxt = model(torch.tensor([ids])).logits[0, -1].argmax().item()
+n = len(ids); nb = n // B
+print(f&quot;{name}: {cfg.num_hidden_layers} layers, {H} query heads in {G} GQA groups; context {n} tokens, next token {tok.decode([nxt])!r}&quot;)
+print(f&quot;NSA-style budget: first block + last {W} tokens + {NSEL - 3} more blocks of {B} = about &quot;
+      f&quot;{B + W + (NSEL - 3) * B} of {n} tokens ({(B + W + (NSEL - 3) * B) / n:.0%})&quot;)
+
+res = {&quot;compressed score (NSA)&quot;: [], &quot;best possible blocks&quot;: [], &quot;random blocks&quot;: [], &quot;window + first block only&quot;: []}
+needle_hit, needle_heads = 0, 0
+g = torch.Generator().manual_seed(0)
+for q, k, w in grab:
+    for grp in range(G):
+        heads = range(grp * H // G, (grp + 1) * H // G)
+        base = set(range(n - W, n)) | set(range(B))
+        cand = [b for b in range(nb) if b != 0 and b * B &lt; n - W]          # blocks outside window and first block
+        kb = k[grp, :nb * B].reshape(nb, B, -1).mean(1)                      # mean-pooled block keys
+        score = sum(torch.softmax(q[h] @ kb.T / q.shape[-1] ** 0.5, -1) for h in heads)   # summed over the group
+        mass = sum(w[h, :nb * B].reshape(nb, B).sum(1) for h in heads)
+        picks = {
+            &quot;compressed score (NSA)&quot;: sorted(cand, key=lambda b: -score[b])[:NSEL - 3],
+            &quot;best possible blocks&quot;: sorted(cand, key=lambda b: -mass[b])[:NSEL - 3],
+            &quot;random blocks&quot;: [cand[i] for i in torch.randperm(len(cand), generator=g)[:NSEL - 3]],
+            &quot;window + first block only&quot;: [],
+        }
+        for key, blocks in picks.items():
+            keep = base | {t for b in blocks for t in range(b * B, b * B + B)}
+            idx = torch.tensor(sorted(keep))
+            for h in heads:
+                res[key].append(w[h, idx].sum().item())
+        for h in heads:                                                       # heads that look at the code
+            if w[h, digits].sum() &gt; 0.3:
+                needle_heads += 1
+                needle_hit += (digits[0] // B) in picks[&quot;compressed score (NSA)&quot;]
+print()
+print(f&quot;{'blocks chosen by':&lt;27} {'median head keeps':&gt;18} {'worst 10% of heads keep':&gt;24}&quot;)
+for key, v in res.items():
+    v = torch.tensor(v)
+    print(f&quot;{key:&lt;27} {v.median():&gt;17.0%} {v.quantile(0.1):&gt;24.0%}&quot;)
+print(f&quot;\nheads putting over 30% of attention on the code: {needle_heads}; the code's block selected for {needle_hit} of them&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">HuggingFaceTB/SmolLM2-360M: 32 layers, 15 query heads in 5 GQA groups; context 4095 tokens, next token &#x27;7&#x27;
+NSA-style budget: first block + last 512 tokens + 13 more blocks of 64 = about 1408 of 4095 tokens (34%)
+
+blocks chosen by             median head keeps  worst 10% of heads keep
+compressed score (NSA)                    94%                      64%
+best possible blocks                      99%                      88%
+random blocks                             86%                      48%
+window + first block only                 82%                      35%
+
+heads putting over 30% of attention on the code: 16; the code&#x27;s block selected for 11 of them</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Keeping 34% of the tokens, the median head keeps 94% of its attention when blocks are chosen from mean-pooled keys, against 99% for the best possible blocks and 86% for random ones; the first block and window alone already hold 82% (much of it the attention sink on token 0 and the recent text). The selection works for typical heads in a model that was never trained to be sparse.</p>
+<p>It is the hard heads that suffer: for the worst 10% of heads only 64% survives (88% with the best blocks). Of the 16 heads that put more than 30% of their attention on the hidden code, the compressed score selected the code's block for 11, so 5 retrieval heads would have lost the code. The best-possible column shows that the right blocks exist; the mean-pooled keys of a dense model cannot always find them. Training with the sparsity in place (NSA) or continued training with a learned token indexer (DeepSeek-V3.2's DSA) closes this gap; bolting selection onto a dense model does not.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Drop the sliding-window branch and the two forced local blocks, keeping only compressed attention and top-k selection. What breaks first, and where would you see it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>DeepSeek Sparse Attention (DSA)</strong> in DeepSeek-V3.2: a token-level lightning indexer picks the top 2,048 tokens per query; served by vLLM, SGLang and TensorRT-LLM.</li>
+<li><strong>MoBA</strong> (Moonshot): block top-k attention serving Kimi's long-context requests.</li>
+<li><strong>Hybrid local/global attention</strong> is the more common production answer to long-context cost: sliding-window layers interleaved with full-attention layers (Gemma 3, gpt-oss), or linear-attention layers mixed with full attention (Qwen3-Next, MiniMax).</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2502.11089">NSA paper</a>, <a href="https://arxiv.org/abs/2512.02556">DeepSeek-V3.2 report</a>, <a href="https://vllm.ai/blog/2025-09-29-deepseek-v3-2">vLLM: DeepSeek-V3.2-Exp</a>, <a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">TensorRT-LLM: DeepSeek-V3.2 on Blackwell</a>, <a href="https://arxiv.org/abs/2502.13189">MoBA</a>, <a href="https://arxiv.org/abs/2503.19786">Gemma 3 report</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Three branches: compressed summaries, selected blocks in full, a sliding window; a sigmoid gate mixes them.</li>
+<li>The compressed branch's scores choose the blocks, so selection needs no gradient of its own.</li>
+<li>Paper settings read 5,632 of 65,536 tokens at 64K: 11.6× fewer.</li>
+<li>NSA cuts reads, not storage.</li>
+<li>Block summaries dilute single tokens by the block length; DSA selects single tokens instead.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-attention-variants"><span class="t" style="--cs-hue:265">AV</span>Cheat sheet · Attention Variants Compared</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-nsa-integrator.md</code>. Given a long-context pre-training run specification, it produces an NSA integration plan: compression block size, top-k, sliding window, gate MLP width, kernel choice, and the specific long-context evals that would justify the architecture change.</p>
+<p><strong><code>outputs/skill-nsa-integrator.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: nsa-integrator
+description: Integration plan for Native Sparse Attention in a long-context pre-training run.
+version: 1.0.0
+phase: 10
+lesson: 17
+tags: [nsa, sparse-attention, long-context, pre-training, kernel-aligned, deepseek]
+---
+
+Given a long-context pre-training run specification (target context, base architecture, training tokens available, GPU topology, deployment target), produce an NSA integration plan.
+
+Produce:
+
+1. Compression block size `l`. Pick 32, 64, or 128. Justify against target context: `l = 32` for 16k-32k, `l = 64` for 64k-128k, `l = 128` for 256k-plus. Larger `l` means fewer compressed keys but coarser routing signal.
+2. Top-k selection count. Pick between 8 and 32. The paper's default is 16. Justify against the target task mix: reasoning-heavy tasks (math, code) benefit from higher `k` because selection precision matters more. Retrieval-heavy tasks work at lower `k`.
+3. Sliding window `W`. Pick 256, 512, or 1024. Default 512. Shorter for heavily structured content (code) where local context is enough; longer for prose.
+4. Gate MLP. Specify width and initialization. Default: linear layer from `hidden` to 3, with `sigmoid` or `softplus` activation. Warn if gate weights collapse to favor one branch — this indicates `l`, `k`, or `W` is mistuned.
+5. Kernel choice. Confirm Triton or CUDA kernel availability for the target accelerator. Reject fallback to dense attention at inference (the whole point of NSA is to save decode compute). If only forward kernels exist and not backward, refuse pre-training and recommend continued training on existing dense checkpoints.
+
+Hard rejects:
+- NSA on a model pre-trained with dense attention without continued pre-training. Cannot be bolted on at inference.
+- Target context under 16k. The three-branch overhead dominates.
+- Inference-only deployments on stacks without NSA kernel support. Recommend MLA or sliding-window attention instead.
+
+Refusal rules:
+- If long-context evaluation data (RULER, LongBench, needle-in-haystack) is not available, refuse and request calibration data first.
+- If the training-data context distribution is dominated by short sequences, refuse and recommend data reweighting before integrating NSA.
+- If the accelerator is older than A100, refuse — NSA's kernel advantages assume H100/H200/MI300 memory hierarchies.
+
+Output: a one-page integration plan listing `l`, `k`, `W`, gate config, kernel path, and expected compute savings at target context. End with a &quot;success criterion&quot; paragraph: the specific RULER or LongBench number (percentage points vs a matched dense-attention baseline) that justifies keeping NSA. Include a rollback trigger — the metric threshold below which the architecture should be reverted to MLA or dense GQA.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code> on a 1024-token synthetic. Sweep <code>(l, k, w)</code> across three presets and print compute counts. Identify the preset that achieves the lowest key-count per query while keeping 95% recall against full attention on a needle-in-haystack test.</p>
+</li>
+<li>
+<p>Replace the mean-pool compressor with a tiny learned MLP (2-layer, hidden 32). Train it on a synthetic task where the signal is the average of a block. Measure the perplexity gap against the mean-pool baseline on held-out data.</p>
+</li>
+<li>
+<p>Implement the gate MLP. It takes the query as input and outputs three scalars. Show that the gate behaves sensibly: near-uniform weighting on random queries, heavy weight on the selected branch when the query hits a far-back block.</p>
+</li>
+<li>
+<p>Compute the KV cache memory budget for an NSA-enabled 70B model at 128k context. KV heads are 8, head dim 128, BF16. Compare to full attention and to MLA (Phase 10 · 14 showed MLA's numbers). Identify the sequence length where NSA's fine-grained branch KV cache equals full attention.</p>
+</li>
+<li>
+<p>Read Section 4 of the NSA paper (arXiv:2502.11089) and explain in three sentences why the compressed branch's attention scores are reused for top-k selection rather than computing a separate routing score. Tie the answer to gradient flow.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1017-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · About 94% for the median head</span></summary><div class="qa-a"><p>About 94%: the median head keeps 94% of its attention, and 82% is already in the first block and the last 512 tokens. Attention in a trained model is concentrated: on the first tokens (the attention sink), on the recent text, and on a few relevant spans, so a third of the context carries almost all of it. The tail is where it hurts: the worst 10% of heads keep only 64%, and 5 of the 16 heads that read the hidden code would lose it. Averages look fine; the heads that do long-range retrieval are the ones a poor selection breaks.</p></div></details>
+<details class="qa" id="a1017-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Local coherence and the newest tokens</span></summary><div class="qa-a"><p>Local text breaks first. Without the window, the newest tokens are only reachable through the selection, which must compete with every other block for a fixed number of slots, and through blurry summaries. The paper keeps both the window and two forced local blocks precisely so that grammar, word pieces and nearby references never depend on the selection. You would see it first in perplexity on ordinary text and in malformed output (wrong word endings, broken code syntax), long before any long-context benchmark moves. The paper also argues the window lets the other two branches specialise in long-range information instead of being dominated by easy local patterns during training.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2502.11089">Yuan et al. — Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention (arXiv:2502.11089, ACL 2025 Best Paper)</a> — the paper</li>
+<li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 Technical Report (arXiv:2412.19437)</a> — the architecture family NSA targets</li>
+<li><a href="https://arxiv.org/abs/2502.13189">Moonshot AI — MoBA: Mixture of Block Attention for Long-Context LLMs (arXiv:2502.13189)</a> — concurrent work, MoE-style attention over blocks</li>
+<li><a href="https://arxiv.org/abs/2004.05150">Beltagy et al. — Longformer: The Long-Document Transformer (arXiv:2004.05150)</a> — sliding-window origins</li>
+<li><a href="https://arxiv.org/abs/2309.17453">Xiao et al. — StreamingLLM: Efficient Streaming Language Models with Attention Sinks (arXiv:2309.17453)</a> — inference-time sparsity baseline NSA improves on</li>
+<li><a href="https://arxiv.org/abs/2307.08691">Dao et al. — FlashAttention-2 (arXiv:2307.08691)</a> — the full-attention baseline NSA kernels beat at 64k</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/17-native-sparse-attention" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1017" id="done-a1017">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1017" id="undo-a1017" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1016"><span class="pn-dir">Previous</span><span class="pn-t">10.16 · Differential Attention (V2)</span></a><a class="pn next" href="#a1018"><span class="pn-dir">Next</span><span class="pn-t">10.18 · Multi-Token Prediction (MTP)</span></a></div></footer>

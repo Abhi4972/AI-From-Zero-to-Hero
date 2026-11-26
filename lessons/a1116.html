@@ -1,0 +1,472 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-11">Phase 11 · LLM Engineering</a></nav><h1>Agent State Machines — Graphs, Nodes, Checkpoints</h1><div class="m-meta"><span class="chip chip-num">Lesson 11.16</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1116" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 11 · 09 (Function Calling), Phase 11 · 14 (Model Context Protocol)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A ReAct loop written by hand is a <code>while True</code>. The same loop written as an explicit graph is something you can checkpoint, interrupt, branch, and time-travel through. The agent hasn't changed. The harness around it has.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>StateGraph</td>
+<td>"The LangGraph graph"</td>
+<td>The builder object you add nodes and edges to before compile.</td>
+</tr>
+<tr>
+<td>Reducer</td>
+<td>"How the field merges"</td>
+<td>A function <code>(old, new) -&gt; merged</code> applied when a node returns an update for that field; default is overwrite, <code>add_messages</code> appends.</td>
+</tr>
+<tr>
+<td>Thread</td>
+<td>"A conversation ID"</td>
+<td>A <code>thread_id</code> string that scopes all checkpoints for one session.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>"A paused state"</td>
+<td>A persisted snapshot of the full graph state after a node transition, keyed on <code>(thread_id, checkpoint_id)</code>.</td>
+</tr>
+<tr>
+<td>Interrupt</td>
+<td>"Pause for a human"</td>
+<td><code>interrupt()</code> inside a node pauses and saves the state; resume with <code>Command(resume=value)</code>. Static <code>interrupt_before</code> / <code>interrupt_after</code> breakpoints are for debugging and resume with <code>invoke(None, config)</code>.</td>
+</tr>
+<tr>
+<td>Time-travel</td>
+<td>"Fork from a prior step"</td>
+<td><code>graph.invoke(None, config_with_old_checkpoint_id)</code> replays from that checkpoint forward.</td>
+</tr>
+<tr>
+<td>Send</td>
+<td>"Parallel subgraph dispatch"</td>
+<td>A constructor a node can return to spawn N parallel executions of a target node.</td>
+</tr>
+<tr>
+<td>Subgraph</td>
+<td>"A compiled graph as a node"</td>
+<td>A compiled StateGraph used as a node in another graph; preserves its own state scope.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>An agent is a loop: the model reads the conversation, maybe asks for a tool, the tool runs, its result is added, and the model reads again. Written as a bare <code>while True:</code> loop, it cannot be paused for a person to approve a risky step, resumed after a crash, or rewound to try a different choice. Writing the same loop as an explicit graph fixes that: each step is a node, the arrows between steps are edges, and everything the agent knows lives in one state object that the runtime saves after every step (a checkpoint). LangGraph is the best-known library for this. This lesson builds the four-node agent graph, then runs a real one: a small local model handles a refund ticket, a human reviewer stops a wrong refund, the thread is rewound and replayed, and three short demos show the mistakes that silently lose data or repeat side effects. No model is trained.</p></div></aside>
+<p>You ship a function-calling agent. It works for three turns, then something goes wrong: the model tries a tool that returns 500, the user changes their mind mid-task, or the agent decides to refund an order without a human signing off. The <code>while True:</code> loop has no hooks. You can't pause it, you can't rewind it, and you can't branch off into "what if the model had picked the other tool." The moment you ship this past a demo, the agent becomes a black box that either worked or didn't.</p>
+<p>The next step is obvious once you see it. The agent is already a state machine — system prompt plus message history plus pending tool calls plus the next action. Make the state machine explicit: nodes for "the model thinks," "a tool runs," "a human approves," and edges for the conditional transitions between them. Once the graph is explicit, the harness gets four things for free: checkpointing (save state between steps), interrupts (pause for a human), streaming (stream tokens and intermediate events), and time-travel (rewind to a prior state and try a different branch).</p>
+<p>The reference implementation of this abstraction is LangGraph. It is not an agent framework in the LangChain sense ("here is an AgentExecutor, good luck"). It is a graph runtime with first-class state, first-class persistence, and first-class interrupts. The agent loop is something you draw, not something you hand-write.</p>
+<h2>The idea</h2>
+<p><img alt="LangGraph StateGraph: nodes, edges, and the checkpointer" src="repo-assets/phases/11-llm-engineering/16-langgraph-state-machines/assets/langgraph-stategraph.svg" /></p>
+<p>A <code>StateGraph</code> has three things.</p>
+<ol>
+<li><strong>State.</strong> A typed dict (TypedDict or Pydantic model) that flows through the graph. Every node receives the full state and returns a partial update, which LangGraph merges using a <em>reducer</em> per field — <code>operator.add</code> for lists that should accumulate, overwrite by default.</li>
+<li><strong>Nodes.</strong> Python functions <code>state -&gt; partial_state</code>. Each is a discrete step: "call the model," "run tools," "summarize."</li>
+<li><strong>Edges.</strong> Transitions between nodes. Static edges go one place. Conditional edges take a router function <code>state -&gt; next_node_name</code> so the graph can branch on model output.</li>
+</ol>
+<p>You compile the graph. Compile binds the topology, attaches a checkpointer (optional but essential for production), and returns a runnable. You invoke it with an initial state and a <code>thread_id</code>. Every step of execution persists a checkpoint keyed on <code>(thread_id, checkpoint_id)</code>.</p>
+<h2>Idea 1 · The four superpowers</h2>
+<p><strong>Checkpointing.</strong> Every node transition writes the new state to a store (in-memory for tests, Postgres/Redis/SQLite for prod). Resume by calling the graph again with the same <code>thread_id</code>. The graph picks up where it paused.</p>
+<p><strong>Interrupts.</strong> Call <code>interrupt(payload)</code> inside a node and execution stops there. The checkpointer saves the state and the payload goes back to the caller, so your API can respond "awaiting approval." A later request to the same <code>thread_id</code> with <code>Command(resume=value)</code> resumes the run, and <code>interrupt()</code> returns <code>value</code>. Static breakpoints (<code>interrupt_before=[...]</code> or <code>interrupt_after=[...]</code> at compile time) still exist, but the LangGraph docs recommend them for debugging, not for human approval; they resume with <code>invoke(None, config)</code>.</p>
+<p><strong>Streaming.</strong> <code>graph.stream(state, mode="updates")</code> yields state deltas as they happen. <code>mode="messages"</code> streams the LLM tokens inside model nodes. <code>mode="values"</code> yields full snapshots. You pick what to surface in your UI.</p>
+<p><strong>Time-travel.</strong> <code>graph.get_state_history(thread_id)</code> returns the full checkpoint log. Pass any prior <code>checkpoint_id</code> to <code>graph.invoke</code> and you fork from that point. Great for debugging ("what if the model had picked tool B instead?") and for regression tests that replay production traces.</p>
+<h2>Idea 2 · Reducers are the point</h2>
+<p>Every state field has a reducer. Most defaults are fine — a new value overwrites the old. But message lists need <code>operator.add</code> so new messages append instead of replacing. Parallel edges merge their updates through the reducer. If two nodes both update <code>messages</code> and you forgot the <code>Annotated[list, add_messages]</code>, the second wins silently and you lose half the turn. The reducer is the only subtle thing in the library; get it right and the rest composes.</p>
+<h2>Idea 3 · The ReAct graph in four nodes</h2>
+<p>A production ReAct agent is four nodes and two edges:</p>
+<ol>
+<li><code>agent</code> — calls the LLM with the current message history. Returns the assistant message (which may contain tool_calls).</li>
+<li><code>tools</code> — executes any tool_calls in the last assistant message, appends the tool results as tool messages.</li>
+<li>A conditional edge from <code>agent</code> that routes to <code>tools</code> if the last message has tool_calls, else to <code>END</code>.</li>
+<li>A static edge from <code>tools</code> back to <code>agent</code>.</li>
+</ol>
+<p>That is it. You get the full ReAct loop (Thought → Action → Observation → Thought → …) with checkpointing, interrupts, and streaming, in roughly 40 lines of code.</p>
+<h2>Idea 4 · StateGraph vs Send (fanout)</h2>
+<p><code>Send(node_name, state)</code> lets a node dispatch parallel subgraphs. Example: the agent decides to query three retrievers at once. Each <code>Send</code> spawns a parallel execution of the target node; their outputs merge through the state reducer. This is how LangGraph expresses the orchestrator-workers pattern without threading primitives.</p>
+<h2>Idea 5 · Subgraphs</h2>
+<p>A compiled graph can be a node in another graph. The outer graph sees a single node; the inner graph has its own state and its own checkpoints. This is how teams build supervisor-worker agents: the supervisor graph routes user intent to a per-domain worker subgraph.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="l5-state-graph-ledger"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>A step.</strong> A node <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> reads the state <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> and returns a partial update <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>. Each key <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> of the state merges through its reducer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0519em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">u</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">default</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">b</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">add</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mspace"> </span><span class="mspace"> </span><span class="mopen">(</span><span class="mord text"><span class="mord">list concatenation</span></span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div>
+<code>add_messages</code> is concatenation that also replaces a message whose <code>id</code> is already present.</p>
+<p><strong>Parallel branches.</strong> When branches <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">m</span></span></span></span> finish in the same step, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0019em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">u</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="minner">⋯</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin"><span class="mbin">⊕</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">u</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">m</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span></span></span></span>. With the default (overwrite) there is no single answer for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal">m</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>, so LangGraph raises an error instead of guessing.</p>
+<p><strong>Routing and checkpoints.</strong> A conditional edge is a function <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">nodes</span></span><span class="mclose">}</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">END</span></span><span class="mclose">}</span></span></span></span>. The runtime saves a checkpoint <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> after every step, so a thread is a sequence <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span></span></span></span>; replaying from <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> adds a new branch <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1467em;vertical-align:-0.3948em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-2.4413em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3948em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.123em;"></span><span class="minner">…</span></span></span></span> and keeps the old one.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">One refund ticket, step by step</div><div class="co-body"><p>The run below produces these checkpoints (messages only; H = human, A = assistant, T = tool result):
+- <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>: empty, next <code>__start__</code>. <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: [H], next <code>agent</code>.
+- <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: [H, A: <code>issue_refund(A-1042, 50)</code>], next <code>approve</code>: the graph is paused inside <code>approve</code>.
+- <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: [H, A, T: "Rejected by a human reviewer…"], next <code>agent</code>. <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: [H, A, T, A: a text reply], next nothing: done.
+- With overwrite instead of <code>add_messages</code>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> would hold only the last assistant message; the model would not see the question on the next turn.
+- Each step adds one checkpoint, so four steps plus the input give 5 snapshots; a replay from <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> that runs four more steps adds more and keeps the first five.</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A graph makes the agent smarter."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The model and prompts are unchanged; the graph adds pause, resume, replay and inspection around them.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "After <code>interrupt()</code> resumes, the node continues from the next line."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The node runs again from its first line, and <code>interrupt()</code> returns the resume value this time.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Replaying from an old checkpoint rewrites history."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It adds a new branch; the old checkpoints stay on the thread.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 0.5B model proposes <code>issue_refund(A-1042, 50)</code> for a lamp that cost 89. The reviewer rejects it with the right amount. Then the thread is replayed from step 0 and the same proposal is approved. How many refunds are issued in total, and does the model use the reviewer's correction? (Solution P1.)</p></div></aside>
+<h2>Step 1 · state and nodes</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from typing import Annotated, TypedDict
+from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import InMemorySaver
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+
+def agent_node(state: State) -&gt; dict:
+    response = llm.invoke(state[&quot;messages&quot;])
+    return {&quot;messages&quot;: [response]}
+
+def should_continue(state: State) -&gt; str:
+    last = state[&quot;messages&quot;][-1]
+    return &quot;tools&quot; if getattr(last, &quot;tool_calls&quot;, None) else END
+
+tool_node = ToolNode(tools=[search_web, read_file])
+
+graph = StateGraph(State)
+graph.add_node(&quot;agent&quot;, agent_node)
+graph.add_node(&quot;tools&quot;, tool_node)
+graph.add_edge(START, &quot;agent&quot;)
+graph.add_conditional_edges(&quot;agent&quot;, should_continue, {&quot;tools&quot;: &quot;tools&quot;, END: END})
+graph.add_edge(&quot;tools&quot;, &quot;agent&quot;)
+
+app = graph.compile(checkpointer=InMemorySaver())
+</code></pre></div>
+
+<p><code>add_messages</code> is the reducer that makes the message list accumulate instead of overwrite. Forgetting it is the most common LangGraph bug.</p>
+<h2>Step 2 · run with a thread</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">config = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;user-42&quot;}}
+for event in app.stream(
+    {&quot;messages&quot;: [HumanMessage(&quot;find the Anthropic headquarters address&quot;)]},
+    config,
+    stream_mode=&quot;updates&quot;,
+):
+    print(event)
+</code></pre></div>
+
+<p>Every update is a dict <code>{node_name: state_delta}</code>. Your frontend can stream these to the UI so users see "agent is thinking… calling search_web… got result… answering."</p>
+<h2>Step 3 · add a human-in-the-loop interrupt</h2>
+<p>Put an approval node on the edge into the side-effecting tools and call <code>interrupt()</code> inside it.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain_core.messages import ToolMessage
+from langgraph.types import interrupt, Command
+
+def approve(state: State) -&gt; Command:
+    calls = state[&quot;messages&quot;][-1].tool_calls
+    decision = interrupt({&quot;needs_approval&quot;: calls})      # pauses here; the state is checkpointed
+    if decision == &quot;approve&quot;:
+        return Command(goto=&quot;tools&quot;)
+    return Command(goto=&quot;agent&quot;, update={&quot;messages&quot;: [
+        ToolMessage(&quot;Rejected by a human reviewer.&quot;, tool_call_id=c[&quot;id&quot;]) for c in calls]})
+
+graph.add_node(&quot;approve&quot;, approve, destinations=(&quot;tools&quot;, &quot;agent&quot;))
+# the router sends side-effecting tool calls to &quot;approve&quot; instead of straight to &quot;tools&quot;
+app = graph.compile(checkpointer=InMemorySaver())
+
+state = app.invoke({&quot;messages&quot;: [HumanMessage(&quot;delete the production database&quot;)]}, config)
+# state[&quot;__interrupt__&quot;] holds the payload: show it to a human, then, in a later request:
+app.invoke(Command(resume=&quot;approve&quot;), config)          # or Command(resume=&quot;reject&quot;)
+</code></pre></div>
+
+<p>The state, the checkpoint, and the thread all persist across the interrupt. Nothing is in memory except during execution.</p>
+<h2>Step 4 · time-travel for debugging</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">history = list(app.get_state_history(config))
+for snapshot in history:
+    print(snapshot.values[&quot;messages&quot;][-1].content[:80], snapshot.config)
+
+# Fork from a prior checkpoint
+target = history[3].config  # three steps back
+for event in app.stream(None, target, stream_mode=&quot;values&quot;):
+    pass  # replay from that point forward
+</code></pre></div>
+
+<p>Passing <code>None</code> as the input replays from the given checkpoint; passing a value appends it as an update to that checkpoint's state before resuming. This is how you reproduce a bad agent run without re-running the whole conversation.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A real LangGraph agent with an approval gate</div><div class="co-body"><p>LangGraph 1.2 with <code>InMemorySaver</code>. The agent node is Qwen2.5-0.5B-Instruct on CPU with its native tool calling; tools are <code>lookup_order</code> and <code>issue_refund</code>. Refunds go through an <code>approve</code> node that calls <code>interrupt()</code>. The reviewer approves only a refund equal to the amount paid. After the main run, the thread is replayed from step 0 and the refund approved. About two minutes on CPU, so the output below was recorded.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, operator, re, time, torch
+from typing import Annotated, TypedDict
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, AnyMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+name = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;                    # a real (small) model drives the agent node
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+
+ORDERS = {&quot;A-1042&quot;: {&quot;item&quot;: &quot;ceramic lamp&quot;, &quot;paid&quot;: 89.0, &quot;status&quot;: &quot;delivered, reported broken&quot;}}
+REFUNDS = []                                          # the side effect we want a human to approve
+
+@tool
+def lookup_order(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Look up an order by its ID, e.g. &quot;A-1042&quot;.&quot;&quot;&quot;
+    return json.dumps(ORDERS.get(order_id, {&quot;error&quot;: &quot;ORDER_NOT_FOUND&quot;}))
+
+@tool
+def issue_refund(order_id: str, amount: float) -&gt; str:
+    &quot;&quot;&quot;Refund an amount of money for an order. This moves real money.&quot;&quot;&quot;
+    REFUNDS.append((order_id, amount))
+    return json.dumps({&quot;refunded&quot;: amount, &quot;order_id&quot;: order_id})
+
+TOOLS = [lookup_order, issue_refund]
+SCHEMAS = [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: t.name, &quot;description&quot;: t.description,
+            &quot;parameters&quot;: t.args_schema.model_json_schema()}} for t in TOOLS]
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]   # reducer: append, never overwrite
+
+def to_chat(msgs):                                    # LangChain messages -&gt; Qwen chat-template messages
+    out = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: (&quot;You are a support agent with tools. Always call lookup_order first for any order ID the user gives, &quot;
+                                     &quot;then call issue_refund for the amount paid if the item is broken.&quot;)}]
+    for m in msgs:
+        if isinstance(m, HumanMessage): out.append({&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: m.content})
+        elif isinstance(m, ToolMessage): out.append({&quot;role&quot;: &quot;tool&quot;, &quot;name&quot;: m.name, &quot;content&quot;: m.content})
+        else: out.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: m.content, &quot;tool_calls&quot;:
+                          [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: c[&quot;name&quot;], &quot;arguments&quot;: c[&quot;args&quot;]}} for c in m.tool_calls] or None})
+    return out
+
+def agent(state: State):
+    text = tok.apply_chat_template(to_chat(state[&quot;messages&quot;]), tools=SCHEMAS, tokenize=False, add_generation_prompt=True)
+    ids = tok(text, return_tensors=&quot;pt&quot;).input_ids
+    with torch.no_grad():
+        g = model.generate(ids, max_new_tokens=80, do_sample=False)
+    reply = tok.decode(g[0, ids.shape[1]:], skip_special_tokens=True)
+    calls = [json.loads(c) for c in re.findall(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, reply, re.S)]
+    n = len(state[&quot;messages&quot;])
+    return {&quot;messages&quot;: [AIMessage(content=&quot;&quot; if calls else reply.strip(),
+            tool_calls=[{&quot;name&quot;: c[&quot;name&quot;], &quot;args&quot;: c[&quot;arguments&quot;], &quot;id&quot;: f&quot;call_{n}_{i}&quot;} for i, c in enumerate(calls)])]}
+
+def route(state: State):
+    last = state[&quot;messages&quot;][-1]
+    if not last.tool_calls: return END
+    return &quot;approve&quot; if any(c[&quot;name&quot;] == &quot;issue_refund&quot; for c in last.tool_calls) else &quot;tools&quot;
+
+def approve(state: State):
+    calls = state[&quot;messages&quot;][-1].tool_calls
+    decision = interrupt({&quot;needs_approval&quot;: [f'{c[&quot;name&quot;]}({c[&quot;args&quot;]})' for c in calls]})   # pause here, state saved
+    if decision == &quot;approve&quot;:
+        return Command(goto=&quot;tools&quot;)
+    return Command(goto=&quot;agent&quot;, update={&quot;messages&quot;: [ToolMessage(f&quot;Rejected by a human reviewer: {decision}&quot;,
+                                                                   tool_call_id=c[&quot;id&quot;], name=c[&quot;name&quot;]) for c in calls]})
+
+g = StateGraph(State)
+g.add_node(&quot;agent&quot;, agent); g.add_node(&quot;tools&quot;, ToolNode(TOOLS)); g.add_node(&quot;approve&quot;, approve, destinations=(&quot;tools&quot;, &quot;agent&quot;))
+g.add_edge(START, &quot;agent&quot;)
+g.add_conditional_edges(&quot;agent&quot;, route, [&quot;tools&quot;, &quot;approve&quot;, END])
+g.add_edge(&quot;tools&quot;, &quot;agent&quot;)
+app = g.compile(checkpointer=InMemorySaver())
+
+def show(stream):
+    for ev in stream:
+        for node, upd in ev.items():
+            if node == &quot;__interrupt__&quot;:
+                print(f&quot;  [paused]   waiting for a human: {upd[0].value['needs_approval']}&quot;); continue
+            for m in (upd or {}).get(&quot;messages&quot;, []):
+                what = &quot; &quot;.join(f'{c[&quot;name&quot;]}({json.dumps(c[&quot;args&quot;])})' for c in m.tool_calls) if getattr(m, &quot;tool_calls&quot;, None) else m.content[:110]
+                print(f&quot;  [{node:&lt;7}] {type(m).__name__:&lt;11} {what}&quot;)
+
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;ticket-7&quot;}}
+t = time.time()
+print(&quot;run 1: the user asks for a refund&quot;)
+show(app.stream({&quot;messages&quot;: [HumanMessage(&quot;Order A-1042 arrived broken. Please refund it.&quot;)]}, cfg, stream_mode=&quot;updates&quot;))
+snap = app.get_state(cfg)
+print(f&quot;  graph stopped before {snap.next}; refunds issued so far: {REFUNDS}&quot;)
+
+def reviewer(proposal):                                # the human: approve only a refund of the amount actually paid
+    order, amount = proposal[&quot;order_id&quot;], proposal[&quot;amount&quot;]
+    paid = ORDERS.get(order, {}).get(&quot;paid&quot;)
+    return &quot;approve&quot; if amount == paid else f&quot;the order was paid {paid}, not {amount}; look it up and refund the amount paid.&quot;
+
+run = 2
+while app.get_state(cfg).next and run &lt;= 4:
+    proposal = app.get_state(cfg).values[&quot;messages&quot;][-1].tool_calls[0][&quot;args&quot;]
+    decision = reviewer(proposal)
+    print(f&quot;\nrun {run}: the reviewer answers {decision!r} (same thread_id, a new request)&quot;)
+    show(app.stream(Command(resume=decision), cfg, stream_mode=&quot;updates&quot;)); run += 1
+print(f&quot;  refunds issued: {REFUNDS}&quot;)
+
+history = list(app.get_state_history(cfg))                 # newest first
+print(f&quot;\ncheckpoint history for thread 'ticket-7': {len(history)} snapshots&quot;)
+for s in reversed(history):
+    last = s.values[&quot;messages&quot;][-1] if s.values.get(&quot;messages&quot;) else None
+    print(f&quot;  step {s.metadata['step']:&gt;2}  next={str(s.next):&lt;14} last message: {type(last).__name__ if last else '-'}&quot;)
+
+before = next(s for s in history if s.metadata[&quot;step&quot;] == 0)       # the checkpoint just before the agent first ran
+print(&quot;\ntime travel: replay from step 0 (the agent runs again) and approve the $50 refund this time&quot;)
+REFUNDS.clear()
+show(app.stream(None, before.config, stream_mode=&quot;updates&quot;))       # None = continue from that checkpoint
+show(app.stream(Command(resume=&quot;approve&quot;), cfg, stream_mode=&quot;updates&quot;))
+print(f&quot;  refunds issued on the fork: {REFUNDS}&quot;)
+print(f&quot;\n({time.time() - t:.0f} s, {sum(1 for s in app.get_state_history(cfg))} checkpoints now on the thread, both branches kept)&quot;)
+</code></pre></div>
+<p><strong>Recorded output</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">run 1: the user asks for a refund
+  [agent  ] AIMessage   issue_refund({&quot;order_id&quot;: &quot;A-1042&quot;, &quot;amount&quot;: 50})
+  [paused]   waiting for a human: [&quot;issue_refund({'order_id': 'A-1042', 'amount': 50})&quot;]
+  graph stopped before ('approve',); refunds issued so far: []
+
+run 2: the reviewer answers 'the order was paid 89.0, not 50; look it up and refund the amount paid.' (same thread_id, a new request)
+  [approve] ToolMessage Rejected by a human reviewer: the order was paid 89.0, not 50; look it up and refund the amount paid.
+  [agent  ] AIMessage   I'm sorry, but I can't proceed without the correct order ID. Could you please provide me with the order ID?
+  refunds issued: []
+
+checkpoint history for thread 'ticket-7': 5 snapshots
+  step -1  next=('__start__',) last message: -
+  step  0  next=('agent',)     last message: HumanMessage
+  step  1  next=('approve',)   last message: AIMessage
+  step  2  next=('agent',)     last message: ToolMessage
+  step  3  next=()             last message: AIMessage
+
+time travel: replay from step 0 (the agent runs again) and approve the $50 refund this time
+  [agent  ] AIMessage   issue_refund({&quot;order_id&quot;: &quot;A-1042&quot;, &quot;amount&quot;: 50})
+  [paused]   waiting for a human: [&quot;issue_refund({'order_id': 'A-1042', 'amount': 50})&quot;]
+  [tools  ] ToolMessage {&quot;refunded&quot;: 50.0, &quot;order_id&quot;: &quot;A-1042&quot;}
+  [agent  ] AIMessage   The refund has been successfully processed. You have refunded $50.00 for the order with ID A-1042.
+  refunds issued on the fork: [('A-1042', 50.0)]
+
+(149 s, 10 checkpoints now on the thread, both branches kept)
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The model skipped its instructions.</strong> The system prompt says to call <code>lookup_order</code> first. The 0.5B model went straight to <code>issue_refund</code> with an amount it made up: 50, for a lamp that cost 89. Small models do this often, and large ones sometimes. The graph does not make the model better, but it decides what happens next.</p>
+<p><strong>The gate caught it.</strong> The router sent the refund call to <code>approve</code>, and <code>interrupt()</code> stopped the run there. <code>get_state</code> reports <code>next=('approve',)</code>, and no money has moved. Run 1 ended. In a real service this is where the API answers "awaiting approval" and the process can even exit, because the state lives in the checkpointer.</p>
+<p><strong>The resume is a new request.</strong> Run 2 passes <code>Command(resume=...)</code> on the same <code>thread_id</code>. The <code>approve</code> node starts again from its first line, and this time <code>interrupt()</code> returns the reviewer's answer: a rejection with the correct amount. The rejection goes back to the model as a tool result. The model did not use the correction; it asked for the order ID it had been given at the start. Recovering from feedback is a model skill, and this one lacks it. The safety came from the gate, not from the model.</p>
+<p><strong>Five checkpoints for four steps.</strong> Step −1 is the input, then one checkpoint after each step: start, agent (paused at approve), approve, agent. Each holds the full message list, because <code>add_messages</code> appended at every step.</p>
+<p><strong>Time travel shows the counterfactual.</strong> Replaying from step 0 runs the agent again. Greedy decoding gives the same wrong proposal. This time it is approved, and the $50 refund goes through on the fork. The thread now holds 10 checkpoints and both branches. This is how you reproduce an incident: replay the exact state, change one decision, and see what would have happened.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Three mistakes the graph will not catch for you</div><div class="co-body"><p>Three tiny graphs, no model: a list field with and without a reducer, three parallel <code>Send</code> branches writing the same field, and a side effect placed before <code>interrupt()</code>. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import Send, interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import InvalidUpdateError
+
+# 1) A list field without a reducer: each update replaces the list
+def two_steps(reducer):
+    class S(TypedDict):
+        log: Annotated[list, operator.add] if reducer else list
+    g = StateGraph(S)
+    g.add_node(&quot;plan&quot;, lambda s: {&quot;log&quot;: [&quot;plan written&quot;]})
+    g.add_node(&quot;act&quot;, lambda s: {&quot;log&quot;: [&quot;tool ran&quot;]})
+    g.add_edge(START, &quot;plan&quot;); g.add_edge(&quot;plan&quot;, &quot;act&quot;); g.add_edge(&quot;act&quot;, END)
+    return g.compile().invoke({&quot;log&quot;: [&quot;user asked&quot;]})[&quot;log&quot;]
+print(&quot;1. sequential updates to a list field&quot;)
+print(&quot;   no reducer:         &quot;, two_steps(False))
+print(&quot;   operator.add reducer:&quot;, two_steps(True))
+
+# 2) Fan-out with Send: three retrievers write the same field in one step
+def fan_out(reducer):
+    class S(TypedDict):
+        query: str
+        docs: Annotated[list, operator.add] if reducer else list
+    g = StateGraph(S)
+    g.add_node(&quot;retrieve&quot;, lambda s: {&quot;docs&quot;: [f&quot;{s['source']}: hit for {s['query']!r}&quot;]})
+    g.add_conditional_edges(START, lambda s: [Send(&quot;retrieve&quot;, {&quot;query&quot;: s[&quot;query&quot;], &quot;source&quot;: src})
+                                              for src in (&quot;wiki&quot;, &quot;tickets&quot;, &quot;code&quot;)], [&quot;retrieve&quot;])
+    g.add_edge(&quot;retrieve&quot;, END)
+    try:
+        return g.compile().invoke({&quot;query&quot;: &quot;refund policy&quot;, &quot;docs&quot;: []})[&quot;docs&quot;]
+    except InvalidUpdateError as e:
+        return f&quot;InvalidUpdateError: {str(e).splitlines()[0][:90]}&quot;
+print(&quot;\n2. three parallel branches update the same field&quot;)
+print(&quot;   no reducer:         &quot;, fan_out(False))
+print(&quot;   operator.add reducer:&quot;, fan_out(True))
+
+# 3) On resume a node restarts from its first line: code before interrupt() runs twice
+calls = []
+class T(TypedDict):
+    answer: str
+def risky(s):
+    calls.append(&quot;charged card&quot;)                    # a side effect placed BEFORE the interrupt
+    ok = interrupt(&quot;approve the charge?&quot;)
+    return {&quot;answer&quot;: &quot;done&quot; if ok else &quot;cancelled&quot;}
+g = StateGraph(T); g.add_node(&quot;risky&quot;, risky); g.add_edge(START, &quot;risky&quot;); g.add_edge(&quot;risky&quot;, END)
+app = g.compile(checkpointer=InMemorySaver())
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;t1&quot;}}
+app.invoke({&quot;answer&quot;: &quot;&quot;}, cfg)
+print(&quot;\n3. side effect placed before interrupt()&quot;)
+print(&quot;   after the pause: &quot;, calls)
+app.invoke(Command(resume=True), cfg)
+print(&quot;   after the resume:&quot;, calls, &quot; &lt;- the card was charged twice&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. sequential updates to a list field
+   no reducer:          [&#x27;tool ran&#x27;]
+   operator.add reducer: [&#x27;user asked&#x27;, &#x27;plan written&#x27;, &#x27;tool ran&#x27;]
+
+2. three parallel branches update the same field
+   no reducer:          InvalidUpdateError: At key &#x27;docs&#x27;: Can receive only one value per step. Use an Annotated key to handle multipl
+   operator.add reducer: [&quot;wiki: hit for &#x27;refund policy&#x27;&quot;, &quot;tickets: hit for &#x27;refund policy&#x27;&quot;, &quot;code: hit for &#x27;refund policy&#x27;&quot;]
+
+3. side effect placed before interrupt()
+   after the pause:  [&#x27;charged card&#x27;]
+   after the resume: [&#x27;charged card&#x27;, &#x27;charged card&#x27;]  &lt;- the card was charged twice</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>1. No reducer, lost history.</strong> Without a reducer, each node's <code>{"log": [...]}</code> replaces the field. Two steps later only <code>['tool ran']</code> is left: the user's request and the plan are gone, and nothing raised an error. With <code>operator.add</code>, all three entries survive. For messages, <code>add_messages</code> does the same and also lets a message with an existing <code>id</code> replace the old one.</p>
+<p><strong>2. Parallel writes without a reducer fail loudly.</strong> Three <code>Send</code> branches all write <code>docs</code> in the same step. With overwrite there is no correct winner, so LangGraph raises <code>InvalidUpdateError</code> and tells you to use an Annotated key. With <code>operator.add</code>, the three results are concatenated. A loud error here is the friendly case. The silent loss in demo 1 is the dangerous one.</p>
+<p><strong>3. The node restarts on resume.</strong> The "charge" ran once when the node first started and paused, and again when the node restarted on resume. One approval, two charges. Anything with an effect outside the graph goes after <code>interrupt()</code>, in a later node, or behind an idempotency key.</p></div></aside>
+<h2>Step 5 · swap the checkpointer for production</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.checkpoint.postgres import PostgresSaver
+
+with PostgresSaver.from_conn_string(&quot;postgresql://...&quot;) as checkpointer:
+    checkpointer.setup()
+    app = graph.compile(checkpointer=checkpointer)
+</code></pre></div>
+
+<p><code>InMemorySaver</code> is for tests. The SQLite and Postgres savers ship as separate packages (<code>langgraph-checkpoint-sqlite</code>, <code>langgraph-checkpoint-postgres</code>); Redis and other stores have their own packages. Anything that persists across restarts wants a real store.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the <code>approve</code> node, send the refund yourself on the line above <code>interrupt()</code> (for example to log it early), so the money moves before the reviewer answers. What happens when the reviewer approves? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>LangGraph 1.x</strong> (1.0 in October 2025): <code>StateGraph</code>, <code>interrupt()</code> and <code>Command</code> for human-in-the-loop, checkpointers for SQLite, Postgres and Redis, durable execution; LangChain 1.0's <code>create_agent</code> is built on it.</li>
+<li><strong>Graph-shaped agent runtimes elsewhere</strong>: Pydantic AI's graphs, Google's Agent Development Kit workflow agents, Microsoft Agent Framework (successor to AutoGen and Semantic Kernel) workflows with checkpoints.</li>
+<li><strong>Durable execution engines</strong> (Temporal and similar) used underneath long-running agents so a crash or deploy resumes a run.</li>
+<li><strong>Approval gates on side effects</strong> in production agents: tool calls that move money, send messages or change data wait for a person, while reads run freely.</li>
+</ul>
+<p>Sources: <a href="https://docs.langchain.com/oss/python/langgraph/interrupts">LangGraph interrupts</a>, <a href="https://docs.langchain.com/oss/python/langgraph/overview">LangGraph documentation</a>, <a href="https://github.com/langchain-ai/langgraph/releases">LangGraph releases</a>, <a href="https://github.com/microsoft/agent-framework">Microsoft Agent Framework</a>, <a href="https://www.anthropic.com/research/building-effective-agents">Anthropic, Building effective agents</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>An agent graph: state, nodes that return partial updates, edges and routers.</li>
+<li>Every list field that should grow needs a reducer (<code>add_messages</code>, <code>operator.add</code>).</li>
+<li>A checkpointer saves state after each step; a <code>thread_id</code> names the conversation.</li>
+<li><code>interrupt()</code> pauses for a human; <code>Command(resume=…)</code> continues; the node re-runs from its top.</li>
+<li>Replay from any checkpoint to debug; it forks and keeps history.</li>
+</ul></div></aside>
+<h2>The Skill</h2>
+<blockquote>
+<p>You build agents as graphs, not as <code>while True</code> loops.</p>
+</blockquote>
+<p>Before you reach for LangGraph, do a 60-second design:</p>
+<ol>
+<li><strong>Name the nodes.</strong> Every discrete decision or side-effecting action is a node. "Agent thinks," "tool runs," "reviewer approves," "response streams." If you can't list them, the task is not agent-shaped yet.</li>
+<li><strong>Declare the state.</strong> Minimal TypedDict with a reducer for every list field. Do not stuff everything into <code>messages</code>; hoist task-specific fields (a working <code>plan</code>, a <code>budget</code> counter, a <code>retrieved_docs</code> list) to the top level.</li>
+<li><strong>Draw the edges.</strong> Static unless the next step depends on model output. Every conditional edge needs a router function with named branches.</li>
+<li><strong>Choose a checkpointer up front.</strong> <code>MemorySaver</code> for tests, Postgres/Redis/SQLite for anything else. Do not ship without one — no checkpointer means no resume, no interrupt, no time-travel.</li>
+<li><strong>Decide interrupts before tools run, not after.</strong> Approvals go on the edge into a side-effecting node so you can cancel before harm; validation goes on the edge out of the model so you can reject bad calls cheaply.</li>
+<li><strong>Stream by default.</strong> <code>mode="updates"</code> for the UI, <code>mode="messages"</code> for token-level streaming inside model nodes, <code>mode="values"</code> for full snapshots during eval.</li>
+</ol>
+<p>Refuse to ship a LangGraph agent that has no checkpointer. Refuse to ship one that interrupts <em>after</em> the side effect. Refuse to ship a <code>messages</code> field without <code>add_messages</code> as its reducer.</p>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Implement the four-node ReAct graph above with a calculator tool and a web-search tool. Verify that <code>list(app.get_state_history(config))</code> returns at least four checkpoints for a two-turn conversation.</li>
+<li><strong>Medium.</strong> Add a <code>planner</code> node that runs before <code>agent</code> and writes a structured <code>plan: list[str]</code> into state. Have <code>agent</code> mark plan steps as done. Fail the test if <code>plan</code> is lost across a checkpoint resume (wrong reducer).</li>
+<li><strong>Hard.</strong> Build a supervisor graph that routes between three subgraphs (<code>researcher</code>, <code>writer</code>, <code>reviewer</code>) using <code>Send</code>. Each subgraph has its own state and checkpointer. Add an <code>interrupt_before=["writer"]</code> on the outer graph so a human can approve the research brief. Confirm that time-travel from a prior checkpoint re-runs only the forked branch.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1116-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · One refund, and no learning from the correction</span></summary><div class="qa-a"><p>One refund in total, and only on the replayed branch. In the main run the 0.5B model proposed <code>issue_refund(A-1042, 50)</code> without looking the order up. The reviewer rejected it with the correct amount, and the model ignored the correction: it asked for the order ID instead. No money moved. On the replay from step 0 the model proposed the same $50 refund (greedy decoding is deterministic). This time it was approved, and the fork records one refund of $50. The thread keeps both histories: 10 checkpoints.</p></div></details>
+<details class="qa" id="a1116-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Approved once, paid twice</span></summary><div class="qa-a"><p>The refund is sent twice. The first pass through the node sends it and then pauses at <code>interrupt()</code>. On <code>Command(resume="approve")</code> LangGraph runs the node again from its first line, so it sends the refund again before <code>interrupt()</code> returns the approval. The third demo in the second visual shows the same thing with a card charge: <code>['charged card', 'charged card']</code>. A rejection would not help either, because the money moved before anyone was asked. Keep side effects after the interrupt, ideally in their own node (<code>tools</code> here). Make them idempotent too, for example with a refund ID derived from the ticket, so a retry cannot pay twice.</p></div></details>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-agent-state-graphs"><span class="t" style="--cs-hue:165">AM</span>Cheat sheet · Agent State Machines and Durable Graphs</a></div>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://langchain-ai.github.io/langgraph/">LangGraph documentation</a> — canonical reference for StateGraph, reducers, checkpointers, and interrupts.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/low_level/">LangGraph concepts: state, reducers, checkpointers</a> — the mental model this lesson uses, straight from the source.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/persistence/">LangGraph Persistence and Checkpoints</a> — the detail on Postgres/SQLite/Redis stores, checkpoint namespaces, and thread IDs.</li>
+<li><a href="https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/">LangGraph Human-in-the-loop</a> — <code>interrupt_before</code>, <code>interrupt_after</code>, <code>Command(resume=...)</code>, and the edit-state pattern.</li>
+<li><a href="https://arxiv.org/abs/2210.03629">Yao et al., "ReAct: Synergizing Reasoning and Acting in Language Models" (ICLR 2023)</a> — the pattern every LangGraph agent implements; read it for the reasoning trace rationale.</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents">Anthropic — Building effective agents (Dec 2024)</a> — which graph shapes (chain, router, orchestrator-workers, evaluator-optimizer) to prefer and when.</li>
+<li>Phase 11 · 09 (Function Calling) — the tool-call primitive every LangGraph agent node reuses.</li>
+<li>Phase 11 · 14 (Model Context Protocol) — external tool discovery that plugs into a LangGraph <code>ToolNode</code> via the MCP adapter.</li>
+<li>Phase 11 · 17 (Agent framework tradeoffs) — when to pick LangGraph over CrewAI, AutoGen, or Agno.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/11-llm-engineering/16-langgraph-state-machines" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1116" id="done-a1116">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1116" id="undo-a1116" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1115"><span class="pn-dir">Previous</span><span class="pn-t">11.15 · Prompt Caching and Context Caching</span></a><a class="pn next" href="#a1117"><span class="pn-dir">Next</span><span class="pn-t">11.17 · Agent Framework Tradeoffs — Graph, Role, and Actor Orchestration</span></a></div></footer>

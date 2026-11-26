@@ -1,0 +1,434 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-12">Phase 12 · Multimodal AI</a></nav><h1>Show-o and Discrete-Diffusion Unified Models</h1><div class="m-meta"><span class="chip chip-num">Lesson 12.14</span><span class="chip">120 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1214" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain masked discrete diffusion: the schedule that masks tokens uniformly then asks the transformer to recover them.</li>
+<li>Compare parallel image decoding (Show-o, MaskGIT) to autoregressive image decoding (Chameleon, Emu3) on speed and quality.</li>
+<li>Name the four tasks Show-o handles in one checkpoint: text generation, VQA, T2I, image inpainting.</li>
+<li>Pick a masking schedule (cosine, linear, truncated) and reason about its effect on sample quality.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 12 · 13 (Transfusion)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 120 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, masked-discrete-diffusion sampler). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Transfusion mixes continuous and discrete representations. Show-o (Xie et al., August 2024) goes the other way: text tokens use causal next-token prediction, image tokens use masked discrete diffusion in the spirit of MaskGIT. Both sit inside one transformer with a hybrid attention mask. The result unifies VQA, text-to-image, inpainting, and mixed-modality generation on one backbone, one tokenizer per modality, one loss formulation (next-token extended to masked prediction). This lesson walks the Show-o design — why masked discrete diffusion is</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Masked discrete diffusion</td>
+<td>"MaskGIT-style"</td>
+<td>Training to predict masked tokens; at inference, iteratively unmask the most-confident predictions</td>
+</tr>
+<tr>
+<td>Cosine schedule</td>
+<td>"Unmask schedule"</td>
+<td>Decay of mask ratio over inference steps; concentrates confidence growth at mid-range</td>
+</tr>
+<tr>
+<td>Parallel decoding</td>
+<td>"All tokens at once"</td>
+<td>Every step predicts the full sequence of masked tokens in one forward pass, then commits top-K</td>
+</tr>
+<tr>
+<td>Hybrid attention</td>
+<td>"Causal + bidirectional"</td>
+<td>Mask that is causal over text tokens and bidirectional within image blocks</td>
+</tr>
+<tr>
+<td>Inpainting</td>
+<td>"Fill-in generation"</td>
+<td>Condition on an image with some tokens masked, predict the missing ones; free from the training objective</td>
+</tr>
+<tr>
+<td>Commitment rate</td>
+<td>"Top-K per step"</td>
+<td>How many tokens are declared "done" per iteration; controls inference vs quality trade-off</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Generating an image one code at a time, as Chameleon does, takes hundreds or thousands of steps. Show-o (August 2024) borrows a faster trick from MaskGIT. Start with an image made entirely of "blank" [MASK] tokens. Predict every blank at once, keep the predictions the model is most sure about, blank the rest again, and repeat. A 256-code image is done in about 16 rounds instead of 256. Show-o does this inside one transformer that also reads and writes text normally, left to right. The attention mask lets image tokens see each other in every direction while text stays causal. One model then answers questions about images, generates images, and fills in masked regions (inpainting). This lesson explains masked prediction, the mask, the two losses and the sampling schedule. It checks a working sampler loop and a miniature training step. No model is trained.</p></div></aside>
+<p>Transfusion's two-loss training works but has trickier dynamics — the continuous diffusion loss lives on a different numerical scale from the discrete NTP loss. Balancing loss weights is a hyperparameter search. The architecture is effective but complex.</p>
+<p>Show-o's answer: keep both modalities discrete (like Chameleon), but generate images in parallel via masked discrete diffusion instead of sequentially. The training objective becomes a single masked-token-prediction that generalizes next-token-prediction naturally.</p>
+<h2>Idea 1 · Masked discrete diffusion (MaskGIT)</h2>
+<p>The original Chang et al. (2022) MaskGIT trick is elegant. Start from a fully-masked image (every token is the special <code>&lt;MASK&gt;</code> id). At each step, predict all masked tokens in parallel, then keep the top-K most confident predictions and re-mask the rest. After ~8-16 iterations, all tokens are filled in. The schedule of how many tokens to unmask per step is tuned — cosine schedules work well.</p>
+<p>Training is simple: draw a masking ratio from the cosine schedule (so every level from a few masked tokens to all of them is seen), apply it to the image's VQ tokens, and train the transformer to recover the masked ones. Exactly what BERT did for text, scaled to image generation.</p>
+<h2>Idea 2 · Show-o: one transformer, hybrid mask</h2>
+<p>Show-o puts MaskGIT inside a causal-language-model transformer. The attention mask is:</p>
+<ul>
+<li>Text tokens: causal (standard LLM).</li>
+<li>Image tokens: full bidirectional within the image block (so the masked tokens can see every other image token during prediction).</li>
+<li>Text-to-image: text attends to prior images, image attends to prior text.</li>
+</ul>
+<p>Training alternates between:
+1. Standard NTP on text sequences.
+2. T2I samples: text → image with masked image tokens, masked-token-prediction loss.
+3. VQA samples: image → text with masked text tokens (really just NTP).</p>
+<p>Show-o uses two cross-entropy losses over one vocabulary: mask token prediction (MTP) on the masked image tokens, and next token prediction (NTP) on text, combined as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">MTP</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">NTP</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>. The base model is Phi-1.5 (1.3B), and images are tokenized MAGVIT-v2-style with a lookup-free quantizer: a 256×256 image becomes 16×16 = 256 codes from 8,192.</p>
+<h2>Idea 3 · Parallel sampling</h2>
+<p>Show-o generates an image in a small number of parallel steps instead of one step per token. The paper shows samples at 2, 8 and 16 steps (quality rises with steps), against 256 sequential steps for an autoregressive model at the same resolution. At each step, predict all masked tokens in parallel; commit the most confident; repeat.</p>
+<p>Compare:
+- Chameleon / Emu3 (autoregressive over tokens): N_tokens forward passes, typically 1024-4096 per image.
+- Transfusion (continuous diffusion): 250 denoising steps in the paper (fewer with modern samplers), each a full transformer pass over all patches.
+- Show-o (masked discrete diffusion): a handful to a few dozen steps (16 in the paper's examples), each a full transformer pass.</p>
+<p>Show-o needs far fewer forward passes than Chameleon-style decoding at the same resolution (the paper claims roughly 20 times fewer steps). Its images stay limited by the discrete tokenizer, while continuous diffusion can reach higher quality.</p>
+<h2>Idea 4 · Tasks in one checkpoint</h2>
+<p>Show-o supports four tasks at inference, selected by prompt format:</p>
+<ul>
+<li>Text generation: standard autoregressive text output.</li>
+<li>VQA: image in, text out.</li>
+<li>T2I: text in, image out via masked discrete diffusion.</li>
+<li>Inpainting: image with some tokens masked, fill in.</li>
+</ul>
+<p>The inpainting capability comes for free from the masked-prediction training. Mask a region of the VQ-token grid, feed the rest plus a text prompt, predict the masked tokens.</p>
+<h2>Idea 5 · Masking schedule</h2>
+<p>The schedule of how many tokens to unmask per step shapes quality. Show-o recommends cosine:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.06em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">mask_ratio</span></span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="mop">cos</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2921em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mord mathnormal">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span></span></div></p>
+<p>At step 0, all tokens masked (ratio 1.0). At step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span>, none masked. Cosine concentrates mass on mid-range ratios where prediction is most informative. Linear schedules also work but plateau faster.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Cosine schedule.</strong> After step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span>, the number of image tokens still masked out of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> is
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.836em;vertical-align:-0.686em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size2">⌊</span></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size2">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size2">)</span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size2">⌋</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.</span></span></span></span></span></div>
+Few tokens are committed early (when the model knows little) and many late.</p>
+<p><strong>Confidence selection.</strong> At each step, every masked position gets a prediction and a confidence <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">visible tokens</span></span><span class="mclose">)</span></span></span></span>; the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> least confident are masked again.</p>
+<p><strong>Training loss</strong> on one sequence with masked image positions <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">M</span></span></span></span> and text positions <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.25417em;">T</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3717em;vertical-align:-1.3217em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8557em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">∈</span><span class="mord mathcal mtight">M</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3217em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1052em;vertical-align:-0.3552em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">∖</span><span class="mord mathcal mtight">M</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3552em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.3717em;vertical-align:-1.3217em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8557em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">∈</span><span class="mord mathcal mtight" style="margin-right:0.25417em;">T</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3217em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A 256-code image in 16 steps</div><div class="co-body"><ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>. After step 1: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌊</span><span class="mord">256</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mord">/32</span><span class="mclose">)⌋</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">254</span></span></span></span> still masked, so only 2 are committed.</li>
+<li>After step 8 (half way): <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌊</span><span class="mord">256</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mord">/4</span><span class="mclose">)⌋</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">181</span></span></span></span> masked; 75 committed so far.</li>
+<li>The last steps commit about 25 tokens each, when most of the image is already visible.</li>
+<li>Forward passes: 16 instead of 256 for token-by-token decoding, 16 times fewer.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Masked diffusion adds Gaussian noise to the image."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The "noise" is replacing tokens with [MASK]; denoising is predicting the masked codes.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Committed tokens can still change."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> In MaskGIT-style sampling a committed token stays fixed; only the remaining masked ones are re-predicted.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Show-o2 is the same masked-token model, scaled up."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Show-o2 moved to continuous VAE latents with flow matching for images.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>With a cosine schedule over 16 steps for a 256-code image, how many tokens are committed in the first step and how many in the last? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The MaskGIT sampler, step by step</div><div class="co-body"><p>A working MaskGIT-style sampler (cosine schedule, confidence ranking, re-masking) for a 16 × 16 grid of codes, with a stand-in predictor that knows a target image and is more often right when confident. The run reports tokens committed per step for 4, 8 and 16 steps and the final agreement with the target. This checks the sampler logic, not image quality. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math, torch
+torch.manual_seed(0)
+# MaskGIT-style parallel decoding, the sampler inside Show-o, on a 16x16 grid of codes (a 256-px image, 8,192 codes).
+# The &quot;model&quot; is a stand-in that knows a target image and is right more often for tokens it is confident about:
+# this checks the sampler logic (schedule, confidence ranking, re-masking), not image quality.
+N, K, MASK = 256, 8192, -1
+target = torch.randint(0, K, (N,))
+def fake_model(tokens):
+    conf = torch.rand(N)                                  # confidence per position
+    guess = torch.where(torch.rand(N) &lt; 0.5 + 0.5 * conf, target, torch.randint(0, K, (N,)))
+    return guess, conf
+
+def sample(steps):
+    tokens = torch.full((N,), MASK)
+    log = []
+    for s in range(steps):
+        guess, conf = fake_model(tokens)
+        masked = tokens == MASK
+        keep_masked = math.floor(N * math.cos(math.pi / 2 * (s + 1) / steps))   # cosine schedule
+        conf = torch.where(masked, conf, torch.tensor(float(&quot;inf&quot;)))          # already-fixed tokens stay fixed
+        order = conf.argsort()                                                # least confident first
+        new = tokens.clone()
+        new[masked] = guess[masked]
+        new[order[:keep_masked]] = MASK                                       # re-mask the least confident
+        log.append(int((tokens == MASK).sum() - (new == MASK).sum()))
+        tokens = new
+    return tokens, log
+
+for steps in [4, 8, 16]:
+    tokens, log = sample(steps)
+    acc = (tokens == target).float().mean()
+    print(f&quot;{steps:&gt;2} steps: tokens fixed per step {log}; masked left {int((tokens == MASK).sum())}; &quot;
+          f&quot;agreement with the target {acc:.0%}&quot;)
+print(f&quot;\nforward passes per image: autoregressive {N}, MaskGIT / Show-o {16} at 16 steps ({N // 16}x fewer)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> 4 steps: tokens fixed per step [20, 55, 84, 97]; masked left 0; agreement with the target 88%
+ 8 steps: tokens fixed per step [5, 15, 24, 31, 39, 45, 48, 49]; masked left 0; agreement with the target 88%
+16 steps: tokens fixed per step [2, 3, 7, 8, 11, 13, 15, 16, 19, 20, 22, 23, 23, 25, 24, 25]; masked left 0; agreement with the target 90%
+
+forward passes per image: autoregressive 256, MaskGIT / Show-o 16 at 16 steps (16x fewer)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The schedule commits few tokens early and many late.</strong> With 16 steps the sampler fixes 2, 3, 7, … tokens at first and about 25 per step at the end; with 4 steps, 20, 55, 84 and 97. Early on almost nothing is visible, so the model's guesses are weakest. Committing only a few lets later steps condition on them. Every run ends with no masked tokens left, so the loop always finishes.</p>
+<p><strong>Confidence ranking does the work.</strong> The stand-in predictor is right 75% of the time on average, but more often when confident. Because the sampler keeps the most confident guesses, the final image agrees with the target on 88–90% of tokens, better than the predictor's average. A real model gains more from extra steps, since each step's predictions condition on the tokens committed before. That is why Show-o's samples improve from 2 to 8 to 16 steps.</p>
+<p><strong>16 passes instead of 256.</strong> Each step is one full forward pass over the whole grid, so a 256-code image costs 16 passes instead of 256 for token-by-token decoding. A step is a little more expensive (the whole grid is processed), but it is far fewer passes in total.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Show-o&#x27;s training step in miniature</div><div class="co-body"><p>One vocabulary of 1,000 text ids, 8,192 image codes and [MASK]; an 8-token caption and an 8 × 8 code grid; masking at three ratios; Show-o's omni-attention mask; and the loss MTP + α·NTP from a random 2-layer transformer. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math, torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+# Show-o's training step in miniature: one transformer, one vocabulary of text + 8,192 image codes + [MASK],
+# omni-attention (causal for text, full inside the image), loss = MTP on masked image tokens + alpha * NTP on text.
+TEXT_V, IMG_V = 1000, 8192
+V, MASK_ID, D = TEXT_V + IMG_V + 1, TEXT_V + IMG_V, 64
+n_text, n_img = 8, 64                                   # an 8-token caption, then an 8x8 grid of image codes
+ids = torch.cat([torch.randint(0, TEXT_V, (n_text,)), TEXT_V + torch.randint(0, IMG_V, (n_img,))])
+is_img = torch.arange(len(ids)) &gt;= n_text
+
+for ratio in [0.25, 0.6, 1.0]:                          # MaskGIT trains on masking ratios across the range
+    m = torch.zeros(len(ids), dtype=torch.bool)
+    m[n_text + torch.randperm(n_img)[: math.ceil(ratio * n_img)]] = True
+    print(f&quot;masking ratio {ratio:.2f}: {int(m.sum())} of {n_img} image tokens replaced by [MASK]&quot;)
+inp = torch.where(m, torch.tensor(MASK_ID), ids)        # the last (fully masked) case is the text-to-image start
+
+L = len(ids)
+mask = torch.tril(torch.ones(L, L, dtype=torch.bool)) | (is_img[:, None] &amp; is_img[None, :])
+emb, head = nn.Embedding(V, D), nn.Linear(D, V)
+body = nn.TransformerEncoder(nn.TransformerEncoderLayer(D, 4, 4 * D, batch_first=True), 2)
+logits = head(body(emb(inp)[None], mask=~mask))[0]
+
+mtp = F.cross_entropy(logits[m], ids[m])                 # predict the codes under [MASK] (all at once)
+ntp = F.cross_entropy(logits[: n_text - 1], ids[1:n_text])  # next text token
+alpha = 1.0
+print(f&quot;\nomni-attention: {int(mask.sum())} allowed pairs (causal alone {L * (L + 1) // 2})&quot;)
+print(f&quot;MTP loss {mtp:.3f} over {int(m.sum())} masked codes, NTP loss {ntp:.3f} over {n_text - 1} text tokens &quot;
+      f&quot;(random model: ln {V:,} = {math.log(V):.3f}); total MTP + alpha*NTP = {mtp + alpha * ntp:.3f} with alpha = {alpha}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">masking ratio 0.25: 16 of 64 image tokens replaced by [MASK]
+masking ratio 0.60: 39 of 64 image tokens replaced by [MASK]
+masking ratio 1.00: 64 of 64 image tokens replaced by [MASK]
+
+omni-attention: 4644 allowed pairs (causal alone 2628)
+MTP loss 9.215 over 64 masked codes, NTP loss 9.165 over 7 text tokens (random model: ln 9,193 = 9.126); total MTP + alpha*NTP = 18.380 with alpha = 1.0</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Masking ratio decides the task.</strong> Masking a quarter of the image tokens is close to inpainting (most of the image is given). Masking all 64 is the starting point of text-to-image generation, where only the caption is visible. Training on the whole range is what lets one checkpoint do both.</p>
+<p><strong>The omni-attention mask.</strong> A causal mask over 72 positions allows 2,628 pairs. Show-o's mask allows 4,644, because the 64 image tokens see each other fully (64 × 64 instead of 64 × 65 / 2). Every masked token can use every visible code around it, which is what parallel prediction needs.</p>
+<p><strong>Two losses, one vocabulary.</strong> The model predicts the codes under all masked positions (MTP) and the next caption token (NTP) from the same logits over 9,193 ids. With random weights both losses sit near ln 9,193 = 9.13, chance level. In training α sets the balance between the two, as λ does in Transfusion.</p></div></aside>
+<h2>Idea 6 · Show-o2</h2>
+<p>Show-o2 (June 2025, arXiv 2506.15564) changes the recipe rather than only scaling it: images and videos live in a 3D causal VAE latent space (continuous, not discrete codes), text keeps autoregressive prediction on a language head, and images and video are generated by flow matching on a separate flow head. It is built on Qwen2.5 language models (1.5B and 7B).</p>
+<h2>Idea 7 · Where Show-o sits</h2>
+<p>In the 2026 taxonomy:</p>
+<ul>
+<li>Discrete tokens + NTP: Chameleon, Emu3, LlamaGen, Janus-Pro. Simple but slow inference.</li>
+<li>Discrete tokens + masked diffusion: Show-o, MaskGIT, Muse. Parallel sampling, still lossy by tokenizer.</li>
+<li>Continuous + diffusion: Transfusion, MMDiT, DiT. Highest quality, more complex training.</li>
+<li>Continuous + flow matching in a VLM: JanusFlow, Show-o2, BAGEL, InternVL-U. Newest.</li>
+</ul>
+<p>Pick by task: Show-o when you want T2I + inpainting + VQA in one open model with reasonable speed; Transfusion when quality is paramount and you can afford the two-loss plumbing.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="masked-diffusion-unmask"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates Show-o sampling:</p>
+<ul>
+<li>A toy grid of 16 VQ tokens.</li>
+<li>A mock "transformer" that predicts logits based on a prompt and the currently-unmasked tokens.</li>
+<li>Parallel masked sampling over 8 steps with cosine schedule.</li>
+<li>Prints the intermediate states (mask pattern evolution) and the final tokens.</li>
+</ul>
+<p>Run it, watch the mask dissolve step by step.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Sample with a reversed schedule: commit most tokens in the first step and only a few at the end. What happens to the images, and why does the cosine schedule avoid it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Show-o2 (June 2025)</strong>: continuous 3D causal VAE latents, flow matching for images and video, autoregressive text, on Qwen2.5 1.5B and 7B.</li>
+<li><strong>Masked generative models</strong> remain the fast discrete option (MaskGIT, Muse, Meissonic); discrete diffusion is also being explored for text itself (diffusion language models such as LLaDA and Mercury).</li>
+<li><strong>Unified models</strong> mostly use continuous latents with diffusion or flow heads for image quality (Transfusion family, BAGEL, Show-o2).</li>
+<li><strong>Laptop reality</strong>: Show-o's 1.3B base fits an 8 GB GPU in bf16, making it one of the few unified models you can try locally.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/html/2408.12528v2">Show-o (arXiv 2408.12528)</a>, <a href="https://arxiv.org/abs/2506.15564">Show-o2 (arXiv 2506.15564)</a>, <a href="https://arxiv.org/abs/2202.04200">MaskGIT (arXiv 2202.04200)</a>, <a href="https://arxiv.org/abs/2301.00704">Muse (arXiv 2301.00704)</a>, <a href="https://arxiv.org/abs/2310.05737">MAGVIT-v2 (arXiv 2310.05737)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Masked discrete diffusion: start fully masked, predict all, keep the confident, repeat.</li>
+<li>A cosine schedule commits few tokens early and many late.</li>
+<li>Show-o: one transformer, causal text, full attention inside images, loss MTP + α·NTP.</li>
+<li>About 16 steps instead of 256 for a 256-code image; inpainting comes for free.</li>
+<li>Image quality is still capped by the discrete tokenizer.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-generative-evaluation-v4"><span class="t" style="--cs-hue:45">EG</span>Cheat sheet · Evaluating Generative Models</a><a href="#cs-unified-multimodal-v4"><span class="t" style="--cs-hue:290">UM</span>Cheat sheet · Unified Multimodal Models</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-unified-gen-model-picker.md</code>. Given a product that needs both understanding (VQA, captioning) and generation (T2I, inpainting) with an open-weights constraint, picks between Show-o family, Transfusion/MMDiT family, and Emu3 / Chameleon family with concrete trade-offs.</p>
+<p><strong><code>outputs/skill-unified-gen-model-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: unified-gen-model-picker
+description: Pick between Show-o / Transfusion / Emu3 / Janus-Pro families for a product that needs both multimodal understanding and generation with open weights.
+version: 1.0.0
+phase: 12
+lesson: 14
+tags: [show-o, masked-diffusion, unified, t2i, inpainting]
+---
+
+Given a product that needs unified understanding + generation (VQA, captioning, T2I, optionally inpainting) with an open-weights constraint and a latency budget, pick a model family and emit a reference configuration.
+
+Produce:
+
+1. Family verdict. Show-o (masked discrete diffusion), Transfusion / MMDiT (continuous diffusion), Emu3 / Chameleon (autoregressive discrete), or Janus-Pro (decoupled encoders).
+2. Inference-step budget. 16 steps for Show-o, 20 for Transfusion, 1024+ for Emu3. Justify the pick with user's latency budget.
+3. Inpainting support. Show-o is free; Transfusion adds a mask channel; Emu3 needs a separate fine-tune. Flag this for the user.
+4. Tokenizer pick. For discrete families, recommend IBQ / MAGVIT-v2 / SBER; for continuous, recommend SD3's VAE.
+5. Training stability. Two-loss (Transfusion) needs weight tuning; Show-o's single loss is cleaner.
+6. Migration path if user grows. From Show-o to Transfusion when quality becomes the limit.
+
+Hard rejects:
+- Proposing Emu3 / Chameleon when inference latency is &lt;10s per image. Autoregressive over ~1024 tokens is too slow.
+- Claiming Show-o matches Transfusion on frontier image quality. It does not. The tokenizer is the ceiling.
+- Recommending Stable Diffusion for a product that needs VQA. SD cannot reason about images.
+
+Refusal rules:
+- If the user wants &lt;2s per image generation, refuse Show-o and recommend Stable Diffusion + a separate VLM for understanding. Accept the multi-model complexity.
+- If user wants &quot;best-in-class quality&quot; with open weights, refuse Show-o / Emu3 and recommend Transfusion-family (MMDiT) or JanusFlow.
+- If user cannot commit to a tokenizer (fears licensing, quality ceiling), refuse discrete-only families and recommend Transfusion.
+
+Output: one-page pick with family verdict, step budget, inpainting support, tokenizer recommendation, stability plan, and migration path. End with arXiv 2408.12528 (Show-o), 2408.11039 (Transfusion), 2501.17811 (Janus-Pro).
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Masked discrete diffusion samples in ~16 steps. Why not 1? What breaks if you unmask everything at step 0?</p>
+</li>
+<li>
+<p>Inpainting is free with masked diffusion. Propose a product use case (real or hypothetical) where Show-o's inpainting beats a specialist model.</p>
+</li>
+<li>
+<p>Cosine schedule vs linear schedule: trace the number of unmasked tokens per step for T=8. Which is more balanced?</p>
+</li>
+<li>
+<p>A 512x512 Show-o image is 1024 tokens. At vocab <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16384</span></span></span></span>, the model emits <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">16384</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">14</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">336</span></span></span></span> bits (~1.75 KiB) of data. Stable Diffusion outputs 512<em>512</em>24 bits = 6,291,456 bits (~768 KiB) of raw pixels. What is the compression ratio and what quality does it buy?</p>
+</li>
+<li>
+<p>Read LlamaGen (arXiv:2406.06525). How is LlamaGen's class-conditional autoregressive image model different from Show-o's masked approach?</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1214-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 2 tokens first, about 25 at the end</span></summary><div class="qa-a"><p>2 tokens in the first step and about 25 in the last. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌊</span><span class="mord">256</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mord">/32</span><span class="mclose">)⌋</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">254</span></span></span></span> positions stay masked after step 1. In the last steps the curve is steep, and the run committed 23 to 25 tokens per step. The model commits the bulk of the image only when most of it is already visible.</p></div></details>
+<details class="qa" id="a1214-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Early guesses lock in and the image falls apart</span></summary><div class="qa-a"><p>If most tokens are committed in the first step, they are chosen when the model sees nothing but the caption. Each guess is made independently, with no neighbours to agree with, so committed tokens contradict each other: a sky patch next to a grass patch next to half a face. Committed tokens are never revisited, so these mistakes are locked in. The few remaining steps cannot repair a scene whose layout was decided by guesses that ignored each other. The result is incoherent or noisy images, even from a good model. The cosine schedule does the opposite. It commits a few high-confidence tokens first (often the global layout), then fills in more and more, each step conditioned on what is already fixed. This is also why very small step counts (2 steps) give poor images.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1214-qa3"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">A design tool wants to ship, with open weights it can host, one model that answers questions about a user's image, edits a region of it on request, and generates a new image from text. The latency per image must stay in seconds, not minutes. Lay out the families you would consider, pick one, and state the test that would make you change the pick.</span></summary><div class="qa-a"><p><em>Level 4 of 4 · about 15 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Three open families cover understanding and generation in one model: next-token prediction over discrete codes, which does everything with one loss but spends one pass per code and minutes per image; continuous patches with a diffusion loss next to the text loss, which gives the best fidelity in about 20 passes but trains two losses; and masked discrete decoding, which keeps one loss, fills an image in about 16 passes, and gets region editing free from its masking objective. For a tool that needs editing and a seconds-level latency with open weights, start with the masked discrete family. Change the pick if a fidelity eval on your own prompts shows the quantizer ceiling hurting, or if the latency budget cannot afford sixteen full passes; the continuous two-loss family then takes over, with editing done through conditioned denoising of the region.</p>
+<p><strong>The requirements, mapped.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Requirement</th>
+<th>Next-token over codes</th>
+<th>Continuous two-loss</th>
+<th>Masked discrete</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Visual question answering</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td>Region edit</td>
+<td>possible, slow: regenerate codes</td>
+<td>possible through conditioned denoising</td>
+<td>native: mask the region's codes</td>
+</tr>
+<tr>
+<td>Text to image</td>
+<td>yes, minutes per image</td>
+<td>yes, about 20 passes</td>
+<td>yes, about 16 passes</td>
+</tr>
+<tr>
+<td>Training</td>
+<td>one loss</td>
+<td>two losses to balance</td>
+<td>one cross-entropy on masked positions</td>
+</tr>
+<tr>
+<td>Fidelity ceiling</td>
+<td>the quantizer, at 30.5 dB in the best reference</td>
+<td>no quantizer, about 32 dB and above</td>
+<td>the quantizer</td>
+</tr>
+<tr>
+<td>Open weights to host</td>
+<td>yes</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Why masked discrete first.</strong></p>
+<p>Editing is the feature that distinguishes the product, and the masked objective is editing: mask a region, keep the rest, add the prompt, predict. A latency in the low tens of passes fits a seconds budget. One loss means one training recipe to operate. The reference open model ships text generation, question answering, text-to-image and inpainting from one checkpoint.</p>
+<p><strong>Why not the other two first.</strong></p>
+<p>Next-token over codes spends thousands of passes per image; the reference puts a 512 by 512 image at about 2 minutes at a typical decode rate, and a region edit means regenerating codes in sequence. The continuous design has the best fidelity and no quantizer ceiling, but two losses on different scales need a weight search, and editing needs a conditioned denoising sampler that you build yourself.</p>
+<p><strong>The eval that decides.</strong></p>
+<ol>
+<li>Fidelity: your own prompt set, judged against the continuous reference at matched passes; if the quantizer ceiling shows, as lost fine texture or unreadable text in images, the pick changes.</li>
+<li>Edit quality: masked region edits judged for seam quality and prompt adherence.</li>
+<li>Latency at your resolution and pass count on your hardware; sixteen full passes of a large transformer can still exceed a budget.</li>
+<li>Understanding: the question-answering eval you already run, because the unified model must not fall behind the adapter model it replaces.</li>
+</ol>
+<p><strong>Operational notes.</strong></p>
+<p>Keep the tokenizer fixed and version it with the model; a tokenizer change invalidates every stored code. Log the mask schedule and the pass count as deployment parameters, because they trade latency for quality at serve time without retraining.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Ship the next-token model; one loss, one stack, no compromise." Minutes per image at the reference decode rate breaks the latency requirement, and a region edit regenerates codes in sequence.</li>
+<li>"Fidelity decides, so take the continuous design." Fidelity is one requirement; editing and operational simplicity favor the masked design until an eval shows the ceiling hurting.</li>
+<li>"Pick the model with the best benchmark score." The product needs three tasks, an edit path and a latency budget; a benchmark covers one of those at best.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Which of the three tasks does the masked objective give for free, and why? Expected: region editing; training predicts masked codes from the rest, which is what an edit asks for.</li>
+<li><em>(level 4)</em> How do you do a region edit in the continuous design? Expected: keep the patches outside the region fixed across the denoising steps and denoise only the region, conditioned on the text and the context; it works, but it is a sampler you write, not a training objective.</li>
+<li><em>(level 4)</em> Why does the pass count become a serving parameter in the masked design? Expected: more passes commit fewer codes each and raise quality, fewer passes cut latency; the schedule is set at inference, so the product can trade them per request.</li>
+<li><em>(level 4)</em> What single measurement tells you that the quantizer is the bottleneck? Expected: the tokenizer's reconstruction of your real images; if the reconstruction already loses the detail your users care about, no generator on those codes can recover it.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1214">Show-o lesson</a> places the three families and names the tasks one checkpoint covers, the <a href="#a1213">Transfusion lesson</a> gives the continuous design, and the <a href="#a1212">Emu3 lesson</a> gives the per-code cost of next-token generation.</p></div></details>
+<details class="qa" id="a1214-qa4"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">Your team needs one open model for answering questions about images, text-to-image generation and inpainting, with a usable generation latency. One candidate generates images one code at a time; another denoises continuous patches; a third stays with discrete codes and fills them in parallel over a few passes. Compare the three on passes, training complexity and what comes for free.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Next-token generation over codes needs one pass per code, 1024 to 4096 passes per image, with one simple loss. Continuous diffusion in a shared transformer needs about 20 passes, but it trains two losses on different scales. Masked discrete decoding keeps codes and one cross-entropy loss, predicts all masked positions at once and commits the most confident ones each pass, so an image takes about 16 passes; inpainting is free, because the training objective is to fill masked codes from the rest. For a product that wants all three tasks in one open model at a usable latency, the masked discrete design is the fit, and the continuous design is the pick when fidelity is paramount.</p>
+<p><strong>How masked discrete decoding works.</strong></p>
+<p>Training samples a masking ratio uniformly, masks that share of an image's codes, and trains the transformer to recover them. That generalizes next-token prediction: for text only the last position is masked, for an image a random subset is. At inference, start from a fully masked grid, predict every masked position in parallel, keep the most confident predictions, re-mask the rest, and repeat on a schedule. A cosine schedule, the mask ratio as the cosine of pi times the step over twice the total steps, concentrates the work at mid-range ratios where predictions are most informative.</p>
+<p><strong>The attention mask.</strong></p>
+<p>Text tokens are causal. Image codes attend to every other code of the same image, so a masked position can see all of its neighbors. Text attends to prior images, and image codes attend to prior text.</p>
+<p><strong>The comparison.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Design</th>
+<th>Passes per image</th>
+<th>Losses</th>
+<th>Free extras</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Next-token over codes</td>
+<td>one per code, 1024 to 4096</td>
+<td>one cross-entropy</td>
+<td>video with a 3D tokenizer; one stack for everything</td>
+</tr>
+<tr>
+<td>Continuous diffusion in the transformer</td>
+<td>about 20</td>
+<td>cross-entropy plus a diffusion loss on patches</td>
+<td>the highest fidelity, no quantizer</td>
+</tr>
+<tr>
+<td>Masked discrete decoding</td>
+<td>about 16</td>
+<td>one cross-entropy on masked positions</td>
+<td>inpainting; one checkpoint for answering, writing and generating</td>
+</tr>
+</tbody>
+</table></div>
+<p>Per pass, the masked design is cheaper than continuous diffusion, because it emits discrete logits rather than a continuous regression at every patch.</p>
+<p><strong>What the masked design pays.</strong></p>
+<p>It keeps the tokenizer ceiling of every discrete design: the image can be no better than the quantizer's reconstruction. Unmasking everything in one pass fails, because the codes are predicted independently and the result is incoherent; the schedule exists so that committed codes condition the rest.</p>
+<p><strong>Inpainting for free.</strong></p>
+<p>Mask the codes of a region, feed the rest plus a text prompt, and predict the masked ones. No new objective and no new head: the training task was exactly this.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Masked decoding is diffusion, so it needs a noise schedule." It is discrete: positions are masked, not noised, and the schedule sets how many codes to commit per pass.</li>
+<li>"Next-token generation is the fastest because each pass is small." Each pass is a full transformer pass over the sequence, and there are thousands of them per image.</li>
+<li>"Inpainting needs a separate model." The masked objective is inpainting; masking a region at inference is the task the model trained on.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why can the model not unmask everything in one pass? Expected: each masked position is predicted from a marginal that ignores the others, so the sampled codes do not agree; committing the confident ones first gives the rest conditioning.</li>
+<li><em>(level 3)</em> Why does a cosine schedule beat a linear one? Expected: it spends more steps at the mid-range ratios where each prediction is most informative, while a linear schedule plateaus earlier.</li>
+<li><em>(level 4)</em> Where does the per-step cost differ between masked discrete and continuous diffusion? Expected: both are full transformer passes, but the discrete head emits logits over the codebook while the continuous head regresses a velocity for every patch; the discrete pass is cheaper per step.</li>
+<li><em>(level 4)</em> What would make you give up the one-model simplicity for a specialist? Expected: a fidelity requirement above the tokenizer ceiling, or a latency budget that even sixteen full passes cannot meet, where a dedicated continuous generator wins.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1214">Show-o lesson</a> walks the masked decoding, the schedule and the task list, the <a href="#a1212">Emu3 lesson</a> gives the per-code cost, and the <a href="#a1213">Transfusion lesson</a> gives the continuous alternative.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2408.12528">Xie et al. — Show-o (arXiv:2408.12528)</a></li>
+<li><a href="https://arxiv.org/abs/2506.15564">Show-o2 (arXiv:2506.15564)</a></li>
+<li><a href="https://arxiv.org/abs/2202.04200">Chang et al. — MaskGIT (arXiv:2202.04200)</a></li>
+<li><a href="https://arxiv.org/abs/2406.06525">Sun et al. — LlamaGen (arXiv:2406.06525)</a></li>
+<li><a href="https://arxiv.org/abs/2301.00704">Chang et al. — Muse (arXiv:2301.00704)</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/12-multimodal-ai/14-show-o-discrete-diffusion-unified" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1214" id="done-a1214">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1214" id="undo-a1214" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1213"><span class="pn-dir">Previous</span><span class="pn-t">12.13 · Transfusion: Autoregressive Text + Diffusion Image in One Transformer</span></a><a class="pn next" href="#a1215"><span class="pn-dir">Next</span><span class="pn-t">12.15 · Janus-Pro: Decoupled Encoders for Unified Multimodal Models</span></a></div></footer>

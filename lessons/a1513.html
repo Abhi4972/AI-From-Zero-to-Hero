@@ -1,0 +1,599 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-15">Phase 15 · Autonomous Systems</a></nav><h1>Action Budgets, Iteration Caps, and Cost Governors</h1><div class="m-meta"><span class="chip chip-num">Lesson 15.13</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1513" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 15 · 10 (Permission modes), Phase 15 · 12 (Durable execution)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, layered cost-governor simulator), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A mid-sized e-commerce agent's monthly LLM cost jumps from $1,200 to $4,800 after its team enables an "order-tracking" skill. That is not a pricing bug. That is an agent that found a new loop and kept spending inside it. The defence is a stack of limits: per-request <code>max_tokens</code>, per-task token and dollar budgets, per-day/month caps, iteration caps, tiered model routing, prompt caching, context windowing, HITL checkpoints on expensive actions, kill switches on budget breach. Anthropic's Claude Agent SDK ships two of them directly, <code>max_turns</code> and <code>max_budget_usd</code>; Microsoft's open-source Agent Governance Toolkit (April 2, 2026) adds policy enforcement, circuit breakers and a kill switch around agents. Financial velocity limits — e.g. cut access on &gt;$50 in 10 minutes — catch loops faster than monthly caps.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Denial of Wallet</td>
+<td>"Runaway bill"</td>
+<td>Agent loop generating spend with no cap to stop it</td>
+</tr>
+<tr>
+<td>max_tokens</td>
+<td>"Per-request cap"</td>
+<td>Ceiling on a single completion's size</td>
+</tr>
+<tr>
+<td>max_turns</td>
+<td>"Iteration cap"</td>
+<td>Ceiling on agent loop iterations in a session</td>
+</tr>
+<tr>
+<td>max_budget_usd</td>
+<td>"Dollar kill switch"</td>
+<td>Session cost cap; aborts on breach</td>
+</tr>
+<tr>
+<td>Velocity limit</td>
+<td>"Rate cap"</td>
+<td>Limit on spend per short window (e.g., $50 / 10 min)</td>
+</tr>
+<tr>
+<td>Tiered routing</td>
+<td>"Small model first"</td>
+<td>Cheap model default; escalate only when classifier warrants</td>
+</tr>
+<tr>
+<td>Prompt caching</td>
+<td>"Cached system prompt"</td>
+<td>Provider-side cache bills re-sent tokens at a fraction of the input price (0.1x on Anthropic's API)</td>
+</tr>
+<tr>
+<td>HITL checkpoint</td>
+<td>"Human approval gate"</td>
+<td>Human tap required before expensive action</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l1207">Zero to Agents 12.7 · Reliability engineering for agents</a></li><li><a class="xref" href="#l1210">Zero to Agents 12.10 · Cost engineering</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Every turn of an agent costs money, and an agent stuck in a loop keeps spending until something stops it. A <strong>cost governor</strong> is that something: a set of limits at different scales, such as tokens per call, turns per session, dollars per session, dollars per minute and dollars per month. Each limit catches a different failure, so you need several. Reliability and cost engineering for agents are covered in Zero to Agents 12.7 and 12.10 (linked above). This lesson runs the lesson's governor on more failure shapes, then meters a real model's agent loop to see which caps would fire.</p></div></aside>
+
+<p>Autonomous agents spend real money on every turn. A chatbot's bad output is a bad reply; an agent's bad loop is a bill. The industry-documented term for the failure mode is "Denial of Wallet" — the agent keeps reasoning, keeps tool-calling, keeps billing, and nothing stops it because nothing was designed to.</p>
+<p>The fix is not one number. It is a stack of limits at different time scales and granularities: per-request, per-task, per-hour, per-day, per-month. A well-designed stack catches a runaway loop within minutes, a slow leak within hours, and a bad release within a day. The same stack keeps a budget at all when the agent is long-horizon and autonomous.</p>
+<p>This is an engineering lesson: the math is trivial, the discipline is where teams fail. The limits below are standard practice; the Claude Agent SDK exposes two of them as options, and the rest you build around the agent.</p>
+<h2>Idea 1 · The cost-governor stack</h2>
+<ol>
+<li><strong><code>max_tokens</code> per request.</strong> Simple. Prevents any one call from emitting an unbounded completion.</li>
+<li><strong>Per-task token budget.</strong> Across the whole run, do not exceed N tokens. Hard stop at the cap.</li>
+<li><strong>Per-task dollar budget.</strong> Same as tokens but in currency. <code>max_budget_usd</code> in Claude Code.</li>
+<li><strong>Per-tool call cap.</strong> No more than N <code>WebFetch</code> calls, N <code>shell_exec</code> calls, etc.</li>
+<li><strong>Iteration cap (<code>max_turns</code>).</strong> Total agent loop iterations; prevents infinite reasoning loops.</li>
+<li><strong>Per-minute / per-hour / per-day / per-month cap.</strong> Rolling windows. Catches leaks at different time scales.</li>
+<li><strong>Financial velocity limit.</strong> E.g., "if spend exceeds $50 in 10 minutes, cut access." Catches loop-based burn before monthly caps fire.</li>
+<li><strong>Tiered model routing.</strong> Default to a smaller model; escalate to a larger one only when a classifier judges the task warrants it.</li>
+<li><strong>Prompt caching.</strong> System prompt and stable context stored in provider cache; re-sent tokens are billed at a fraction of the normal input price (a tenth on Anthropic's API, after a one-time write that costs more).</li>
+<li><strong>Context windowing.</strong> Compaction / summarization to keep the active context below a threshold; direct token-cost reduction.</li>
+<li><strong>HITL checkpoints on expensive actions.</strong> Before an action known to be expensive (long tool call, large download, a costly model upgrade), require a human tap.</li>
+<li><strong>Kill switch on budget breach.</strong> Session aborts when any cap fires. Cap is recorded; requires a separate re-enable path.</li>
+</ol>
+<h2>Idea 2 · Why the stack, not one cap</h2>
+<p>A single monthly cap catches a runaway agent only after the wallet is gone. A single per-request cap catches nothing at the session level. Different failure modes require different time scales:</p>
+<ul>
+<li><strong>Runaway loop</strong> (agent stuck in a 5-second retry): caught by velocity limit.</li>
+<li><strong>Slow leak</strong> (agent doing ~2x expected work per task): caught by daily cap.</li>
+<li><strong>Bad release</strong> (new version uses 5x tokens): caught by weekly / monthly cap.</li>
+<li><strong>Legitimate surge</strong> (real demand, not a bug): caught by hour / day cap with clear log.</li>
+</ul>
+<h2>Idea 3 · A harness budget surface</h2>
+<p>The Claude Code Agent SDK exposes (public docs):</p>
+<ul>
+<li><code>max_turns</code> — iteration cap.</li>
+<li><code>max_budget_usd</code> — dollar cap; session aborts on breach.</li>
+<li><code>allowed_tools</code> / <code>disallowed_tools</code> — tool allowlist and denylist.</li>
+<li>Hook points before tool use for custom cost-accounting.</li>
+</ul>
+<p>Combine with the permission-mode ladder (<a href="#a1510">Lesson 15.10</a>). An auto-mode session without <code>max_budget_usd</code> is ungoverned autonomy: auto mode's classifier judges whether an action is safe, not what it costs. Both caps are off unless you set them, and a session that hits one ends with an <code>error_max_turns</code> or <code>error_max_budget_usd</code> result.</p>
+<h2>Idea 4 · EU AI Act, OWASP Agentic Top 10</h2>
+<p>Microsoft's Agent Governance Toolkit maps its controls to the OWASP Top 10 for Agentic Applications and to regulatory frameworks including the EU AI Act. For a high-risk system under the AI Act, record-keeping (Article 12) and human oversight (Article 14) are legal duties. Spending caps are not required by law, but they sit in the same control layer as the logs and the oversight.</p>
+<h2>Idea 5 · The $1,200 → $4,800 pattern</h2>
+<p>The story as the lesson tells it (we could not find it in Microsoft's published material, so treat it as an illustration): an e-commerce agent whose monthly cost quadrupled after a new tool was added. The tool allowed the agent to poll order status during every session. No loop detection. No per-tool cap. No alert on week-over-week growth. The fix was a per-tool cap plus a daily-growth alert. The template holds whatever its source: every new tool surface is a new potential loop; every new tool needs its own cap and its own alert. The second code block below rebuilds this month and shows which layers notice.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cost-governor-stack"></div></figure></p>
+
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Each layer has its own stopping time.</strong> A run stops at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mop"><span class="mop">min</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">ℓ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">ℓ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, the first layer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">ℓ</span></span></span></span> to fire. Which layer that is depends on the failure's shape, which is why one cap is not enough.</p>
+<p><strong>A velocity limit compares a rate to a threshold.</strong> A turn costing <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> dollars every <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> seconds spends at
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">s</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">60</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mord text"><span class="mord">dollars a minute</span></span><span class="mpunct">,</span></span></span></span></span></div>
+and the limit fires when <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">v</span></span></span></span>. The lesson's normal turn gives <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">60</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0.0075/30</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.015</span></span></span></span>, and its limit is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.03</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7944em;vertical-align:-0.15em;"></span><span class="mord">2</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>. Anything that doubles the normal rate trips it, a loop or a busy day.</p>
+<p><strong>Re-sent context grows quadratically.</strong> If turn 1 sends <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> input tokens and each turn adds <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span>, turn <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> sends <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">Δ</span></span></span></span>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> turns send
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.9535em;vertical-align:-1.3021em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.6514em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">Δ</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord mathnormal">n</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.113em;vertical-align:-0.686em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord">.</span></span></span></span></span></div>
+A loop's cost per turn rises as it runs. Caching bills the repeated prefix at about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.1</span><span class="mord">×</span></span></span></span>, which cuts the quadratic term but does not remove it.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting one month</div><div class="co-body"><ul>
+<li>The fleet: 270 sessions a day, 20 turns each, 2,500 tokens a turn at the lesson's price of 0.003 dollars per 1,000 tokens. One session costs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.003</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.15</span></span></span></span> dollars, a day 40.50, a month about 1,215.</li>
+<li>A polling tool adds 60 turns to every session. One session costs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">80</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.003</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>, a day 162, a month 4,860: the same quadrupling.</li>
+<li>Per session nothing looks wrong: 80 turns is under the 200-turn cap, 0.60 is far under the 50-dollar session cap, and the spend rate per minute has not changed.</li>
+<li>A daily alert compares today with the last 7 days: day 11 spends 162 against an average of 40.50, four times as much, so it fires the first day.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A tight velocity limit only stops loops."<br>
+  ✓ It stops anything that doubles the normal spend rate. The lesson's limit also ends a legitimate session running at 3x pace after 2 turns.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Per-session caps protect the monthly bill."<br>
+  ✓ A tool that adds polling to every session raises the bill 4x while every session stays inside every cap.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A loop costs the same every turn."<br>
+  ✓ Each turn re-sends the whole context, so input grows every turn and the total grows quadratically.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Prompt caching makes re-sent tokens free."<br>
+  ✓ Cached reads cost about a tenth of the input price, and the first write costs more than a normal send.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Run the lesson's layered <code>Governor</code> on a legitimate busy day, the normal 2,500 tokens a turn but one turn every 10 seconds instead of 30. Which layer fires, and when? Then ship a tool that adds 60 polling turns to each of 270 daily sessions. Which per-session layer notices? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">More failure shapes, then a fleet for a month</div><div class="co-body"><p>The lesson's <code>simulate()</code> and <code>Governor</code> on a bad release, a busy day and a slow leak, then a month of 270 sessions a day with a polling tool shipped on day 11, with and without a per-tool cap. Runs in under a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson&#x27;s simulate() and Governor (imported from main.py) on three more trajectories, then a month of a whole
+# fleet of sessions. Part 1 asks which layer fires first, and whether one fires on traffic that is not a bug. Part 2
+# adds a tool that makes every session poll, the shape of the $1,200 -&gt; $4,800 story, and asks which layer notices.
+# Deterministic arithmetic; runs in under a second.
+import main
+from main import Governor, simulate, NORMAL_TURN_TOKENS, DOLLARS_PER_KTOK
+
+PROFILES = {   # name: (tokens on turn t, seconds per turn)
+    &quot;polling loop at turn 30&quot;: (main.turn_cost, 30),
+    &quot;bad release, 5x tokens&quot;:  (lambda t: 5 * NORMAL_TURN_TOKENS, 30),
+    &quot;busy day, 3x the pace&quot;:   (lambda t: NORMAL_TURN_TOKENS, 10),
+    &quot;slow leak, 1.8x tokens&quot;:  (lambda t: int(1.8 * NORMAL_TURN_TOKENS), 30),
+}
+print(&quot;1. one session, the lesson&#x27;s layered stack&quot;)
+for name, (cost, pace) in PROFILES.items():
+    main.turn_cost = cost
+    simulate(Governor(seconds_per_turn=pace), name)
+main.turn_cost = PROFILES[&quot;polling loop at turn 30&quot;][0]
+
+print(&quot;\n2. a fleet for 30 days: 270 sessions a day, 20 turns each; a polling tool ships on day 11&quot;)
+SESSIONS, TURNS, PACE = 270, 20, 30
+POLL_TURNS = 60                                   # the new tool: each session polls order status 60 more times
+def session(day, per_tool_cap=None):
+    polls = POLL_TURNS if day &gt;= 11 else 0
+    if per_tool_cap is not None:
+        polls = min(polls, per_tool_cap)
+    turns = TURNS + polls
+    dollars = turns * NORMAL_TURN_TOKENS / 1000 * DOLLARS_PER_KTOK
+    rate = NORMAL_TURN_TOKENS / 1000 * DOLLARS_PER_KTOK / (PACE / 60)    # $/min, the same every turn
+    g = Governor()
+    fired = [n for n, hit in ((&quot;max_turns&quot;, turns &gt;= g.max_turns), (&quot;max_budget_usd&quot;, dollars &gt;= g.max_budget_usd),
+                              (&quot;velocity_limit&quot;, rate &gt; g.velocity_usd_per_min)) if hit]
+    return dollars, turns, fired
+
+for label, cap in ((&quot;no per-tool cap&quot;, None), (&quot;per-tool cap: 3 polls a session&quot;, 3)):
+    daily, fired_any, spent, cap_day, alert_day = [], set(), 0.0, None, None
+    for day in range(1, 31):
+        d, turns, fired = session(day, cap)
+        fired_any |= set(fired)
+        daily.append(SESSIONS * d)
+        spent += daily[-1]
+        if cap_day is None and spent &gt;= 2000:
+            cap_day = day
+        if alert_day is None and day &gt; 7 and daily[-1] &gt; 1.5 * sum(daily[-8:-1]) / 7:
+            alert_day = day
+    print(f&quot;   {label}: session {turns} turns ${d:.2f}; per-session layers fired: {sorted(fired_any) or &#x27;none&#x27;}&quot;)
+    print(f&quot;      day 1-10 ${sum(daily[:10]):,.0f}, day 11-30 ${sum(daily[10:]):,.0f}; as a 30-day month: &quot;
+          f&quot;${30 * daily[0]:,.0f} -&gt; ${30 * daily[-1]:,.0f}&quot;)
+    when = lambda d: f&quot;on day {d}&quot; if d else &quot;never&quot;
+    print(f&quot;      monthly cap $2,000 trips {when(cap_day)}; alert &#x27;today &gt; 1.5x the last 7 days&#x27; fires {when(alert_day)}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. one session, the lesson&#x27;s layered stack
+  polling loop at turn 30   turns=   39  tokens= 152,500  dollars=$   0.46  stopped_by=velocity_limit
+  bad release, 5x tokens    turns=    2  tokens=  20,000  dollars=$   0.06  stopped_by=velocity_limit
+  busy day, 3x the pace     turns=    2  tokens=   5,000  dollars=$   0.01  stopped_by=velocity_limit
+  slow leak, 1.8x tokens    turns=  200  tokens= 900,000  dollars=$   2.70  stopped_by=max_turns
+
+2. a fleet for 30 days: 270 sessions a day, 20 turns each; a polling tool ships on day 11
+   no per-tool cap: session 80 turns $0.60; per-session layers fired: none
+      day 1-10 $405, day 11-30 $3,240; as a 30-day month: $1,215 -&gt; $4,860
+      monthly cap $2,000 trips on day 20; alert &#x27;today &gt; 1.5x the last 7 days&#x27; fires on day 11
+   per-tool cap: 3 polls a session: session 23 turns $0.17; per-session layers fired: none
+      day 1-10 $405, day 11-30 $932; as a 30-day month: $1,215 -&gt; $1,397
+      monthly cap $2,000 trips never; alert &#x27;today &gt; 1.5x the last 7 days&#x27; fires never
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The velocity limit catches the loop, the bad release and a busy day alike.</strong> The polling loop stops at turn 39 after 0.46 dollars, as in the lesson. A release that uses 5x the tokens stops at turn 2. So does a legitimate busy day at 3x the pace with normal turns: the lesson's limit of 0.03 dollars a minute is only twice the normal rate, so any session running twice as fast trips it.</p>
+<p><strong>A slow leak slips under it.</strong> At 1.8x the tokens, the rate is 0.027 dollars a minute, just under the limit. Only the 200-turn cap stops it, which every long session hits anyway.</p>
+<p><strong>Per-session layers miss a fleet-wide change.</strong> With the polling tool, a session runs 80 turns and costs 0.60 dollars, and no per-session layer fires. The month goes from 1,215 to 4,860 dollars at the new rate. A 2,000-dollar monthly cap trips on day 20, ten days late. An alert on "today above 1.5x the last 7 days" fires on day 11, the first day.</p>
+<p><strong>A per-tool cap removes most of the cost.</strong> Capping polls at 3 a session keeps sessions at 23 turns and 0.17 dollars, and the month at 1,397 dollars. That is 15% more than before, so the growth alert stays quiet.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A real agent loop, metered</div><div class="co-body"><p>This block continues from the one above. Qwen2.5-0.5B-Instruct (greedy, CPU) answers "has order 4417 shipped?" with <code>check_order</code> and <code>reply_to_customer</code>, against an order system that stays pending. It runs once plainly, once on a waiting request, and once with an order-tracking skill's instruction. Then a scheduled poller re-runs it every 5 minutes. Real token counts are priced at $3 and $15 per million input and output tokens, and each cap is replayed on the hour. About 2 minutes.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># This block continues from the one above: a real agent loop, metered. Qwen2.5-0.5B-Instruct (greedy, CPU) answers
+# customer requests with two tools, check_order and reply_to_customer, then with an order-tracking skill&#x27;s instruction
+# added. The order system never changes its answer, and its message invites another check.
+# Then the skill as a poller that re-runs the agent until the status is final. Real token counts are priced, and each
+# cap is replayed on the trace to see where it would have stopped. About 2 minutes.
+import json, os, re, warnings
+os.environ[&quot;HF_HUB_OFFLINE&quot;] = &quot;1&quot;
+warnings.filterwarnings(&quot;ignore&quot;)
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;)
+llm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;).eval()
+
+def fn(name, desc, **params):
+    return {&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: name, &quot;description&quot;: desc, &quot;parameters&quot;: {
+        &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {k: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: v} for k, v in params.items()}, &quot;required&quot;: list(params)}}}
+TOOLS = [fn(&quot;check_order&quot;, &quot;Look up the shipping status of an order&quot;, order_id=&quot;the order number&quot;),
+         fn(&quot;reply_to_customer&quot;, &quot;Send the final answer to the customer and end the task&quot;, message=&quot;the reply&quot;)]
+FORCED = &#x27;&lt;tool_call&gt;\n{&quot;name&quot;: &quot;&#x27;
+def step(messages):
+    ids = tok.apply_chat_template(messages, tools=TOOLS, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    ids = torch.cat([ids, tok(FORCED, return_tensors=&quot;pt&quot;)[&quot;input_ids&quot;]], dim=1)
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=60, do_sample=False)
+    text = FORCED + tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
+    m = re.search(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*(?:&lt;/tool_call&gt;|$)&quot;, text, re.S)
+    try:
+        d = json.loads(m.group(1)); name, args = d[&quot;name&quot;], d.get(&quot;arguments&quot;, {}) or {}
+    except (AttributeError, json.JSONDecodeError, KeyError, TypeError):
+        name, args = &quot;malformed&quot;, {}
+    return name, args, ids.shape[1], out.shape[1] - ids.shape[1]
+
+STATUS = &quot;order 4417: status pending (label created). Tracking updates every few minutes; check again for the latest status.&quot;
+SKILL = (&quot; Order-tracking skill: only reply to the customer once the order status is final (shipped or delivered);&quot;
+         &quot; while it is pending, keep checking.&quot;)
+def run(task, skill=False, max_turns=20):
+    messages = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are a support agent for an online shop. Use the tools to answer the customer.&quot;
+                 + (SKILL if skill else &quot;&quot;)},
+                {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: task}]
+    trace = []                                 # (tool, args, input tokens, output tokens)
+    for turn in range(1, max_turns + 1):
+        name, args, n_in, n_out = step(messages)
+        trace.append((name, json.dumps(args, sort_keys=True), n_in, n_out))
+        if name == &quot;reply_to_customer&quot;:
+            break
+        result = STATUS if name == &quot;check_order&quot; else &quot;error: unknown tool&quot;
+        messages += [{&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;&quot;, &quot;tool_calls&quot;: [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: name, &quot;arguments&quot;: args}}]},
+                     {&quot;role&quot;: &quot;tool&quot;, &quot;name&quot;: name, &quot;content&quot;: result}]
+    return trace
+
+for task, skill in ((&quot;Has my order 4417 shipped yet?&quot;, False), (&quot;Please tell me as soon as my order 4417 ships.&quot;, False),
+                    (&quot;Has my order 4417 shipped yet?&quot;, True)):
+    trace = run(task, skill)
+    calls = [t[0] for t in trace]
+    print(f&quot;{task!r}{&#x27; + skill&#x27; if skill else &#x27;&#x27;}: {len(trace)} turns, &quot; + &quot;, &quot;.join(f&quot;{c} x{calls.count(c)}&quot; for c in dict.fromkeys(calls))
+          + (&quot;&quot; if calls[-1] == &quot;reply_to_customer&quot; else &quot;, still going when the observation stopped&quot;))
+
+print(&quot;\nthe skill as a scheduled poller: it re-runs the agent every 5 minutes until the status is final&quot;)
+IN, OUT = 3 / 1e6, 15 / 1e6                    # $ per token: $3 and $15 per million (a Sonnet-class list price)
+hour = [run(&quot;Has my order 4417 shipped yet?&quot;) for _ in range(12)]
+cost = [sum(t[2] * IN + t[3] * OUT for t in tr) for tr in hour]
+replies = [json.loads(tr[-1][1]).get(&quot;message&quot;, &quot;&quot;) for tr in hour]
+print(f&quot;   one hour: 12 sessions of {len(hour[0])} turns, {sum(len(tr) for tr in hour)} model calls, ${sum(cost):.4f}; &quot;
+      f&quot;the customer got {len(replies)} replies, {len(set(replies))} distinct&quot;)
+print(f&quot;   one order for a day: ${sum(cost) * 24:.2f}; 270 pending orders: ${sum(cost) * 24 * 270:,.0f} a day&quot;)
+
+print(&quot;\nreplaying each cap on that hour:&quot;)
+cum = [sum(cost[:k + 1]) for k in range(12)]
+RULES = {&quot;max_turns = 8 (per session)&quot;: lambda k: len(hour[k]) &gt;= 8,
+         &quot;max_budget_usd = $0.02 (per session)&quot;: lambda k: cost[k] &gt;= 0.02,
+         &quot;velocity $0.03/min (per session, 1 min)&quot;: lambda k: cost[k] / 1 &gt; 0.03,
+         &quot;check_order(4417) at most 3 an hour (per order)&quot;: lambda k: k + 1 &gt; 3,
+         &quot;same reply sent 3 times (per customer)&quot;: lambda k: replies[:k + 1].count(replies[k]) &gt;= 3}
+for label, rule in RULES.items():
+    at = next((k + 1 for k in range(12) if rule(k)), None)
+    print(f&quot;   {label:&lt;48} &quot; + (f&quot;fires at session {at}, after ${cum[at - 1]:.4f}&quot; if at else &quot;never fires&quot;))
+
+t0, step_up = hour[0][0][2], hour[0][1][2] - hour[0][0][2]
+print(f&quot;\nif the agent had looped inside one session instead: input starts at {t0} tokens and grows {step_up} a turn,&quot;)
+for n in (10, 50, 200):
+    tokens = n * t0 + step_up * n * (n - 1) // 2
+    new = t0 + (n - 1) * step_up                       # tokens sent for the first time: written to the cache at 1.25x
+    print(f&quot;   {n:&gt;3} turns: {tokens:&gt;9,} input tokens, ${tokens * IN:.3f}; with the prefix cached (reads at 0.1x) ${(new * 1.25 + (tokens - new) * 0.1) * IN:.3f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">&#x27;Has my order 4417 shipped yet?&#x27;: 2 turns, check_order x1, reply_to_customer x1
+&#x27;Please tell me as soon as my order 4417 ships.&#x27;: 2 turns, check_order x1, reply_to_customer x1
+&#x27;Has my order 4417 shipped yet?&#x27; + skill: 2 turns, check_order x1, reply_to_customer x1
+
+the skill as a scheduled poller: it re-runs the agent every 5 minutes until the status is final
+   one hour: 12 sessions of 2 turns, 24 model calls, $0.0319; the customer got 12 replies, 1 distinct
+   one order for a day: $0.76; 270 pending orders: $206 a day
+
+replaying each cap on that hour:
+   max_turns = 8 (per session)                      never fires
+   max_budget_usd = $0.02 (per session)             never fires
+   velocity $0.03/min (per session, 1 min)          never fires
+   check_order(4417) at most 3 an hour (per order)  fires at session 4, after $0.0106
+   same reply sent 3 times (per customer)           fires at session 3, after $0.0080
+
+if the agent had looped inside one session instead: input starts at 264 tokens and grows 67 a turn,
+    10 turns:     5,655 input tokens, $0.017; with the prefix cached (reads at 0.1x) $0.005
+    50 turns:    95,275 input tokens, $0.286; with the prefix cached (reads at 0.1x) $0.041
+   200 turns: 1,386,100 input tokens, $4.158; with the prefix cached (reads at 0.1x) $0.463
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>This model does not loop by itself.</strong> In all three runs, including the one with the skill's "keep checking while pending" instruction, it calls <code>check_order</code> once and replies. A stronger instruction-follower is more likely to obey "keep checking" literally, so do not count on this.</p>
+<p><strong>The loop came from the code around it.</strong> Re-run every 5 minutes, the agent makes 24 model calls in an hour for 0.032 dollars, and the customer gets 12 replies, all identical. At that rate one order costs 0.76 dollars a day, and 270 pending orders cost about 206 dollars a day.</p>
+<p><strong>Per-session caps see nothing.</strong> Each session is 2 turns and under a cent, so <code>max_turns</code>, <code>max_budget_usd</code> and a per-session velocity limit never fire. The caps that fire are scoped to the order or the customer: at most 3 checks of order 4417 an hour stops it at session 4, and "the same reply 3 times" at session 3.</p>
+<p><strong>Inside one session, a loop costs more every turn.</strong> Input starts at 264 tokens and grows 67 a turn, so 200 turns send 1.39 million input tokens, 4.16 dollars. With the repeated prefix read from the cache at 0.1x, the same loop costs about 0.46 dollars.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates an agent run with and without a layered cost-governor stack. The simulated agent drifts into a polling loop after some turns; the layered stack catches it within the velocity window while a single monthly cap would not fire until days later.</p>
+
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>turn_cost</code>, <code>Governor</code>, <code>Run</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Layered cost-governor simulator — stdlib Python.
+
+Simulates an agent that drifts into a polling loop after 30 turns. Compares
+three configurations:
+
+  1. no caps: unbounded spend
+  2. monthly cap only: catches eventually, spends a lot first
+  3. layered stack: per-request + iteration + velocity limit + monthly cap
+
+Metrics: turns executed, total tokens, total dollars, trigger that fired.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+# ---------- Simulated run profile ----------
+
+NORMAL_TURN_TOKENS = 2_500
+LOOP_TURN_TOKENS = 8_000
+LOOP_STARTS_AT = 30
+
+# $/token (input+output blended) for a Sonnet-class model, mid-2026 rates
+DOLLARS_PER_KTOK = 0.003
+
+
+def turn_cost(turn: int) -&gt; int:
+    return LOOP_TURN_TOKENS if turn &gt;= LOOP_STARTS_AT else NORMAL_TURN_TOKENS
+
+
+# ---------- Governor ----------
+
+@dataclass
+class Governor:
+    max_tokens_per_request: int = 10_000
+    max_turns: int = 200
+    max_budget_usd: float = 50.0
+    velocity_usd_per_min: float = 0.03       # cut off above this rolling rate
+    velocity_window_min: float = 10.0
+    monthly_cap_usd: float = 500.0
+
+    enable_request_cap: bool = True
+    enable_iter_cap: bool = True
+    enable_velocity: bool = True
+    enable_session_cap: bool = True
+    enable_monthly_cap: bool = True
+
+    # per-minute turn rate (seconds per turn) for the simulator
+    seconds_per_turn: float = 30.0
+
+
+@dataclass
+class Run:
+    turns: int = 0
+    tokens: int = 0
+    dollars: float = 0.0
+    history: list[tuple[float, float]] = field(default_factory=list)  # (minute, dollars-at-that-minute)
+    stopped_by: str = &quot;&quot;
+
+
+EPSILON_MIN = 1e-9
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>velocity_exceeded</code>, <code>simulate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def velocity_exceeded(run: Run, gov: Governor, now_min: float) -&gt; bool:
+    if not run.history:
+        return False
+    cutoff = now_min - gov.velocity_window_min
+    window = [(t, d) for (t, d) in run.history if t &gt;= cutoff]
+    if not window:
+        return False
+    start_min, start_dollars = window[0]
+    window_dollars = run.dollars - start_dollars
+    # Use the actual elapsed time inside the window, not the nominal
+    # window width. During warm-up (now_min &lt; velocity_window_min) this
+    # stops the rate being under-reported.
+    elapsed = max(now_min - start_min, EPSILON_MIN)
+    rate = window_dollars / elapsed
+    return rate &gt; gov.velocity_usd_per_min
+
+
+def simulate(gov: Governor, label: str) -&gt; Run:
+    run = Run()
+    now_min = 0.0
+
+    for turn in range(1, 10_001):
+        tok = turn_cost(turn)
+        if gov.enable_request_cap and tok &gt; gov.max_tokens_per_request:
+            tok = gov.max_tokens_per_request
+        run.turns = turn
+        run.tokens += tok
+        run.dollars += (tok / 1000.0) * DOLLARS_PER_KTOK
+        now_min += gov.seconds_per_turn / 60.0
+        run.history.append((now_min, run.dollars))
+
+        if gov.enable_iter_cap and turn &gt;= gov.max_turns:
+            run.stopped_by = &quot;max_turns&quot;
+            break
+        if gov.enable_session_cap and run.dollars &gt;= gov.max_budget_usd:
+            run.stopped_by = &quot;max_budget_usd&quot;
+            break
+        if gov.enable_velocity and velocity_exceeded(run, gov, now_min):
+            run.stopped_by = &quot;velocity_limit&quot;
+            break
+        if gov.enable_monthly_cap and run.dollars &gt;= gov.monthly_cap_usd:
+            run.stopped_by = &quot;monthly_cap&quot;
+            break
+
+    if not run.stopped_by:
+        run.stopped_by = &quot;ran out of simulated turns&quot;
+
+    print(f&quot;  {label:&lt;24}  turns={run.turns:&gt;5}  tokens={run.tokens:&gt;8,}  &quot;
+          f&quot;dollars=${run.dollars:&gt;7.2f}  stopped_by={run.stopped_by}&quot;)
+    return run
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 85)
+    print(&quot;LAYERED COST GOVERNORS (Phase 15, Lesson 13)&quot;)
+    print(&quot;=&quot; * 85)
+    print()
+    print(&quot;Agent enters a polling loop at turn 30.&quot;)
+    print(&quot;-&quot; * 85)
+
+    # 1. no caps
+    g = Governor(
+        enable_request_cap=False,
+        enable_iter_cap=False,
+        enable_velocity=False,
+        enable_session_cap=False,
+        enable_monthly_cap=False,
+    )
+    # Cap at something huge so the sim terminates; this line is the &quot;unbounded&quot; case.
+    g.max_turns = 10_000
+    g.enable_iter_cap = True
+    simulate(g, &quot;no caps (iter 10k sim)&quot;)
+
+    # 2. monthly cap only
+    g = Governor(
+        enable_request_cap=False,
+        enable_iter_cap=False,
+        enable_velocity=False,
+        enable_session_cap=False,
+        enable_monthly_cap=True,
+    )
+    simulate(g, &quot;monthly cap only&quot;)
+
+    # 3. layered stack
+    g = Governor()
+    simulate(g, &quot;layered stack&quot;)
+
+    print()
+    print(&quot;=&quot; * 85)
+    print(&quot;HEADLINE: caps must layer, because failure modes differ by time scale&quot;)
+    print(&quot;-&quot; * 85)
+    print(&quot;  Monthly cap fires too late: it does not trip within 10k simulated turns.&quot;)
+    print(&quot;  Velocity limit ($0.03/min rolling) catches a loop within minutes.&quot;)
+    print(&quot;  Iteration cap prevents any single run from exceeding N turns.&quot;)
+    print(&quot;  Per-request cap prevents any one completion from being unbounded.&quot;)
+    print(&quot;  Session dollar cap (max_budget_usd) closes the seatbelt on cost.&quot;)
+    print(&quot;  Each layer covers a different failure (loop, leak, surge, release).&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=====================================================================================
+LAYERED COST GOVERNORS (Phase 15, Lesson 13)
+=====================================================================================
+
+Agent enters a polling loop at turn 30.
+-------------------------------------------------------------------------------------
+  no caps (iter 10k sim)    turns=10000  tokens=79,840,500  dollars=$ 239.52  stopped_by=max_turns
+  monthly cap only          turns=10000  tokens=79,840,500  dollars=$ 239.52  stopped_by=ran out of simulated turns
+  layered stack             turns=   39  tokens= 152,500  dollars=$   0.46  stopped_by=velocity_limit
+
+=====================================================================================
+HEADLINE: caps must layer, because failure modes differ by time scale
+-------------------------------------------------------------------------------------
+  Monthly cap fires too late: it does not trip within 10k simulated turns.
+  Velocity limit ($0.03/min rolling) catches a loop within minutes.
+  Iteration cap prevents any single run from exceeding N turns.
+  Per-request cap prevents any one completion from being unbounded.
+  Session dollar cap (max_budget_usd) closes the seatbelt on cost.
+  Each layer covers a different failure (loop, leak, surge, release).
+</code></pre></div></div></aside>
+
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A nightly job uses your agent to triage 500 support tickets, one agent session per ticket, each with <code>max_budget_usd</code> set to 5 dollars. One night a bad prompt change makes every session run to just under its cap, and the morning bill is about 2,400 dollars. No cap fired. Using this lesson, what was missing? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What's current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Session caps are built in.</strong> The Claude Agent SDK has <code>max_turns</code> and <code>max_budget_usd</code> (both off unless set; a breach ends the run with an <code>error_max_*</code> result), and Claude Managed Agents has session budgets. The OpenAI Agents SDK stops a run after <code>max_turns</code>.</li>
+<li><strong>Fleet caps live at the gateway.</strong> Proxies such as LiteLLM put budgets and rate limits on each API key, team or user. This is where per-day spend, velocity limits and growth alerts across many sessions belong.</li>
+<li><strong>Caching is a cost control.</strong> Anthropic bills cache reads at a tenth of the input price, so a stable system prompt and tool list cut a long loop's input bill. Order the prompt so the stable part comes first.</li>
+<li><strong>Governance toolkits sit around agents.</strong> Microsoft's Agent Governance Toolkit (open source, April 2026) adds runtime policy, circuit breakers and a kill switch, mapped to the OWASP Top 10 for Agentic Applications.</li>
+<li><strong>On your laptop</strong>: a local model costs no API money, but the same caps apply to time. Cap turns and wall-clock minutes for a model served on the RTX 4060, or a loop holds the GPU all night.</li>
+</ul>
+<p>Sources: <a href="https://code.claude.com/docs/en/agent-sdk/configuration">Claude Agent SDK, Configure your agent</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic, Prompt caching</a>, <a href="https://opensource.microsoft.com/blog/2026/04/02/introducing-the-agent-governance-toolkit-open-source-runtime-security-for-ai-agents/">Microsoft, Agent Governance Toolkit</a>, <a href="https://docs.litellm.ai/docs/proxy/users">LiteLLM, Budgets and rate limits</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Stack limits at several scales: per call, per session, per tool, per minute, per day and per month.</li>
+<li>Set velocity limits from the measured normal rate with headroom, or a busy day looks like a loop.</li>
+<li>Per-session caps cannot see a change that makes every session a little more expensive; alert on daily growth across the fleet.</li>
+<li>Give every new tool its own cap; a polling tool is a loop waiting to happen.</li>
+<li>Loops get more expensive every turn, because the context is re-sent each time.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-autonomous-agents"><span class="t" style="--cs-hue:330">AA</span>Cheat sheet · Autonomous Agents and Permissions</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-agent-budget-audit.md</code> audits a proposed agent deployment's cost-governor stack and flags missing layers.</p>
+<p><strong><code>outputs/skill-agent-budget-audit.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: agent-budget-audit
+description: Audit an agent deployment's cost-governor stack and flag missing layers before enabling unattended runs.
+version: 1.0.0
+phase: 15
+lesson: 13
+tags: [cost-governors, denial-of-wallet, budgets, claude-code-sdk, agent-governance]
+---
+
+Given a proposed agent deployment, audit its cost-governor stack against the twelve-layer reference and flag which layers are missing, under-tuned, or over-tuned.
+
+Produce:
+
+1. **Layer inventory.** For each of the twelve reference layers (per-request cap, per-task token budget, per-task dollar budget, per-tool cap, iteration cap, per-minute/hour/day/month rolling caps, velocity limit, tiered routing, prompt caching, context windowing, HITL checkpoints, kill switch), state whether it is configured, and at what value.
+2. **Failure-mode mapping.** For each time-scale failure (runaway loop, slow leak, bad release, legitimate surge), name the specific layer that catches it and how fast.
+3. **Tool-specific caps.** List every tool the agent can call. For each, name a per-session cap and a reason. Any tool without an explicit cap is an open loop.
+4. **Alert thresholds.** Separate from caps: at what spend rate does a human get paged? The e-commerce pattern ($1,200 → $4,800) is a growth problem, caught by a day-over-day or week-over-week alert, not by a monthly cap.
+5. **Kill-switch path.** When a cap fires, what happens? Clean abort, rollback, alert, re-enable procedure. Confirm the kill switch is external to the agent (the agent cannot edit its own cap).
+
+Hard rejects:
+- Any autonomous deployment without a per-task dollar budget.
+- Any unattended long-horizon run without a velocity limit.
+- Tool surfaces with no per-tool cap on a new (&lt;30 days) tool addition.
+- Kill switches the agent itself can modify.
+- Monthly cap as the only cap (every other time scale is unguarded).
+
+Refusal rules:
+- If the user cannot price a worst-case run on today's model prices, refuse and require a costed estimate.
+- If the proposed budget exceeds the organization's acceptable loss on a single mistake, refuse and require a lower cap.
+- If the user treats the Auto Mode classifier (Lesson 10) as a replacement for budgets, refuse. The classifier is orthogonal to cost; both layers are required.
+
+Output format:
+
+Return a cost-governor audit with:
+- **Layer table** (layer name, configured y/n, value)
+- **Failure-mode coverage** (4 rows: loop / leak / release / surge)
+- **Per-tool caps** (tool, cap, reason)
+- **Alert thresholds** (rate, owner, channel)
+- **Kill-switch path** (trigger, action, re-enable procedure)
+- **Readiness** (production / staging / research-only)
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Confirm the velocity limit fires before the iteration cap on a polling-loop trajectory. Now disable the velocity limit and measure how much the agent "spends" before the iteration cap catches it.</p>
+</li>
+<li>
+<p>Design a per-tool cap set for a browser agent (<a href="#a1511">Lesson 15.11</a>). Which tool needs the tightest cap? Which tool can run unbounded without risk?</p>
+</li>
+<li>
+<p>Read the Microsoft Agent Governance Toolkit docs. List every cap type the toolkit names. Map each to one of the failure modes (runaway loop, slow leak, bad release, surge).</p>
+</li>
+<li>
+<p>Price an overnight unattended run for a realistic task (e.g., "triage 50 issues in a repo"). Set <code>max_budget_usd</code> at 2x your point estimate. Justify the 2x.</p>
+</li>
+<li>
+<p>Claude Code's <code>max_budget_usd</code> fires on session aggregate cost. Design a complementary velocity limit you would enforce externally. What triggers the cut-off, and what does re-enable look like?</p>
+</li>
+</ol>
+
+<h2>Solutions</h2>
+<details class="qa" id="a1513-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · A busy day trips the velocity limit; the fleet change trips nothing</span></summary><div class="qa-a"><p><strong>The busy day: the velocity limit fires after 2 turns.</strong> Normal turns cost 0.0075 dollars. At one every 10 seconds the rate is 0.045 dollars a minute, above the lesson's limit of 0.03. The session ends after 2 turns and a cent, though nothing is wrong. Set velocity limits from the measured normal rate with real headroom, and scope them to match: per session for loops, per fleet for surges.</p>
+<p><strong>The polling tool: no per-session layer notices.</strong> Sessions grow to 80 turns and 0.60 dollars, under every per-session cap, and the per-minute rate does not change. Only fleet-level checks see it: a daily-growth alert on day 11, or a monthly cap ten days later. A per-tool cap of 3 polls stops most of the extra cost at the source.</p></div></details>
+<details class="qa" id="a1513-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Five hundred sessions under five caps</span></summary><div class="qa-a"><p>Every limit was per session, and the failure was spread across 500 sessions. Each one stayed just under its 5-dollar cap, so the job as a whole had no limit: 500 times about 4.80 dollars is about 2,400.</p>
+<p>The missing layers:
+- <strong>A per-job budget</strong>, for example 150 dollars for the whole night's run, checked before each new session starts.
+- <strong>A velocity limit across sessions</strong>: a nightly job that normally spends about 50 dollars an hour should be cut off and someone paged at, say, 3x that.
+- <strong>A growth alert</strong>, so tonight's cost per ticket is compared with last week's.
+- <strong>A canary</strong> for prompt changes: run the new prompt on 20 tickets first and compare cost per ticket before running all 500.</p>
+<p>The session cap still matters, because it stops any one ticket from looping forever. It just cannot see the total.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://code.claude.com/docs/en/agent-sdk/agent-loop">Anthropic Claude Code Agent SDK — agent loop and budgets</a> — <code>max_turns</code>, <code>max_budget_usd</code>, tool allowlists.</li>
+<li><a href="https://learn.microsoft.com/en-us/agent-framework/workflows/human-in-the-loop">Microsoft Agent Framework — human-in-the-loop</a> — pausing a workflow for a human decision, the HITL checkpoint in the stack.</li>
+<li><a href="https://opensource.microsoft.com/blog/2026/04/02/introducing-the-agent-governance-toolkit-open-source-runtime-security-for-ai-agents/">Microsoft — Introducing the Agent Governance Toolkit</a> — runtime policy, circuit breakers and a kill switch for agents.</li>
+<li><a href="https://platform.claude.com/docs/en/managed-agents/overview">Anthropic — Claude Managed Agents overview</a> — Anthropic's hosted agent harness, with session budgets.</li>
+<li><a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Anthropic — Prompt caching (Claude API docs)</a> — caching mechanics.</li>
+<li><a href="https://www.anthropic.com/research/measuring-agent-autonomy">Anthropic — Measuring agent autonomy in practice</a> — how long agents run unattended in practice, which sets how long a loop can run before anyone looks.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/15-autonomous-systems/13-cost-governors" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1513" id="done-a1513">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1513" id="undo-a1513" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1512"><span class="pn-dir">Previous</span><span class="pn-t">15.12 · Long-Running Background Agents: Durable Execution</span></a><a class="pn next" href="#a1514"><span class="pn-dir">Next</span><span class="pn-t">15.14 · Kill Switches, Circuit Breakers, and Canary Tokens</span></a></div></footer>

@@ -1,0 +1,608 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>Multi-Token Prediction (MTP)</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.18</span><span class="chip">60 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1018" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>State the MTP training objective and derive the joint loss across prediction depths.</li>
+<li>Explain the difference between Gloeckle et al.'s parallel MTP heads (2024) and DeepSeek-V3's sequential MTP modules and why the sequential design preserves the causal chain.</li>
+<li>Compute the parameter and memory overhead of adding MTP modules to a pre-training run.</li>
+<li>Implement one MTP module from scratch: the shared embedding, the per-depth transformer block, the projection, and the shared output head.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10 · 04 (pre-training a mini GPT), Phase 10 · 15 (speculative decoding)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Every autoregressive LLM from GPT-2 to Llama 3 trains on one loss per position: predict the next token. DeepSeek-V3 added a second loss per position: predict the token after that. The extra 14B of parameters (on a 671B model) got distilled back into the main model through gradient flow, and the trained MTP heads were repurposed at inference as speculative-decoding drafters with 80%+ acceptance. 1.8× generation throughput came for free. This lesson builds the sequential MTP module from the DeepSeek technical report, computes the loss and the shared-head paramet</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MTP module</td>
+<td>"Extra loss block"</td>
+<td>A small transformer block plus projection that predicts a token <code>k</code> positions ahead of the main model</td>
+</tr>
+<tr>
+<td>Prediction depth</td>
+<td>"Which offset"</td>
+<td>The integer <code>k</code> such that module <code>k</code> predicts <code>t_{i+k+1}</code> from prefix through position <code>i</code> (the main model is depth 0 and predicts <code>t_{i+1}</code>)</td>
+</tr>
+<tr>
+<td>Parallel MTP</td>
+<td>"Gloeckle-style"</td>
+<td>D independent heads on the same backbone hidden state, no conditional chain</td>
+</tr>
+<tr>
+<td>Sequential MTP</td>
+<td>"DeepSeek-V3 style"</td>
+<td>Each module conditions on the previous depth's hidden state plus the next token's embedding; preserves causal chain</td>
+</tr>
+<tr>
+<td>Shared output head</td>
+<td>"Reuse the main head"</td>
+<td>The MTP modules call the main model's LM head, not a separate output projection</td>
+</tr>
+<tr>
+<td>Shared embedding</td>
+<td>"Reuse the main table"</td>
+<td>Same vocabulary embedding table is used everywhere; no duplicate parameters</td>
+</tr>
+<tr>
+<td>Projection matrix $M_k$</td>
+<td>"Combine hidden + next-token"</td>
+<td>An <code>h x 2h</code> linear layer that folds the previous hidden state and the target-token embedding into the next depth's input</td>
+</tr>
+<tr>
+<td>Joint loss $L_{\text{MTP}}$</td>
+<td>"Averaged extra losses"</td>
+<td>Arithmetic mean of per-depth cross-entropy losses, scaled by <code>lambda</code></td>
+</tr>
+<tr>
+<td>Acceptance rate at depth 1</td>
+<td>"How often MTP draft is right"</td>
+<td>The rate at which the D=1 MTP module's top-1 prediction equals the main model's top-1 prediction; 80%+ on DeepSeek-V3</td>
+</tr>
+<tr>
+<td>Lambda weighting</td>
+<td>"Extra-loss importance"</td>
+<td>Per-depth scaling factor; 0.3 at start of training, 0.1 later on DeepSeek-V3</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A language model is normally trained to predict only the next token. Multi-token prediction (MTP) adds a small extra module that, at every position, also predicts the token <em>after</em> next, given the main model's hidden state and the actual next token. Training on this harder second target gives the model a denser learning signal, and at inference the same module is a ready-made draft for speculative decoding (<a href="#a1015">Lesson 10.15</a>): it guesses one extra token per step, the main model checks it, and DeepSeek-V3 gets 1.8× more tokens per second. This lesson runs the lesson's toy module, counts DeepSeek-V3's real MTP module from its config, works out exactly why the module must see the next token, and measures that effect with a real model. No model is trained.</p></div></aside>
+<p>Next-token prediction is the standard LLM training objective. Every hidden state is supervised to predict exactly one thing: the immediately following token. That is a surprisingly weak signal. Most of the information in a sequence extends beyond one token — structure, coherence, factuality, arithmetic flow. The model has to learn those by accumulating many one-token signals over trillions of tokens.</p>
+<p>MTP asks: what if every hidden state were supervised to predict multiple future tokens at once? Gloeckle et al. (Meta, 2024) showed this helps. Their implementation put several independent output heads on top of the backbone, each predicting a different offset. Parallel and simple, but every head sees the same hidden state and none knows what the earlier heads predicted. (They can still serve as drafts: Gloeckle et al. report up to 3× faster inference with 4-token heads used for self-speculative decoding.)</p>
+<p>DeepSeek-V3 (December 2024) re-designed MTP as sequential modules that keep the causal chain at each prediction depth. The model predicts <code>t+1</code> from <code>h_i^(0)</code>, then predicts <code>t+2</code> from a new hidden state <code>h_i^(1)</code> that combined <code>h_i^(0)</code> with the <code>E(t+1)</code> embedding, and so on. Each depth is its own small transformer block. The shared embedding and shared output head keep parameter overhead modest. At DeepSeek-V3's scale, 14B extra parameters across MTP modules on top of 671B main-model weights. That 2% overhead bought denser training signals AND a ready-made speculative-decoding draft at inference.</p>
+<p>This lesson builds a single MTP module and the D-depth loss from scratch. The math is tidy. The implementation is 150 lines.</p>
+<h2>Idea 1 · The sequential MTP recipe</h2>
+<p>DeepSeek-V3 adds <code>D</code> MTP modules on top of the main model. The main model predicts <code>t_{i+1}</code>. Each module <code>k</code> (for <code>k = 1..D</code>) predicts the token <code>k</code> steps further out, <code>t_{i+k+1}</code>, given a prefix through position <code>i</code>.</p>
+<p>Module <code>k</code> consists of:</p>
+<ul>
+<li>A transformer block <code>T_k</code> with its own attention and MLP.</li>
+<li>A projection matrix <code>M_k</code> that combines the previous-depth hidden state with the embedding of the next-depth ground-truth token.</li>
+<li>The shared embedding <code>E</code> (same as the main model).</li>
+<li>The shared output head <code>Out</code> (same as the main model).</li>
+</ul>
+<p>At training, for a prefix through position <code>i</code>, the per-depth hidden state is:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:3.8048em;vertical-align:-1.6524em;"></span><span class="mord"><span class="mtable"><span class="col-align-r"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.1524em;"><span style="top:-4.2576em;"><span class="pstrut" style="height:3.15em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mtight">0</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span></span></span><span style="top:-2.4476em;"><span class="pstrut" style="height:3.15em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6524em;"><span></span></span></span></span></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.1524em;"><span style="top:-4.2576em;"><span class="pstrut" style="height:3.15em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">main model backbone at position </span></span><span class="mord mathnormal">i</span></span></span><span style="top:-2.4476em;"><span class="pstrut" style="height:3.15em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">concat</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">RMSNorm</span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">−</span><span class="mord mtight">1</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">RMSNorm</span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">))</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">for </span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6524em;"><span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>The per-depth prediction is:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9969em;vertical-align:-0.3025em;"></span><span class="mord"><span class="mord text"><span class="mord">logits</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3025em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.3217em;vertical-align:-0.2769em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">Out</span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">for </span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span></span></div></p>
+<p>The per-depth loss is cross-entropy against the ground-truth <code>t_{i+k+1}</code>:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0525em;vertical-align:-0.3025em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">CE</span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">logits</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3025em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></div></p>
+<p>The joint loss across depths:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">MTP</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.1304em;vertical-align:-1.3021em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">λ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">D</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p><code>lambda</code> is a small weighting factor: DeepSeek-V3 uses 0.3 for the first 10T training tokens and 0.1 for the remaining 4.8T. DeepSeek-V3 uses <code>D = 1</code>, so the joint loss is a single extra cross-entropy. The total training loss is <code>L_main + L_MTP</code>.</p>
+<h2>Idea 2 · Why sequential, not parallel</h2>
+<p>Gloeckle's original parallel MTP had D output heads, each directly applied to <code>h_i^(0)</code>. Each head predicts <code>t_{i+k}</code> from the same backbone hidden state. That trains fine, but the predictions are not conditioned on each other. You cannot use <code>head_1</code>'s output to help <code>head_2</code> — the heads fire in parallel.</p>
+<p>DeepSeek-V3's sequential design builds <code>h_i^(k)</code> from <code>h_i^(k-1)</code> plus the actual next-token embedding <code>E(t_{i+k})</code>. That preserves the causal chain: to predict <code>t_{i+k+1}</code>, the module at depth <code>k</code> sees what was at <code>t_{i+k}</code>. This is structurally identical to how an autoregressive decoder consumes its own output, which makes the MTP modules directly usable as speculative-decoding drafters.</p>
+<p>At inference: feed <code>h_i^(k-1)</code> and the drafted <code>t_{i+k}</code> into module <code>k</code>, get a prediction for <code>t_{i+k+1}</code>. Repeat. That is exactly an EAGLE-style draft, using the trained MTP module as the draft network. DeepSeek-V3 reports 85–90% acceptance of the second token and 1.8× more tokens per second.</p>
+<h2>Idea 3 · Parameter accounting</h2>
+<p>For a model with hidden <code>h</code> and vocabulary <code>V</code>:</p>
+<ul>
+<li>Main model: billions of parameters, plus one output head of size <code>V * h</code>.</li>
+<li>Shared output head: reuse the main model's head. No extra params.</li>
+<li>Shared embedding: reuse the main model's embedding. No extra params.</li>
+<li>Per-MTP module:</li>
+<li>Projection <code>M_k</code>: <code>(2h) * h = 2h^2</code>.</li>
+<li>Transformer block <code>T_k</code>: attention (<code>4h^2</code> for MHA) plus MLP (typically <code>8h^2</code> for SwiGLU with ratio 8/3). About <code>12h^2</code> per block.</li>
+</ul>
+<p>Total extra per module: <code>~14h^2</code>. For DeepSeek-V3's <code>h = 7168</code>, D = 1 module: <code>~14 * 7168^2 = ~720M</code> parameters on paper. DeepSeek-V3 reports 14B: its MTP block is a full MoE layer with 256 experts, 11.5B parameters on its own (counted from the config after Build it), and the count includes the shared embedding and output head.</p>
+<h2>Idea 4 · The speculative-decoding payoff</h2>
+<p>During pre-training, an MTP module adds one more transformer layer and one more pass through the output head per token: for DeepSeek-V3 about 4% more forward compute (computed after Build it). The payoff is two-fold:</p>
+<ol>
+<li>
+<p>Denser training signal. Each hidden state sees D+1 supervision targets. Measured effect on MMLU, GSM8K, MATH, HumanEval: consistent few-percentage-point improvements in DeepSeek-V3's ablations.</p>
+</li>
+<li>
+<p>Free speculative decoding draft at inference. The MTP module is already trained to predict the token after next. Used as a one-token draft, it is accepted 85–90% of the time, so each main-model step yields 1.85 to 1.9 tokens: DeepSeek reports 1.8× more tokens per second.</p>
+</li>
+</ol>
+<h2>Idea 5 · Relation to EAGLE</h2>
+<p>EAGLE trains a small draft model SEPARATELY after pre-training. MTP bakes the draft into pre-training. The two approaches converge on similar accept rates but via different pipelines:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Dimension</th>
+<th>EAGLE-3</th>
+<th>MTP (DeepSeek-V3)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>When trained</td>
+<td>Post-pre-training</td>
+<td>During pre-training</td>
+</tr>
+<tr>
+<td>Backward-compatible with existing weights</td>
+<td>Yes</td>
+<td>No (need to re-train)</td>
+</tr>
+<tr>
+<td>Draft params</td>
+<td>1-2 transformer layers</td>
+<td>1 transformer block + projection</td>
+</tr>
+<tr>
+<td>Acceptance rate</td>
+<td>0.88-0.92</td>
+<td>0.85-0.90 for the second token</td>
+</tr>
+<tr>
+<td>Benefit beyond speedup</td>
+<td>Speculative decoding only</td>
+<td>Denser training signal + speedup</td>
+</tr>
+</tbody>
+</table></div>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="multi-token-predict"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>For position <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> and depth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span> (depth 0 is the main model):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.3217em;vertical-align:-0.2769em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mord"><span class="mord mathrm">RMSNorm</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">−</span><span class="mord mtight">1</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">;</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">RMSNorm</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathrm">Emb</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">))</span><span class="mord"><span class="delimsizing size1">]</span></span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.3987em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3596em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.3948em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathrm">softmax</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">Out</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord">.</span></span></span></span></span></div>
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5991em;vertical-align:-1.2777em;"></span><span class="mord">−</span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.0448em;"><span style="top:-2.3987em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.2198em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3596em;"><span></span></span></span></span></span></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">]</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">main</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.1304em;vertical-align:-1.3021em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">λ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">D</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Why the module needs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>.</strong> A parallel head predicting two tokens ahead must average over the unknown next token: its best possible loss is the conditional entropy <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">2</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">≤</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2452em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>, which is at least <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">2</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">≤</span><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2452em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>, the sequential module's best loss, because conditioning never increases entropy.</p>
+<p><strong>As a draft</strong> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>: tokens per main-model step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>, with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> the acceptance rate of the drafted token.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">DeepSeek-V3&#x27;s numbers</div><div class="co-body"><ul>
+<li>Projection <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: $2h \times h = 2 \times 7{,}168^2 = 103$M parameters.</li>
+<li>One MoE transformer block: attention plus 256 routed experts and one shared expert, 11.5B (counted after Build it). Only 8 experts run per token, so about 0.59B of it is active.</li>
+<li>Output head, reused: $129{,}280 \times 7{,}168 = 0.93$B, all of it active.</li>
+<li>Extra forward compute per token: $0.59 + 0.10 + 0.93 = 1.6$B active parameters against 37B, about 4%.</li>
+<li>At inference with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.85</span></span></span></span> to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.90</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.85</span></span></span></span> to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.9</span></span></span></span> tokens per step; DeepSeek measures 1.8× tokens per second after the verification overhead.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "MTP makes the model predict several tokens at once at inference."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The main model still predicts one token per step; the MTP module only drafts, and the main model verifies.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Parallel MTP heads cannot be used for speculative decoding."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They can (Gloeckle et al. report up to 3×); the sequential design improves the second prediction by conditioning on the next token.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The 14B MTP parameters cost 14B parameters of compute."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The block is MoE: about 1.6B parameters are active per token, including the shared output head.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>With a real model (SmolLM2-360M) on Wikipedia text, how much higher is the loss of predicting the token two ahead <em>without</em> knowing the next one, compared with ordinary next-token prediction: about the same, 1.5 times, or twice as high? (Solution P1.)</p></div></aside>
+<h2>Step 1 · shared embedding table</h2>
+<p><code>code/main.py</code> builds a single MTP module end to end: shared embedding, projection, transformer block, shared output head. It then computes the per-depth cross-entropy loss on a short synthetic sequence and prints the parameter count by component. A toy vocabulary of 32 tokens keeps the numbers readable.</p>
+<p>A single <code>vocab_size x hidden</code> table is used by the main model AND by every MTP module at every depth. Not a second copy — literally the same tensor.</p>
+<h2>Step 2 · the per-depth combination</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def combine(prev_hidden, next_token_embed, M_k):
+    # concat along feature dim, then project down to hidden
+    concat = rms_norm(prev_hidden) + rms_norm(next_token_embed)  # vector addition stand-in
+    projected = matvec(M_k, concat)
+    return projected
+</code></pre></div>
+
+<p>Real DeepSeek-V3 concatenates the two RMSNormed vectors to <code>[2h]</code> and projects with an <code>h x 2h</code> matrix. The toy uses vector addition for stdlib brevity.</p>
+<h2>Step 3 · the transformer block at depth k</h2>
+<p>Self-attention plus MLP. In the toy, a one-layer linear attention block and a SwiGLU MLP keep the structure visible without numpy.</p>
+<h2>Step 4 · the shared output head</h2>
+<p>Reuse the main model's output projection. Logits over the vocabulary.</p>
+<h2>Step 5 · per-depth loss</h2>
+<p>Cross-entropy of softmax(logits) against the ground-truth token at offset <code>k+1</code>. Aggregate across depths with the <code>lambda / D</code> scaling factor.</p>
+<h2>Step 6 · parameter accounting</h2>
+<p>Print the total parameter count, the shared (embedding, head) count, and the per-module extra count. Show the ratio of MTP extra to main-model size.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s toy</div><div class="co-body"><p><code>main.py</code>: two sequential MTP modules on a 32-token vocabulary with random weights, the per-depth and joint losses, parameter counts for several model shapes, and the losses as the backbone's hidden states become less noisy (instant).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # toy MTP module, loss and parameter accounting; instant
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+MULTI-TOKEN PREDICTION: DeepSeek-V3 sequential MTP (Phase 10, Lesson 18)
+======================================================================
+
+----------------------------------------------------------------------
+Step 1: toy setup  vocab=32, hidden=8, ff=16, seq=12, D=2
+----------------------------------------------------------------------
+  per-depth losses   : L_1=3.255, L_2=3.394
+  joint L_MTP (lam=0.3)  : 0.9974
+  (uniform random-guess reference: 3.466 per depth)
+
+----------------------------------------------------------------------
+Step 2: parameter accounting
+----------------------------------------------------------------------
+  toy                    main=   1.5K  + 2 MTP module(s) =   1.4K  (91.2% overhead)
+  mini GPT               main= 211.6M  + 1 MTP module(s) =  10.0M  (4.7% overhead)
+  7B dense               main=   8.3B  + 1 MTP module(s) = 260.0M  (3.1% overhead)
+  70B dense              main=  78.9B  + 1 MTP module(s) =   1.0B  (1.3% overhead)
+  DeepSeek-V3-shape      main=  37.6B  + 1 MTP module(s) = 653.3M  (1.7% overhead)
+
+----------------------------------------------------------------------
+Step 3: per-depth loss vs training progress (synthetic)
+----------------------------------------------------------------------
+  simulate a training step: reduce noise in backbone hidden states
+  and watch L_1 and L_2 both drop.
+
+    noise     L_1     L_2    L_MTP
+     0.50   3.314   3.462   1.0164
+     0.30   3.301   3.449   1.0125
+     0.15   3.285   3.431   1.0074
+     0.05   3.274   3.416   1.0035
+
+takeaway: DeepSeek-V3 MTP adds ~1-2% parameters for a dense model and
+          ~14B out of 671B for the MoE model. Denser training signal +
+          free speculative-decoding draft at inference (80%+ accept)
+          with reported 1.8x throughput speedup.</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Step 1.</strong> The modules have random weights, so the losses (3.26 and 3.39) sit just below the 3.47 of a uniform guess over 32 tokens: the toy shows the data flow (normalise, combine, transform, shared head, cross-entropy at offset <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>, then <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">λ</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span> times the sum), not learning. Its attention is a stand-in that attends only to the token itself, and the combination adds the two normalised vectors instead of concatenating and projecting them.</p>
+<p><strong>Step 3</strong> is not training either. It makes the synthetic "backbone" hidden states less noisy while keeping the same random modules, and the losses move only from 3.31 to 3.27. Real MTP losses fall because the modules and the backbone are trained together on trillions of tokens.</p>
+<p><strong>Step 2.</strong> The counts are rough. The projection is counted as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">2</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>, every model gets a 128K vocabulary (so "mini GPT" is 212M instead of GPT-2's 124M), and "DeepSeek-V3-shape" is a dense 61-layer model with an MLP width of 18,432: its 37.6B happens to be close to DeepSeek-V3's <em>active</em> parameters (37B), not its 671B total, and the 653M MTP overhead misses that DeepSeek's MTP block is a full MoE layer (11.5B, next run). For dense models the conclusion holds: one MTP module adds 1 to 3% parameters.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">DeepSeek-V3&#x27;s module, the draft payoff, and why conditioning matters</div><div class="co-body"><p>A: DeepSeek-V3's MTP module counted from its published config on PyTorch's meta device (shapes only). B: tokens per step when the module drafts one token. C: exact entropies on a random Markov chain for next-token, parallel two-ahead and sequential two-ahead prediction.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np, torch, transformers
+from transformers import AutoConfig
+from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3DecoderLayer
+transformers.logging.set_verbosity_error()
+
+print(&quot;A. DeepSeek-V3's MTP module, counted from the published config (shapes only, no weights)&quot;)
+cfg = AutoConfig.from_pretrained(&quot;deepseek-ai/DeepSeek-V3&quot;)
+h, V = cfg.hidden_size, cfg.vocab_size
+with torch.device(&quot;meta&quot;):
+    layer = DeepseekV3DecoderLayer(cfg, layer_idx=cfg.num_hidden_layers)     # an MoE layer like layers 3..60
+n_layer = sum(p.numel() for p in layer.parameters())
+n_expert = sum(p.numel() for n, p in layer.named_parameters() if &quot;.experts.&quot; in n)
+proj, norms = 2 * h * h, 3 * h                                                # M_k (2h -&gt; h), two input norms + final norm
+emb = V * h
+print(f&quot;  MTP depths in the config (num_nextn_predict_layers): {cfg.num_nextn_predict_layers}&quot;)
+print(f&quot;  transformer block (MoE, {cfg.n_routed_experts} experts): {n_layer / 1e9:6.2f}B   of which routed experts {n_expert / 1e9:.2f}B&quot;)
+print(f&quot;  projection M (2h x h)                 : {proj / 1e9:6.2f}B&quot;)
+print(f&quot;  embedding and output head (shared)     : {2 * emb / 1e9:6.2f}B   reused from the main model&quot;)
+print(f&quot;  total with the shared matrices         : {(n_layer + proj + norms + 2 * emb) / 1e9:6.2f}B   (model card: 14B)&quot;)
+act = n_layer - n_expert + n_expert * cfg.num_experts_per_tok / cfg.n_routed_experts
+print(f&quot;  active per token: block {act / 1e9:.2f}B + projection {proj / 1e9:.2f}B + output head {emb / 1e9:.2f}B&quot;
+      f&quot; = {(act + proj + emb) / 1e9:.2f}B, against 37B for the main model: about {(act + proj + emb) / 37e9:.0%} more forward compute&quot;)
+print()
+
+print(&quot;B. Speculative decoding with one MTP module (D = 1): one draft token per step&quot;)
+for a in [0.80, 0.85, 0.90]:
+    print(f&quot;  acceptance {a:.2f}: {1 + a:.2f} tokens per main-model step&quot;)
+print(&quot;  DeepSeek reports 85-90% acceptance of the second token and 1.8x tokens per second&quot;)
+print()
+
+print(&quot;C. Why condition on the next token: a sparse random Markov chain, exact entropies (nats)&quot;)
+rng = np.random.default_rng(0)
+S = 50
+P = np.zeros((S, S))
+for s in range(S):
+    nxt = rng.choice(S, 3, replace=False)            # each state has 3 likely successors
+    P[s, nxt] = rng.dirichlet([1, 1, 1])
+pi = np.ones(S) / S
+for _ in range(500): pi = pi @ P                       # stationary distribution
+H = lambda M: -(np.where(M &gt; 0, M * np.log(np.where(M &gt; 0, M, 1)), 0)).sum(1)
+P2 = P @ P                                             # two steps ahead, t_{i+1} marginalised out
+print(f&quot;  next token, H(t+1 | t)                 : {pi @ H(P):.3f}   (what the main head learns)&quot;)
+print(f&quot;  parallel head, H(t+2 | t)              : {pi @ H(P2):.3f}   (must average over the unknown t+1)&quot;)
+print(f&quot;  sequential module, H(t+2 | t, t+1)     : {pi @ H(P):.3f}   (sees the embedding of t+1)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. DeepSeek-V3&#x27;s MTP module, counted from the published config (shapes only, no weights)
+  MTP depths in the config (num_nextn_predict_layers): 1
+  transformer block (MoE, 256 experts):  11.51B   of which routed experts 11.27B
+  projection M (2h x h)                 :   0.10B
+  embedding and output head (shared)     :   1.85B   reused from the main model
+  total with the shared matrices         :  13.46B   (model card: 14B)
+  active per token: block 0.59B + projection 0.10B + output head 0.93B = 1.61B, against 37B for the main model: about 4% more forward compute
+
+B. Speculative decoding with one MTP module (D = 1): one draft token per step
+  acceptance 0.80: 1.80 tokens per main-model step
+  acceptance 0.85: 1.85 tokens per main-model step
+  acceptance 0.90: 1.90 tokens per main-model step
+  DeepSeek reports 85-90% acceptance of the second token and 1.8x tokens per second
+
+C. Why condition on the next token: a sparse random Markov chain, exact entropies (nats)
+  next token, H(t+1 | t)                 : 0.838   (what the main head learns)
+  parallel head, H(t+2 | t)              : 1.644   (must average over the unknown t+1)
+  sequential module, H(t+2 | t, t+1)     : 0.838   (sees the embedding of t+1)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> Built from the published config, DeepSeek-V3's single MTP module is one MoE transformer layer of 11.51B parameters, almost all of it (11.27B) in its 256 routed experts, plus the 0.10B projection. Counting the embedding and output head it shares with the main model (1.85B) gives 13.5B, close to the 14B on the model card. Because only 8 of the 256 experts run per token, the module's forward cost is far smaller than its size: about 1.6B active parameters including the output head, roughly 4% more forward compute than the 37B-active main model.</p>
+<p><strong>B.</strong> With one draft token per step, tokens per main-model step are simply <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span>. DeepSeek's 85–90% acceptance gives 1.85 to 1.9, and the measured 1.8× tokens per second is that minus the cost of running the module and verifying.</p>
+<p><strong>C.</strong> On a Markov chain where each state has three likely successors, predicting the next token costs 0.84 nats. A parallel head predicting two ahead must spread its bets over all the possible intermediate states: 1.64 nats, almost twice as much. A sequential module that sees the embedding of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> is back to 0.84: in a Markov chain, knowing <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> makes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> irrelevant, so its task is exactly a next-token task. Real text is not Markov, but the effect is the same in kind; the next run measures it on a real model.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>MTP is integrated into DeepSeek-V3 (December 2024) and the DeepSeek-R1 series. At inference:</p>
+<ul>
+<li>vLLM uses the MTP module as a draft with <code>--speculative-config '{"method": "mtp", "num_speculative_tokens": 1}'</code>.</li>
+<li>SGLang runs it through its EAGLE speculative-decoding path, with DeepSeek-V3's MTP weights as the draft.</li>
+<li>Later open models ship MTP layers for the same purpose: Qwen3-Next, GLM-4.5 and Xiaomi's MiMo.</li>
+</ul>
+<p>When to use MTP in a new pre-training run:</p>
+<ul>
+<li>You control the full pre-training pipeline and want to bank denser training signal.</li>
+<li>You know you will serve the model at scale and want speculative decoding for free.</li>
+<li>Your hidden size is at least 4096. At 1B-scale the overhead hurts more than the gain helps.</li>
+</ul>
+<p>When not to:</p>
+<ul>
+<li>Fine-tuning an existing pre-trained dense model. The MTP module is not trained.</li>
+<li>Research models where you want a clean baseline to compare against. MTP changes the architecture.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">What a real model gains from seeing the next token</div><div class="co-body"><p>SmolLM2-360M on 200 positions of Wikipedia text. For each position: the next-token loss; the loss of the token two ahead when the next token is summed out over its 16 most likely values (the best a parallel head could do with this model's knowledge); and the loss two ahead given the true next token (what a sequential module sees in training). Inference only, about a minute on CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import copy, math, torch, transformers, datasets
+from transformers import AutoTokenizer, AutoModelForCausalLM
+transformers.logging.disable_progress_bar(); transformers.logging.set_verbosity_error(); datasets.disable_progress_bars()
+name = &quot;HuggingFaceTB/SmolLM2-360M&quot;
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+wiki = datasets.load_dataset(&quot;Salesforce/wikitext&quot;, &quot;wikitext-2-raw-v1&quot;, split=&quot;test&quot;)
+text = &quot; &quot;.join(t.strip() for t in wiki[&quot;text&quot;][1:60] if t.strip())
+ids = tok(text)[&quot;input_ids&quot;][:400]
+K = 16                                                    # candidates for the unknown next token
+with torch.no_grad():
+    full = model(torch.tensor([ids]), use_cache=True)
+    lp1 = torch.log_softmax(full.logits[0].float(), -1)                       # log p(t_{i+1} | &lt;= i)
+
+rows = []
+positions = range(100, 300)
+for i in positions:
+    top = lp1[i].topk(K)
+    cand = top.indices.tolist()
+    if ids[i + 1] not in cand:                            # make sure the true next token is a candidate
+        cand[-1] = ids[i + 1]
+    with torch.no_grad():                                 # reuse the prefix cache, then run all candidates as one batched step
+        cache = copy.deepcopy(full.past_key_values); cache.crop(-(len(ids) - i - 1))   # keep the prefix's cache, reused
+        cache.batch_repeat_interleave(len(cand))
+        lp2 = torch.log_softmax(model(torch.tensor(cand)[:, None], past_key_values=cache).logits[:, -1].float(), -1)
+    w = lp1[i, cand]
+    cover = w.exp().sum().item()
+    marg = torch.logsumexp(w[:, None] + lp2, 0) - math.log(cover)                # p(t_{i+2} | &lt;= i), t_{i+1} summed out
+    j = cand.index(ids[i + 1])
+    greedy1 = lp1[i].argmax().item()
+    rows.append(dict(next=-lp1[i, ids[i + 1]].item(), cond=-lp2[j, ids[i + 2]].item(), marg=-marg[ids[i + 2]].item(),
+                     cover=cover, top_marg=marg.argmax().item() == ids[i + 2],
+                     top_cond=lp2[j].argmax().item() == ids[i + 2], top_next=greedy1 == ids[i + 1]))
+avg = lambda k: sum(r[k] for r in rows) / len(rows)
+print(f&quot;{name} on {len(rows)} positions of Wikipedia text; t+1 summed over its {K} most likely values &quot;
+      f&quot;(covering {avg('cover'):.0%} of the probability on average)&quot;)
+print()
+print(f&quot;{'prediction':&lt;52} {'loss (nats)':&gt;11} {'top-1 right':&gt;12}&quot;)
+print(f&quot;{'t+1 from the prefix (next-token head)':&lt;52} {avg('next'):&gt;11.2f} {avg('top_next'):&gt;11.0%}&quot;)
+print(f&quot;{'t+2 from the prefix, t+1 unknown (parallel)':&lt;52} {avg('marg'):&gt;11.2f} {avg('top_marg'):&gt;11.0%}&quot;)
+print(f&quot;{'t+2 from the prefix and the true t+1 (sequential)':&lt;52} {avg('cond'):&gt;11.2f} {avg('top_cond'):&gt;11.0%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">HuggingFaceTB/SmolLM2-360M on 200 positions of Wikipedia text; t+1 summed over its 16 most likely values (covering 76% of the probability on average)
+
+prediction                                           loss (nats)  top-1 right
+t+1 from the prefix (next-token head)                       2.88         52%
+t+2 from the prefix, t+1 unknown (parallel)                 4.14         32%
+t+2 from the prefix and the true t+1 (sequential)           2.86         52%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Predicting the token after next without knowing the next one is much harder: 4.14 nats against 2.88 for ordinary next-token prediction, and the best guess is right 32% of the time instead of 52%. Given the true next token, the two-ahead prediction is as easy as a next-token prediction again (2.86 nats, 52%): with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> in its input, it <em>is</em> a next-token prediction one step later.</p>
+<p>That is the sequential module's training situation. In training it always receives the true next token, so its target is "the next token, one step later", from a hidden state of the main model that has not yet seen that token. A parallel head must learn the much harder averaged prediction. At inference the module receives the main model's own prediction of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> (correct about half the time for this small model, more often for large ones), which is why its drafts are accepted at high rates.</p>
+<p>The middle row is an estimate: the unknown next token is summed over its 16 most likely values, which hold 76% of the probability on average, and the sum is renormalised.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the MTP module, feed the embedding of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>, the token being predicted, instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span>. What happens to the training loss, and what happens when the module is used as a draft? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>DeepSeek-V3, R1 and V3.2</strong> train with one MTP module and use it as a speculative draft; vLLM (<code>"method": "mtp"</code>) and SGLang serve it.</li>
+<li><strong>Qwen3-Next, GLM-4.5 and MiMo</strong> also ship MTP layers, used for speculative decoding in vLLM and SGLang.</li>
+<li><strong>EAGLE-3 drafts</strong> remain the option for models trained without MTP (<a href="#a1015">Lesson 10.15</a>).</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 technical report</a>, <a href="https://arxiv.org/abs/2404.19737">Gloeckle et al.</a>, <a href="https://docs.vllm.ai/projects/ascend/en/main/user_guide/feature_guide/Multi_Token_Prediction.html">vLLM MTP guide</a>, <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct">Qwen3-Next model card</a>, <a href="https://arxiv.org/abs/2508.06471">GLM-4.5 report</a>, <a href="https://arxiv.org/abs/2505.07608">MiMo report</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>MTP: an extra module predicts the token after next from the hidden state plus the next token's embedding.</li>
+<li>Extra loss λ/D·ΣL_k; DeepSeek-V3 uses D = 1, λ = 0.3 then 0.1.</li>
+<li>The module conditions on the next token, so its best loss is a next-token loss, not a two-ahead one.</li>
+<li>DeepSeek-V3's module: an 11.5B MoE layer, about 4% more forward compute.</li>
+<li>As a one-token draft: 85–90% accepted, 1.8× tokens per second.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-speculative-decoding"><span class="t" style="--cs-hue:252">SD</span>Cheat sheet · Speculative Decoding: Draft, EAGLE, MTP</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-mtp-planner.md</code>. Given a pre-training run specification (model size, data, compute), it returns a plan for integrating MTP: number of depths D, <code>lambda</code> schedule, memory overhead, and the inference-time speculative-decoding wiring.</p>
+<p><strong><code>outputs/skill-mtp-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: mtp-planner
+description: Plan a multi-token prediction integration for a new pre-training run.
+version: 1.0.0
+phase: 10
+lesson: 18
+tags: [mtp, multi-token-prediction, deepseek-v3, pre-training, speculative-decoding]
+---
+
+Given a pre-training run specification (model scale, hidden size, layers, data tokens budget, GPU topology, target deployment) and a stated goal (denser training signal vs speculative-decoding draft vs both), produce an MTP integration plan.
+
+Produce:
+
+1. Depth D. Pick 1 or 2. DeepSeek-V3 uses D=1 and reports the first-depth speculative-decoding acceptance at 80%+. D=2 is diminishing-returns territory for most runs. Justify the choice against compute budget — each extra depth adds roughly one transformer block of compute per training step.
+2. Lambda schedule. Default: 0.3 for the first 10% of training, 0.1 afterward. Adjust up to 0.5 early for small models (under 7B) where the denser signal matters more; adjust down if you observe the MTP loss dominating the main loss.
+3. Parameter budget. Report per-module parameter count against the main model. Confirm overhead is under 5% of main parameters (dense) or under 3% (MoE).
+4. Memory and compute overhead. Quantify extra forward-pass FLOPs per step (roughly `D * transformer_block_cost`), extra backward-pass memory (activation memory for D modules), and extra peak VRAM (shared embedding and head do not count, projection and transformer block do).
+5. Inference-time wiring. Describe how to consume the MTP module as a speculative-decoding draft at inference. Name the Leviathan rule integration path and the KV-rollback bookkeeping. Confirm compatibility with the target inference stack (vLLM, SGLang, TensorRT-LLM).
+
+Hard rejects:
+- Adding MTP to a dense model pre-trained without it. Cannot retrofit — the MTP modules are not trained.
+- D &gt; 2 for a first integration. Gain over D=1 is small; complexity grows quickly.
+- MTP on a model under 1B active parameters. Signal is weaker than the overhead cost at that scale.
+- Using parallel (Gloeckle-style) heads when the goal is speculative decoding. They do not chain causally.
+
+Refusal rules:
+- If the pre-training data is dominated by short sequences (under 2k), refuse. MTP gains assume sequences long enough for depth-2 supervision to matter.
+- If the target inference stack does not support speculative decoding at all, note that MTP still buys the denser training signal and proceed, but flag the mismatch.
+- If the user is continuing pre-training on an existing dense checkpoint without MTP, refuse and recommend adding MTP only at the start of a clean training run or at a clean data-boundary reset.
+
+Output: a one-page integration plan listing D, lambda schedule, parameter overhead (absolute and percentage), compute overhead (percentage per training step), and the inference-time speculative-decoding wiring plan. End with a &quot;success criterion&quot; paragraph naming the measured metric that justifies keeping MTP: acceptance rate at depth 1 after 50B training tokens must be above 70%, otherwise the architecture should be reverted.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Show the per-depth loss decreases monotonically as the synthetic signal strengthens. Modify the synthetic to use a fixed pattern and verify both depth-1 and depth-2 losses converge.</p>
+</li>
+<li>
+<p>Compute the parameter overhead for a dense 70B model (hidden 8192, 80 layers) with D=1 MTP module. Compare to the DeepSeek-V3 reported 14B overhead. Explain why DeepSeek's number is higher: the MTP transformer block inherits the same MoE structure, inflating the per-module parameter count.</p>
+</li>
+<li>
+<p>Implement D=2 in the toy: add a second MTP module that takes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mopen mtight">(</span><span class="mord mtight">1</span><span class="mclose mtight">)</span></span></span></span></span></span></span></span></span></span></span></span> and predicts <code>t_{i+3}</code>. Verify the joint loss and the parameter accounting match the DeepSeek paper's equations 19-21.</p>
+</li>
+<li>
+<p>Switch the toy to parallel MTP (Gloeckle-style): add D output heads on top of the main hidden state, each predicting a different offset. Measure how the losses per depth compare to the sequential version on the same synthetic signal. The sequential version should produce lower depth-k loss for k &gt; 1 because it conditions on the intermediate predictions.</p>
+</li>
+<li>
+<p>Use the trained MTP module as an EAGLE-style draft: call module k to propose <code>t_{i+k+1}</code> at inference. Measure the acceptance rate of these draft tokens against the main model's predictions on a held-out sequence. If you hit 50%+ on the toy, you have reproduced the empirical MTP-as-draft property.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1018-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · About 1.4 times as high</span></summary><div class="qa-a"><p>About 1.4 times: 4.14 nats against 2.88, and the most likely guess is right 32% of the time instead of 52%. Without the next token, a prediction two ahead must average over every possible next token, and the uncertainty of both steps adds up. Given the true next token, the loss falls back to 2.86, the same as next-token prediction. This is why DeepSeek-V3's module receives the next token's embedding: its task stays learnable, and its drafts, conditioned on the main model's own next-token prediction, are accepted 85–90% of the time.</p></div></details>
+<details class="qa" id="a1018-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The loss collapses and the draft is useless</span></summary><div class="qa-a"><p>The training loss collapses toward zero: the module receives the answer as input and only has to copy it through the projection and the output head. The main model learns nothing useful from this extra loss, and at inference the module cannot work, because the token it would need as input is exactly the one it is supposed to predict. Fed the drafted <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8234em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> instead, it has never learned to predict anything and its drafts are almost always rejected. This is the same bug as a causal mask that is shifted by one: check offsets with a test where the input and target positions are printed side by side.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1018-qa3"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">You are about to pretrain a model that will later serve a large volume using speculative decoding. Three ways to get a draft are on the table: bake sequential multi-token modules into pretraining, train a hidden-state draft head after pretraining, or reuse a small model of the same family. Give the decision with its costs, and name the gate you measure before you ship the flag.</span></summary><div class="qa-a"><p><em>Level 4 of 4 · about 15 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> If I control pretraining and the hidden size is at least 4096, I bake in the sequential modules: about 10 percent slower training buys a denser supervision signal and a draft that accepts 80 percent or more at depth one. If the weights already exist, I train a post-hoc head on the verifier's features with about 60 to 200B tokens; it is backward compatible and reaches 0.88 to 0.92 acceptance on general chat. A same-family small model needs no training and sits around 0.55 to 0.70. Whatever I pick, the gate is measured acceptance on my own traffic mix at production concurrency, with the flag off below about 0.55 and the tail latency watched, not the mean.</p>
+<p><strong>The three options.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Option</th>
+<th>When trained</th>
+<th>Works with existing weights</th>
+<th>Draft parameters</th>
+<th>Acceptance</th>
+<th>Extra benefit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sequential modules in pretraining</td>
+<td>during pretraining</td>
+<td>no</td>
+<td>one block plus a projection per depth</td>
+<td>0.80 and above at depth one</td>
+<td>denser training signal</td>
+</tr>
+<tr>
+<td>Post-hoc head on verifier features</td>
+<td>after pretraining</td>
+<td>yes</td>
+<td>one or two layers, trained on about 60 to 200B tokens</td>
+<td>0.88 to 0.92 on chat</td>
+<td>none beyond speed</td>
+</tr>
+<tr>
+<td>Same-family small model</td>
+<td>none</td>
+<td>yes</td>
+<td>a whole small model</td>
+<td>0.55 to 0.70</td>
+<td>none, and it costs memory</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>The decision tree.</strong></p>
+<ol>
+<li><strong>Do you own pretraining?</strong> If yes and the model is large enough, the modules are the only option that improves the model and the serving at once; the report that introduced them measured about 1.8 times generation throughput from the draft alone. At a 1B scale the overhead hurts more than it helps.</li>
+<li><strong>Do the weights already exist?</strong> Then the post-hoc head. It is a light training job compared with the verifier, and it does not touch the verifier's outputs.</li>
+<li><strong>No training budget at all?</strong> The small model, as a prototype, knowing the acceptance ceiling is low and the second model takes memory.</li>
+</ol>
+<p><strong>The gate.</strong></p>
+<p>Speculation is opt-in on the production engine, and the production lesson's rule is that flipping the flag without measuring acceptance on real traffic is an anti-pattern. The plan:</p>
+<ol>
+<li>Serve the target plain and record time to first token, inter-token latency and throughput at the target concurrency.</li>
+<li>Enable the draft and rerun the same benchmark.</li>
+<li>Read accepted draft tokens and proposed draft tokens per request from the engine and divide the first by the second to get acceptance.</li>
+<li>Below about 0.55 at production concurrency, disable the flag or train a domain-specific head.</li>
+<li>Confirm that the tail inter-token latency did not get worse, because a rejected draft costs a verify and a re-roll.</li>
+</ol>
+<p><strong>Traffic mix.</strong></p>
+<p>A head trained on general chat sits at 0.6 to 0.8 there and falls to 0.4 to 0.6 on code, medical or legal traffic. Weight the acceptance by traffic share before you decide, and measure each slice on its own; a blended number can hide a slice where speculation is net negative. The capstone's exercise asks exactly this for a 70 percent chat and 30 percent code mix with acceptances of 0.7 and 0.4.</p>
+<p><strong>Operate it.</strong></p>
+<p>Acceptance drifts when the target changes version and the draft does not, so alert on it per slice, and keep a draft-free or n-gram fallback for the slices where the head stops paying.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Always use the latest hidden-state draft; it is strictly best." It needs training against your target and its acceptance on domain traffic can fall to 0.4; the baked-in modules give you a draft and a better model if you own pretraining.</li>
+<li>"Bake the modules in later with a fine-tune." They are a pretraining choice; an existing dense model gets a post-hoc head instead.</li>
+<li>"Pick by the speedup on a public benchmark." Acceptance depends on your traffic; the gate is measured on your own mix at your concurrency.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> The traffic is 70 percent chat at 0.7 acceptance and 30 percent code at 0.4. How do you decide? Expected: weight by traffic share, then check each slice against the floor; code alone is below it, so route code to a plain decode or train a code head.</li>
+<li><em>(level 4)</em> The target gets a new version next quarter. What happens to each option? Expected: the baked-in modules move with the model; the post-hoc head must be retrained against the new target; the small model drifts further; alert on acceptance per version.</li>
+<li><em>(level 4)</em> What does a hidden-state head read in the current generation? Expected: features from several target layers, not only the last, which is part of why acceptance rose.</li>
+<li><em>(level 4)</em> Where does the small-model option still win? Expected: a prototype with no training budget, or a CPU deployment where the engine ships only the plain draft path.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1018">multi-token prediction lesson</a> and the <a href="#a1015">EAGLE-3 lesson</a> give the two trained options and their costs, the production EAGLE-3 lesson sets the measurement gate, and the speculative decoding server capstone covers drift and fallback.</p></div></details>
+<details class="qa" id="a1018-qa4"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">A pretraining team wants to supervise each position on more than the next token. One design puts several independent output heads on the backbone. Another chains small modules, one per extra depth. Which design gives you a usable speculative draft at inference, and what does it cost during training?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The chained design. Module k takes the previous depth's hidden state and the embedding of the actual next token, runs its own small transformer block, and reuses the shared embedding and the shared output head, so its prediction of the token at t plus k plus 1 is conditioned on the token at t plus k, which is the same causal chain a decoder follows and lets the module draft tokens at inference with acceptance at depth one of 80 percent or more for about 1.8 times throughput. Independent heads all read the same hidden state and cannot condition on each other. The training cost is about 10 percent slower pretraining and about 14 h squared parameters per module, with a loss weight of 0.3 early and 0.1 later.</p>
+<p><strong>The sequential recipe.</strong></p>
+<p>For a prefix through position i, depth zero is the main backbone, and depth k builds on depth k minus 1:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">h_i^(k) = T_k( M_k · concat( RMSNorm(h_i^(k-1)), RMSNorm(E(t_{i+k})) ) )
+logits_{i+k+1} = Out( h_i^(k) )
+L_k = cross-entropy( logits_{i+k+1}, t_{i+k+1} )
+L_MTP = (lambda / D) · sum over k of L_k
+</code></pre></div>
+<p><code>E</code> is the embedding table and <code>Out</code> is the output head, both shared with the main model. <code>M_k</code> folds the previous hidden state and the next token's embedding into one vector. <code>T_k</code> is one transformer block. The total loss is the main next-token loss plus <code>L_MTP</code>, with lambda at 0.3 for the first 10 percent of training and 0.1 afterward.</p>
+<p><strong>Why the chain matters.</strong></p>
+<p>To predict two tokens ahead, module one sees what the next token actually was. At inference you feed it the drafted token instead, and it predicts the one after. That is exactly how a hidden-state draft works, so the trained module is a draft network for free. Parallel heads fire from one hidden state, so head two cannot use head one's answer. A verifier can still check their guesses, but they are accepted less often.</p>
+<p><strong>The accounting.</strong></p>
+<p>Per module: the projection is <code>2 h^2</code>, the block is about <code>12 h^2</code> for attention and a gated MLP, so about <code>14 h^2</code>. At a hidden size of 7168 and one module that is about 720M on paper; the published figure is 14B on a 671B main model, about 2 percent, because the module's MLP inherits the expert structure of the main model. The embedding and head add nothing, because they are shared.</p>
+<p><strong>What you get.</strong></p>
+<ol>
+<li>A denser training signal: every hidden state is supervised on D plus 1 targets, and the report shows consistent gains on reasoning, math and code evaluations.</li>
+<li>A draft at inference with 80 percent or more acceptance at depth one, for about 1.8 times generation throughput, and the training-time cost is paid back the first time the model serves.</li>
+</ol>
+<p><strong>Against a post-hoc draft.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>Post-hoc hidden-state draft</th>
+<th>Baked-in modules</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>When trained</td>
+<td>after pretraining</td>
+<td>during pretraining</td>
+</tr>
+<tr>
+<td>Works with existing weights</td>
+<td>yes</td>
+<td>no, retrain</td>
+</tr>
+<tr>
+<td>Draft parameters</td>
+<td>one or two layers</td>
+<td>one block plus a projection</td>
+</tr>
+<tr>
+<td>Acceptance</td>
+<td>0.88 to 0.92</td>
+<td>0.80 and above at depth one</td>
+</tr>
+<tr>
+<td>Benefit beyond speed</td>
+<td>none</td>
+<td>denser training signal</td>
+</tr>
+</tbody>
+</table></div>
+<p>Use the baked-in design when you control pretraining and the hidden size is at least 4096; at a 1B scale the overhead hurts more than it helps. Use the post-hoc draft when the weights already exist.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The extra loss replaces next-token prediction." It is added to the main loss with a small weight; the main objective stays.</li>
+<li>"The module can be bolted onto a trained model with a quick fine-tune." The design is a pretraining choice; existing weights get a post-hoc draft instead.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why share the embedding and the output head with the main model? Expected: no extra parameters, and the module predicts in the same vocabulary space as the backbone.</li>
+<li><em>(level 3)</em> Why is the published parameter overhead larger than the <code>14 h^2</code> estimate? Expected: the module's MLP has the same expert structure as the main model, which multiplies its parameters.</li>
+<li><em>(level 4)</em> With two modules, what does the second one take as input? Expected: the first module's hidden state and the embedding of the token two ahead, to predict the token three ahead.</li>
+<li><em>(level 4)</em> A team wants to add this to an existing dense model by fine-tuning a new head. Your answer? Expected: the module is not trained and the backbone was not shaped by the extra loss; the lesson's position is that it needs a pretraining run, and a post-hoc draft is the right tool for existing weights.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1018">multi-token prediction lesson</a> gives the sequential recipe, the loss, the parameter accounting and the comparison with post-hoc drafts.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI — DeepSeek-V3 Technical Report (arXiv:2412.19437)</a> — the full sequential MTP description (Section 2.2), including the joint-loss equations and the 1.8× speedup at inference</li>
+<li><a href="https://arxiv.org/abs/2404.19737">Gloeckle et al. — Better &amp; Faster Large Language Models via Multi-token Prediction (arXiv:2404.19737)</a> — the parallel MTP baseline DeepSeek's design improves on</li>
+<li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V3">DeepSeek-V3 model card on Hugging Face</a> — 685B total (671B main + 14B MTP), deployment notes</li>
+<li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al. — Fast Inference from Transformers via Speculative Decoding (arXiv:2211.17192)</a> — the speculative-decoding framework MTP fits into</li>
+<li><a href="https://arxiv.org/abs/2503.01840">Li et al. — EAGLE-3 (arXiv:2503.01840)</a> — EAGLE's 2025 draft architecture, the counterpart MTP competes with</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/18-multi-token-prediction" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1018" id="done-a1018">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1018" id="undo-a1018" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1017"><span class="pn-dir">Previous</span><span class="pn-t">10.17 · Native Sparse Attention (DeepSeek NSA)</span></a><a class="pn next" href="#a1019"><span class="pn-dir">Next</span><span class="pn-t">10.19 · DualPipe Parallelism</span></a></div></footer>

@@ -1,0 +1,626 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-04">Phase 4 · Computer Vision</a></nav><h1>3D Gaussian Splatting from Scratch</h1><div class="m-meta"><span class="chip chip-num">Lesson 4.22</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a0422" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why 3D Gaussian Splatting displaced NeRF for most real-time photorealistic 3D reconstruction</li>
+<li>State the six per-Gaussian parameters (position, rotation quaternion, scale, opacity, spherical harmonics colour, optional feature) and how many floats each contributes</li>
+<li>Implement a 2D Gaussian splatting rasterizer from scratch using <code>alpha</code> compositing, then show how the 3D case projects to the same loop</li>
+<li>Use <code>nerfstudio</code>, <code>gsplat</code>, or <code>SuperSplat</code> to reconstruct a scene from 20-50 photos and export to the <code>KHR_gaussian_splatting</code> glTF extension or the OpenUSD 26.03 <code>UsdVolParticleField3DGaussianSplat</code> schema</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 4 Lesson 13 (3D Vision &amp; NeRF), Phase 1 Lesson 12 (Tensor Operations), Phase 4 Lesson 10 (Diffusion basics optional)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A scene is a cloud of millions of 3D Gaussians. Each one has a position, orientation, scale, opacity, and a colour that depends on viewing direction. Rasterise them, backprop through the rasterisation, done.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>3DGS</td>
+<td>"Gaussian splats"</td>
+<td>Explicit scene representation as millions of 3D Gaussians with per-Gaussian position, rotation, scale, opacity, SH colour</td>
+</tr>
+<tr>
+<td>Covariance</td>
+<td>"Shape of the Gaussian"</td>
+<td><code>Sigma = R S S^T R^T</code>; orientation and anisotropic scale of one Gaussian</td>
+</tr>
+<tr>
+<td>Alpha compositing</td>
+<td>"Back-to-front blend"</td>
+<td>Same equation as NeRF's volumetric render, now over an explicit sparse set</td>
+</tr>
+<tr>
+<td>Densification</td>
+<td>"Clone and split"</td>
+<td>Adaptive addition of new Gaussians where reconstruction is under-fit</td>
+</tr>
+<tr>
+<td>Pruning</td>
+<td>"Delete low-opacity"</td>
+<td>Remove Gaussians that have collapsed to near-zero opacity during training</td>
+</tr>
+<tr>
+<td>Spherical harmonics</td>
+<td>"View-dependent colour"</td>
+<td>Fourier basis on the sphere; stores colour as a function of viewing direction</td>
+</tr>
+<tr>
+<td>Splatfacto</td>
+<td>"nerfstudio's 3DGS"</td>
+<td>The easiest path to training 3DGS in 2026</td>
+</tr>
+<tr>
+<td><code>KHR_gaussian_splatting</code></td>
+<td>"glTF standard"</td>
+<td>Khronos 2026 extension that makes 3DGS portable across viewers and engines</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Gaussian splatting describes a 3D scene as a cloud of soft, coloured, see-through blobs. Each blob is a 3D Gaussian: it has a centre, a size and stretch in each direction, an orientation, a colour and an opacity. To draw a picture, every blob is flattened onto the screen as a 2D ellipse, and the ellipses are blended front to back, exactly like layers of tinted glass. Because each step is differentiable, the blobs can be moved, stretched and recoloured by gradient descent until the rendered pictures match real photos. Unlike a NeRF there is no network to query per pixel, so rendering is fast enough for real time.</p></div></aside>
+<p>A NeRF stores a scene as the weights of an MLP. Every rendered pixel is hundreds of MLP queries along a ray. Training takes hours, rendering takes seconds, and the weights cannot be edited — if you want to move a chair inside a scene, you have to retrain.</p>
+<p>3D Gaussian Splatting (Kerbl, Kopanas, Leimkühler, Drettakis, SIGGRAPH 2023) replaced all of that. A scene is an explicit set of 3D Gaussians. Rendering is GPU rasterisation at 100+ fps. Training takes minutes. Editing is direct: translate a subset of Gaussians and you have moved the chair. By 2026 the Khronos Group has ratified a glTF extension for Gaussian splats, OpenUSD 26.03 ships a Gaussian splat schema, Zillow and Apartments.com render real estate with them, and most new research papers on 3D reconstruction are variants on the core 3DGS idea.</p>
+<p>The mental model is simple, the math has enough moving parts that most introductions start at rasterisation and skip past the projections and spherical harmonics. This lesson builds the whole thing — a 2D version first, then the 3D extension.</p>
+<h2>Idea 1 · What a Gaussian carries</h2>
+<p>One 3D Gaussian is a parametric blob in space with these attributes:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">position         mu         (3,)    centre in world coordinates
+rotation         q          (4,)    unit quaternion encoding orientation
+scale            s          (3,)    log-scales per axis (exponentiated at render time)
+opacity          alpha      (1,)    post-sigmoid opacity [0, 1]
+SH coefficients  c_lm       (3 * (L+1)^2,)   view-dependent colour
+</code></pre></div>
+<p>Rotation + scale build a 3x3 covariance: <code>Sigma = R S S^T R^T</code>. That is the shape of the Gaussian in 3D. Spherical harmonics let the colour change with viewing direction — specular highlights, subtle sheen, view-dependent glow — without storing per-view textures. With SH degree 3 you get 16 coefficients per colour channel, 48 floats per Gaussian for colour alone.</p>
+<p>A scene typically has 1-5 million Gaussians. Each stores roughly 60 floats (3 + 4 + 3 + 1 + 48 + misc). At 4 bytes per float that is about 240 bytes per Gaussian, so a five-million-Gaussian scene needs about 1.2 GB uncompressed: much more than a NeRF's few-megabyte MLP, which is the price of real-time rendering. Quantised formats (<code>.splat</code>, SPZ, glTF with compression) shrink it several-fold.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting the floats</div><div class="co-body"><p>Per Gaussian: position 3, rotation quaternion 4, log-scales 3, opacity 1, and spherical-harmonic colour up to degree 3: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span> coefficients for each of 3 colour channels, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">16</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">48</span></span></span></span>. Total <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">48</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">59</span></span></span></span> floats, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">59</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">236</span></span></span></span> bytes.</p>
+<ul>
+<li>1 million Gaussians: 236 MB.</li>
+<li>5 million: 1.18 GB.</li>
+<li>Dropping view dependence (degree 0, 3 colour floats instead of 48): <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">14</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">56</span></span></span></span> bytes, 4.2 times smaller. That is the first knob compressed formats turn: most of a splat file is the view-dependent colour.</li>
+</ul></div></aside>
+<h2>Idea 2 · Rasterisation, not ray marching</h2>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm761aab8608" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1394.69px; background-color: transparent;" viewBox="0 0 1394.6875 109" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm761aab8608{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm761aab8608 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm761aab8608 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm761aab8608 .error-icon{fill:#f4efe7;}#mm761aab8608 .error-text{fill:#0b1018;stroke:#0b1018;}#mm761aab8608 .edge-thickness-normal{stroke-width:1px;}#mm761aab8608 .edge-thickness-thick{stroke-width:3.5px;}#mm761aab8608 .edge-pattern-solid{stroke-dasharray:0;}#mm761aab8608 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm761aab8608 .edge-pattern-dashed{stroke-dasharray:3;}#mm761aab8608 .edge-pattern-dotted{stroke-dasharray:2;}#mm761aab8608 .marker{fill:#6c6357;stroke:#6c6357;}#mm761aab8608 .marker.cross{stroke:#6c6357;}#mm761aab8608 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm761aab8608 p{margin:0;}#mm761aab8608 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm761aab8608 .cluster-label text{fill:#0b1018;}#mm761aab8608 .cluster-label span{color:#0b1018;}#mm761aab8608 .cluster-label span p{background-color:transparent;}#mm761aab8608 .label text,#mm761aab8608 span{fill:#211c16;color:#211c16;}#mm761aab8608 .node rect,#mm761aab8608 .node circle,#mm761aab8608 .node ellipse,#mm761aab8608 .node polygon,#mm761aab8608 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm761aab8608 .rough-node .label text,#mm761aab8608 .node .label text,#mm761aab8608 .image-shape .label,#mm761aab8608 .icon-shape .label{text-anchor:middle;}#mm761aab8608 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm761aab8608 .rough-node .label,#mm761aab8608 .node .label,#mm761aab8608 .image-shape .label,#mm761aab8608 .icon-shape .label{text-align:center;}#mm761aab8608 .node.clickable{cursor:pointer;}#mm761aab8608 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm761aab8608 .arrowheadPath{fill:#0b0b0b;}#mm761aab8608 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm761aab8608 .flowchart-link{stroke:#6c6357;fill:none;}#mm761aab8608 .edgeLabel{background-color:#ffffff;text-align:center;}#mm761aab8608 .edgeLabel p{background-color:#ffffff;}#mm761aab8608 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm761aab8608 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm761aab8608 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm761aab8608 .cluster text{fill:#0b1018;}#mm761aab8608 .cluster span{color:#0b1018;}#mm761aab8608 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm761aab8608 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm761aab8608 rect.text{fill:none;stroke-width:0;}#mm761aab8608 .icon-shape,#mm761aab8608 .image-shape{background-color:#ffffff;text-align:center;}#mm761aab8608 .icon-shape p,#mm761aab8608 .image-shape p{background-color:#ffffff;padding:2px;}#mm761aab8608 .icon-shape .label rect,#mm761aab8608 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm761aab8608 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm761aab8608 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm761aab8608 .node .neo-node{stroke:#b5521b;}#mm761aab8608 [data-look="neo"].node rect,#mm761aab8608 [data-look="neo"].cluster rect,#mm761aab8608 [data-look="neo"].node polygon{stroke:url(#mm761aab8608-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm761aab8608 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm761aab8608 [data-look="neo"].node path{stroke:url(#mm761aab8608-gradient);stroke-width:1px;}#mm761aab8608 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm761aab8608 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm761aab8608 [data-look="neo"].node circle{stroke:url(#mm761aab8608-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm761aab8608 [data-look="neo"].node circle .state-start{fill:#000000;}#mm761aab8608 [data-look="neo"].icon-shape .icon{fill:url(#mm761aab8608-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm761aab8608 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm761aab8608-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm761aab8608 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm761aab8608_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm761aab8608_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm761aab8608_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M230.984,54.5L235.151,54.5C239.318,54.5,247.651,54.5,255.318,54.5C262.984,54.5,269.984,54.5,273.484,54.5L276.984,54.5" id="mm761aab8608-L_SCENE_PROJ_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SCENE_PROJ_0" data-points="W3sieCI6MjMwLjk4NDM3NSwieSI6NTQuNX0seyJ4IjoyNTUuOTg0Mzc1LCJ5Ijo1NC41fSx7IngiOjI4MC45ODQzNzUsInkiOjU0LjV9XQ==" data-look="classic" marker-end="url(#mm761aab8608_flowchart-v2-pointEnd)"/><path d="M540.984,54.5L545.151,54.5C549.318,54.5,557.651,54.5,565.318,54.5C572.984,54.5,579.984,54.5,583.484,54.5L586.984,54.5" id="mm761aab8608-L_PROJ_TILES_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PROJ_TILES_0" data-points="W3sieCI6NTQwLjk4NDM3NSwieSI6NTQuNX0seyJ4Ijo1NjUuOTg0Mzc1LCJ5Ijo1NC41fSx7IngiOjU5MC45ODQzNzUsInkiOjU0LjV9XQ==" data-look="classic" marker-end="url(#mm761aab8608_flowchart-v2-pointEnd)"/><path d="M794.578,54.5L798.745,54.5C802.911,54.5,811.245,54.5,818.911,54.5C826.578,54.5,833.578,54.5,837.078,54.5L840.578,54.5" id="mm761aab8608-L_TILES_SORT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TILES_SORT_0" data-points="W3sieCI6Nzk0LjU3ODEyNSwieSI6NTQuNX0seyJ4Ijo4MTkuNTc4MTI1LCJ5Ijo1NC41fSx7IngiOjg0NC41NzgxMjUsInkiOjU0LjV9XQ==" data-look="classic" marker-end="url(#mm761aab8608_flowchart-v2-pointEnd)"/><path d="M976.578,54.5L980.745,54.5C984.911,54.5,993.245,54.5,1000.911,54.5C1008.578,54.5,1015.578,54.5,1019.078,54.5L1022.578,54.5" id="mm761aab8608-L_SORT_ALPHA_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SORT_ALPHA_0" data-points="W3sieCI6OTc2LjU3ODEyNSwieSI6NTQuNX0seyJ4IjoxMDAxLjU3ODEyNSwieSI6NTQuNX0seyJ4IjoxMDI2LjU3ODEyNSwieSI6NTQuNX1d" data-look="classic" marker-end="url(#mm761aab8608_flowchart-v2-pointEnd)"/><path d="M1199.797,54.5L1203.964,54.5C1208.13,54.5,1216.464,54.5,1224.13,54.5C1231.797,54.5,1238.797,54.5,1242.297,54.5L1245.797,54.5" id="mm761aab8608-L_ALPHA_PIX_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ALPHA_PIX_0" data-points="W3sieCI6MTE5OS43OTY4NzUsInkiOjU0LjV9LHsieCI6MTIyNC43OTY4NzUsInkiOjU0LjV9LHsieCI6MTI0OS43OTY4NzUsInkiOjU0LjV9XQ==" data-look="classic" marker-end="url(#mm761aab8608_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_SCENE_PROJ_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_PROJ_TILES_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_TILES_SORT_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_SORT_ALPHA_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_ALPHA_PIX_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm761aab8608-flowchart-SCENE-0" data-look="classic" transform="translate(119.4921875, 54.5)"><rect class="basic label-container" style="fill:#dbeafe !important;stroke:#2563eb !important" x="-111.4921875" y="-46.5" width="222.984375" height="93"/><g class="label" style="" transform="translate(-81.4921875, -31.5)"><rect/><foreignObject width="162.984375" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Millions of 3D Gaussians<br />(position, rotation, scale,<br />opacity, SH colour)</p></span></div></foreignObject></g></g><g class="node default" id="mm761aab8608-flowchart-PROJ-1" data-look="classic" transform="translate(410.984375, 54.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Project to 2D<br />(camera extrinsics + intrinsics)</p></span></div></foreignObject></g></g><g class="node default" id="mm761aab8608-flowchart-TILES-3" data-look="classic" transform="translate(692.78125, 54.5)"><rect class="basic label-container" style="" x="-101.796875" y="-36" width="203.59375" height="72"/><g class="label" style="" transform="translate(-71.796875, -21)"><rect/><foreignObject width="143.59375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Assign to tiles<br />(16x16 screen-space)</p></span></div></foreignObject></g></g><g class="node default" id="mm761aab8608-flowchart-SORT-5" data-look="classic" transform="translate(910.578125, 54.5)"><rect class="basic label-container" style="" x="-66" y="-36" width="132" height="72"/><g class="label" style="" transform="translate(-36, -21)"><rect/><foreignObject width="72" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Depth-sort<br />per tile</p></span></div></foreignObject></g></g><g class="node default" id="mm761aab8608-flowchart-ALPHA-7" data-look="classic" transform="translate(1113.1875, 54.5)"><rect class="basic label-container" style="fill:#fef3c7 !important;stroke:#d97706 !important" x="-86.609375" y="-36" width="173.21875" height="72"/><g class="label" style="" transform="translate(-56.609375, -21)"><rect/><foreignObject width="113.21875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Alpha-composite<br />front-to-back</p></span></div></foreignObject></g></g><g class="node default" id="mm761aab8608-flowchart-PIX-9" data-look="classic" transform="translate(1318.2421875, 54.5)"><rect class="basic label-container" style="fill:#dcfce7 !important;stroke:#16a34a !important" x="-68.4453125" y="-25.5" width="136.890625" height="51"/><g class="label" style="" transform="translate(-38.4453125, -10.5)"><rect/><foreignObject width="76.890625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Pixel colour</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm761aab8608-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm761aab8608-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm761aab8608-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>Five steps, all GPU-friendly. No MLP query per pixel. The original paper reports well over 100 frames per second at 1080p on a single high-end GPU.</p>
+<h2>Idea 3 · The projection step</h2>
+<p>The 3D Gaussian at world position <code>mu</code> with 3D covariance <code>Sigma</code> projects to a 2D Gaussian at screen position <code>mu'</code> with 2D covariance <code>Sigma'</code>:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:6.6513em;vertical-align:-3.0757em;"></span><span class="mord"><span class="mtable"><span class="col-align-r"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:3.5757em;"><span style="top:-5.7357em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span><span style="top:-4.1843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span><span style="top:-2.0843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span><span style="top:-0.5843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.0757em;"><span></span></span></span></span></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:3.5757em;"><span style="top:-5.7357em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">project</span></span></span><span class="mopen">(</span><span class="mord mathnormal">μ</span><span class="mclose">)</span></span></span><span style="top:-4.1843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mord">Σ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:2em;"></span><span class="mopen">(</span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">2</span><span class="mclose">)</span></span></span><span style="top:-2.0843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">viewing transform (rotation + translation of camera)</span></span></span></span><span style="top:-0.5843em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">Jacobian of the perspective projection at </span></span><span class="mord"><span class="mord mathnormal">μ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.0757em;"><span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>The 2D Gaussian's footprint is an ellipse whose axes are the eigenvectors of <code>Sigma'</code>. Every pixel inside that ellipse receives the Gaussian's contribution, weighted by <code>exp(-0.5 * (p - mu')^T Sigma'^-1 (p - mu'))</code>.</p>
+<h2>Idea 4 · The alpha-compositing rule</h2>
+<p>For one pixel, the Gaussians that cover it are sorted back-to-front (or equivalently front-to-back with inverted formula). Colour is composited with the same equation as every semi-transparent rasteriser since the 1980s:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:8.4428em;vertical-align:-3.9714em;"></span><span class="mord"><span class="mtable"><span class="col-align-r"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:4.4714em;"><span style="top:-6.4714em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">pixel</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.8437em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-1.2386em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:0.2614em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.9714em;"><span></span></span></span></span></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:4.4714em;"><span style="top:-6.4714em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.8437em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-1.2386em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord text"><span class="mord">opacity</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mop">exp</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">(</span></span><span class="mord">−</span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span><span class="mord mathnormal">d</span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">)</span></span></span></span></span><span style="top:0.2614em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">eval_SH</span></span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">SH</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">view_direction</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.9714em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-r"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8437em;"><span style="top:-3.8437em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"></span></span><span style="top:-1.2386em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"></span></span><span style="top:0.2614em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.9714em;"><span></span></span></span></span></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8437em;"><span style="top:-3.8437em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mord text"><span class="mord">transmittance up to </span></span><span class="mord mathnormal">i</span></span></span><span style="top:-1.2386em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mord text"><span class="mord">local contribution</span></span></span></span><span style="top:0.2614em;"><span class="pstrut" style="height:3.05em;"></span><span class="mord"><span class="mord"></span><span class="mord text"><span class="mord">view-dependent colour</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:3.9714em;"><span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>This is <strong>the same equation as NeRF's volumetric render</strong>, just over an explicit sparse set of Gaussians instead of dense samples along a ray. That identity is why rendered quality matches NeRF — both are integrating the same radiance-field equation.</p>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A Gaussian splat is a point with a colour."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is a soft 3D ellipsoid with its own shape and transparency; overlapping ellipsoids blend.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Splatting needs a neural network at render time."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It only projects, sorts and blends explicit primitives. The learning is gradient descent on their parameters.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The draw order does not matter, the colours just add up."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Front-to-back order decides who hides whom; "Use it" renders a trained scene with the order reversed.</li>
+</ul></div></aside>
+<h2>Idea 5 · Why this is differentiable</h2>
+<p>Every step — projection, tile assignment, alpha compositing, SH evaluation — is differentiable with respect to the Gaussian parameters. Given a ground-truth image, compute rendered pixel loss, backprop through the rasteriser, update all <code>(mu, q, s, alpha, c_lm)</code> by gradient descent. Over ~30,000 iterations the Gaussians find their right positions, scales, and colours.</p>
+<h2>Idea 6 · Densification and pruning</h2>
+<p>A fixed set of Gaussians cannot cover a complex scene. Training includes two adaptive mechanisms:</p>
+<ul>
+<li><strong>Clone</strong> a Gaussian at its current position when its gradient magnitude is high but its scale is small — the reconstruction needs more detail here.</li>
+<li><strong>Split</strong> a large-scale Gaussian into two smaller ones when its gradient is high — one big Gaussian is too smooth to fit the region.</li>
+<li><strong>Prune</strong> Gaussians whose opacity drops below a threshold — they are not contributing.</li>
+</ul>
+<p>Densification runs every <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> iterations. A scene typically grows from ~100k initial Gaussians (seeded from SfM points) to 1-5M at the end of training.</p>
+<h2>Idea 7 · Spherical harmonics in one paragraph</h2>
+<p>View-dependent colour is a function <code>c(direction)</code> on the unit sphere. Spherical harmonics are the sphere's Fourier basis. Truncate at degree <code>L</code> and you get <code>(L+1)^2</code> basis functions per channel. Evaluating the colour for a new view is a dot product between the learned SH coefficients and the basis evaluated at the viewing direction. Degree 0 = one coefficient = constant colour. Degree 3 = 16 coefficients = enough to capture Lambertian shading, specular, and mild reflection. SD Gaussian Splatting papers use degree 3 by default.</p>
+<h2>Idea 8 · The 2026 production stack</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. Capture         smartphone / DJI drone / handheld scanner
+2. SfM / MVS       COLMAP or GLOMAP derives camera poses + sparse points
+3. Train 3DGS      nerfstudio / gsplat / inria official / PostShot (~10-30 min on RTX 4090)
+4. Edit            SuperSplat / SplatForge (clean floaters, segment)
+5. Export          .ply -&gt; glTF KHR_gaussian_splatting or .usd (OpenUSD 26.03)
+6. View            Cesium / Unreal / Babylon.js / Three.js / Vision Pro
+</code></pre></div>
+<h2>Idea 9 · 4D and generative variants</h2>
+<ul>
+<li><strong>4D Gaussian Splatting</strong> — Gaussians are functions of time; used for volumetric video (Framestore's work on the 2025 film <em>Superman</em>, A$AP Rocky's "Helicopter" video).</li>
+<li><strong>Generative splats</strong> — text-to-splat models (Marble by World Labs) that hallucinate entire scenes.</li>
+<li><strong>3D Gaussian Unscented Transform</strong> — NVIDIA NuRec's variant for autonomous driving simulation.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cv3-gaussian-splat"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>One Gaussian.</strong> Each primitive has a centre <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span>, a covariance <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Σ</span></span></span></span>, an opacity <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> and a colour; its density at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">G</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mop">exp</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal">μ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal">μ</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span>. To keep <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Σ</span></span></span></span> a valid covariance during optimisation it is built from a rotation (a unit quaternion) and per-axis scales:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Σ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8991em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p><strong>Projection.</strong> With the world-to-camera transform <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span></span> and the Jacobian <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.09618em;">J</span></span></span></span> of the perspective projection at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span></span></span></span>, the 2-D footprint on screen is the Gaussian with covariance <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mord">Σ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span></span></span></span> (its top-left <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> block).</p>
+<p><strong>Compositing.</strong> Sorted front to back, the Gaussians covering a pixel blend as</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4638em;vertical-align:-1.4138em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0037em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0519em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">G</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord text"><span class="mord">pixel</span></span><span class="mclose">)</span></span></span></span></span></div></p>
+<p>the same form as NeRF's volume rendering, but over a short list of splats per pixel instead of hundreds of network evaluations per ray, so it rasterises in real time and every term is differentiable.</p>
+<p><strong>Size.</strong> With degree-3 spherical harmonics for view-dependent colour (16 coefficients per channel, 48 numbers), each Gaussian stores <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">48</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">59</span></span></span></span> floats: position, scale, rotation, opacity, colour. A scene of 3 million Gaussians is about 700 MB in float32, which is why compression and pruning matter for deployment.</p></div></aside>
+<h2>Step 1 · A 2D Gaussian</h2>
+<p>We first build a 2D rasteriser. The 3D case reduces to it after projection.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def eval_2d_gaussian(means, covs, points):
+    &quot;&quot;&quot;
+    means:  (G, 2)      centres
+    covs:   (G, 2, 2)   covariance matrices
+    points: (H, W, 2)   pixel coordinates
+    returns: (G, H, W)  density at every pixel for every Gaussian
+    &quot;&quot;&quot;
+    G = means.size(0)
+    H, W, _ = points.shape
+    flat = points.view(-1, 2)
+    inv = torch.linalg.inv(covs)
+    diff = flat[None, :, :] - means[:, None, :]
+    d = torch.einsum(&quot;gpi,gij,gpj-&gt;gp&quot;, diff, inv, diff)
+    density = torch.exp(-0.5 * d)
+    return density.view(G, H, W)
+</code></pre></div>
+
+<p><code>einsum</code> does the quadratic form <code>diff^T Sigma^-1 diff</code> for every (Gaussian, pixel) pair.</p>
+<h2>Step 2 · 2D splatting rasteriser</h2>
+<p>Alpha-compositing front-to-back. Depth in 2D is meaningless, so we use a learned per-Gaussian scalar for order.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def rasterise_2d(means, covs, colours, opacities, depths, image_size):
+    &quot;&quot;&quot;
+    means:     (G, 2)
+    covs:      (G, 2, 2)
+    colours:   (G, 3)
+    opacities: (G,)     in [0, 1]
+    depths:    (G,)     per-Gaussian scalar used for ordering
+    image_size: (H, W)
+    returns:   (H, W, 3) rendered image
+    &quot;&quot;&quot;
+    H, W = image_size
+    yy, xx = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=means.device),
+        torch.arange(W, dtype=torch.float32, device=means.device),
+        indexing=&quot;ij&quot;,
+    )
+    points = torch.stack([xx, yy], dim=-1)
+
+    densities = eval_2d_gaussian(means, covs, points)
+    alphas = opacities[:, None, None] * densities
+    alphas = alphas.clamp(0.0, 0.99)
+
+    order = torch.argsort(depths)
+    alphas = alphas[order]
+    colours_sorted = colours[order]
+
+    T = torch.ones(H, W, device=means.device)
+    out = torch.zeros(H, W, 3, device=means.device)
+    for i in range(means.size(0)):
+        a = alphas[i]
+        out += (T * a)[..., None] * colours_sorted[i][None, None, :]
+        T = T * (1.0 - a)
+    return out
+</code></pre></div>
+
+<p>Not fast — a real implementation uses tile-based CUDA kernels — but exactly the right math and fully differentiable.</p>
+<h2>Step 3 · A trainable 2D splat scene</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class Splats2D(nn.Module):
+    def __init__(self, num_splats=128, image_size=64, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        H, W = image_size, image_size
+        self.means = nn.Parameter(torch.rand(num_splats, 2, generator=g) * torch.tensor([W, H]))
+        self.log_scale = nn.Parameter(torch.ones(num_splats, 2) * math.log(2.0))
+        self.rot = nn.Parameter(torch.zeros(num_splats))  # single angle in 2D
+        self.colour_logits = nn.Parameter(torch.randn(num_splats, 3, generator=g) * 0.5)
+        self.opacity_logit = nn.Parameter(torch.zeros(num_splats))
+        self.depth = nn.Parameter(torch.rand(num_splats, generator=g))
+
+    def covs(self):
+        s = torch.exp(self.log_scale)
+        c, si = torch.cos(self.rot), torch.sin(self.rot)
+        R = torch.stack([
+            torch.stack([c, -si], dim=-1),
+            torch.stack([si, c], dim=-1),
+        ], dim=-2)
+        S = torch.diag_embed(s ** 2)
+        return R @ S @ R.transpose(-1, -2)
+
+    def forward(self, image_size):
+        covs = self.covs()
+        colours = torch.sigmoid(self.colour_logits)
+        opacities = torch.sigmoid(self.opacity_logit)
+        return rasterise_2d(self.means, covs, colours, opacities, self.depth, image_size)
+</code></pre></div>
+
+<p><code>log_scale</code>, <code>opacity_logit</code>, and <code>colour_logits</code> are all unconstrained parameters mapped through the right activation at render time. This is the standard pattern for every 3DGS implementation.</p>
+<h2>Step 4 · Fit 2D Gaussians to a target image</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+import numpy as np
+
+def make_target(size=64):
+    yy, xx = np.meshgrid(np.arange(size), np.arange(size), indexing=&quot;ij&quot;)
+    img = np.zeros((size, size, 3), dtype=np.float32)
+    # Red circle
+    mask = (xx - 20) ** 2 + (yy - 20) ** 2 &lt; 10 ** 2
+    img[mask] = [1.0, 0.2, 0.2]
+    # Blue square
+    mask = (np.abs(xx - 45) &lt; 8) &amp; (np.abs(yy - 40) &lt; 8)
+    img[mask] = [0.2, 0.3, 1.0]
+    return torch.from_numpy(img)
+
+
+target = make_target(64)
+model = Splats2D(num_splats=64, image_size=64)
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+
+for step in range(200):
+    pred = model((64, 64))
+    loss = F.mse_loss(pred, target)
+    opt.zero_grad(); loss.backward(); opt.step()
+    if step % 40 == 0:
+        print(f&quot;step {step:3d}  mse {loss.item():.4f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">step   0  mse 0.0481
+step  40  mse 0.0085
+step  80  mse 0.0059
+step 120  mse 0.0050
+step 160  mse 0.0046</code></pre></div></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">See the fitted splats</div><div class="co-body"><p>The target, the 64 trained Gaussians rendered by <code>rasterise_2d</code>, and the same Gaussians drawn as ellipses (one standard deviation) to show their shapes.</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import matplotlib.pyplot as plt
+from matplotlib.patches import Ellipse
+with torch.no_grad():
+    rendered = model((64, 64))
+    covs, means = model.covs(), model.means
+    opac, cols = torch.sigmoid(model.opacity_logit), torch.sigmoid(model.colour_logits)
+print(f&quot;final mse {F.mse_loss(rendered, target).item():.4f}; Gaussians with opacity above 0.5: {int((opac &gt; 0.5).sum())} of {len(opac)}&quot;)
+fig, axes = plt.subplots(1, 3, figsize=(10, 3.4))
+axes[0].imshow(target); axes[0].set_title(&quot;target&quot;, fontsize=9)
+axes[1].imshow(rendered.clamp(0, 1)); axes[1].set_title(&quot;64 Gaussians, rendered&quot;, fontsize=9)
+axes[2].set_facecolor(&quot;black&quot;); axes[2].set_xlim(0, 64); axes[2].set_ylim(64, 0); axes[2].set_aspect(&quot;equal&quot;)
+for m, c, colour, o in zip(means, covs, cols, opac):
+    vals, vecs = torch.linalg.eigh(c)
+    angle = float(torch.rad2deg(torch.atan2(vecs[1, 1], vecs[0, 1])))
+    axes[2].add_patch(Ellipse(m.tolist(), 2 * vals[1].sqrt().item(), 2 * vals[0].sqrt().item(), angle=angle,
+                              facecolor=colour.tolist(), alpha=float(o) * 0.8, edgecolor=&quot;white&quot;, lw=0.3))
+axes[2].set_title(&quot;the same Gaussians as ellipses&quot;, fontsize=9)
+for ax in axes: ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">final mse 0.0043; Gaussians with opacity above 0.5: 15 of 64</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/26d2c19d951b7c75.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The Gaussians have moved onto the two shapes and stretched to fit them: round, overlapping blobs fill the circle, while the square's straight edges need narrower, elongated ones near the borders. Gaussians that were not needed faded towards zero opacity rather than disappearing, which is exactly what pruning in Idea 6 cleans up. The soft edges in the render are the remaining error: 64 smooth blobs cannot make a perfectly sharp corner, which is why real scenes need millions and densification adds them where the error is.</p></div></aside>
+<p>Over 200 steps the 64 Gaussians settle into the two shapes. That is the entire idea — gradient-descent on explicit geometric primitives.</p>
+<h2>Step 5 · From 2D to 3D</h2>
+<p>The 3D extension keeps the same loop. The additions:</p>
+<ol>
+<li>Per-Gaussian rotation is a quaternion instead of a single angle.</li>
+<li>Covariance is <code>R S S^T R^T</code> with <code>R</code> built from the quaternion and <code>S = diag(exp(log_scale))</code>.</li>
+<li>Projection <code>(mu, Sigma) -&gt; (mu', Sigma')</code> uses the camera extrinsics and the Jacobian of the perspective projection at <code>mu</code>.</li>
+<li>Colour becomes a spherical-harmonics expansion; evaluate it at the viewing direction.</li>
+<li>Depth-sort is from actual camera-space z instead of a learned scalar.</li>
+</ol>
+<p>Every production implementation (<code>gsplat</code>, <code>inria/gaussian-splatting</code>, <code>nerfstudio</code>) does exactly this on the GPU with tile-based CUDA kernels.</p>
+<h2>Step 6 · Spherical harmonics evaluation</h2>
+<p>The SH basis up to degree 3 has 16 terms per channel. Evaluation:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def eval_sh_degree_3(sh_coeffs, dirs):
+    &quot;&quot;&quot;
+    sh_coeffs: (..., 16, 3)   last dim is RGB channels
+    dirs:      (..., 3)       unit vectors
+    returns:   (..., 3)
+    &quot;&quot;&quot;
+    C0 = 0.282094791773878
+    C1 = 0.488602511902920
+    C2 = [1.092548430592079, 1.092548430592079,
+          0.315391565252520, 1.092548430592079,
+          0.546274215296039]
+    x, y, z = dirs[..., 0], dirs[..., 1], dirs[..., 2]
+    x2, y2, z2 = x * x, y * y, z * z
+    xy, yz, xz = x * y, y * z, x * z
+
+    result = C0 * sh_coeffs[..., 0, :]
+    result = result - C1 * y[..., None] * sh_coeffs[..., 1, :]
+    result = result + C1 * z[..., None] * sh_coeffs[..., 2, :]
+    result = result - C1 * x[..., None] * sh_coeffs[..., 3, :]
+
+    result = result + C2[0] * xy[..., None] * sh_coeffs[..., 4, :]
+    result = result + C2[1] * yz[..., None] * sh_coeffs[..., 5, :]
+    result = result + C2[2] * (2.0 * z2 - x2 - y2)[..., None] * sh_coeffs[..., 6, :]
+    result = result + C2[3] * xz[..., None] * sh_coeffs[..., 7, :]
+    result = result + C2[4] * (x2 - y2)[..., None] * sh_coeffs[..., 8, :]
+
+    # degree 3 terms omitted here for brevity; full 16-coefficient version in the code file
+    return result
+</code></pre></div>
+
+<p>Learned <code>sh_coeffs</code> store the "colour in every direction" for that Gaussian. At render time you evaluate against the current view direction and get a 3-vector RGB.</p>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Under "Use it", 300 Gaussians start as a random cloud in a cube and train for 600 steps on the same 24 tiny photos of three spheres that the NeRF in Lesson 4.13 learned from (here on a black background), with a pinhole projection built from Idea 3. Will a view from a new camera look right? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the 3D renderer under "Use it", sort the Gaussians by <em>negative</em> camera depth, so the farthest is composited first, but keep the front-to-back formula. What happens to the image? (Solution B1.)</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>For real 3DGS work, use <code>gsplat</code> (from the nerfstudio team) or <code>nerfstudio</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">pip install nerfstudio gsplat
+ns-download-data example
+ns-train splatfacto --data path/to/data
+</code></pre></div>
+<p><code>splatfacto</code> is nerfstudio's 3DGS trainer. The run takes 10-30 minutes on an RTX 4090 for a typical scene.</p>
+<p>Export options that matter in 2026:</p>
+<ul>
+<li><code>.ply</code> — raw Gaussian cloud (portable, largest file).</li>
+<li><code>.splat</code> — PlayCanvas / SuperSplat quantised format.</li>
+<li>glTF <code>KHR_gaussian_splatting</code> — Khronos standard, portable across viewers (Feb 2026 RC).</li>
+<li>OpenUSD <code>UsdVolParticleField3DGaussianSplat</code> — USD-native, for NVIDIA Omniverse and Vision Pro pipelines.</li>
+</ul>
+<p>For 4D / dynamic scenes, <code>4DGS</code> and <code>Deformable-3DGS</code> extend the same machinery with time-varying means and opacities.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">3D splatting from scratch, on CPU</div><div class="co-body"><p>Steps 1 to 5 in full: 3D Gaussians with quaternion rotations, projected with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mord">Σ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span></span></span></span> (plus 0.3 px² on the diagonal, as the official code does to keep tiny splats visible) and composited by the lesson's <code>rasterise_2d</code> in camera-depth order. Colour is view-independent here (degree-0 spherical harmonics).</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time
+H = W = 32
+FOCAL = 40.0
+SPHERES = [((-0.45, 0.0, 0.0), 0.55, (0.70, 0.29, 0.11)), ((0.5, 0.15, 0.2), 0.4, (0.28, 0.30, 0.60)),
+           ((0.0, -0.55, -0.4), 0.3, (0.14, 0.46, 0.23))]
+
+def camera(angle, elevation, radius=4.0):                       # returns eye position and world-to-camera rotation
+    eye = torch.tensor([radius * math.cos(elevation) * math.sin(angle), radius * math.sin(elevation),
+                        radius * math.cos(elevation) * math.cos(angle)])
+    fwd = -eye / eye.norm()
+    right = torch.linalg.cross(fwd, torch.tensor([0.0, 1.0, 0.0])); right = right / right.norm()
+    return eye, torch.stack([right, torch.linalg.cross(right, fwd), fwd])       # rows: right, up, forward
+
+def ray_trace(eye, R):                                          # ground-truth photo of the spheres
+    row, col = torch.meshgrid(torch.arange(H, dtype=torch.float32), torch.arange(W, dtype=torch.float32), indexing=&quot;ij&quot;)
+    d = ((col - W / 2 + 0.5) / FOCAL)[..., None] * R[0] - ((row - H / 2 + 0.5) / FOCAL)[..., None] * R[1] + R[2]
+    d = d / d.norm(dim=-1, keepdim=True)
+    o = eye.expand(H, W, 3)
+    nearest, img = torch.full((H, W), float(&quot;inf&quot;)), torch.zeros(H, W, 3)
+    light = torch.tensor([0.5, 0.8, 0.6]) / torch.tensor([0.5, 0.8, 0.6]).norm()
+    for centre, radius, colour in SPHERES:
+        oc = o - torch.tensor(centre); b = (oc * d).sum(-1)
+        disc = b ** 2 - ((oc ** 2).sum(-1) - radius ** 2); t = -b - disc.clamp(min=0).sqrt()
+        hit = (disc &gt; 0) &amp; (t &gt; 0) &amp; (t &lt; nearest)
+        normal = (o + t[..., None] * d - torch.tensor(centre)) / radius
+        img[hit] = (torch.tensor(colour) * (0.35 + 0.65 * (normal * light).sum(-1).clamp(min=0))[..., None])[hit]
+        nearest = torch.where(hit, t, nearest)
+    return img
+
+poses = [(2 * math.pi * k / 12 + (0.26 if e &gt; 0.5 else 0.0), e) for k in range(12) for e in (0.15, 0.75)]
+cams = [camera(a, e) for a, e in poses]
+photos = [ray_trace(*c) for c in cams]
+test_cam = camera(math.pi / 12 + 0.13, 0.45)
+test_photo = ray_trace(*test_cam)
+
+def quat_to_rot(q):
+    w, x, y, z = F.normalize(q, dim=-1).unbind(-1)
+    return torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y),
+                        2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x),
+                        2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1).view(-1, 3, 3)
+
+class Splats3D(nn.Module):
+    def __init__(self, n=300, seed=0):
+        super().__init__()
+        g = torch.Generator().manual_seed(seed)
+        self.means = nn.Parameter(torch.rand(n, 3, generator=g) * 2 - 1)          # random cloud in a cube
+        self.quats = nn.Parameter(torch.tensor([1.0, 0, 0, 0]).repeat(n, 1))
+        self.log_scale = nn.Parameter(torch.full((n, 3), math.log(0.08)))
+        self.colour_logits = nn.Parameter(torch.zeros(n, 3))
+        self.opacity_logit = nn.Parameter(torch.full((n,), -1.0))
+    def forward(self, eye, R_cam, reverse_order=False):
+        R = quat_to_rot(self.quats)
+        cov3 = R @ torch.diag_embed(torch.exp(self.log_scale) ** 2) @ R.transpose(1, 2)    # Sigma = R S S^T R^T
+        x, y, z = ((self.means - eye) @ R_cam.T).unbind(-1)                                # world -&gt; camera
+        z = z.clamp(min=0.1)
+        mu2 = torch.stack([FOCAL * x / z + W / 2 - 0.5, -FOCAL * y / z + H / 2 - 0.5], -1)  # perspective projection
+        J = torch.zeros(len(z), 2, 3)
+        J[:, 0, 0], J[:, 0, 2] = FOCAL / z, -FOCAL * x / z ** 2
+        J[:, 1, 1], J[:, 1, 2] = -FOCAL / z, FOCAL * y / z ** 2
+        T = J @ R_cam
+        cov2 = T @ cov3 @ T.transpose(1, 2) + 0.3 * torch.eye(2)                           # Sigma' = J W Sigma W^T J^T
+        return rasterise_2d(mu2, cov2, torch.sigmoid(self.colour_logits), torch.sigmoid(self.opacity_logit),
+                            -z if reverse_order else z, (H, W))
+
+torch.manual_seed(0)
+splats = Splats3D()
+opt = torch.optim.Adam(splats.parameters(), lr=0.01)
+start = time.time()
+for step in range(600):
+    k = step % len(cams)
+    loss = F.mse_loss(splats(*cams[k]), photos[k])
+    opt.zero_grad(); loss.backward(); opt.step()
+with torch.no_grad():
+    t0 = time.perf_counter(); render = splats(*test_cam); render_ms = (time.perf_counter() - t0) * 1000
+    wrong_order = splats(*test_cam, reverse_order=True)
+psnr = lambda img: (-10 * torch.log10(F.mse_loss(img, test_photo))).item()
+print(f&quot;300 Gaussians, 600 steps in {time.time() - start:.0f} s; held-out view PSNR {psnr(render):.1f} dB &quot;
+      f&quot;(one 32 x 32 render: {render_ms:.0f} ms on CPU)&quot;)
+print(f&quot;same splats composited far-to-near: PSNR {psnr(wrong_order):.1f} dB&quot;)
+
+fig, axes = plt.subplots(1, 4, figsize=(10, 2.8))
+for ax, (img, title) in zip(axes, [(photos[0], &quot;training view 1&quot;), (test_photo, &quot;held-out view (truth)&quot;),
+                                   (render.clamp(0, 1), &quot;splats, held-out view&quot;), (wrong_order.clamp(0, 1), &quot;far-to-near order&quot;)]):
+    ax.imshow(img, interpolation=&quot;nearest&quot;); ax.set_title(title, fontsize=9); ax.axis(&quot;off&quot;)
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">300 Gaussians, 600 steps in 45 s; held-out view PSNR 29.8 dB (one 32 x 32 render: 15 ms on CPU)
+same splats composited far-to-near: PSNR 27.4 dB</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/72136e473e36a439.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>From a random cloud, 300 Gaussians learn the three spheres well enough to render a viewpoint no camera used at around 30 dB PSNR, in well under a minute on a CPU. The NeRF in Lesson 4.13 needed several times longer on the same photos for about 23 dB (on white rather than black, so the numbers are only roughly comparable), and every one of its pixels needed 32 network calls. Here a render is a projection and a blend. The last panel composites the same trained splats far-to-near. The green sphere, which sits behind the others, is now painted over the orange one, and the PSNR drops (second printed line). This scene has few overlaps; in a real room, with walls behind furniture behind people, the wrong order would wreck the image. Order is part of the rendering equation.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A 3D Gaussian carries a position, rotation, scale, opacity and view-dependent colour, about 59 floats.</li>
+<li>Rendering projects each Gaussian to a 2D ellipse with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7519em;"></span><span class="mord"><span class="mord">Σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mord">Σ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.09618em;">J</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span></span></span></span></span></span></span> and alpha-composites front to back.</li>
+<li>The compositing equation is NeRF's volume rendering applied to explicit primitives.</li>
+<li>Everything is differentiable, so the primitives are fitted to photos by gradient descent, with densification and pruning.</li>
+<li>Splats render in real time but take much more storage than a NeRF; compressed formats and glTF/USD standards now exist.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a0422-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Yes, and quickly</span></summary><div class="qa-a"><p>Yes: the held-out render shows all three spheres in the right places at about 30 dB PSNR (printed), blurrier at the edges than the truth. Each training view constrains where the Gaussians can be; a blob in the wrong place would show up wrongly in other views, so only a consistent 3D arrangement fits all 24.</p></div></details>
+<details class="qa" id="a0422-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Back paints over front</span></summary><div class="qa-a"><p>The front-to-back formula gives the first Gaussian in the list full weight and dims everything after it. Sorting far-to-near therefore lets the farthest Gaussians cover the nearer ones: the green sphere hidden behind the orange one shows through on top of it, and the PSNR drops (the printed second line). The more the scene overlaps itself, the worse it gets. The trained parameters are fine; only the order is wrong, which is why real rasterisers sort by depth for every view.</p></div></details>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Splats in products.</strong> Capture apps (Niantic's Scaniverse, Polycam, Luma) and viewers (PlayCanvas SuperSplat) create and share Gaussian splats from phone video; game engines and web viewers render them in real time.</li>
+<li><strong>A standard file format.</strong> Khronos announced a glTF extension for Gaussian splats (2025–2026), so splats can travel between tools like ordinary 3-D assets.</li>
+<li><strong>Tooling.</strong> nerfstudio's gsplat library is a common open implementation for training splats.</li>
+</ul>
+<p>Sources: <a href="https://www.khronos.org/news/tags/tag/gaussian+splats">Khronos glTF Gaussian splatting</a>, <a href="https://github.com/nerfstudio-project/gsplat">gsplat</a>, <a href="https://superspl.at/editor">SuperSplat</a>, <a href="https://scaniverse.com/">Scaniverse</a>.</p></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-video-3d-generation"><span class="t" style="--cs-hue:170">V3</span>Cheat sheet · Video and 3D Generation</a><a href="#cs-video-3d-vision"><span class="t" style="--cs-hue:190">VD</span>Cheat sheet · Video, Depth and 3D Vision</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-3dgs-capture-planner.md</code> — a prompt that plans a capture session (number of photos, camera path, lighting) for a given scene type.</li>
+<li><code>outputs/skill-3dgs-export-router.md</code> — a skill that picks the right export format (<code>.ply</code> / <code>.splat</code> / glTF / USD) given the downstream viewer or engine.</li>
+</ul>
+<p><strong><code>outputs/prompt-3dgs-capture-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-3dgs-capture-planner
+description: Plan a photo capture session for 3DGS reconstruction given scene type and hardware
+phase: 4
+lesson: 22
+---
+
+You are a 3DGS capture planner. Given the scene and hardware, return a specific shooting plan.
+
+## Inputs
+
+- `scene_type`: small_object | room | building_exterior | landscape | face_portrait | product_shot
+- `hardware`: smartphone | DSLR | drone | handheld_LiDAR_scanner
+- `lighting`: natural | indoor_controlled | mixed | harsh_sun
+- `target_quality`: preview | production
+
+## Decision rules
+
+### Photo count
+
+- small_object (&lt; 1 m): 60-120 photos, full sphere of angles.
+- room: 120-300 photos, figure-8 path through the room.
+- building_exterior: 200-500 photos, drone orbit at 2-3 altitudes.
+- landscape: drone mission grid, 150+ photos.
+- face_portrait: 60-80, evenly spaced on front hemisphere.
+- product_shot: 80-120 photos on turntable + elevation sweep.
+
+### Capture rules
+
+1. Overlap between consecutive photos must be &gt;= 70%.
+2. Camera exposure locked — autoexposure variance confuses SfM.
+3. No motion blur: fast shutter, stabilise or tripod.
+4. Cover every angle likely to be rendered; holes in coverage become floaters.
+5. Avoid mirrors, transparent glass, and highly reflective metal; 3DGS handles them poorly.
+6. Aim for matte surfaces and diffuse light; harsh shadows bake into the scene.
+
+### SfM step
+
+- Process photos through COLMAP or GLOMAP first to produce camera poses + sparse points.
+- Verify reprojection error &lt; 1 pixel on average before starting 3DGS training.
+- Typical output: `cameras.bin`, `images.bin`, `points3D.bin` — feed directly to `splatfacto`.
+
+## Output
+
+```
+[capture plan]
+  scene:           &lt;type&gt;
+  hardware:        &lt;device&gt;
+  photo count:     &lt;N&gt;
+  capture path:    &lt;orbit / figure-8 / hemisphere / grid&gt;
+  exposure:        locked at &lt;settings&gt;
+  focal length:    fixed | zoom-locked
+
+[processing pipeline]
+  1. SfM: COLMAP | GLOMAP
+  2. 3DGS train: nerfstudio splatfacto | gsplat
+  3. cleanup: SuperSplat (remove floaters)
+  4. export: &lt;.ply | glTF KHR_gaussian_splatting | USD&gt;
+
+[quality expectations]
+  Gaussian count after training: &lt;approx&gt;
+  rendered fps:                  &lt;approx&gt;
+  known failure modes:           &lt;list&gt;
+```
+
+## Rules
+
+- Do not recommend handheld captures for outdoor landscapes &gt; 100 m — use a drone mission.
+- For face portraits, flag that 3DGS struggles with hair detail below a certain photo count.
+- Never recommend capturing in direct harsh sunlight for production quality; suggest golden hour or overcast.
+- If the downstream engine is Omniverse, Pixar, or Apple Vision Pro, route export to OpenUSD (USDZ for Apple). If it is a web engine (Three.js, Babylon.js, Cesium), route to glTF `KHR_gaussian_splatting`. For Unreal, route to the Volinga plugin or glTF KHR.
+</code></pre></div>
+<p><strong><code>outputs/skill-3dgs-export-router.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-3dgs-export-router
+description: Pick the right 3DGS export format (.ply / .splat / glTF KHR_gaussian_splatting / USD) given the downstream viewer or engine
+version: 1.0.0
+phase: 4
+lesson: 22
+tags: [3d-gaussian-splatting, export, glTF, OpenUSD, pipeline]
+---
+
+# 3DGS Export Router
+
+Map a downstream target to the right 3DGS file format. Saves hours of &quot;it does not load&quot; debugging.
+
+## When to use
+
+- After training a 3DGS scene, before sharing it with a content pipeline.
+- Choosing between research-grade (.ply) and production-grade (glTF / USD) formats.
+- Pipeline handoff: capture team -&gt; 3DGS engineer -&gt; game designer / VFX artist / web developer.
+
+## Inputs
+
+- `target_engine`: unreal | unity | omniverse | blender | vision_pro | three_js | babylon_js | cesium | playcanvas | supersplat
+- `priority`: portability | file_size | quality_preservation
+- `include_sh_degree`: 0 | 1 | 2 | 3
+
+## Format decision
+
+| Target | Recommended format | Why |
+|--------|--------------------|-----|
+| Unreal Engine (virtual production) | Volinga plugin or glTF KHR_gaussian_splatting | Native Unreal SDK path |
+| Unity (XR / game) | .ply via Aras-P Unity-GaussianSplatting plugin | Community-standard Unity pipeline |
+| NVIDIA Omniverse, Pixar tools | OpenUSD 26.03 (UsdVolParticleField3DGaussianSplat) | Native USD prim type |
+| Apple Vision Pro | OpenUSD 26.03 | Native to visionOS 2.x |
+| Blender | .ply + KIRI Engine add-on | Community add-on reads raw splats |
+| Three.js web viewer | glTF KHR_gaussian_splatting or .splat | Browser-standard, works with `GaussianSplats3D` |
+| Babylon.js V9+ | glTF KHR_gaussian_splatting | V9 added native support |
+| Cesium (CesiumJS 1.139+, Cesium for Unreal 2.23+) | glTF KHR_gaussian_splatting | Shipped explicit support |
+| PlayCanvas | .splat | PlayCanvas native quantised format |
+| SuperSplat (editor) | .ply or .splat | Import + export |
+
+## Quantisation trade-offs
+
+- `.ply` full-precision: largest file, lossless, any viewer.
+- `.splat`: 4x-8x smaller, slight quality loss on SH3 coefficients, PlayCanvas-ecosystem standard.
+- glTF KHR: configurable via EXT_meshopt_compression; smallest with highest compatibility.
+- USD: compressed by USDZ packaging; smallest for Apple pipelines.
+
+## Output report
+
+```
+[export plan]
+  target:         &lt;engine&gt;
+  format:         &lt;name&gt;
+  sh degree:      &lt;0|1|2|3&gt;
+  compression:    &lt;none|meshopt|quantisation|usdz&gt;
+  expected size:  &lt;MB&gt;
+  compatible with: &lt;list of viewers&gt;
+
+[pipeline]
+  1. source: &lt;.ply from training&gt;
+  2. optional: SuperSplat cleanup pass
+  3. convert: &lt;tool + CLI or API call&gt;
+  4. package: &lt;.gltf / .glb / .usd / .usdz / .splat / .ply&gt;
+  5. validate: &lt;viewer sanity check&gt;
+```
+
+## Rules
+
+- Never strip SH3 coefficients silently — it visibly changes specular reflections.
+- If `priority == file_size`, recommend `.splat` or glTF with meshopt; warn about quality loss.
+- For Apple platforms, prefer USD / USDZ over glTF in 2026; USDZ has first-class visionOS support.
+- If the target viewer's 3DGS support is pre-standard (pre-Feb 2026), recommend `.ply` and the viewer's custom loader; Khronos-standard glTF will not yet be recognised.
+- Always validate the exported file in at least one viewer before handing off; silent corruption happens during quantisation.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Run the 2D splat trainer above on a different synthetic image. Vary <code>num_splats</code> in <code>[16, 64, 256]</code> and plot MSE vs step for each. Identify the point of diminishing returns.</li>
+<li><strong>(Medium)</strong> Extend the 2D rasteriser to support per-Gaussian RGB colours that depend on a scalar "view angle" through a degree-2 harmonic. Train on a pair of target images and verify the model reconstructs both.</li>
+<li><strong>(Hard)</strong> Clone <code>nerfstudio</code> and train <code>splatfacto</code> on a 20-photo capture of any scene you have (desk, plant, face, room). Export to glTF <code>KHR_gaussian_splatting</code> and open it in a viewer (Three.js <code>GaussianSplats3D</code>, SuperSplat, Babylon.js V9). Report training time, number of Gaussians, and rendered fps.</li>
+</ol>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/">3D Gaussian Splatting for Real-Time Radiance Field Rendering (Kerbl et al., SIGGRAPH 2023)</a> — the original paper</li>
+<li><a href="https://github.com/nerfstudio-project/gsplat">gsplat (nerfstudio project)</a> — production-quality CUDA rasteriser</li>
+<li><a href="https://docs.nerf.studio/nerfology/methods/splat.html">nerfstudio Splatfacto</a> — reference training recipe</li>
+<li><a href="https://github.com/KhronosGroup/glTF/blob/main/extensions/2.0/Khronos/KHR_gaussian_splatting/README.md">Khronos KHR_gaussian_splatting extension</a> — the 2026 portable format</li>
+<li><a href="https://openusd.org/release/">OpenUSD 26.03 release notes</a> — <code>UsdVolParticleField3DGaussianSplat</code> schema</li>
+<li><a href="https://www.thefuture3d.com/blog-0/2026/4/4/state-of-gaussian-splatting-2026">THE FUTURE 3D State of Gaussian Splatting 2026</a> — industry overview</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/04-computer-vision/22-3d-gaussian-splatting" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0422" id="done-a0422">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0422" id="undo-a0422" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0421"><span class="pn-dir">Previous</span><span class="pn-t">4.21 · Keypoint Detection &amp; Pose Estimation</span></a><a class="pn next" href="#a0423"><span class="pn-dir">Next</span><span class="pn-t">4.23 · Diffusion Transformers &amp; Rectified Flow</span></a></div></footer>

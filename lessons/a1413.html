@@ -1,0 +1,634 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · Agent Engineering</a></nav><h1>Stateful Graph Orchestration — Durable Execution and Checkpoints</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.13</span><span class="chip">75 min</span><span class="chip chip-core">Learn + Build</span><span class="chip chip-done" data-done-chip="a1413" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Describe LangGraph's core model: state machine with typed state, function nodes, conditional edges, and post-node checkpoints.</li>
+<li>Name the four capabilities the docs highlight: durable execution, streaming, human-in-the-loop, comprehensive memory.</li>
+<li>Explain the three orchestration topologies LangGraph supports: supervisor, peer-to-peer (swarm), hierarchical (nested subgraphs).</li>
+<li>Implement a stdlib state graph with typed state, conditional edges, and a checkpoint/resume cycle.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 14 · 01 (Agent Loop), Phase 14 · 12 (Workflow Patterns)</li>
+<li><strong>Type</strong>: Learn + Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Agent is a state machine; nodes are functions; edges are transitions; state is checkpointed after each node. Resume from any failure at the last successful checkpoint. LangGraph is the 2026 reference for this model of low-level stateful orchestration.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>State graph</td>
+<td>"Agent as state machine"</td>
+<td>Typed state + nodes + edges + reducers</td>
+</tr>
+<tr>
+<td>Checkpointer</td>
+<td>"Persistence backend"</td>
+<td>Serializes state after every node; enables resume</td>
+</tr>
+<tr>
+<td>Reducer</td>
+<td>"State merger"</td>
+<td>Function that combines current state with a node's update</td>
+</tr>
+<tr>
+<td>Conditional edge</td>
+<td>"Branch"</td>
+<td>Edge chosen by a function of state</td>
+</tr>
+<tr>
+<td>Subgraph</td>
+<td>"Nested graph"</td>
+<td>A graph used as a node inside another graph</td>
+</tr>
+<tr>
+<td>Durable execution</td>
+<td>"Resume from failure"</td>
+<td>Restart at the last successful node with exact state</td>
+</tr>
+<tr>
+<td>Supervisor</td>
+<td>"Router LLM"</td>
+<td>Central dispatcher for specialist subagents</td>
+</tr>
+<tr>
+<td>Swarm</td>
+<td>"P2P agents"</td>
+<td>Agents hand off via shared tools; no central router</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0609">Zero to Agents 6.9 · Execution graphs from scratch</a></li><li><a class="xref" href="#l0610">Zero to Agents 6.10 · LangGraph StateGraph: state, nodes, edges and reducers</a></li><li><a class="xref" href="#l0611">Zero to Agents 6.11 · Routing, loops and the agent as a graph</a></li><li><a class="xref" href="#l0612">Zero to Agents 6.12 · Persistence: checkpoints, threads, resume and time travel</a></li><li><a class="xref" href="#l0613">Zero to Agents 6.13 · Human in the loop: interrupt and Command</a></li><li><a class="xref" href="#l0624">Zero to Agents 6.24 · Inside the LangGraph runtime: supersteps, channels, checkpoints and durability</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A long agent run that crashes at step 38 should continue from step 38, not start again and repeat (and re-pay for) the first 37. <strong>LangGraph</strong> organises an agent as a <strong>graph</strong>: <strong>nodes</strong> are functions that each update a shared, typed <strong>state</strong>, and <strong>edges</strong> say which node runs next, possibly depending on the state. After each step it saves a <strong>checkpoint</strong> (a snapshot of the state) to a store such as SQLite or Postgres, under a <strong>thread id</strong>. Resuming is running the same thread again; pausing for a person to approve something is a node that waits; going back in time is starting from an earlier snapshot. This lesson builds a small graph runner in plain Python, then runs the same ticket graph in real LangGraph, kills the process mid-run, and resumes it from the database.</p></div></aside>
+<p>Agents and workflows share a problem: when a 40-step run fails at step 38, you want to resume from step 38, not start over. Second-class state models leave operators hacking retries around a library that assumes fresh runs.</p>
+<p>LangGraph's design answer: state is a first-class typed object, mutations are explicit, and checkpoints persist after every node. Resuming is invoking the graph again with the same thread id.</p>
+<h2>Idea 1 · The graph</h2>
+<p>A graph is defined by:</p>
+<ul>
+<li><strong>State type.</strong> A typed dict (or Pydantic model) that every node reads and mutates.</li>
+<li><strong>Nodes.</strong> Pure functions <code>(state) -&gt; state_update</code>. Updates are merged into state after return.</li>
+<li><strong>Edges.</strong> Conditional or direct transitions between nodes.</li>
+<li><strong>Entry and exit.</strong> <code>START</code> and <code>END</code> sentinel nodes mark the boundary.</li>
+</ul>
+<p>Example: an agent with <code>classify</code>, <code>refund</code>, <code>bug</code>, <code>sales</code>, <code>done</code> nodes — a routing workflow as a graph.</p>
+<h2>Idea 2 · Durable execution</h2>
+<p>After each node returns, the runtime serializes the state and writes it to a checkpointer (SQLite, Postgres, Redis, custom). On failure at step N, the runtime can <code>resume(session_id)</code> and pick up from step N+1 with exact state.</p>
+<p>The LangGraph docs explicitly highlight production users where this matters: Klarna, Uber, J.P. Morgan. The claim isn't the graph shape; it's that the graph shape plus checkpointing makes recovery cheap.</p>
+<h2>Idea 3 · Streaming</h2>
+<p>Every node can yield partial output. The graph streams per-node-delta events to the caller so UIs update as the graph runs.</p>
+<h2>Idea 4 · Human-in-the-loop</h2>
+<p>Inspect and modify state between nodes. Implementations: pause before a critical node, surface state to a human, accept modifications, resume. The checkpointer makes this easy because state is already serialized.</p>
+<h2>Idea 5 · Memory</h2>
+<p>Short-term (within a run — conversation history in state) and long-term (across runs — persistent via the checkpointer plus a separate long-term store). LangGraph integrates with external memory systems (Mem0, custom) via tools.</p>
+<h2>Idea 6 · Three topologies</h2>
+<ol>
+<li><strong>Supervisor.</strong> Central router LLM dispatches to specialist subagents. <code>create_supervisor()</code> in <code>langgraph-supervisor</code> (though the LangChain team in 2026 recommends doing this through tool calls directly for more context control).</li>
+<li><strong>Swarm / peer-to-peer.</strong> Agents hand off directly via a shared tool surface. No central router.</li>
+<li><strong>Hierarchical.</strong> Supervisors managing sub-supervisors, implemented as nested subgraphs.</li>
+</ol>
+<h2>Idea 7 · Where this pattern goes wrong</h2>
+<ul>
+<li><strong>Checkpoints too small.</strong> Only checkpointing conversation turns leaves tool state and memory writes unrecoverable. Full state must serialize.</li>
+<li><strong>Non-deterministic nodes.</strong> Resume assumes node inputs produce the same state update. Random seeds, wall-clock, external APIs must be captured.</li>
+<li><strong>Over-use of conditional edges.</strong> A graph with every edge conditional is a state machine that cannot be reasoned about. Prefer linear chains with occasional branches.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="langgraph-state"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>A step.</strong> With state <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, the node <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> chosen by the edges, and a reducer that merges its update:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊕</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">edge</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span></span></span></span></span></div>
+and the checkpointer stores <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> for the thread.</p>
+<p><strong>What a crash costs.</strong> If the process dies during step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> and the last durable checkpoint is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>), resuming re-runs steps <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>. Durable writes after every step make <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>: only the step that was interrupted runs again. That step runs <strong>at least once</strong>, so its side effects must be idempotent.</p>
+<p><strong>Durability modes</strong> in LangGraph decide when <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> reaches the store: <code>exit</code> (only when the run ends), <code>async</code> (in the background while the next step runs; the default) or <code>sync</code> (before the next step starts).</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting re-runs in the crash below</div><div class="co-body"><ul>
+<li>The graph runs classify, then bug; the process is killed inside bug (step 2).</li>
+<li><code>exit</code>: nothing is written until the run ends, and this run never ended. The thread is empty: resuming fails with <code>EmptyInputError</code>, and the whole run must start again from the user's input.</li>
+<li><code>sync</code>: the checkpoint after classify was committed before bug started, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> and the resume re-runs only bug. Classify, which loads a model, runs once.</li>
+<li><code>async</code>: the checkpoint after classify is being written while bug runs. If the crash wins the race, the last durable checkpoint is the input and classify runs again; if the write wins, only bug does. The trial count in the output shows how often the crash won.</li>
+<li>In every mode human_gate runs twice: once to raise the interrupt, once when the answer arrives. A node that pauses with <code>interrupt()</code> restarts from its beginning on resume, so code before the interrupt must be safe to repeat.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "With a checkpointer, nothing ever runs twice."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The interrupted step runs again; with background or end-of-run writes, earlier steps can too.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A paused node continues from the line where it paused."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It runs again from the top; <code>interrupt()</code> returns the person's answer the second time.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Going back in time overwrites history."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A fork from an earlier checkpoint adds a branch; the original stays.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The graph is the hard part."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The state shape, idempotent nodes and the durability setting are what make recovery work.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The process is killed inside the <code>bug</code> node and a new process resumes the same thread. Which nodes run again under each durability mode: <code>exit</code>, <code>async</code> (the default) and <code>sync</code>? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Kill the process, resume from SQLite</div><div class="co-body"><p>The lesson's ticket graph rebuilt in LangGraph 1.x with a <code>SqliteSaver</code>. The classify node runs a real model (<code>bge-small-en-v1.5</code>, nearest of three labelled examples); human_gate pauses with <code>interrupt()</code>. Process 1 is killed inside <code>bug</code> with <code>os._exit</code>; process 2 resumes the thread; process 3 answers the interrupt; each node logs which process ran it. This runs with <code>durability="exit"</code> and <code>"sync"</code>; <code>"async"</code>, the default, is a race between the background write and the crash, so it runs as eight quick crash-and-resume trials. About a minute, mostly model loading in each new process.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson's ticket graph in real LangGraph, with a SQLite checkpointer and a real model in the classify
+# node (bge-small: the label of the nearest example). The first process is killed inside the 'bug' node;
+# a second process resumes the same thread from the database. Then the human gate uses interrupt().
+# Durability 'exit' and 'sync' are shown in full; 'async' (the default) is a race, so it is run 8 times.
+import os, pathlib, subprocess, sys, tempfile, textwrap
+work = pathlib.Path(tempfile.mkdtemp())
+(work / &quot;ticket_graph.py&quot;).write_text(textwrap.dedent('''
+    import os, sqlite3, sys, time, zlib
+    from typing import TypedDict
+    from langgraph.graph import StateGraph, START, END
+    from langgraph.checkpoint.sqlite import SqliteSaver
+    from langgraph.types import interrupt, Command
+    LOG = os.environ[&quot;NODE_LOG&quot;]
+    def log(node):
+        with open(LOG, &quot;a&quot;) as f:
+            f.write(f&quot;process {os.environ['PROC']} ran {node}\\n&quot;)
+    class State(TypedDict, total=False):
+        input: str
+        route: str
+        ticket: str
+        approved: bool
+        output: str
+    EXAMPLES = [(&quot;Refund my last payment, I was overcharged.&quot;, &quot;refund&quot;), (&quot;The app logs me out every minute.&quot;, &quot;bug&quot;),
+                (&quot;How much is the pro plan for 20 users?&quot;, &quot;sales&quot;)]
+    def classify(state):
+        log(&quot;classify&quot;)
+        if os.environ.get(&quot;NO_MODEL&quot;):                             # quick variant for repeated trials
+            return {&quot;route&quot;: &quot;bug&quot; if &quot;crash&quot; in state[&quot;input&quot;] else &quot;refund&quot;}
+        from sentence_transformers import SentenceTransformer       # a real model inside the node
+        emb = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;)
+        ex = emb.encode([e for e, _ in EXAMPLES], normalize_embeddings=True)
+        q = emb.encode([state[&quot;input&quot;]], normalize_embeddings=True)[0]
+        return {&quot;route&quot;: EXAMPLES[int((ex @ q).argmax())][1]}
+    def make(prefix):
+        def node(state):
+            log(prefix)
+            if prefix == &quot;bug&quot; and os.environ.get(&quot;CRASH_IN_BUG&quot;):
+                os._exit(1)                                        # the process dies mid-node: no cleanup
+            return {&quot;ticket&quot;: f&quot;{prefix.upper()[:3]}-{zlib.crc32(state['input'].encode()) % 10000:04d}&quot;}
+        return node
+    def human_gate(state):
+        log(&quot;human_gate&quot;)
+        decision = interrupt({&quot;ticket&quot;: state[&quot;ticket&quot;], &quot;question&quot;: &quot;send this ticket?&quot;})
+        return {&quot;approved&quot;: decision == &quot;approve&quot;}
+    def send(state):
+        log(&quot;send&quot;)
+        return {&quot;output&quot;: f&quot;sent {state['ticket']}&quot; if state[&quot;approved&quot;] else &quot;held for review&quot;}
+    g = StateGraph(State)
+    g.add_node(&quot;classify&quot;, classify)
+    for name in (&quot;refund&quot;, &quot;bug&quot;, &quot;sales&quot;):
+        g.add_node(name, make(name)); g.add_edge(name, &quot;human_gate&quot;)
+    g.add_node(&quot;human_gate&quot;, human_gate); g.add_node(&quot;send&quot;, send)
+    g.add_edge(START, &quot;classify&quot;)
+    g.add_conditional_edges(&quot;classify&quot;, lambda s: s[&quot;route&quot;], {&quot;refund&quot;: &quot;refund&quot;, &quot;bug&quot;: &quot;bug&quot;, &quot;sales&quot;: &quot;sales&quot;})
+    g.add_edge(&quot;human_gate&quot;, &quot;send&quot;); g.add_edge(&quot;send&quot;, END)
+    saver = SqliteSaver(sqlite3.connect(os.environ[&quot;DB&quot;], check_same_thread=False))
+    app = g.compile(checkpointer=saver)
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;ticket-42&quot;}}
+    if __name__ == &quot;__main__&quot;:
+        step = sys.argv[1]
+        mode = os.environ[&quot;DURABILITY&quot;]                            # &quot;async&quot; is LangGraph's default
+        if step == &quot;start&quot;:
+            out = app.invoke({&quot;input&quot;: &quot;The export button crashes the app every time.&quot;}, cfg, durability=mode)
+        elif step == &quot;resume&quot;:
+            out = app.invoke(None, cfg, durability=mode)           # continue from the last checkpoint
+        else:
+            out = app.invoke(Command(resume=step), cfg, durability=mode)   # answer the interrupt
+        snap = app.get_state(cfg)
+        print(f&quot;  returned keys {sorted(k for k in out if not k.startswith('__'))}; next node: {list(snap.next) or 'END'}&quot;
+              + (f&quot;; waiting on: {out['__interrupt__'][0].value}&quot; if &quot;__interrupt__&quot; in out else &quot;&quot;)
+              + (f&quot;; output: {out.get('output')}&quot; if out.get(&quot;output&quot;) else &quot;&quot;))
+'''))
+def run(step, **extra):
+    r = subprocess.run([sys.executable, str(work / &quot;ticket_graph.py&quot;), step], env={**env, **extra},
+                       capture_output=True, text=True, timeout=180)
+    print(f&quot;process '{step}': exit code {r.returncode}&quot;
+          + (&quot; (killed inside 'bug' on purpose)&quot; if step == &quot;start&quot; and r.returncode else &quot;&quot;)
+          + &quot;&quot;.join(f&quot; ({l.strip()[:110]})&quot; for l in [l for l in r.stderr.splitlines() if &quot;Error&quot; in l][-1:]
+                    if step != &quot;start&quot; and r.returncode))
+    if r.stdout.strip():
+        print(r.stdout.rstrip())
+for mode in (&quot;exit&quot;, &quot;sync&quot;):
+    env = dict(os.environ, DB=str(work / f&quot;{mode}.sqlite&quot;), NODE_LOG=str(work / f&quot;{mode}.log&quot;),
+               HF_HUB_OFFLINE=&quot;1&quot;, DURABILITY=mode)
+    print(f&quot;\n== durability='{mode}'&quot;)
+    run(&quot;start&quot;, CRASH_IN_BUG=&quot;1&quot;, PROC=&quot;1&quot;)
+    run(&quot;resume&quot;, PROC=&quot;2&quot;)
+    run(&quot;approve&quot;, PROC=&quot;3&quot;)
+    print(&quot;  node log across the three processes:&quot;)
+    print(&quot;&quot;.join(&quot;    &quot; + l for l in (work / f&quot;{mode}.log&quot;).read_text().splitlines(True)), end=&quot;&quot;)
+
+print(&quot;\n== durability='async' (the default): 8 crash-and-resume trials, no model in classify&quot;)
+reran = 0
+for trial in range(8):
+    env = dict(os.environ, DB=str(work / f&quot;async{trial}.sqlite&quot;), NODE_LOG=str(work / f&quot;async{trial}.log&quot;),
+               HF_HUB_OFFLINE=&quot;1&quot;, DURABILITY=&quot;async&quot;, NO_MODEL=&quot;1&quot;)
+    for step, extra in ((&quot;start&quot;, {&quot;CRASH_IN_BUG&quot;: &quot;1&quot;, &quot;PROC&quot;: &quot;1&quot;}), (&quot;resume&quot;, {&quot;PROC&quot;: &quot;2&quot;})):
+        subprocess.run([sys.executable, str(work / &quot;ticket_graph.py&quot;), step], env={**env, **extra},
+                       capture_output=True, text=True, timeout=120)
+    reran += &quot;process 2 ran classify&quot; in (work / f&quot;async{trial}.log&quot;).read_text()
+print(f&quot;  classify ran again after the crash in {reran} of 8 trials (the background write races the crash)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">
+== durability=&#x27;exit&#x27;
+process &#x27;start&#x27;: exit code 1 (killed inside &#x27;bug&#x27; on purpose)
+process &#x27;resume&#x27;: exit code 1 (langgraph.errors.EmptyInputError: Received no input for __start__)
+process &#x27;approve&#x27;: exit code 1 (KeyError: &#x27;input&#x27;)
+  node log across the three processes:
+    process 1 ran classify
+    process 1 ran bug
+    process 3 ran classify
+
+== durability=&#x27;sync&#x27;
+process &#x27;start&#x27;: exit code 1 (killed inside &#x27;bug&#x27; on purpose)
+process &#x27;resume&#x27;: exit code 0
+  returned keys [&#x27;input&#x27;, &#x27;route&#x27;, &#x27;ticket&#x27;]; next node: [&#x27;human_gate&#x27;]; waiting on: {&#x27;ticket&#x27;: &#x27;BUG-0928&#x27;, &#x27;question&#x27;: &#x27;send this ticket?&#x27;}
+process &#x27;approve&#x27;: exit code 0
+  returned keys [&#x27;approved&#x27;, &#x27;input&#x27;, &#x27;output&#x27;, &#x27;route&#x27;, &#x27;ticket&#x27;]; next node: END; output: sent BUG-0928
+  node log across the three processes:
+    process 1 ran classify
+    process 1 ran bug
+    process 2 ran bug
+    process 2 ran human_gate
+    process 3 ran human_gate
+    process 3 ran send
+
+== durability=&#x27;async&#x27; (the default): 8 crash-and-resume trials, no model in classify
+  classify ran again after the crash in 8 of 8 trials (the background write races the crash)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong><code>exit</code> saves nothing for a crash.</strong> Its checkpoints are written only when a run ends, and this one was killed. Process 2 finds an empty thread and fails (<code>EmptyInputError</code>); process 3's resume command starts a fresh run with no input and fails in classify. For a crash, <code>exit</code> is the same as having no checkpointer.</p>
+<p><strong><code>sync</code> recovers exactly.</strong> Process 2 re-runs only <code>bug</code>, the node that was interrupted; classify ran once. Process 3 answers the interrupt and the ticket is sent. Bug ran twice in total: the step in progress always repeats (at-least-once). Human_gate also ran twice, once to pause and once to receive "approve".</p>
+<p><strong><code>async</code> is a race.</strong> Its checkpoint after classify is written in the background while bug starts, so whether classify runs again depends on whether the write or the crash finishes first. The trial line counts the runs in which classify ran again; the count varies with timing (in an earlier run with the model-loading classify the write usually won), and any nonzero count means a repeated step. If a repeated step is expensive or has side effects, use <code>sync</code>.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Time travel: fork from an earlier checkpoint</div><div class="co-body"><p>This block continues from the one above, in this process. It lists the finished <code>sync</code> thread's checkpoints, takes the one saved right after classify, corrects the route to <code>sales</code> with <code>update_state</code> (a person overriding the classifier), and runs the fork to its interrupt. About 10 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Time travel on the finished 'sync' thread, in this process: list its checkpoints, then fork from the one
+# taken right after 'classify' with the route corrected by a person, and run the fork to its interrupt.
+# Continues from the block above (work directory and database).
+import importlib
+os.environ.update(DB=str(work / &quot;sync.sqlite&quot;), NODE_LOG=str(work / &quot;fork.log&quot;), PROC=&quot;4&quot;, HF_HUB_OFFLINE=&quot;1&quot;)
+sys.path.insert(0, str(work))
+tg = importlib.import_module(&quot;ticket_graph&quot;)
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;ticket-42&quot;}}
+history = list(tg.app.get_state_history(cfg))
+print(f&quot;{len(history)} checkpoints on thread ticket-42, newest first:&quot;)
+for snap in history:
+    vals = {k: v for k, v in snap.values.items() if k in (&quot;route&quot;, &quot;ticket&quot;, &quot;approved&quot;, &quot;output&quot;)}
+    print(f&quot;  step {snap.metadata.get('step'):&gt;2}  next={list(snap.next) or ['END']!s:&lt;16} {vals}&quot;)
+after_classify = next(s for s in history if list(s.next) == [&quot;bug&quot;])
+fork_cfg = tg.app.update_state(after_classify.config, {&quot;route&quot;: &quot;sales&quot;}, as_node=&quot;classify&quot;)
+out = tg.app.invoke(None, fork_cfg, durability=&quot;sync&quot;)
+print(f&quot;\nfork with route corrected to 'sales': ticket {out['ticket']}, waiting on {out['__interrupt__'][0].value['question']!r}&quot;)
+print(&quot;nodes the fork ran:&quot;, (work / &quot;fork.log&quot;).read_text().split(&quot;\n&quot;)[:-1])
+print(f&quot;checkpoints on the thread now: {len(list(tg.app.get_state_history(cfg)))} (the original branch is kept)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">6 checkpoints on thread ticket-42, newest first:
+  step  4  next=[&#x27;END&#x27;]          {&#x27;route&#x27;: &#x27;bug&#x27;, &#x27;ticket&#x27;: &#x27;BUG-0928&#x27;, &#x27;approved&#x27;: True, &#x27;output&#x27;: &#x27;sent BUG-0928&#x27;}
+  step  3  next=[&#x27;send&#x27;]         {&#x27;route&#x27;: &#x27;bug&#x27;, &#x27;ticket&#x27;: &#x27;BUG-0928&#x27;, &#x27;approved&#x27;: True}
+  step  2  next=[&#x27;human_gate&#x27;]   {&#x27;route&#x27;: &#x27;bug&#x27;, &#x27;ticket&#x27;: &#x27;BUG-0928&#x27;}
+  step  1  next=[&#x27;bug&#x27;]          {&#x27;route&#x27;: &#x27;bug&#x27;}
+  step  0  next=[&#x27;classify&#x27;]     {}
+  step -1  next=[&#x27;__start__&#x27;]    {}
+
+fork with route corrected to &#x27;sales&#x27;: ticket SAL-0928, waiting on &#x27;send this ticket?&#x27;
+nodes the fork ran: [&#x27;process 4 ran sales&#x27;, &#x27;process 4 ran human_gate&#x27;]
+checkpoints on the thread now: 8 (the original branch is kept)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Every step left a checkpoint.</strong> Six snapshots, from the input (step −1) to the end (step 4), each with the node that would run next; the state grows from nothing to the sent ticket.</p>
+<p><strong>A fork changes the past without erasing it.</strong> <code>update_state</code> on the snapshot taken after classify writes a new checkpoint with <code>route</code> set to <code>sales</code>, as if classify had said so. Running from there executes <code>sales</code> and <code>human_gate</code> (and pauses for approval) and produces a <code>SAL-</code> ticket. The thread now holds 8 checkpoints: the original branch is still there for audit, and the fork is the new head.</p>
+<p><strong>This is how a reviewer fixes a misrouted ticket</strong>: correct the one field, replay only what depends on it.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements a stdlib stateful graph:</p>
+<ul>
+<li><code>State</code> — a typed dict with <code>messages</code>, <code>step</code>, <code>route</code>, <code>output</code>, <code>human_approval</code>.</li>
+<li><code>Node</code> — callable taking state and returning an update dict.</li>
+<li><code>StateGraph</code> — nodes + edges + conditional edges + run + resume.</li>
+<li><code>SQLiteCheckpointer</code> (in-memory fake) — serializes state after every node; <code>load(session_id)</code> restores.</li>
+<li>A demo graph: classify -&gt; branch(refund / bug / sales) -&gt; human gate -&gt; send.</li>
+</ul>
+<p>Run it:</p>
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>Edge</code>, <code>StateGraph</code>, <code>_make_router</code>, <code>InMemoryCheckpointer</code>, <code>START</code>, <code>END</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;LangGraph-shaped stateful graph in stdlib, with checkpoint and resume.
+
+State is a typed dict. Nodes return update dicts. Runtime serializes state
+after every node so resume picks up exactly where it left off.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import copy
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+State = dict[str, Any]
+Update = dict[str, Any]
+NodeFn = Callable[[State], Update]
+Router = Callable[[State], str]
+
+
+START = &quot;__start__&quot;
+END = &quot;__end__&quot;
+
+
+@dataclass
+class Edge:
+    src: str
+    dst: str
+    router: Router | None = None
+
+
+class StateGraph:
+    def __init__(self) -&gt; None:
+        self.nodes: dict[str, NodeFn] = {}
+        self.edges: dict[str, list[Edge]] = {}
+        self.entry: str | None = None
+
+    def add_node(self, name: str, fn: NodeFn) -&gt; None:
+        self.nodes[name] = fn
+
+    def set_entry(self, name: str) -&gt; None:
+        self.entry = name
+
+    def add_edge(self, src: str, dst: str) -&gt; None:
+        self.edges.setdefault(src, []).append(Edge(src=src, dst=dst))
+
+    def add_conditional_edges(self, src: str, router: Router,
+                              targets: dict[str, str]) -&gt; None:
+        for value, dst in targets.items():
+            self.edges.setdefault(src, []).append(
+                Edge(src=src, dst=dst, router=_make_router(router, value))
+            )
+
+    def _next(self, current: str, state: State) -&gt; str | None:
+        for edge in self.edges.get(current, []):
+            if edge.router is None or edge.router(state):
+                return edge.dst
+        return None
+
+
+def _make_router(router: Router, expected: str) -&gt; Router:
+    def fn(state: State) -&gt; bool:
+        return router(state) == expected
+    return fn
+
+
+class InMemoryCheckpointer:
+    def __init__(self) -&gt; None:
+        self._store: dict[str, list[tuple[str, State]]] = {}
+
+    def save(self, session_id: str, step_name: str, state: State) -&gt; None:
+        self._store.setdefault(session_id, []).append((step_name, copy.deepcopy(state)))
+
+    def load_latest(self, session_id: str) -&gt; tuple[str, State] | None:
+        history = self._store.get(session_id, [])
+        if not history:
+            return None
+        return history[-1]
+
+    def history(self, session_id: str) -&gt; list[tuple[str, State]]:
+        return list(self._store.get(session_id, []))
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>PausedAtNode</code>, <code>Runner</code>, <code>_classify</code>, <code>_refund</code>, <code>_bug</code>, <code>_sales</code>, <code>_human_gate</code>, <code>_send</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class PausedAtNode(Exception):
+    def __init__(self, node: str, state: State) -&gt; None:
+        super().__init__(node)
+        self.node = node
+        self.state = state
+
+
+class Runner:
+    def __init__(self, graph: StateGraph,
+                 checkpointer: InMemoryCheckpointer) -&gt; None:
+        self.graph = graph
+        self.checkpointer = checkpointer
+
+    def run(self, session_id: str, initial_state: State,
+            resume_from: str | None = None,
+            state_override: State | None = None) -&gt; State:
+        if state_override is not None:
+            state = copy.deepcopy(state_override)
+        else:
+            state = copy.deepcopy(initial_state)
+        current = resume_from or self.graph.entry
+        if current is None:
+            raise RuntimeError(&quot;no entry node set&quot;)
+        while current is not None and current != END:
+            fn = self.graph.nodes.get(current)
+            if fn is None:
+                raise RuntimeError(f&quot;unknown node {current!r}&quot;)
+            update = fn(state)
+            if update is None:
+                update = {}
+            state = {**state, **update}
+            self.checkpointer.save(session_id, current, state)
+            if state.get(&quot;_pause_reason&quot;):
+                reason = state.pop(&quot;_pause_reason&quot;)
+                raise PausedAtNode(current, state)
+            current = self.graph._next(current, state)
+        return state
+
+
+def _classify(state: State) -&gt; Update:
+    text = state[&quot;input&quot;].lower()
+    if &quot;refund&quot; in text or &quot;money back&quot; in text:
+        route = &quot;refund&quot;
+    elif &quot;crash&quot; in text or &quot;bug&quot; in text or &quot;error&quot; in text:
+        route = &quot;bug&quot;
+    elif &quot;pricing&quot; in text or &quot;quote&quot; in text:
+        route = &quot;sales&quot;
+    else:
+        route = &quot;sales&quot;
+    return {&quot;route&quot;: route, &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+
+
+def _refund(state: State) -&gt; Update:
+    return {&quot;ticket&quot;: f&quot;REF-{state.get('input', '')[:12]}&quot;,
+            &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+
+
+def _bug(state: State) -&gt; Update:
+    return {&quot;ticket&quot;: f&quot;BUG-{state.get('input', '')[:12]}&quot;,
+            &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+
+
+def _sales(state: State) -&gt; Update:
+    return {&quot;ticket&quot;: f&quot;SAL-{state.get('input', '')[:12]}&quot;,
+            &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+
+
+def _human_gate(state: State) -&gt; Update:
+    if not state.get(&quot;human_approval&quot;):
+        return {&quot;_pause_reason&quot;: &quot;awaiting human approval&quot;,
+                &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+    return {&quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+
+
+def _send(state: State) -&gt; Update:
+    return {&quot;output&quot;: f&quot;sent {state.get('ticket')}&quot;,
+            &quot;step&quot;: state.get(&quot;step&quot;, 0) + 1}
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · <code>build_graph</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def build_graph() -&gt; StateGraph:
+    graph = StateGraph()
+    graph.add_node(&quot;classify&quot;, _classify)
+    graph.add_node(&quot;refund&quot;, _refund)
+    graph.add_node(&quot;bug&quot;, _bug)
+    graph.add_node(&quot;sales&quot;, _sales)
+    graph.add_node(&quot;human_gate&quot;, _human_gate)
+    graph.add_node(&quot;send&quot;, _send)
+    graph.set_entry(&quot;classify&quot;)
+
+    graph.add_conditional_edges(
+        &quot;classify&quot;,
+        router=lambda s: s[&quot;route&quot;],
+        targets={&quot;refund&quot;: &quot;refund&quot;, &quot;bug&quot;: &quot;bug&quot;, &quot;sales&quot;: &quot;sales&quot;},
+    )
+    graph.add_edge(&quot;refund&quot;, &quot;human_gate&quot;)
+    graph.add_edge(&quot;bug&quot;, &quot;human_gate&quot;)
+    graph.add_edge(&quot;sales&quot;, &quot;human_gate&quot;)
+    graph.add_edge(&quot;human_gate&quot;, &quot;send&quot;)
+    graph.add_edge(&quot;send&quot;, END)
+    return graph
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;LANGGRAPH STATE MACHINE — Phase 14, Lesson 13&quot;)
+    print(&quot;=&quot; * 70)
+
+    graph = build_graph()
+    ckpt = InMemoryCheckpointer()
+    runner = Runner(graph, ckpt)
+
+    session = &quot;s001&quot;
+    initial: State = {&quot;input&quot;: &quot;the CLI crashes on ctrl-c, please fix&quot;,
+                      &quot;step&quot;: 0, &quot;human_approval&quot;: False}
+
+    print(&quot;\nfirst run (will pause at human_gate)&quot;)
+    try:
+        final = runner.run(session, initial)
+        print(f&quot;  final: {final}&quot;)
+    except PausedAtNode as paused:
+        print(f&quot;  PAUSED at {paused.node}&quot;)
+        print(f&quot;  state at pause: {json.dumps(paused.state, default=str)}&quot;)
+
+    print(&quot;\ncheckpoint history&quot;)
+    for node, snap in ckpt.history(session):
+        print(f&quot;  {node}  route={snap.get('route')}  &quot;
+              f&quot;ticket={snap.get('ticket')}  step={snap.get('step')}&quot;)
+
+    print(&quot;\nhuman approves; resume from next node after human_gate&quot;)
+    latest = ckpt.load_latest(session)
+    assert latest is not None
+    last_node, last_state = latest
+    approved_state = {**last_state, &quot;human_approval&quot;: True}
+    approved_state.pop(&quot;_pause_reason&quot;, None)
+    ckpt.save(session, f&quot;{last_node}_reviewed&quot;, approved_state)
+
+    final = runner.run(
+        session_id=session,
+        initial_state=initial,
+        resume_from=&quot;send&quot;,
+        state_override=approved_state,
+    )
+    print(f&quot;  final: {final}&quot;)
+
+    print()
+    print(&quot;property: state serializes after every node; resume is exact.&quot;)
+    print(&quot;no fresh re-runs after step 38 fails; pick up at step 39.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+LANGGRAPH STATE MACHINE — Phase 14, Lesson 13
+======================================================================
+
+first run (will pause at human_gate)
+  PAUSED at human_gate
+  state at pause: {&quot;input&quot;: &quot;the CLI crashes on ctrl-c, please fix&quot;, &quot;step&quot;: 3, &quot;human_approval&quot;: false, &quot;route&quot;: &quot;bug&quot;, &quot;ticket&quot;: &quot;BUG-the CLI cras&quot;}
+
+checkpoint history
+  classify  route=bug  ticket=None  step=1
+  bug  route=bug  ticket=BUG-the CLI cras  step=2
+  human_gate  route=bug  ticket=BUG-the CLI cras  step=3
+
+human approves; resume from next node after human_gate
+  final: {&#x27;input&#x27;: &#x27;the CLI crashes on ctrl-c, please fix&#x27;, &#x27;step&#x27;: 4, &#x27;human_approval&#x27;: True, &#x27;route&#x27;: &#x27;bug&#x27;, &#x27;ticket&#x27;: &#x27;BUG-the CLI cras&#x27;, &#x27;output&#x27;: &#x27;sent BUG
+
+property: state serializes after every node; resume is exact.
+no fresh re-runs after step 38 fails; pick up at step 39.</code></pre></div></div></aside>
+<p>The trace shows the first run failing at the human gate, persistence, then resume producing the final output.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<ul>
+<li><strong>LangGraph</strong> — the reference, production-ready. Use LangChain's <code>create_agent</code> (which runs on LangGraph and replaced the deprecated <code>create_react_agent</code>), <code>create_supervisor</code>, or build your own graph.</li>
+<li><strong>AutoGen v0.4</strong> (<a href="#a1414">Lesson 14.14</a>) — actor model alternative for high-concurrency scenarios; it is in maintenance now, with Microsoft Agent Framework as its successor.</li>
+<li><strong>Claude Agent SDK</strong> (<a href="#a1417">Lesson 14.17</a>) — managed harness with built-in session store.</li>
+<li><strong>Custom</strong> — when you need exact control over state shape or checkpointer backend.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>The <code>refund</code> node calls a payment API to issue the refund, then returns <code>{"ticket": ...}</code>. The process crashes right after the API call returns, before the node finishes. What happens on resume, and how do you make it safe? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>LangGraph 1.x</strong> is the most used graph runtime for agents in Python and JavaScript; LangChain 1.0's <code>create_agent</code> runs on it, and LangGraph Platform (LangSmith Deployment) hosts graphs with Postgres checkpointing, task queues and a studio for time travel.</li>
+<li><strong>Durable execution elsewhere</strong>: Temporal, Restate, DBOS and Inngest give the same "resume from the last completed step" guarantee to general workflows, and are used to run agents too (lesson 15.12).</li>
+<li><strong>Human-in-the-loop</strong> through <code>interrupt()</code> and <code>Command(resume=...)</code> is the standard way to put approvals inside a LangGraph run.</li>
+<li><strong>On your laptop</strong>: SQLite checkpointing needs nothing but <code>langgraph-checkpoint-sqlite</code>; Postgres in Docker is the production-like option. The graph itself is cheap; the model calls in nodes are what you avoid repeating.</li>
+</ul>
+<p>Sources: <a href="https://docs.langchain.com/oss/python/langgraph/persistence">LangGraph persistence</a>, <a href="https://docs.langchain.com/oss/python/langgraph/checkpointers">LangGraph checkpointers and durability modes</a>, <a href="https://docs.langchain.com/oss/python/langgraph/interrupts">LangGraph interrupts</a>, <a href="https://docs.langchain.com/oss/python/langchain/agents">LangChain create_agent</a>, <a href="https://temporal.io/">Temporal</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>State, nodes, edges, and a checkpoint after each step, per thread.</li>
+<li>Resume re-runs the interrupted step; make nodes idempotent.</li>
+<li>Use synchronous durability when a lost step is expensive.</li>
+<li><code>interrupt()</code> pauses for a person; the node restarts on resume.</li>
+<li>Forks from old checkpoints add branches without losing history.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-agent-state-graphs-v5"><span class="t" style="--cs-hue:165">AM</span>Cheat sheet · Agent State Machines and Durable Graphs</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-state-graph.md</code> generates a LangGraph-shaped state graph in any target runtime with checkpointing and resume wired in.</p>
+<p><strong><code>outputs/skill-state-graph.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: state-graph
+description: Build a LangGraph-shaped state machine with typed state, conditional edges, per-node checkpointing, and durable resume.
+version: 1.0.0
+phase: 14
+lesson: 13
+tags: [langgraph, state-machine, durable, checkpointing, human-in-the-loop]
+---
+
+Given a target runtime, a state shape, a set of node functions, and a checkpointer backend, produce a stateful agent graph.
+
+Produce:
+
+1. A typed `State` (dict or Pydantic). Document every field. Nodes read state; they return updates.
+2. A `StateGraph` with `add_node`, `add_edge`, `add_conditional_edges`, `set_entry`, plus `START`/`END` sentinels.
+3. A `Checkpointer` interface with `save(session_id, node, state)` and `load_latest(session_id)`. Default to SQLite; allow Postgres/Redis/custom.
+4. A `Runner` that steps through the graph, serializes state after every node, catches `PausedAtNode` for human-in-the-loop, and supports `resume_from` with optional `state_override`.
+5. Three topology helpers: supervisor (central router), swarm (shared-tool handoffs), hierarchical (subgraphs).
+
+Hard rejects:
+
+- Non-deterministic nodes without explicit random-seed or wall-clock capture. Resume assumes node output is reproducible given input state.
+- A checkpointer that only saves &quot;summary&quot; state. Serialize the full state or resume breaks.
+- Graphs where every edge is conditional. Prefer linear chains with occasional branches.
+
+Refusal rules:
+
+- If the user asks for a state graph without persistence, refuse. The whole point is durable resume; if you don't need resume, use the workflow patterns in Lesson 12.
+- If the user asks to &quot;checkpoint only on success,&quot; refuse. Failures need state too — that's where debugging starts.
+- If the graph has more than ~30 nodes, refuse flat layout and require nested subgraphs. Flat 30-node graphs are unreviewable.
+
+Output: `state.py`, `graph.py`, `checkpointer.py`, `runner.py`, `README.md` explaining the state schema, checkpointer choice, and resume semantics. End with &quot;what to read next&quot; pointing to Lesson 14 for actor-model alternative, Lesson 16 for handoffs/guardrails layer, or Lesson 23 for OTel spans on graph steps.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Add a conditional edge from <code>classify</code> to <code>end</code> when classification confidence is below a threshold. Resume the run after a human sets <code>route</code> manually.</li>
+<li>Swap the SQLite-like fake for a real SQLite checkpointer. Measure per-step serialization overhead.</li>
+<li>Implement parallel edges: two nodes run concurrently, merge by a custom reducer. What does immutable state buy here?</li>
+<li>Read <code>langgraph-supervisor</code> reference. Port the toy to <code>create_supervisor</code>. Compare the trace shapes.</li>
+<li>Add streaming: each node yields partial state while it runs. Print the deltas as they arrive.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1413-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · It depends on the durability mode</span></summary><div class="qa-a"><p>With <code>exit</code>, nothing was saved, so there is nothing to resume: the run starts over from the input (or, as in the lab, the resume fails because no input is given). With <code>sync</code>, only <code>bug</code> runs again. With <code>async</code>, the default, it depends on timing: <code>bug</code> always, and <code>classify</code> too whenever the crash beat the background write of the checkpoint after classify. The interrupted node repeats in every mode.</p></div></details>
+<details class="qa" id="a1413-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A refund issued twice</span></summary><div class="qa-a"><p>On resume the <code>refund</code> node runs again from the top, because its checkpoint was never written: it calls the payment API a second time and the customer is refunded twice. No durability mode prevents this; checkpoints are taken between steps, and the crash happened inside one.</p>
+<p>Make the side effect idempotent: send an idempotency key derived from the thread and ticket (for example <code>refund-{thread_id}</code>) so the payment provider ignores the duplicate; or split the node so that one step records the intent in the state, a second step performs the call with the key, and a third records the result. For irreversible actions, put the human approval before the call, not after.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview">LangGraph overview</a> — the reference docs</li>
+<li><a href="https://reference.langchain.com/python/langgraph/supervisor/">langgraph-supervisor reference</a> — supervisor pattern API</li>
+<li><a href="https://www.microsoft.com/en-us/research/articles/autogen-v0-4-reimagining-the-foundation-of-agentic-ai-for-scale-extensibility-and-robustness/">AutoGen v0.4, Microsoft Research</a> — actor-model alternative</li>
+<li><a href="https://platform.claude.com/docs/en/agent-sdk/overview">Claude Agent SDK overview</a> — session store and subagents</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/14-agent-engineering/13-langgraph-stateful-graphs" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1413" id="done-a1413">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1413" id="undo-a1413" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1412"><span class="pn-dir">Previous</span><span class="pn-t">14.12 · Anthropic's Workflow Patterns: Simple Over Complex</span></a><a class="pn next" href="#a1414"><span class="pn-dir">Next</span><span class="pn-t">14.14 · The Actor Model for Agents — Async Messages and Typed Runtimes</span></a></div></footer>

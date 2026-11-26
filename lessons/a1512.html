@@ -1,0 +1,716 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-15">Phase 15 · Autonomous Systems</a></nav><h1>Long-Running Background Agents: Durable Execution</h1><div class="m-meta"><span class="chip chip-num">Lesson 15.12</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1512" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 15 · 10 (Permission modes), Phase 15 · 01 (Long-horizon agents)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, minimal durable-execution state machine), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Production long-horizon agents do not run in <code>while True</code>. Every LLM call becomes an activity with checkpoint, retry, and replay. Temporal's OpenAI Agents SDK integration entered public preview in July 2025, and its Python version is now generally available. Claude Code scheduled tasks (launched as Routines in April 2026) run Claude Code in Anthropic's cloud on a schedule or a trigger, with no process on your machine. Sessions pause on human-input, survive deploys, and resume from the latest checkpoint keyed by <code>thread_id</code>. Behind the new ergonomics sits an old pattern — workflow orchestration — with one new input: LLM calls as non-deterministic activities that must be deterministically replayed on recovery.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Workflow</td>
+<td>"Agent's script"</td>
+<td>Deterministic orchestration code; replayable from event log</td>
+</tr>
+<tr>
+<td>Activity</td>
+<td>"A step"</td>
+<td>Non-deterministic unit (LLM call, tool call); logged before and after</td>
+</tr>
+<tr>
+<td>Event log</td>
+<td>"The backing store"</td>
+<td>Durable record of every state transition</td>
+</tr>
+<tr>
+<td>Replay</td>
+<td>"Resume"</td>
+<td>Re-run workflow; completed activities return logged results without re-execution</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>"Save point"</td>
+<td>Persisted state keyed by thread_id; latest-wins on resume</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>"Session key"</td>
+<td>Identifier that scopes durable state</td>
+</tr>
+<tr>
+<td>Agent half-life</td>
+<td>"Reliability decay"</td>
+<td>Ord (2025), on METR's tasks: success falls exponentially with task length, as if each hour had the same chance of a fatal error</td>
+</tr>
+<tr>
+<td>Non-determinism</td>
+<td>"Drift on replay"</td>
+<td>Wall clock, random, LLM output; must be registered as side effect</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l1208">Zero to Agents 12.8 · Durable execution and deployment</a></li><li><a class="xref" href="#l0305">Zero to Agents 3.5 · State, checkpoints, resume and human approval</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>An agent that runs for hours will be interrupted: a deploy, a crash, a reboot, a human who answers tomorrow. <strong>Durable execution</strong> writes every outside call (a model call, a tool call, an email) to a log before and after it runs. On restart the workflow code runs again from the top, and every call already in the log returns its logged result instead of running again. Durable execution and checkpoint-and-resume are covered in Zero to Agents 12.8 and 3.5 (linked above). This lesson breaks the toy engine in three realistic ways, fixes it, and then puts a real model call inside it.</p></div></aside>
+
+<p>Consider an agent that runs for four hours. It calls three tools, prompts the user twice, and makes forty LLM calls. Halfway through, the host it is running on reboots. What happens?</p>
+<ul>
+<li>In a naive <code>while True</code> loop: everything is lost. The run restarts from scratch. The three tool calls (with real side effects) execute again. The user is prompted again for things they already approved. Forty LLM calls are re-billed.</li>
+<li>With durable execution: the run resumes from the most recent checkpoint. Already-completed activities are not re-executed; their results are replayed from the durable log. The user does not re-approve things they already approved. The LLM calls already made are not re-billed.</li>
+</ul>
+<p>This is the same pattern workflow engines have shipped for a decade (Temporal, Cadence, Uber's Cherami). What's new is that LLM calls are now a kind of activity — non-deterministic, expensive, with side effects — and they fit this pattern cleanly.</p>
+<p>The running theme of the lesson: long-horizon reliability decays. On METR's task suite, an agent's success rate falls roughly exponentially with how long the task takes a human, so each agent has a "half-life" (Toby Ord, 2025). Durable execution enables runs that are longer than the reliability profile supports, which is a new way to fail safely if the design is right and unsafely if the design is wrong.</p>
+<h2>Idea 1 · Activities, workflows, and replay</h2>
+<ul>
+<li><strong>Workflow</strong>: deterministic orchestration code. Defines the sequence of activities, the branches, the waits. Must be deterministic so it can be replayed from the event log without surprising divergence.</li>
+<li><strong>Activity</strong>: a non-deterministic, potentially failing unit of work. LLM call, tool call, file write, HTTP request. Each activity is logged with its inputs and (once complete) its outputs.</li>
+<li><strong>Event log</strong>: the durable backing store. Every activity start, complete, fail, retry, and every workflow decision is recorded.</li>
+<li><strong>Replay</strong>: on recovery, the workflow code re-runs from the start; every activity that already completed returns its logged result without re-executing. Only activities that had not completed are actually run.</li>
+</ul>
+<p>This is the same shape as React re-rendering against a virtual DOM, or Git rebuilding a working tree from commits. Determinism in the orchestrator is what makes durability cheap.</p>
+<h2>Idea 2 · Why LLM calls fit the pattern</h2>
+<p>LLM calls are:
+- Non-deterministic (temperature &gt; 0; even temperature 0 drifts across model versions).
+- Expensive (money and latency).
+- Potentially failing (rate limits, timeouts).
+- Side-effectful (if they invoke tools).</p>
+<p>This is exactly the activity profile. Wrapping every LLM call as an activity gives you retry with exponential backoff, checkpointing across restarts, and a replayable trace for debugging.</p>
+<h2>Idea 3 · Checkpoints keyed by <code>thread_id</code></h2>
+<p>LangGraph, Microsoft Agent Framework, Cloudflare Durable Objects, and the Claude Agent SDK (resumable session IDs) all converged on the same API shape: a <code>thread_id</code> (or equivalent) identifies the session; each state transition persists to a backend (PostgreSQL default, SQLite for dev, Redis for cache); resume reads the latest checkpoint.</p>
+<p>The backend choice matters:</p>
+<ul>
+<li><strong>PostgreSQL</strong>: durable, queryable, survives deploys. Default for LangGraph.</li>
+<li><strong>SQLite</strong>: local-dev only; loses data across hosts.</li>
+<li><strong>Redis</strong>: fast but ephemeral unless AOF/snapshot configured.</li>
+<li><strong>Cloudflare Durable Objects</strong>: transparently distributed; scoped by a unique key; survives for hours to weeks.</li>
+</ul>
+<h2>Idea 4 · Human-input as a first-class state</h2>
+<p>Propose-then-commit (<a href="#a1515">Lesson 15.15</a>) requires a durable "waiting on human" state. The workflow pauses, the external queue holds the pending request, and an approval resumes from exactly that point. Without durability this is best-effort; with it, an overnight approval arrives and the workflow picks up in the morning.</p>
+<h2>Idea 5 · Reliability falls with task length</h2>
+<p>METR measures each agent's "time horizon": the length of task, timed on human experts, that it completes half the time. Toby Ord (2025) showed that METR's success curves fit a constant failure rate per minute of task: success falls exponentially with length, and each agent has a half-life. Doubling a task's length squares the success rate. At a 4-hour half-life a 1-hour task succeeds 84% of the time and a 2-hour task 71%, so failure goes from 16% to 29%. Durable execution does not fix this; it lets you run longer than the reliability profile supports. The safe pattern is to combine durability with checkpoints that require fresh HITL on re-entry, and with budget kill switches (<a href="#a1513">Lesson 15.13</a>) that cap total compute regardless of wall-clock time.</p>
+<h2>Idea 6 · When durable execution is the wrong answer</h2>
+<ul>
+<li>Runs shorter than a few minutes with no human input. Overhead &gt; benefit.</li>
+<li>Strictly read-only information retrieval.</li>
+<li>Tasks where correctness requires end-to-end within one context window (some reasoning tasks; some one-shot generation).</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="memory-consolidation"></div></figure></p>
+
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Replay.</strong> Number the activities a workflow asks for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">2</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span></span></span></span> and let the log <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> map a position to its result. On a run, activity <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> returns
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal">L</span><span class="mopen">[</span><span class="mord mathnormal">i</span><span class="mclose">]</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">run it, then log </span></span><span class="mord mathnormal">L</span><span class="mopen">[</span><span class="mord mathnormal">i</span><span class="mclose">]</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">if </span></span><span class="mord mathnormal">i</span><span class="mord text"><span class="mord"> is logged as done</span></span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">otherwise.</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div>
+Replay is correct only if the workflow code asks for the same activity at each position every time, which is why the code must be deterministic. Keying by position, not by name and arguments, lets the same call legitimately return different results (a poll).</p>
+<p><strong>Idempotency.</strong> A crash between "the side effect happened" and "done was logged" makes replay run that activity again. Pass the outside system a key <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">workflow id</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">i</span><span class="mclose">)</span></span></span></span> and have it ignore a key it has seen: the effect then happens once however many times the activity runs.</p>
+<p><strong>The half-life.</strong> If every minute of work carries the same chance of a fatal error, success on a task of length <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> is
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1324em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mathnormal mtight">t</span><span class="mord mtight">/</span><span class="mord mathnormal mtight">h</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span></span></span></span></span></div>
+where <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> is the agent's half-life. Doubling the length squares success, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord">2</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>, so failure grows by
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.4271em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.</span></span></span></span></span></div>
+Doubling a task at most doubles its failure rate under this model; it cannot quadruple it.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting one crash</div><div class="co-body"><ul>
+<li>The workflow is fetch → summarise → send. The host dies inside <code>send_report</code>, after the report reached the customer and before "done" was logged.</li>
+<li>The lesson's engine on restart: fetch and summarise replay from the log, send runs again. The customer receives <strong>2</strong> reports.</li>
+<li>The position-keyed engine passes key <code>wf-42/2</code> to the outside system. The second send is answered "duplicate ignored", and the customer receives <strong>1</strong>.</li>
+<li>Half-life arithmetic, with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> hours: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">1/4</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.841</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord">2</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.84</span><span class="mord"><span class="mord">1</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.707</span></span></span></span>. Failure goes from 15.9% to 29.3%, a factor of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.841</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.84</span></span></span></span>.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "With an event log, retries never repeat a side effect."<br>
+  ✓ A crash inside an activity, after its effect and before "done", repeats it. Idempotency keys stop that.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Matching a logged event by name and arguments is enough."<br>
+  ✓ A poll with the same arguments then returns its first answer forever. Real engines match by position in the history.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Reading the clock in workflow code is harmless."<br>
+  ✓ On replay the clock reads differently and the workflow takes another branch. Read it through the engine (<code>Workflow.now()</code>) so the value is logged.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Durable execution makes long runs reliable."<br>
+  ✓ It saves work lost to crashes, not to mistakes. Success still falls with task length.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The host dies right after a report is delivered, before "done" is logged; the run restarts with its log. How many reports does the customer get? Then a workflow polls a job's status three times with the same arguments, and the job finishes on the third poll. What does the lesson's engine return? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Three gaps in the toy engine, and the fixes</div><div class="co-body"><p>The lesson's engine against a fake outside world (an outbox, a job queue, a clock): a crash inside an activity, a poll, and a clock read in workflow code. Then the same runs on a small engine that keys events by position and passes idempotency keys. Runs in under a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson&#x27;s engine (imported from main.py) has three gaps, each shown here against a fake outside world:
+# a crash inside an activity (after its side effect, before &quot;done&quot; is logged), the same activity called twice with
+# the same arguments, and a clock read inside workflow code. Then the fixes real engines use. Runs in under a second.
+import contextlib, io, json, os, tempfile
+from main import activity, fetch_docs, call_llm, reset_log
+
+OUTBOX = []                       # the outside world: every report the customer actually received
+def deliver(report, key=None):
+    if key is not None and any(k == key for k, _ in OUTBOX):
+        return &quot;duplicate ignored&quot;
+    OUTBOX.append((key, report))
+    return &quot;delivered&quot;
+
+class HostDied(Exception):
+    pass
+crash = {&quot;inside_send&quot;: False}
+
+@activity(&quot;send_report&quot;)
+def send_report(summary):
+    deliver(summary)
+    if crash[&quot;inside_send&quot;]:
+        crash[&quot;inside_send&quot;] = False
+        raise HostDied(&quot;host died after delivering, before &#x27;done&#x27; was logged&quot;)
+    return &quot;sent&quot;
+
+def report_workflow(log, query):
+    return send_report(log, call_llm(log, fetch_docs(log, query)))
+
+quiet = contextlib.redirect_stdout(io.StringIO())    # hide the toy engine&#x27;s [run]/[replay] lines
+tmp = tempfile.mkdtemp()
+print(&quot;1. crash inside an activity, the lesson&#x27;s engine&quot;)
+log = reset_log(os.path.join(tmp, &quot;a.json&quot;))
+crash[&quot;inside_send&quot;] = True
+try:
+    with quiet:
+        report_workflow(log, &quot;hello&quot;)
+except HostDied as e:
+    print(f&quot;   attempt 1: {e}&quot;)
+with quiet:
+    report_workflow(log, &quot;hello&quot;)
+print(f&quot;   attempt 2 resumes from the log; the customer received {len(OUTBOX)} reports&quot;)
+
+# ---- the fix: events keyed by position in the workflow, plus an idempotency key per side effect ----
+class Durable:
+    &quot;&quot;&quot;Event i is the i-th activity the workflow asks for, whatever its name or arguments.&quot;&quot;&quot;
+    def __init__(self, path, workflow_id):
+        self.path, self.wf, self.pos, self.calls = path, workflow_id, 0, 0
+        if not os.path.exists(path):
+            json.dump([], open(path, &quot;w&quot;))
+    def events(self):
+        return json.load(open(self.path))
+    def act(self, name, fn, *args, idempotent=False):
+        i, self.pos = self.pos, self.pos + 1
+        logged = [e for e in self.events() if e[&quot;seq&quot;] == i]
+        done = next((e for e in logged if e[&quot;status&quot;] == &quot;done&quot;), None)
+        if logged and logged[0][&quot;name&quot;] != name:
+            raise RuntimeError(f&quot;non-determinism: event {i} was {logged[0][&#x27;name&#x27;]!r} in the log, the code now asks for {name!r}&quot;)
+        if done:
+            return done[&quot;result&quot;]
+        evs = self.events() + [{&quot;seq&quot;: i, &quot;name&quot;: name, &quot;args&quot;: list(args), &quot;status&quot;: &quot;started&quot;}]
+        json.dump(evs, open(self.path, &quot;w&quot;))
+        self.calls += 1
+        result = fn(*args, key=f&quot;{self.wf}/{i}&quot;) if idempotent else fn(*args)
+        json.dump(evs + [{&quot;seq&quot;: i, &quot;name&quot;: name, &quot;status&quot;: &quot;done&quot;, &quot;result&quot;: result}], open(self.path, &quot;w&quot;))
+        return result
+
+def send(summary, key=None):
+    r = deliver(summary, key)
+    if crash[&quot;inside_send&quot;]:
+        crash[&quot;inside_send&quot;] = False
+        raise HostDied(&quot;host died after delivering, before &#x27;done&#x27; was logged&quot;)
+    return r
+
+def report_workflow2(d, query):
+    docs = d.act(&quot;fetch_docs&quot;, lambda q: len(q) * 3, query)
+    summary = d.act(&quot;call_llm&quot;, lambda n: f&quot;summary({n}_docs)&quot;, docs)
+    return d.act(&quot;send_report&quot;, send, summary, idempotent=True)
+
+OUTBOX.clear()
+print(&quot;\n   same crash, position-keyed log and an idempotency key the outside system checks&quot;)
+path = os.path.join(tmp, &quot;b.json&quot;)
+crash[&quot;inside_send&quot;] = True
+try:
+    report_workflow2(Durable(path, &quot;wf-42&quot;), &quot;hello&quot;)
+except HostDied as e:
+    print(f&quot;   attempt 1: {e}&quot;)
+print(f&quot;   attempt 2: send_report -&gt; {report_workflow2(Durable(path, &#x27;wf-42&#x27;), &#x27;hello&#x27;)!r}; the customer received {len(OUTBOX)} report&quot;)
+
+print(&quot;\n2. polling: the same activity, the same arguments, a different answer each time&quot;)
+STATUS = {&quot;job-7&quot;: iter([&quot;pending&quot;, &quot;pending&quot;, &quot;done&quot;] + [&quot;done&quot;] * 10)}
+def check_status(job, key=None):
+    return next(STATUS[job])
+check = activity(&quot;check_status&quot;)(check_status)
+log = reset_log(os.path.join(tmp, &quot;c.json&quot;))
+with quiet:
+    seen = [check(log, &quot;job-7&quot;) for _ in range(5)]
+print(f&quot;   lesson&#x27;s engine, 5 polls: {seen}  (it matches the event by name and arguments)&quot;)
+STATUS[&quot;job-7&quot;] = iter([&quot;pending&quot;, &quot;pending&quot;, &quot;done&quot;] + [&quot;done&quot;] * 10)
+d = Durable(os.path.join(tmp, &quot;d.json&quot;), &quot;wf-43&quot;)
+seen = []
+while not seen or seen[-1] != &quot;done&quot;:
+    seen.append(d.act(&quot;check_status&quot;, check_status, &quot;job-7&quot;))
+print(f&quot;   position-keyed engine:    {seen}&quot;)
+d2 = Durable(os.path.join(tmp, &quot;d.json&quot;), &quot;wf-43&quot;)
+again = []
+while not again or again[-1] != &quot;done&quot;:
+    again.append(d2.act(&quot;check_status&quot;, check_status, &quot;job-7&quot;))
+print(f&quot;   replay after a restart:   {again}, {d2.calls} calls to the outside system&quot;)
+
+print(&quot;\n3. a clock read inside workflow code (the lesson&#x27;s exercise 3)&quot;)
+def triage(d, read_clock):
+    hour = read_clock(d)
+    if hour &lt; 17:
+        return d.act(&quot;page_oncall&quot;, lambda: &quot;paged&quot;)
+    return d.act(&quot;queue_for_morning&quot;, lambda: &quot;queued&quot;)
+raw = lambda d: next(CLOCK)                                      # reads the clock directly
+wrapped = lambda d: d.act(&quot;now&quot;, lambda: next(CLOCK))            # the clock as an activity: Workflow.now()
+for label, reader in ((&quot;raw clock&quot;, raw), (&quot;clock as an activity&quot;, wrapped)):
+    CLOCK = iter([9, 18])                     # hours: the run starts at 09:00, the restart happens at 18:00
+    p = os.path.join(tmp, label.replace(&quot; &quot;, &quot;_&quot;) + &quot;.json&quot;)
+    first = triage(Durable(p, &quot;wf-44&quot;), reader)
+    try:
+        second = triage(Durable(p, &quot;wf-44&quot;), reader)
+    except RuntimeError as e:
+        second = f&quot;error: {e}&quot;
+    print(f&quot;   {label:&lt;21} first run {first!r}, replay {second!r}&quot;)
+
+ACTIONS = []
+page = activity(&quot;page_oncall&quot;)(lambda: ACTIONS.append(&quot;paged&quot;) or &quot;paged&quot;)
+queue = activity(&quot;queue_for_morning&quot;)(lambda: ACTIONS.append(&quot;queued&quot;) or &quot;queued&quot;)
+log = reset_log(os.path.join(tmp, &quot;e.json&quot;))
+CLOCK = iter([9, 18])
+with quiet:
+    for _ in range(2):                         # first run, then a replay after the restart
+        (page if next(CLOCK) &lt; 17 else queue)(log)
+print(f&quot;   the lesson&#x27;s engine, raw clock: no error, and the outside world saw {ACTIONS}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. crash inside an activity, the lesson&#x27;s engine
+   attempt 1: host died after delivering, before &#x27;done&#x27; was logged
+   attempt 2 resumes from the log; the customer received 2 reports
+
+   same crash, position-keyed log and an idempotency key the outside system checks
+   attempt 1: host died after delivering, before &#x27;done&#x27; was logged
+   attempt 2: send_report -&gt; &#x27;duplicate ignored&#x27;; the customer received 1 report
+
+2. polling: the same activity, the same arguments, a different answer each time
+   lesson&#x27;s engine, 5 polls: [&#x27;pending&#x27;, &#x27;pending&#x27;, &#x27;pending&#x27;, &#x27;pending&#x27;, &#x27;pending&#x27;]  (it matches the event by name and arguments)
+   position-keyed engine:    [&#x27;pending&#x27;, &#x27;pending&#x27;, &#x27;done&#x27;]
+   replay after a restart:   [&#x27;pending&#x27;, &#x27;pending&#x27;, &#x27;done&#x27;], 0 calls to the outside system
+
+3. a clock read inside workflow code (the lesson&#x27;s exercise 3)
+   raw clock             first run &#x27;paged&#x27;, replay &quot;error: non-determinism: event 0 was &#x27;page_oncall&#x27; in the log, the code now asks for &#x27;queue_for_morning&#x27;&quot;
+   clock as an activity  first run &#x27;paged&#x27;, replay &#x27;paged&#x27;
+   the lesson&#x27;s engine, raw clock: no error, and the outside world saw [&#x27;paged&#x27;, &#x27;queued&#x27;]
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A crash inside an activity repeats its side effect.</strong> The host died after <code>send_report</code> delivered and before "done" was logged. On restart the lesson's engine replays fetch and summarise, then runs send again: the customer received 2 reports. With an idempotency key (<code>wf-42/2</code>) the outside system answers the second send with <code>'duplicate ignored'</code>, and the customer received 1.</p>
+<p><strong>Matching by name and arguments breaks polling.</strong> The lesson's engine returns <code>pending</code> on all 5 polls, because the second poll finds the first one's logged result. Keyed by position, the polls return <code>pending</code>, <code>pending</code>, <code>done</code>, and a replay after a restart returns the same three answers with 0 calls to the outside system.</p>
+<p><strong>A raw clock changes the branch on replay.</strong> The run started at 09:00 and paged on-call; the restart read 18:00 and asked to queue for the morning instead. The position-keyed engine stops with a non-determinism error. The lesson's engine raises nothing, and the outside world saw both <code>paged</code> and <code>queued</code>. Read through the engine as an activity, the clock replays 09:00 and the run pages once.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A real model call as an activity</div><div class="co-body"><p>This block continues from the one above. Qwen2.5-0.5B-Instruct (sampling at temperature 1.0, CPU) decides whether each of 4 support tickets goes to a human, and the workflow escalates or auto-closes it. The host then dies, and recovery either replays the logged decision or calls the model again. Then greedy decoding at two precisions, and the half-life table. About 1 minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># This block continues from the one above: a real LLM call as an activity. Qwen2.5-0.5B-Instruct (CPU) decides
+# whether a support ticket goes to a human; the workflow then acts on that decision, and the host dies before the
+# run finishes. Recovery either replays the logged decision or calls the model again. Sampling at temperature 1.0,
+# 4 tickets x 3 seeds. Then: does greedy decoding give the same answer at two precisions? And what does a constant
+# failure rate per hour (Ord&#x27;s half-life model) say about long runs? About 1 minute.
+import os, warnings
+os.environ[&quot;HF_HUB_OFFLINE&quot;] = &quot;1&quot;
+warnings.filterwarnings(&quot;ignore&quot;)
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;)
+llm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;).eval()
+
+TICKETS = [&quot;My order arrived damaged, but I can live with it.&quot;,
+           &quot;I was charged twice this month. Please look into it when you can.&quot;,
+           &quot;The app logs me out every few hours. Annoying, not urgent.&quot;,
+           &quot;Your courier left my parcel in the rain again. Third time.&quot;]
+def ask(ticket, seed, model=llm, sample=True):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;Support ticket: {ticket}\nShould this ticket be escalated to a human agent? Answer yes or no.&quot;}],
+                                  add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=3, do_sample=sample, temperature=1.0 if sample else None,
+                             top_p=None, top_k=None)
+    return &quot;yes&quot; if tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip().lower().startswith(&quot;yes&quot;) else &quot;no&quot;
+
+def ticket_workflow(d, ticket, seed, world):
+    decision = d.act(&quot;call_llm&quot;, ask, ticket, seed)
+    d.act(&quot;escalate&quot; if decision == &quot;yes&quot; else &quot;auto_close&quot;, lambda: world.append(decision) or decision)
+    return decision
+
+results = {&quot;replay&quot;: [0, 0], &quot;call again&quot;: [0, 0]}     # [runs where the two decisions differ, tickets both escalated and closed]
+print(f&quot;{&#x27;ticket&#x27;:&lt;44} seed  first  replay  called again&quot;)
+for t_i, ticket in enumerate(TICKETS):
+    for seed in range(3):
+        row = []
+        for mode in (&quot;replay&quot;, &quot;call again&quot;):
+            world = []
+            path = os.path.join(tmp, f&quot;t{t_i}_{seed}_{mode[0]}.json&quot;)
+            first = ticket_workflow(Durable(path, f&quot;tk-{t_i}&quot;), ticket, seed, world)   # host dies right after this
+            if mode == &quot;call again&quot;:
+                os.remove(path)                       # no log for the LLM call: recovery asks the model again
+            again = ticket_workflow(Durable(path, f&quot;tk-{t_i}&quot;), ticket, seed + 100, world)
+            results[mode][0] += first != again
+            results[mode][1] += {&quot;yes&quot;, &quot;no&quot;} &lt;= set(world)
+            row.append(again)
+        print(f&quot;{ticket[:42]:&lt;44} {seed:&gt;4}  {first:&lt;5}  {row[0]:&lt;6}  {row[1]}&quot;)
+for mode, (diff, both) in results.items():
+    print(f&quot;recovery by {mode:&lt;10}: decision changed in {diff}/12 runs; {both}/12 tickets were both escalated and auto-closed&quot;)
+
+print(&quot;\ngreedy decoding (temperature 0), the same weights at two precisions:&quot;)
+llm16 = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;, torch_dtype=torch.bfloat16).eval()
+same = 0
+for ticket in TICKETS:
+    a, b = ask(ticket, 0, llm, sample=False), ask(ticket, 0, llm16, sample=False)
+    same += a == b
+    print(f&quot;   {ticket[:42]:&lt;44} float32 {a:&lt;4} bfloat16 {b}&quot;)
+print(f&quot;   {same}/4 agree&quot;)
+
+print(&quot;\na constant hazard: each hour of work has the same chance of a fatal mistake (Ord 2025, on METR&#x27;s tasks)&quot;)
+print(f&quot;{&#x27;half-life&#x27;:&lt;10}&quot; + &quot;&quot;.join(f&quot;{f&#x27;{t} h&#x27;:&gt;8}&quot; for t in (0.5, 1, 2, 4, 8)))
+for h in (1, 4):
+    print(f&quot;{f&#x27;{h} h&#x27;:&lt;10}&quot; + &quot;&quot;.join(f&quot;{0.5 ** (t / h):&gt;8.1%}&quot; for t in (0.5, 1, 2, 4, 8)))
+p1 = 0.5 ** (1 / 4)
+print(f&quot;half-life 4 h: 1 h succeeds {p1:.0%}, 2 h {p1 ** 2:.0%}; failure goes {1 - p1:.0%} -&gt; {1 - p1 ** 2:.0%}, &quot;
+      f&quot;x{(1 - p1 ** 2) / (1 - p1):.2f}, not x4&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ticket                                       seed  first  replay  called again
+My order arrived damaged, but I can live w      0  no     no      yes
+My order arrived damaged, but I can live w      1  yes    yes     yes
+My order arrived damaged, but I can live w      2  no     no      no
+I was charged twice this month. Please loo      0  yes    yes     yes
+I was charged twice this month. Please loo      1  yes    yes     yes
+I was charged twice this month. Please loo      2  yes    yes     yes
+The app logs me out every few hours. Annoy      0  yes    yes     yes
+The app logs me out every few hours. Annoy      1  yes    yes     yes
+The app logs me out every few hours. Annoy      2  yes    yes     yes
+Your courier left my parcel in the rain ag      0  yes    yes     yes
+Your courier left my parcel in the rain ag      1  yes    yes     yes
+Your courier left my parcel in the rain ag      2  yes    yes     yes
+recovery by replay    : decision changed in 0/12 runs; 0/12 tickets were both escalated and auto-closed
+recovery by call again: decision changed in 1/12 runs; 1/12 tickets were both escalated and auto-closed
+
+greedy decoding (temperature 0), the same weights at two precisions:
+   My order arrived damaged, but I can live w   float32 yes  bfloat16 yes
+   I was charged twice this month. Please loo   float32 yes  bfloat16 yes
+   The app logs me out every few hours. Annoy   float32 yes  bfloat16 yes
+   Your courier left my parcel in the rain ag   float32 yes  bfloat16 yes
+   4/4 agree
+
+a constant hazard: each hour of work has the same chance of a fatal mistake (Ord 2025, on METR&#x27;s tasks)
+half-life    0.5 h     1 h     2 h     4 h     8 h
+1 h          70.7%   50.0%   25.0%    6.2%    0.4%
+4 h          91.7%   84.1%   70.7%   50.0%   25.0%
+half-life 4 h: 1 h succeeds 84%, 2 h 71%; failure goes 16% -&gt; 29%, x1.84, not x4
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Replaying the logged decision never changes it.</strong> Recovery from the log gave the same decision in all 12 runs, and no ticket had two conflicting actions.</p>
+<p><strong>Calling the model again changed one decision.</strong> For "My order arrived damaged, but I can live with it" with seed 0, the first call said <code>no</code> and the ticket was auto-closed; the recovery call said <code>yes</code>, and the same ticket was escalated too. That is 1 of 12 here, because this model answers <code>yes</code> to almost every ticket. On a ticket that is a closer call, re-sampling flips the decision far more often.</p>
+<p><strong>Greedy decoding agreed at both precisions here.</strong> All 4 tickets got the same greedy answer in float32 and bfloat16, so this small test shows no drift. That does not make greedy output a safe replay source: a different model version, library or batch can still change it, and the log costs nothing.</p>
+<p><strong>The half-life table.</strong> With a 1-hour half-life an 8-hour task succeeds 0.4% of the time; with a 4-hour half-life, 25%. Doubling from 1 to 2 hours at a 4-hour half-life takes failure from 16% to 29%, a factor of 1.84, not 4.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> implements a minimal durable-execution engine in stdlib Python. It supports:</p>
+<ul>
+<li><code>@activity</code> decorator that logs inputs and outputs to a JSON event log.</li>
+<li>A workflow function that sequences activities.</li>
+<li>A <code>run_or_replay(workflow, event_log)</code> function that replays completed activities without re-executing them.</li>
+</ul>
+<p>The driver simulates a three-activity workflow, crashes halfway through, and shows (a) a naive retry re-executing everything versus (b) a replay running only the missing activity.</p>
+
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>EventLog</code>, <code>activity</code>, <code>fetch_docs</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Minimal durable-execution engine — stdlib Python.
+
+Models the workflow / activity / event-log pattern used by Temporal, LangGraph
+checkpointing, Microsoft Agent Framework, and Claude Code Routines.
+
+Activities are logged with inputs before execution and outputs after. A
+replay of a workflow re-runs the workflow code but returns cached outputs
+for activities whose event is already in the log. A crash mid-run loses
+only the incomplete activity.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import functools
+import json
+import os
+import tempfile
+from dataclasses import dataclass
+
+
+# ---------- Event log ----------
+
+@dataclass
+class EventLog:
+    path: str
+
+    def __post_init__(self) -&gt; None:
+        if not os.path.exists(self.path):
+            with open(self.path, &quot;w&quot;) as f:
+                json.dump([], f)
+
+    def events(self) -&gt; list[dict]:
+        with open(self.path) as f:
+            return json.load(f)
+
+    def append(self, ev: dict) -&gt; None:
+        evs = self.events()
+        evs.append(ev)
+        with open(self.path, &quot;w&quot;) as f:
+            json.dump(evs, f)
+
+    def lookup(self, name: str, args: tuple) -&gt; dict | None:
+        for ev in self.events():
+            if ev[&quot;name&quot;] == name and ev[&quot;args&quot;] == list(args) and ev[&quot;status&quot;] == &quot;done&quot;:
+                return ev
+        return None
+
+
+# ---------- Activity decorator ----------
+
+def activity(name: str):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(log: EventLog, *args):
+            hit = log.lookup(name, args)
+            if hit:
+                print(f&quot;    [replay] {name}({args}) -&gt; {hit[&#x27;result&#x27;]} (from log)&quot;)
+                return hit[&quot;result&quot;]
+            log.append({&quot;name&quot;: name, &quot;args&quot;: list(args), &quot;status&quot;: &quot;started&quot;})
+            result = fn(*args)
+            log.append({&quot;name&quot;: name, &quot;args&quot;: list(args),
+                        &quot;status&quot;: &quot;done&quot;, &quot;result&quot;: result})
+            print(f&quot;    [run]    {name}({args}) -&gt; {result}&quot;)
+            return result
+        return wrapper
+    return deco
+
+
+# ---------- Example activities ----------
+
+@activity(&quot;fetch_docs&quot;)
+def fetch_docs(query: str) -&gt; int:
+    # Pretend to hit an API; return number of docs.
+    return len(query) * 3
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>call_llm</code>, <code>write_report</code>, <code>workflow</code>, <code>reset_log</code>, <code>count_runs</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@activity(&quot;call_llm&quot;)
+def call_llm(doc_count: int) -&gt; str:
+    # Pretend LLM call; deterministic here for pedagogy.
+    return f&quot;summary({doc_count}_docs)&quot;
+
+
+@activity(&quot;write_report&quot;)
+def write_report(summary: str) -&gt; str:
+    # Pretend tool call with a side effect.
+    return f&quot;report://{summary}&quot;
+
+
+# ---------- Workflow ----------
+
+def workflow(log: EventLog, query: str, crash_after: int = -1) -&gt; str:
+    &quot;&quot;&quot;Three-activity workflow with an optional crash for pedagogy.&quot;&quot;&quot;
+    doc_count = fetch_docs(log, query)
+    if crash_after == 1:
+        raise RuntimeError(&quot;simulated crash after fetch_docs&quot;)
+    summary = call_llm(log, doc_count)
+    if crash_after == 2:
+        raise RuntimeError(&quot;simulated crash after call_llm&quot;)
+    report = write_report(log, summary)
+    return report
+
+
+# ---------- Driver ----------
+
+def reset_log(path: str) -&gt; EventLog:
+    if os.path.exists(path):
+        os.remove(path)
+    return EventLog(path)
+
+
+def count_runs(log: EventLog) -&gt; int:
+    return sum(1 for ev in log.events() if ev[&quot;status&quot;] == &quot;started&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;DURABLE EXECUTION (Phase 15, Lesson 12)&quot;)
+    print(&quot;=&quot; * 70)
+
+    tmpdir = tempfile.mkdtemp()
+
+    # Naive retry: lose the event log on crash. Every restart re-runs
+    # everything.
+    print(&quot;\nNaive retry (no event log persisted)&quot;)
+    print(&quot;-&quot; * 70)
+    for attempt in range(1, 4):
+        log = reset_log(os.path.join(tmpdir, &quot;naive.json&quot;))
+        print(f&quot;  attempt {attempt}:&quot;)
+        try:
+            crash = 2 if attempt == 1 else -1
+            r = workflow(log, &quot;hello&quot;, crash_after=crash)
+            print(f&quot;    -&gt; result {r}&quot;)
+            print(f&quot;    -&gt; {count_runs(log)} activity starts this attempt&quot;)
+            break
+        except RuntimeError as e:
+            print(f&quot;    -&gt; crash: {e}; {count_runs(log)} activity starts wasted&quot;)
+
+    # Durable retry: keep the event log across attempts; replay does not
+    # re-execute completed activities.
+    print(&quot;\nDurable retry (event log preserved across attempts)&quot;)
+    print(&quot;-&quot; * 70)
+    durable_path = os.path.join(tmpdir, &quot;durable.json&quot;)
+    if os.path.exists(durable_path):
+        os.remove(durable_path)
+
+    for attempt in range(1, 4):
+        log = EventLog(durable_path)
+        print(f&quot;  attempt {attempt}:&quot;)
+        try:
+            crash = 2 if attempt == 1 else -1
+            r = workflow(log, &quot;hello&quot;, crash_after=crash)
+            print(f&quot;    -&gt; result {r}&quot;)
+            print(f&quot;    -&gt; {count_runs(log)} total activity starts across attempts&quot;)
+            break
+        except RuntimeError as e:
+            print(f&quot;    -&gt; crash: {e}&quot;)
+
+    print()
+    print(&quot;=&quot; * 70)
+    print(&quot;HEADLINE: durability makes long-horizon runs affordable to fail&quot;)
+    print(&quot;-&quot; * 70)
+    print(&quot;  Naive retry re-executes every activity on every attempt.&quot;)
+    print(&quot;  Durable retry replays completed activities from the log;&quot;)
+    print(&quot;  only the missing activity actually runs. Same design used&quot;)
+    print(&quot;  by Temporal, LangGraph checkpointing, Microsoft Agent&quot;)
+    print(&quot;  Framework, and Claude Code Routines. The LLM call is&quot;)
+    print(&quot;  just another non-deterministic activity in the log.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+DURABLE EXECUTION (Phase 15, Lesson 12)
+======================================================================
+
+Naive retry (no event log persisted)
+----------------------------------------------------------------------
+  attempt 1:
+    [run]    fetch_docs((&#x27;hello&#x27;,)) -&gt; 15
+    [run]    call_llm((15,)) -&gt; summary(15_docs)
+    -&gt; crash: simulated crash after call_llm; 2 activity starts wasted
+  attempt 2:
+    [run]    fetch_docs((&#x27;hello&#x27;,)) -&gt; 15
+    [run]    call_llm((15,)) -&gt; summary(15_docs)
+    [run]    write_report((&#x27;summary(15_docs)&#x27;,)) -&gt; report://summary(15_docs)
+    -&gt; result report://summary(15_docs)
+    -&gt; 3 activity starts this attempt
+
+Durable retry (event log preserved across attempts)
+----------------------------------------------------------------------
+  attempt 1:
+    [run]    fetch_docs((&#x27;hello&#x27;,)) -&gt; 15
+    [run]    call_llm((15,)) -&gt; summary(15_docs)
+    -&gt; crash: simulated crash after call_llm
+  attempt 2:
+    [replay] fetch_docs((&#x27;hello&#x27;,)) -&gt; 15 (from log)
+    [replay] call_llm((15,)) -&gt; summary(15_docs) (from log)
+    [run]    write_report((&#x27;summary(15_docs)&#x27;,)) -&gt; report://summary(15_docs)
+    -&gt; result report://summary(15_docs)
+    -&gt; 3 total activity starts across attempts
+
+======================================================================
+HEADLINE: durability makes long-horizon runs affordable to fail
+----------------------------------------------------------------------
+  Naive retry re-executes every activity on every attempt.
+  Durable retry replays completed activities from the log;
+  only the missing activity actually runs. Same design used
+  by Temporal, LangGraph checkpointing, Microsoft Agent
+  Framework, and Claude Code Routines. The LLM call is
+  just another non-deterministic activity in the log.
+</code></pre></div></div></aside>
+
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Your refund agent runs as a workflow: look up the order, ask the model whether the refund is justified, then call the payments API. The payments call times out after the money moved, the activity is retried, and the customer is refunded twice. A week later a restarted run refunds a customer the model had first refused. Using this lesson, what is missing? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What's current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Workflow engines took on agents.</strong> Temporal's OpenAI Agents SDK integration (public preview July 2025, Python now generally available) runs each model and tool call as a Temporal activity. LangGraph persists every step through a checkpointer (Postgres in production, SQLite for development) keyed by <code>thread_id</code>.</li>
+<li><strong>Agent platforms ship the same shape.</strong> Microsoft Agent Framework workflows checkpoint and pause on a human-input request. Cloudflare Workflows and Durable Objects give per-key durable state. The Claude Agent SDK resumes a session by its ID.</li>
+<li><strong>Scheduled runs without your laptop.</strong> Claude Code scheduled tasks (launched as Routines in April 2026) run Claude Code in Anthropic's cloud on a schedule, an API call or a GitHub event.</li>
+<li><strong>Measured run lengths are growing.</strong> Anthropic reports the longest Claude Code turns (99.9th percentile) grew from under 25 to over 45 minutes between October 2025 and January 2026.</li>
+<li><strong>On your laptop</strong>: a SQLite file is a fine event log for one machine, and this lesson's engine and model run on CPU in about a minute. Use Postgres or a hosted engine once a run must survive moving between hosts.</li>
+</ul>
+<p>Sources: <a href="https://temporal.io/blog/announcing-openai-agents-sdk-integration">Temporal, OpenAI Agents SDK integration</a>, <a href="https://code.claude.com/docs/en/routines">Claude Code docs, scheduled tasks</a>, <a href="https://www.anthropic.com/research/measuring-agent-autonomy">Anthropic, Measuring agent autonomy in practice</a>, <a href="https://arxiv.org/abs/2505.05115">Ord, A half-life for AI agent success rates (arXiv:2505.05115)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Wrap every model call, tool call and outside write as an activity, logged before and after it runs.</li>
+<li>Key logged events by position in the workflow, and keep workflow code deterministic: clocks and random values go through the engine.</li>
+<li>Give every side effect an idempotency key that the outside system checks, because a crash can land between the effect and the log.</li>
+<li>On recovery, replay the logged model output; calling the model again can change a decision after you acted on it.</li>
+<li>Durability saves work lost to crashes, not to mistakes: success still falls with task length, so add fresh approval on resume and a budget cap.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-autonomous-agents"><span class="t" style="--cs-hue:330">AA</span>Cheat sheet · Autonomous Agents and Permissions</a><a href="#cs-production-agent-runtimes"><span class="t" style="--cs-hue:30">PA</span>Cheat sheet · Production Agent Runtimes and Queues</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-durable-execution-review.md</code> reviews a proposed long-running agent deployment for correct durable-execution shape: activities, determinism, checkpoint backend, human-input state, and HITL-on-resume policy.</p>
+<p><strong><code>outputs/skill-durable-execution-review.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: durable-execution-review
+description: Review a proposed long-running agent deployment for correct durable-execution shape (activities, determinism, checkpoint backend, human-input state, HITL-on-resume).
+version: 1.0.0
+phase: 15
+lesson: 12
+tags: [durable-execution, workflows, checkpointing, temporal, langgraph, agents-sdk]
+---
+
+Given a proposed long-running agent deployment (Temporal + OpenAI Agents SDK, LangGraph with PostgreSQL checkpointer, Microsoft Agent Framework, Claude Code scheduled tasks, Cloudflare Durable Objects, or an in-house equivalent), audit the design against the durable-execution pattern.
+
+Produce:
+
+1. **Activity inventory.** List every activity (LLM call, tool call, HTTP request, file write). For each, confirm it is wrapped as an activity with retry policy, timeout, and idempotency key. Raw LLM calls outside the activity envelope are a reliability hole.
+2. **Workflow determinism.** Identify every non-deterministic read inside the workflow code (wall clock, random, external state). Each must be registered as a side-effect activity so replay returns the same value. Hidden non-determinism is the most common cause of replay drift.
+3. **Checkpoint backend.** Name the backend (PostgreSQL, SQLite, Redis, Durable Objects). Confirm it survives deploys. SQLite is dev-only. Redis requires AOF or snapshot config. Cloudflare Durable Objects are transparent but require a unique key discipline.
+4. **Human-input state.** Confirm pauses for HITL are a first-class workflow state, not a polling loop. The workflow should block on an external signal (approval queue, webhook, `interrupt()` primitive) that resumes exactly when the approval arrives.
+5. **HITL-on-resume policy.** For any resume after a crash, state whether fresh HITL is required before executing the next activity. Without this, durable execution plus an approval granted before the crash may re-fire an approved action when the context has changed. Critical for long horizons.
+
+Hard rejects:
+- Agent SDK usage where LLM calls are not wrapped as activities.
+- Checkpoint backends that do not survive a deploy.
+- Workflows that embed wall clock or random without activity wrapping.
+- Human-input modeled as a polling loop rather than a signal.
+- Long-horizon runs (above one hour) with no HITL-on-resume policy.
+- Runs with no budget kill switch (Lesson 13) layered on top of durability.
+
+Refusal rules:
+- If the user proposes a durable workflow with no explicit idempotency on side-effect activities, refuse and require idempotency keys first. Retries will double-execute otherwise.
+- If the user cannot show a replay test (run workflow, crash mid-run, replay, assert no double side effects), refuse and require that test before production.
+- If the user proposes a 24-hour unattended run with no HITL checkpoint, refuse. Success falls with task length (the agent half-life in this lesson), so this is a reliability problem even if durability is correct.
+
+Output format:
+
+Return a design-review memo with:
+- **Activity table** (activity, retry policy, timeout, idempotency key)
+- **Determinism audit** (non-deterministic reads and how each is handled)
+- **Checkpoint backend** (name, survives-deploy y/n, replay-test status)
+- **HITL state shape** (first-class state / polling / missing)
+- **HITL-on-resume policy** (explicit, with rationale)
+- **Readiness** (production / staging / research-only)
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Observe the difference in activity-execution count between naive retry and replay. Change the crash point and show the replay count changes accordingly.</p>
+</li>
+<li>
+<p>Convert the toy engine to use <code>thread_id</code> explicitly. Simulate two concurrent sessions sharing the engine and confirm their event logs do not collide.</p>
+</li>
+<li>
+<p>Take one activity in the toy engine. Introduce a non-determinism (a wall-clock timestamp inside a workflow decision). Demonstrate the divergence on replay. Explain how real engines handle this (side-effect registration, <code>Workflow.now()</code> APIs).</p>
+</li>
+<li>
+<p>Read the LangChain "Runtime behind production deep agents" post. List every state that the runtime persists and name which failure mode each covers.</p>
+</li>
+<li>
+<p>Design a checkpoint policy for a 6-hour autonomous coding task. Where do you checkpoint? What does resume-on-crash look like? What requires fresh HITL?</p>
+</li>
+</ol>
+
+<h2>Solutions</h2>
+<details class="qa" id="a1512-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Two reports, and a poll that never finishes</span></summary><div class="qa-a"><p>Two reports. The log has <code>fetch_docs</code> and <code>call_llm</code> as done and <code>send_report</code> only as started, so the restart replays the first two and runs <code>send_report</code> again. The report was already delivered, so it goes out twice. An idempotency key per side effect, checked by the outside system, brings it back to one.</p>
+<p>The poll returns <code>pending</code> every time. The lesson's <code>lookup()</code> matches a logged event by name and arguments, so from the second poll on it returns the first poll's result without calling the job queue. Keying events by their position in the workflow fixes it: the polls return <code>pending</code>, <code>pending</code>, <code>done</code>.</p></div></details>
+<details class="qa" id="a1512-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A refund paid twice, and a refused one paid</span></summary><div class="qa-a"><p>Two things are missing.</p>
+<ul>
+<li><strong>An idempotency key on the payments call.</strong> The money moved, the timeout hid that, and the retry paid again. Pass a key such as the workflow ID plus the activity's position. Payment APIs such as Stripe accept one and return the first result for a repeated key.</li>
+<li><strong>Replay of the model's decision.</strong> The restarted run called the model again instead of returning the logged decision, and the new sample approved a refund the first had refused. Model calls are activities: log the output and replay it on recovery.</li>
+</ul>
+<p>It also helps to require fresh approval before a money-moving step runs after a restart, since the situation may have changed while the run was down.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://code.claude.com/docs/en/agent-sdk/agent-loop">Anthropic — Claude Code Agent SDK: agent loop</a> — budget, turns, and resume semantics.</li>
+<li><a href="https://learn.microsoft.com/en-us/agent-framework/workflows/human-in-the-loop">Microsoft — Agent Framework: human-in-the-loop and checkpointing</a> — RequestInfoEvent shape.</li>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents">LangChain — The Runtime Behind Production Deep Agents</a> — concrete runtime requirements.</li>
+<li><a href="https://temporal.io/blog/announcing-openai-agents-sdk-integration">Temporal — Production-ready agents with the OpenAI Agents SDK + Temporal</a> — activity shape for LLM calls.</li>
+<li><a href="https://www.anthropic.com/research/measuring-agent-autonomy">Anthropic — Measuring agent autonomy in practice</a> — how long Claude Code works unattended: the 99.9th-percentile turn grew from under 25 to over 45 minutes between October 2025 and January 2026.</li>
+<li><a href="https://arxiv.org/abs/2505.05115">Toby Ord — Is there a half-life for the success rates of AI agents? (arXiv:2505.05115)</a> — the constant-hazard model behind Idea 5.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/15-autonomous-systems/12-durable-execution" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1512" id="done-a1512">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1512" id="undo-a1512" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1511"><span class="pn-dir">Previous</span><span class="pn-t">15.11 · Browser Agents and Long-Horizon Web Tasks</span></a><a class="pn next" href="#a1513"><span class="pn-dir">Next</span><span class="pn-t">15.13 · Action Budgets, Iteration Caps, and Cost Governors</span></a></div></footer>

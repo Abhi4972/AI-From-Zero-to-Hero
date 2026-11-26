@@ -1,0 +1,673 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>Open Models: Architecture Walkthroughs</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.14</span><span class="chip">45 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1014" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Read the config.json of Llama 3, Mistral, Mixtral, Gemma 2, Qwen 2.5, and DeepSeek-V3 and explain every field</li>
+<li>Name the specific architectural change each model made versus GPT-2 Small and justify it from first principles</li>
+<li>Compute parameter count, KV cache size, and activation memory for any open model from its config alone</li>
+<li>Pick the right open model for a deployment target given latency, memory, and capability constraints</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10, Lessons 04, 05, 12 (Pre-training, Scaling, Inference)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 45 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>You built a GPT-2 Small from scratch in Lesson 04. Frontier open models in 2026 are the same family with five or six concrete changes. RMSNorm instead of LayerNorm. SwiGLU instead of GELU. RoPE instead of learned positions. GQA or MLA instead of full MHA. Mixture-of-Experts at scale. The math you already know covers 95% of them. This lesson reads Llama 3, DeepSeek-V3, Mixtral, Qwen, and Gemma side by side and names the exact line where each architecture diverges.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RMSNorm</td>
+<td>"LayerNorm without the mean"</td>
+<td>Normalize by root mean square only, with a learned scale — cheaper and comparable to LayerNorm</td>
+</tr>
+<tr>
+<td>RoPE</td>
+<td>"Rotary positions"</td>
+<td>Rotate each Q and K vector in 2D pairs by an angle that depends on position — extrapolates beyond training length with scaling tricks</td>
+</tr>
+<tr>
+<td>SwiGLU</td>
+<td>"The new MLP activation"</td>
+<td>Gated linear unit with Swish: <code>(xW1) * sigmoid(xW1) * xV</code> — standard in every 2024+ open model</td>
+</tr>
+<tr>
+<td>GQA</td>
+<td>"Middle ground attention"</td>
+<td>Grouped-Query Attention: G groups of Q heads share one K and one V head — shrinks KV cache without MQA's accuracy hit</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>"DeepSeek's attention"</td>
+<td>Multi-Head Latent Attention: compress K/V into a shared low-rank latent, decompress per head — smallest KV cache for large models</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>"Sparse experts"</td>
+<td>Mixture of Experts: N MLPs per block, router picks top-k per token — huge total params, small active params</td>
+</tr>
+<tr>
+<td>Top-k routing</td>
+<td>"Pick k experts per token"</td>
+<td>The router computes a score per expert and activates the k highest — typical k is 2 (Mixtral) to 8 (DeepSeek)</td>
+</tr>
+<tr>
+<td>YaRN</td>
+<td>"Stretch RoPE"</td>
+<td>Yet another RoPE extension — interpolates rotary angles to extend context from 8k to 128k+ at inference time</td>
+</tr>
+<tr>
+<td>Sliding-window attention</td>
+<td>"Don't attend to everything"</td>
+<td>Each token attends only to the last $W$ tokens — caps attention cost at $O(W)$ per token, used in Gemma 2 and early Mistral</td>
+</tr>
+<tr>
+<td>Active params</td>
+<td>"What runs per token"</td>
+<td>For MoE models, the parameter count that sees a forward pass per token (much smaller than total params) — governs per-token FLOPs</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Today's open models (Llama, Mistral, Qwen, Gemma, DeepSeek) are still GPT-2's design: token embeddings, a stack of attention-plus-MLP blocks, and an output layer. What changed is a handful of well-understood parts: a cheaper normalisation (RMSNorm), positions encoded by rotating vectors (RoPE), a gated MLP (SwiGLU), attention heads that share keys and values to shrink the memory cache (GQA, MLA), and mixture-of-experts layers that switch on only a few sub-networks per token. Everything you need to know about a model's size and memory follows from its <code>config.json</code>. This lesson runs the lesson's calculator, builds six real models from their published configs without downloading any weights to count their parameters exactly, and checks three of the six "knobs" numerically. No model is trained.</p></div></aside>
+<p>In <a href="#a1004">Lesson 10.4</a> you wrote 350 lines of numpy and had a GPT-2-shaped model. Llama 3 405B has a 200-page technical report. Your instinct is that these are different beasts. They are not. The 200 pages describe the same object with five or six well-motivated modifications, plus a thousand implementation details about scaling. The skeleton -- embedding, transformer blocks, attention, MLP, norm, head -- is unchanged.</p>
+<p>This lesson is a diff. For each major open model family, we list exactly what changed from GPT-2, why, and what it cost. When you are done you can read a fresh model card and mentally translate it back to the GPT-2 baseline.</p>
+<p>The practical payoff is that when Meta releases Llama 5 or DeepSeek releases V4, you will not need a new mental model. You will look at the config, see which of the well-known knobs moved, and know what the downstream implications are. The 2026 architectures are a finite toolbox. Each new model picks a different subset.</p>
+<h2>Idea 1 · The Invariant Core</h2>
+<p>All autoregressive open models share:</p>
+<ul>
+<li>Token embedding matrix (vocab_size x hidden_dim).</li>
+<li>Stack of N decoder blocks: norm, self-attention, residual, norm, MLP, residual.</li>
+<li>Final norm and linear head projecting to vocab_size (often weight-tied with embeddings).</li>
+<li>Causal mask, next-token cross-entropy loss.</li>
+</ul>
+<p>That is the shape. The rest is knobs.</p>
+<h2>Idea 2 · The Six Knobs That Actually Move</h2>
+<p>Across every 2024-2026 frontier open model, the same six design choices get picked over and over:</p>
+<ol>
+<li><strong>Normalization.</strong> LayerNorm -&gt; RMSNorm.</li>
+<li><strong>Positional encoding.</strong> Learned absolute -&gt; RoPE (plus variants: YaRN, NTK).</li>
+<li><strong>Activation.</strong> GELU -&gt; SwiGLU (or GeGLU).</li>
+<li><strong>Attention head sharing.</strong> MHA -&gt; GQA -&gt; MQA -&gt; MLA.</li>
+<li><strong>Dense vs sparse MLP.</strong> Dense -&gt; Mixture-of-Experts.</li>
+<li><strong>Pre-norm placement.</strong> Pre-norm stays. Post-norm is gone.</li>
+</ol>
+<p>Everything else (learning rate schedule, data mix, batch size, context length) lives in the training config, not the architecture. Six knobs.</p>
+<h2>Idea 3 · Knob 1: RMSNorm</h2>
+<p>LayerNorm subtracts mean, divides by std, scales, and shifts. RMSNorm keeps only the scale:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">RMSNorm</span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2376em;vertical-align:-1.13em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.175em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.935em;"><span class="svg-align" style="top:-3.2em;"><span class="pstrut" style="height:3.2em;"></span><span class="mord" style="padding-left:1em;"><span class="mop"><span class="mord"><span class="mord mathrm">mean</span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-2.895em;"><span class="pstrut" style="height:3.2em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.28em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.28em" viewBox="0 0 400000 1296" preserveAspectRatio="xMinYMin slice"><path d="M263,681c0.7,0,18,39.7,52,119
+c34,79.3,68.167,158.7,102.5,238c34.3,79.3,51.8,119.3,52.5,120
+c340,-704.7,510.7,-1060.3,512,-1067
+l0 -0
+c4.7,-7.3,11,-11,19,-11
+H40000v40H1012.3
+s-271.3,567,-271.3,567c-38.7,80.7,-84,175,-136,283c-52,108,-89.167,185.3,-111.5,232
+c-22.3,46.7,-33.8,70.3,-34.5,71c-4.7,4.7,-12.3,7,-23,7s-12,-1,-12,-1
+s-109,-253,-109,-253c-72.7,-168,-109.3,-252,-110,-252c-10.7,8,-22,16.7,-34,26
+c-22,17.3,-33.3,26,-34,26s-26,-26,-26,-26s76,-59,76,-59s76,-60,76,-60z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.305em;"><span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">x</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.13em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span></span></span></span></span></div></p>
+<p>No mean subtraction. No bias. No mean to compute and no bias to add. Zhang and Sennrich (2019) argued it matched LayerNorm on machine translation while being 10% faster. Every modern open model runs it.</p>
+<p>Cost: none. Benefit: small throughput win, simpler code.</p>
+<h2>Idea 4 · Knob 2: RoPE</h2>
+<p>Learned position embeddings were a 1024-slot lookup table in GPT-2. Context 1025 is off the end of the table. Models cannot extrapolate beyond their training length.</p>
+<p>Rotary Position Embedding (RoPE, Su et al. 2021) injects position by rotating each Q and K vector in pairs before the attention dot product. The angle of rotation is a deterministic function of position, so there is nothing learned and nothing to run out of. With scaling tricks (NTK-aware interpolation, YaRN), a model trained on 8k context can stretch to 128k at inference with modest accuracy loss.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">q_rotated = rotate(q, angle(pos))
+k_rotated = rotate(k, angle(pos))
+score = q_rotated . k_rotated
+</code></pre></div>
+<p>Every Llama, Mistral, Qwen, DeepSeek, and Gemma uses RoPE. Gemma 2 uses a hybrid (RoPE on most layers, local sliding-window attention on others).</p>
+<h2>Idea 5 · Knob 3: SwiGLU</h2>
+<p>GPT-2's MLP is <code>x -&gt; gelu(xW1 + b1) -&gt; (...)W2 + b2</code>. SwiGLU (Shazeer 2020) replaces the activation with a gated product:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">SwiGLU</span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mord"><span class="mord mathrm">sigmoid</span></span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">x</span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span></span></span></span></div></p>
+<p>Two projections in parallel instead of one, gated by the Swish activation. Empirically stronger on perplexity per parameter. PaLM and the first LLaMA (2023) adopted it, and everyone followed. The MLP's hidden size is usually set so that total parameter count matches the original dense MLP: if GPT-2 used <code>ff_dim = 4 * hidden</code>, SwiGLU uses <code>ff_dim = (2/3) * 4 * hidden = 8/3 * hidden</code>.</p>
+<h2>Idea 6 · Knob 4: Attention Head Sharing</h2>
+<p>GPT-2 used <strong>Multi-Head Attention (MHA)</strong>: every head has its own Q, K, V projection.</p>
+<p><strong>Multi-Query Attention (MQA, Shazeer 2019)</strong> shares one K and one V across all heads. Cuts the KV cache by num_heads, which is a 12x to 32x reduction on a typical model. Accuracy drops slightly on hard benchmarks.</p>
+<p><strong>Grouped-Query Attention (GQA, Ainslie et al. 2023)</strong> is the middle ground: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">G</span></span></span></span> groups of Q heads share one K and one V. Llama 3 8B uses GQA with 32 Q heads and 8 KV heads (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">G</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>), so the KV cache shrinks 4x versus full MHA.</p>
+<p><strong>Multi-Head Latent Attention (MLA, DeepSeek 2024)</strong> compresses K and V into a shared low-rank latent, projecting them back up per head. Further reduces KV cache while preserving per-head expressiveness. DeepSeek-V2 and V3 rely on this for their long-context performance.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Scheme</th>
+<th>KV Heads</th>
+<th>KV Cache</th>
+<th>Accuracy</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MHA</td>
+<td>num_heads</td>
+<td>full</td>
+<td>best</td>
+</tr>
+<tr>
+<td>GQA</td>
+<td>num_groups (G &lt; num_heads)</td>
+<td>num_heads / G reduction</td>
+<td>near-MHA</td>
+</tr>
+<tr>
+<td>MQA</td>
+<td>1</td>
+<td>num_heads reduction</td>
+<td>small hit</td>
+</tr>
+<tr>
+<td>MLA</td>
+<td>latent, per-head decompression</td>
+<td>smaller than MQA</td>
+<td>near-MHA</td>
+</tr>
+</tbody>
+</table></div>
+<p>For any model above ~13B parameters, GQA or MLA is effectively mandatory. Full MHA at scale is a KV cache disaster.</p>
+<h2>Idea 7 · Knob 5: Mixture of Experts</h2>
+<p>A dense MLP activates all its parameters for every token. An MoE MLP has K experts per block and a router that picks the top-k experts per token (typically top-2). Only those experts' weights see a forward pass for that token.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">router_logits = xW_r
+indices, weights = top_k(router_logits, k=2)
+output = sum_i weights[i] * expert[indices[i]](x)
+</code></pre></div>
+<p>The appeal: you can have 64 experts of size 7B each (so total param count is huge) while only running 2 of them per token (so per-token compute matches a dense 7B model). Mixtral 8x7B has 47B total parameters but activates only 13B per token. DeepSeek-V3 has 671B total parameters but activates only 37B per token.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmf6f79fbbdb" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1210.92px; background-color: transparent;" viewBox="0 0 1210.921875 332" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmf6f79fbbdb{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmf6f79fbbdb .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmf6f79fbbdb .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmf6f79fbbdb .error-icon{fill:#f4efe7;}#mmf6f79fbbdb .error-text{fill:#0b1018;stroke:#0b1018;}#mmf6f79fbbdb .edge-thickness-normal{stroke-width:1px;}#mmf6f79fbbdb .edge-thickness-thick{stroke-width:3.5px;}#mmf6f79fbbdb .edge-pattern-solid{stroke-dasharray:0;}#mmf6f79fbbdb .edge-thickness-invisible{stroke-width:0;fill:none;}#mmf6f79fbbdb .edge-pattern-dashed{stroke-dasharray:3;}#mmf6f79fbbdb .edge-pattern-dotted{stroke-dasharray:2;}#mmf6f79fbbdb .marker{fill:#6c6357;stroke:#6c6357;}#mmf6f79fbbdb .marker.cross{stroke:#6c6357;}#mmf6f79fbbdb svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmf6f79fbbdb p{margin:0;}#mmf6f79fbbdb .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmf6f79fbbdb .cluster-label text{fill:#0b1018;}#mmf6f79fbbdb .cluster-label span{color:#0b1018;}#mmf6f79fbbdb .cluster-label span p{background-color:transparent;}#mmf6f79fbbdb .label text,#mmf6f79fbbdb span{fill:#211c16;color:#211c16;}#mmf6f79fbbdb .node rect,#mmf6f79fbbdb .node circle,#mmf6f79fbbdb .node ellipse,#mmf6f79fbbdb .node polygon,#mmf6f79fbbdb .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmf6f79fbbdb .rough-node .label text,#mmf6f79fbbdb .node .label text,#mmf6f79fbbdb .image-shape .label,#mmf6f79fbbdb .icon-shape .label{text-anchor:middle;}#mmf6f79fbbdb .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmf6f79fbbdb .rough-node .label,#mmf6f79fbbdb .node .label,#mmf6f79fbbdb .image-shape .label,#mmf6f79fbbdb .icon-shape .label{text-align:center;}#mmf6f79fbbdb .node.clickable{cursor:pointer;}#mmf6f79fbbdb .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmf6f79fbbdb .arrowheadPath{fill:#0b0b0b;}#mmf6f79fbbdb .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmf6f79fbbdb .flowchart-link{stroke:#6c6357;fill:none;}#mmf6f79fbbdb .edgeLabel{background-color:#ffffff;text-align:center;}#mmf6f79fbbdb .edgeLabel p{background-color:#ffffff;}#mmf6f79fbbdb .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmf6f79fbbdb .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmf6f79fbbdb .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmf6f79fbbdb .cluster text{fill:#0b1018;}#mmf6f79fbbdb .cluster span{color:#0b1018;}#mmf6f79fbbdb div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmf6f79fbbdb .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmf6f79fbbdb rect.text{fill:none;stroke-width:0;}#mmf6f79fbbdb .icon-shape,#mmf6f79fbbdb .image-shape{background-color:#ffffff;text-align:center;}#mmf6f79fbbdb .icon-shape p,#mmf6f79fbbdb .image-shape p{background-color:#ffffff;padding:2px;}#mmf6f79fbbdb .icon-shape .label rect,#mmf6f79fbbdb .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmf6f79fbbdb .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmf6f79fbbdb .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmf6f79fbbdb .node .neo-node{stroke:#b5521b;}#mmf6f79fbbdb [data-look="neo"].node rect,#mmf6f79fbbdb [data-look="neo"].cluster rect,#mmf6f79fbbdb [data-look="neo"].node polygon{stroke:url(#mmf6f79fbbdb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmf6f79fbbdb [data-look="neo"].swimlane.cluster rect{filter:none;}#mmf6f79fbbdb [data-look="neo"].node path{stroke:url(#mmf6f79fbbdb-gradient);stroke-width:1px;}#mmf6f79fbbdb [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmf6f79fbbdb [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmf6f79fbbdb [data-look="neo"].node circle{stroke:url(#mmf6f79fbbdb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmf6f79fbbdb [data-look="neo"].node circle .state-start{fill:#000000;}#mmf6f79fbbdb [data-look="neo"].icon-shape .icon{fill:url(#mmf6f79fbbdb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmf6f79fbbdb [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmf6f79fbbdb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmf6f79fbbdb :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmf6f79fbbdb_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmf6f79fbbdb_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M193.781,166L197.948,166C202.115,166,210.448,166,218.115,166C225.781,166,232.781,166,236.281,166L239.781,166" id="mmf6f79fbbdb-L_I_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_I_R_0" data-points="W3sieCI6MTkzLjc4MTI1LCJ5IjoxNjZ9LHsieCI6MjE4Ljc4MTI1LCJ5IjoxNjZ9LHsieCI6MjQzLjc4MTI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M424.547,166L428.714,166C432.88,166,441.214,166,448.88,166C456.547,166,463.547,166,467.047,166L470.547,166" id="mmf6f79fbbdb-L_R_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_T_0" data-points="W3sieCI6NDI0LjU0Njg3NSwieSI6MTY2fSx7IngiOjQ0OS41NDY4NzUsInkiOjE2Nn0seyJ4Ijo0NzQuNTQ2ODc1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M578.137,140.5L592.159,124.417C606.18,108.333,634.223,76.167,655.377,60.083C676.531,44,690.797,44,697.93,44L705.063,44" id="mmf6f79fbbdb-L_T_E1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_E1_0" data-points="W3sieCI6NTc4LjEzNzEwMjk3MTMxMTUsInkiOjE0MC41fSx7IngiOjY2Mi4yNjU2MjUsInkiOjQ0fSx7IngiOjcwOS4wNjI1LCJ5Ijo0NH1d" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M637.266,166L641.432,166C645.599,166,653.932,166,664.995,166C676.057,166,689.849,166,696.745,166L703.641,166" id="mmf6f79fbbdb-L_T_E2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_E2_0" data-points="W3sieCI6NjM3LjI2NTYyNSwieSI6MTY2fSx7IngiOjY2Mi4yNjU2MjUsInkiOjE2Nn0seyJ4Ijo3MDcuNjQwNjI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M578.137,191.5L592.159,207.583C606.18,223.667,634.223,255.833,651.744,271.917C669.266,288,676.266,288,679.766,288L683.266,288" id="mmf6f79fbbdb-L_T_EN_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_EN_0" data-points="W3sieCI6NTc4LjEzNzEwMjk3MTMxMTUsInkiOjE5MS41fSx7IngiOjY2Mi4yNjU2MjUsInkiOjI4OH0seyJ4Ijo2ODcuMjY1NjI1LCJ5IjoyODh9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M821.563,44L829.362,44C837.161,44,852.76,44,869.908,49.575C887.056,55.15,905.752,66.301,915.1,71.876L924.448,77.451" id="mmf6f79fbbdb-L_E1_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E1_S_0" data-points="W3sieCI6ODIxLjU2MjUsInkiOjQ0fSx7IngiOjg2OC4zNTkzNzUsInkiOjQ0fSx7IngiOjkyNy44ODM3MDkwMTYzOTM1LCJ5Ijo3OS41fV0=" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M822.984,166L830.547,166C838.109,166,853.234,166,870.145,160.425C887.056,154.85,905.752,143.699,915.1,138.124L924.448,132.549" id="mmf6f79fbbdb-L_E2_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E2_S_0" data-points="W3sieCI6ODIyLjk4NDM3NSwieSI6MTY2fSx7IngiOjg2OC4zNTkzNzUsInkiOjE2Nn0seyJ4Ijo5MjcuODgzNzA5MDE2MzkzNSwieSI6MTMwLjV9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/><path d="M1047.922,105L1052.089,105C1056.255,105,1064.589,105,1072.255,105C1079.922,105,1086.922,105,1090.422,105L1093.922,105" id="mmf6f79fbbdb-L_S_O_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_O_0" data-points="W3sieCI6MTA0Ny45MjE4NzUsInkiOjEwNX0seyJ4IjoxMDcyLjkyMTg3NSwieSI6MTA1fSx7IngiOjEwOTcuOTIxODc1LCJ5IjoxMDV9XQ==" data-look="classic" marker-end="url(#mmf6f79fbbdb_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_I_R_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_R_T_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_T_E1_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_T_E2_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_T_EN_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_E1_S_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_E2_S_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_S_O_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmf6f79fbbdb-flowchart-I-0" data-look="classic" transform="translate(100.890625, 166)"><rect class="basic label-container" style="" x="-92.890625" y="-25.5" width="185.78125" height="51"/><g class="label" style="" transform="translate(-62.890625, -10.5)"><rect/><foreignObject width="125.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Token hidden state</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-R-1" data-look="classic" transform="translate(334.1640625, 166)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#e94560 !important" x="-90.3828125" y="-36" width="180.765625" height="72"/><g class="label" style="color:#fff !important" transform="translate(-60.3828125, -21)"><rect/><foreignObject width="120.765625" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Router<br />(linear -&gt; softmax)</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-T-3" data-look="classic" transform="translate(555.90625, 166)"><rect class="basic label-container" style="" x="-81.359375" y="-25.5" width="162.71875" height="51"/><g class="label" style="" transform="translate(-51.359375, -10.5)"><rect/><foreignObject width="102.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Top-k selection</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-E1-5" data-look="classic" transform="translate(765.3125, 44)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-56.25" y="-36" width="112.5" height="72"/><g class="label" style="color:#fff !important" transform="translate(-26.25, -21)"><rect/><foreignObject width="52.5" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Expert 1<br />(MLP)</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-E2-7" data-look="classic" transform="translate(765.3125, 166)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-57.671875" y="-36" width="115.34375" height="72"/><g class="label" style="color:#fff !important" transform="translate(-27.671875, -21)"><rect/><foreignObject width="55.34375" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Expert 2<br />(MLP)</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-EN-9" data-look="classic" transform="translate(765.3125, 288)"><rect class="basic label-container" style="fill:#eeeeee !important;stroke:#999 !important" x="-78.046875" y="-36" width="156.09375" height="72"/><g class="label" style="color:#999 !important" transform="translate(-48.046875, -21)"><rect/><foreignObject width="96.09375" height="42"><div style="color: rgb(153, 153, 153) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#999 !important" class="nodeLabel"><p>Expert 64<br />(MLP, unused)</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-S-11" data-look="classic" transform="translate(970.640625, 105)"><rect class="basic label-container" style="" x="-77.28125" y="-25.5" width="154.5625" height="51"/><g class="label" style="" transform="translate(-47.28125, -10.5)"><rect/><foreignObject width="94.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Weighted sum</p></span></div></foreignObject></g></g><g class="node default" id="mmf6f79fbbdb-flowchart-O-15" data-look="classic" transform="translate(1150.421875, 105)"><rect class="basic label-container" style="" x="-52.5" y="-25.5" width="105" height="51"/><g class="label" style="" transform="translate(-22.5, -10.5)"><rect/><foreignObject width="45" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Output</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmf6f79fbbdb-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmf6f79fbbdb-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmf6f79fbbdb-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>Pros: same compute, more parameters, better capacity. Cons: the expert memory still has to live somewhere (so serving needs more VRAM than a dense equivalent), load-balancing the router is hard, and fine-tuning the router during alignment is its own research area.</p>
+<h2>Idea 8 · Knob 6: Pre-norm stays</h2>
+<p>The original transformer applied layer norm after each sublayer. Every open model since GPT-2 puts it <em>before</em> each sublayer. Pre-norm is strictly easier to train at depth. Nothing to argue about.</p>
+<h2>Idea 9 · Model-by-Model Diff</h2>
+<p>Here is the table that makes all of this concrete.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Year</th>
+<th>Total Params</th>
+<th>Active Params</th>
+<th>Norm</th>
+<th>Activation</th>
+<th>Position</th>
+<th>Attention</th>
+<th>MoE</th>
+<th>Context</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GPT-2 Small</td>
+<td>2019</td>
+<td>124M</td>
+<td>124M</td>
+<td>LayerNorm</td>
+<td>GELU</td>
+<td>Learned</td>
+<td>MHA (12 heads)</td>
+<td>no</td>
+<td>1k</td>
+</tr>
+<tr>
+<td>Llama 3 8B</td>
+<td>2024</td>
+<td>8B</td>
+<td>8B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>GQA (32/8)</td>
+<td>no</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>Llama 3 70B</td>
+<td>2024</td>
+<td>70B</td>
+<td>70B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>GQA (64/8)</td>
+<td>no</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>Llama 3 405B</td>
+<td>2024</td>
+<td>405B</td>
+<td>405B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>GQA (128/8)</td>
+<td>no</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>Mistral 7B</td>
+<td>2023</td>
+<td>7.2B</td>
+<td>7.2B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>GQA</td>
+<td>no</td>
+<td>32k</td>
+</tr>
+<tr>
+<td>Mixtral 8x7B</td>
+<td>2023</td>
+<td>47B</td>
+<td>13B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>GQA</td>
+<td>yes (8 experts, top-2)</td>
+<td>32k</td>
+</tr>
+<tr>
+<td>Gemma 2 9B</td>
+<td>2024</td>
+<td>9B</td>
+<td>9B</td>
+<td>RMSNorm (pre+post)</td>
+<td>GeGLU</td>
+<td>RoPE + sliding</td>
+<td>GQA</td>
+<td>no</td>
+<td>8k</td>
+</tr>
+<tr>
+<td>Qwen 2.5 72B</td>
+<td>2024</td>
+<td>72B</td>
+<td>72B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE (YaRN)</td>
+<td>GQA (64/8)</td>
+<td>no</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>DeepSeek V2 236B</td>
+<td>2024</td>
+<td>236B</td>
+<td>21B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>MLA</td>
+<td>yes (160 experts, top-6)</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>DeepSeek V3</td>
+<td>2024</td>
+<td>671B</td>
+<td>37B</td>
+<td>RMSNorm</td>
+<td>SwiGLU</td>
+<td>RoPE</td>
+<td>MLA</td>
+<td>yes (256 experts, top-8)</td>
+<td>128k</td>
+</tr>
+<tr>
+<td>Spark-X2.5 4B</td>
+<td>2026</td>
+<td>4.1B</td>
+<td>4.1B</td>
+<td>RMSNorm</td>
+<td>GeGLU</td>
+<td>RoPE + sliding (3:1)</td>
+<td>GQA (16/4), gated output</td>
+<td>no</td>
+<td>1M</td>
+</tr>
+</tbody>
+</table></div>
+<p>Scan the columns. RMSNorm is universal. SwiGLU or its GeGLU cousin is universal. RoPE is universal. GQA is universal above 7B except when replaced by MLA. MoE is the differentiator at the top end.</p>
+<h2>Idea 10 · Reading a config.json</h2>
+<p>Llama 3 8B config:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{
+  &quot;hidden_size&quot;: 4096,
+  &quot;intermediate_size&quot;: 14336,
+  &quot;num_hidden_layers&quot;: 32,
+  &quot;num_attention_heads&quot;: 32,
+  &quot;num_key_value_heads&quot;: 8,
+  &quot;max_position_embeddings&quot;: 131072,
+  &quot;rope_theta&quot;: 500000.0,
+  &quot;rms_norm_eps&quot;: 1e-5,
+  &quot;vocab_size&quot;: 128256
+}
+</code></pre></div>
+<p>Every field corresponds to something you have already implemented.
+Newer configs add a few fields that change the arithmetic, so the calculator
+reads them when they are present:</p>
+<ul>
+<li><code>head_dim</code>: set explicitly when it is not <code>hidden_size / num_attention_heads</code>. Gemma 2 9B has hidden 3584 and 16 heads but <code>head_dim</code> 256, so its Q projection is 3584 x 4096, not square.</li>
+<li><code>tie_word_embeddings</code>: whether the LM head reuses the embedding matrix. Llama 3 8B does not tie, which is 525M parameters you miss if you only count the embedding once.</li>
+<li>
+<p><code>layer_types</code> and <code>sliding_window</code>: which layers attend to the full context and which only to the last W tokens.</p>
+</li>
+<li>
+<p><code>hidden_size</code>: embedding dimension.</p>
+</li>
+<li><code>intermediate_size</code>: MLP hidden size (3.5x hidden -- SwiGLU math).</li>
+<li><code>num_hidden_layers</code>: stack depth.</li>
+<li><code>num_attention_heads</code>: Q heads.</li>
+<li><code>num_key_value_heads</code>: KV heads (GQA).</li>
+<li><code>max_position_embeddings</code>: training context length.</li>
+<li><code>rope_theta</code>: RoPE base frequency. Meta scaled it from the default 10k to 500k for long-context extrapolation.</li>
+<li><code>rms_norm_eps</code>: numerical stability.</li>
+<li><code>vocab_size</code>: tokens.</li>
+</ul>
+<p>From these alone you compute total parameters, KV cache, and peak activation memory. See <code>code/main.py</code> for the exact formulas.</p>
+<h2>Idea 11 · Activation memory budget</h2>
+<p>Activations dominate training memory above a few billion parameters. The rule of thumb for pre-training (with gradient checkpointing):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">activation_mem ~ batch_size * seq_len * hidden_size * num_layers * bytes_per_element
+</code></pre></div>
+<p>For Llama 3 8B at batch 1, seq 8192, BF16, 32 layers, hidden 4096: about 2 GB of activations with full checkpointing (one BF16 copy of each layer's input), and tens of GB without checkpointing even with FlashAttention. This is why flash-attention and ring-attention matter -- they rewrite the attention computation so activations fit.</p>
+<h2>Idea 12 · KV Cache budget</h2>
+<p>For inference at max context:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">kv_cache = 2 * num_layers * num_kv_heads * head_dim * max_seq_len * bytes_per_element
+</code></pre></div>
+<p>Llama 3 8B at 128k context, BF16, head_dim = hidden / num_heads = 128:
+<code>2 * 32 * 8 * 128 * 131072 * 2 = 17.2 GB</code> per sequence.</p>
+<p>The 8B weights are 16 GB in BF16. The KV cache for a single 128k sequence is larger than the weights. This is the memory pressure driving GQA, MLA, and KV cache quantization research.</p>
+<p>The formula assumes every layer caches the whole sequence. A sliding-window layer only ever needs the last W tokens, so for hybrid models the sum runs per layer:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">kv_cache = 2 * num_kv_heads * head_dim * bytes_per_element
+           * (full_layers * max_seq_len + sliding_layers * min(W, max_seq_len))
+</code></pre></div>
+<p>Spark-X2.5 4B runs three sliding-window layers (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span>) for every full-attention layer: 9 full and 27 sliding out of 36. At its 1M-token context that is about 38.7 GB (36 GiB) per sequence in BF16. If all 36 layers cached the full context it would be 154.6 GB (144 GiB). The full layers carry nearly the whole cost, which is why the ratio of full to sliding layers is the number to read first on a long-context model.</p>
+<h2>Idea 13 · When Each Model Wins</h2>
+<ul>
+<li><strong>Single 80GB GPU, no MoE</strong>: Llama 3 8B, Mistral 7B, Gemma 2 9B. Easy to serve, wide tooling.</li>
+<li><strong>Single node (8x80GB), big capacity</strong>: Llama 3 70B, Qwen 2.5 72B. Highest dense open capability.</li>
+<li><strong>Biggest open capability, accept MoE complexity</strong>: DeepSeek V3, Mixtral 8x22B. Best capability per active FLOP.</li>
+<li><strong>Long-context needs</strong>: Llama 3 (128k with RoPE scaling), DeepSeek (MLA advantage).</li>
+<li><strong>Low-latency serving</strong>: Gemma 2 9B (sliding window cuts long-context compute).</li>
+<li><strong>Long context on a small memory budget</strong>: hybrid sliding-window models such as Spark-X2.5 4B, where only a quarter of the layers pay for the full context.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="rmsnorm-vs-layernorm"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Parameters</strong> of a dense decoder with width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> layers, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> query heads and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> key/value heads of size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>, MLP width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span>, vocabulary <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span></span></span>:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1647em;vertical-align:-1.4702em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.6659em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">embedding</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.352em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">Vh</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.648em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4702em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.7516em;vertical-align:-1.6016em;"></span><span class="mord mathnormal">L</span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.3984em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">attention</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.0659em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">2</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9341em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6016em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.2152em;vertical-align:-1.5208em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.4792em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">SwiGLU MLP</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.1576em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">3</span><span class="mord mathnormal">h</span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8424em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.5208em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord">2</span><span class="mord mathnormal">h</span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">Vh</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">[</span><span class="mord text"><span class="mord">untied head</span></span><span class="mclose">]</span></span></span></span></span></div></p>
+<p>For an MoE layer, the MLP term is multiplied by the number of experts for <em>total</em> parameters and by top-<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> (plus shared experts) for <em>active</em> ones.</p>
+<p><strong>KV cache per token</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">2</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mord">×</span></span></span></span> bytes (GQA); for MLA, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">×</span></span></span></span> bytes, with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> the compressed latent and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> the shared RoPE key dimension.</p>
+<p><strong>RMSNorm</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">RMSNorm</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊙</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.3634em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1134em;"><span class="svg-align" style="top:-3.2em;"><span class="pstrut" style="height:3.2em;"></span><span class="mord" style="padding-left:1em;"><span class="mord overline"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9401em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.8601em;"><span class="pstrut" style="height:3em;"></span><span class="overline-line" style="border-bottom-width:0.04em;"></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-3.0734em;"><span class="pstrut" style="height:3.2em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.28em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.28em" viewBox="0 0 400000 1296" preserveAspectRatio="xMinYMin slice"><path d="M263,681c0.7,0,18,39.7,52,119
+c34,79.3,68.167,158.7,102.5,238c34.3,79.3,51.8,119.3,52.5,120
+c340,-704.7,510.7,-1060.3,512,-1067
+l0 -0
+c4.7,-7.3,11,-11,19,-11
+H40000v40H1012.3
+s-271.3,567,-271.3,567c-38.7,80.7,-84,175,-136,283c-52,108,-89.167,185.3,-111.5,232
+c-22.3,46.7,-33.8,70.3,-34.5,71c-4.7,4.7,-12.3,7,-23,7s-12,-1,-12,-1
+s-109,-253,-109,-253c-72.7,-168,-109.3,-252,-110,-252c-10.7,8,-22,16.7,-34,26
+c-22,17.3,-33.3,26,-34,26s-26,-26,-26,-26s76,-59,76,-59s76,-60,76,-60z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1266em;"><span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>RoPE</strong> rotates each pair of dimensions <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span><span class="mord mathnormal mtight">i</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> by angle <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.888em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.888em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight">i</span><span class="mord mtight">/</span><span class="mord mathnormal mtight">d</span></span></span></span></span></span></span></span></span></span></span></span> (base <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> = 10,000; 500,000 in Llama 3). Because rotations compose, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mopen">⟨</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">⟩</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mopen">⟨</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mbin mtight">−</span><span class="mord mathnormal mtight">p</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">⟩</span></span></span></span>: attention scores depend only on the <em>relative</em> position.</p>
+<p><strong>SwiGLU</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">MLP</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">SiLU</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊙</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal">x</span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>; matching a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">h</span></span></span></span> GELU MLP's parameters gives <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">3</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord mathnormal">h</span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Llama 3 8B from its config by hand</div><div class="co-body"><p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">096</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">14</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">336</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">128</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">256</span></span></span></span>, untied head.</p>
+<ul>
+<li>Attention per layer: $4{,}096 \times (32 + 16) \times 128 + 32 \times 128 \times 4{,}096 = 25.2\text{M} + 16.8\text{M} = 41.9$M.</li>
+<li>MLP per layer: $3 \times 4{,}096 \times 14{,}336 = 176.2$M; norms <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">096</span></span></span></span>.</li>
+<li>32 layers: $32 \times 218.1\text{M} = 6.98$B. Embedding and head: $2 \times 128{,}256 \times 4{,}096 = 1.05$B. Final norm 4,096. Total $8.03$B.</li>
+</ul>
+<p><strong>KV cache</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">32</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">131</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">072</span></span></span></span> bytes = 128 KB per token; 16 GiB at 128K tokens. With full multi-head attention (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>) it would be 4× that.</p>
+<p><strong>MoE</strong>: DeepSeek-V3 routes each token to 8 of 256 experts (3%), Mixtral to 2 of 8 (25%).</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Bigger total parameter count means more compute per token."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> For MoE models only the active parameters run: Qwen3-30B-A3B has 30.5B parameters but uses about 3B per token.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The embedding is a small part of the model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> With a 128K vocabulary and an untied output layer, Llama 3 8B spends over 1B of its 8B parameters on the two vocabulary matrices.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "RoPE adds a position vector to each token."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It rotates queries and keys, so the score depends only on the distance between positions (the second run after Build it).</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>DeepSeek-V3 has 671B parameters and Qwen2.5-72B has 73B. Which needs more KV cache per token: DeepSeek-V3 (about ten times the parameters), Qwen2.5-72B, or about the same? (Solution P1.)</p></div></aside>
+<h2>Build it</h2>
+<p>The lesson's code is a calculator. Given any config.json, it prints parameter count by component, KV cache at max context, SwiGLU MLP ratio, and a short verdict on the architecture (dense / GQA / MLA / MoE).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">config = {
+    &quot;hidden_size&quot;: 4096, &quot;intermediate_size&quot;: 14336,
+    &quot;num_hidden_layers&quot;: 32, &quot;num_attention_heads&quot;: 32,
+    &quot;num_key_value_heads&quot;: 8, &quot;vocab_size&quot;: 128256,
+    &quot;max_position_embeddings&quot;: 131072,
+}
+</code></pre></div>
+
+<p>The script walks the architecture field by field, computes param counts for embedding, attention (with GQA reduction and an explicit <code>head_dim</code> when the config sets one), MLP (with SwiGLU or GeGLU expansion), layernorms, and the LM head when it is not tied to the embedding. It then computes the KV cache at the stated context length, layer by layer so sliding-window layers are capped at their window, and prints a summary.</p>
+<p>For the dense models the totals match the published parameter counts exactly: Llama 3 8B comes out at 8,030,261,248, Gemma 2 9B at 9,241,705,984, and Spark-X2.5 4B at 4,112,079,360. Qwen 2.5 72B is off by 819,200, which is Exercise 1.</p>
+<p>See <code>code/main.py</code> for the implementation.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s calculator</div><div class="co-body"><p><code>main.py</code>: parameter counts by component, active parameters and KV cache at maximum context for GPT-2 Small, Mistral 7B, Llama 3 8B and 70B, Gemma 2 9B, Spark-X2.5 4B, Mixtral and DeepSeek-V3, from configs written into the script (instant).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # parameter and KV-cache calculator over bundled configs; instant
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+OPEN MODEL ARCHITECTURE WALKTHROUGH
+======================================================================
+
+gpt2-small
+----------------------------------------------------------------------
+  architecture    : LAYERNORM · GELU · LEARNED · MHA
+  total params    : 123.6M
+  active params   : 123.6M
+  embedding       : 38.6M
+  attn / layer    : 2.4M
+  mlp  / layer    : 4.7M  (ratio ff/h = 4.00)
+  context length  : 1,024
+  KV cache BF16   : 37.7MB  (per sequence at max context)
+
+mistral-7b
+----------------------------------------------------------------------
+  architecture    : RMSNORM · SWIGLU · ROPE · GQA (32/8)
+  total params    : 7.2B
+  active params   : 7.2B
+  embedding       : 131.1M
+  attn / layer    : 41.9M
+  mlp  / layer    : 176.2M  (ratio ff/h = 3.50)
+  context length  : 32,768
+  KV cache BF16   : 4.3GB  (per sequence at max context)
+
+llama3-8b
+----------------------------------------------------------------------
+  architecture    : RMSNORM · SWIGLU · ROPE · GQA (32/8)
+  total params    : 8.0B
+  active params   : 8.0B
+  embedding       : 525.3M
+  attn / layer    : 41.9M
+  mlp  / layer    : 176.2M  (ratio ff/h = 3.50)
+  context length  : 131,072
+  KV cache BF16   : 17.2GB  (per sequence at max context)
+…
+(81 more lines)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The calculator reproduces published sizes from a handful of config fields: Llama 3 8B at 8.0B (with 525M in its untied vocabulary matrices), Mistral 7B at 7.2B, Mixtral at 46.7B total and 12.9B active. The MLP is the largest block in every dense model (176M of each Llama 3 8B layer against 42M for attention). The KV-cache column shows what the knobs buy: GPT-2 Small needs 37.7 MB at its 1K context, Llama 3 8B 17.2 GB at 128K. Hybrid models are the interesting case: Gemma 2 9B saves a quarter of its KV cache by giving half its layers a 4K window at an 8K context, while Spark-X2.5 4B, with three of every four layers on a 512-token window, needs 38.7 GB at 1M tokens instead of 154.6 GB. (GPT-2's 123.6M omits biases; Lesson 10.4 counted 124.4M with them.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Three knobs, checked numerically</div><div class="co-body"><p>RoPE scores for the same query and key at shifted positions; RMSNorm versus LayerNorm on one vector; and the SwiGLU width that keeps a GELU MLP's parameter count.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+# A. RoPE: rotating q and k by position-dependent angles makes their dot product depend only on the distance
+d, base = 64, 10000.0
+freqs = base ** (-np.arange(0, d, 2) / d)                    # one frequency per pair of dimensions
+def rope(x, pos):
+    a = pos * freqs; c, s = np.cos(a), np.sin(a)
+    x1, x2 = x[0::2], x[1::2]
+    out = np.empty_like(x); out[0::2] = x1 * c - x2 * s; out[1::2] = x1 * s + x2 * c
+    return out
+q, k = rng.normal(size=d), rng.normal(size=d)
+print(&quot;A. RoPE: score of the same q and k placed at different absolute positions&quot;)
+for pq, pk in ((5, 2), (105, 102), (10005, 10002), (5, 4)):
+    print(f&quot;   q at {pq:&gt;5}, k at {pk:&gt;5} (distance {pq - pk}): score {rope(q, pq) @ rope(k, pk):+.4f}&quot;)
+print(f&quot;   wavelengths of the {d // 2} rotation pairs: {2 * np.pi / freqs[0]:.1f} to {2 * np.pi / freqs[-1]:,.0f} positions&quot;)
+
+# B. RMSNorm versus LayerNorm on the same vector
+x = rng.normal(3.0, 2.0, 8)
+ln = (x - x.mean()) / np.sqrt(x.var() + 1e-5); rms = x / np.sqrt((x ** 2).mean() + 1e-5)
+print(f&quot;\nB. x has mean {x.mean():.2f}: LayerNorm output mean {ln.mean():+.2f}, std {ln.std():.2f}; &quot;
+      f&quot;RMSNorm output mean {rms.mean():+.2f}, root-mean-square {np.sqrt((rms ** 2).mean()):.2f}&quot;)
+
+# C. SwiGLU with the same parameter count as a 4x GELU MLP: three matrices of width (8/3) h instead of two of 4h
+h = 4096
+gelu_params, swiglu_ff = 2 * h * 4 * h, int(8 / 3 * h)
+print(f&quot;\nC. h = {h}: GELU MLP 2 x h x 4h = {gelu_params / 1e6:.1f}M; SwiGLU 3 x h x {swiglu_ff} = {3 * h * swiglu_ff / 1e6:.1f}M; &quot;
+      f&quot;Llama 3 8B uses 14,336 = 3.5h: {3 * h * 14336 / 1e6:.1f}M per layer&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. RoPE: score of the same q and k placed at different absolute positions
+   q at     5, k at     2 (distance 3): score -8.4462
+   q at   105, k at   102 (distance 3): score -8.4462
+   q at 10005, k at 10002 (distance 3): score -8.4462
+   q at     5, k at     4 (distance 1): score -8.5191
+   wavelengths of the 32 rotation pairs: 6.3 to 47,117 positions
+
+B. x has mean 3.08: LayerNorm output mean -0.00, std 1.00; RMSNorm output mean +0.88, root-mean-square 1.00
+
+C. h = 4096: GELU MLP 2 x h x 4h = 134.2M; SwiGLU 3 x h x 10922 = 134.2M; Llama 3 8B uses 14,336 = 3.5h: 176.2M per layer</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> The same query and key give exactly the same score (−8.4462) at positions 5/2, 105/102 and 10005/10002: only the distance, 3, matters. At distance 1 the score changes. The 32 rotation pairs turn at wavelengths from about 6 positions to 47,000, so nearby and distant tokens are distinguished by different pairs; raising the base (Llama 3 uses 500,000) stretches the slowest wavelengths for long contexts.</p>
+<p><strong>B.</strong> LayerNorm centres and scales (mean 0, standard deviation 1); RMSNorm only scales (root mean square 1) and leaves the mean at 0.88. In practice models trained with RMSNorm work as well, and it saves computing a mean.</p>
+<p><strong>C.</strong> A SwiGLU MLP with width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">3</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord mathnormal">h</span></span></span></span> has exactly the parameters of a GELU MLP with width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">h</span></span></span></span> (134.2M for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">096</span></span></span></span>). Llama 3 chose a wider 3.5h (176M per layer), spending more parameters in the MLP.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>Run the calculator on Llama 3 8B, Mistral 7B, Mixtral 8x7B, and DeepSeek V3 configs bundled in the script. Compare the parameter breakdowns. Notice that the MoE models have a total param count that dwarfs the dense models but an active param count that is often smaller. Notice that DeepSeek V3's KV cache is smaller than Llama 3 405B's despite having more total parameters -- that is MLA in action.</p>
+<p>Then compare Gemma 2 9B and Spark-X2.5 4B. For both, the script prints the KV cache it actually needs and the KV cache it would need if every layer were full attention. Gemma 2 alternates 1:1 at an 8k context, so the saving is modest. Spark-X2.5 goes 3:1 with a 512-token window at 1M, so the saving is 4x.</p>
+<p>Then plug in a config for any model you have locally, read the summary, and decide whether it fits your GPU.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Six real models, counted from their configs</div><div class="co-body"><p>The published <code>config.json</code> of GPT-2, Mistral 7B, Llama 3.1 8B (open copy), Qwen2.5-72B, Qwen3-30B-A3B and DeepSeek-V3, each built by Hugging Face <code>transformers</code> on PyTorch's meta device (shapes only, no weights downloaded): exact parameter counts, attention layout, experts and KV cache per token. About 10 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, transformers
+from transformers import AutoConfig, AutoModelForCausalLM
+
+transformers.logging.set_verbosity_error()
+# Real config.json files from the Hugging Face Hub; each model is built on PyTorch's &quot;meta&quot; device:
+# every tensor has a shape but no storage, so exact parameter counts cost no memory and no weight downloads.
+repos = [&quot;openai-community/gpt2&quot;, &quot;mistralai/Mistral-7B-v0.1&quot;, &quot;unsloth/Llama-3.1-8B&quot;, &quot;Qwen/Qwen2.5-72B&quot;,
+         &quot;Qwen/Qwen3-30B-A3B&quot;, &quot;deepseek-ai/DeepSeek-V3&quot;]
+print(f&quot;{'model':&lt;28} {'params':&gt;9} {'layers':&gt;6} {'heads q/kv':&gt;10} {'head dim':&gt;8} {'experts (top-k)':&gt;15} {'KV cache per token':&gt;19}&quot;)
+for repo in repos:
+    cfg = AutoConfig.from_pretrained(repo)
+    with torch.device(&quot;meta&quot;):
+        model = AutoModelForCausalLM.from_config(cfg)
+    n = sum(p.numel() for p in model.parameters())
+    L = getattr(cfg, &quot;num_hidden_layers&quot;, None) or cfg.n_layer
+    hq = getattr(cfg, &quot;num_attention_heads&quot;, None) or cfg.n_head
+    hkv = getattr(cfg, &quot;num_key_value_heads&quot;, None) or hq
+    hd = getattr(cfg, &quot;head_dim&quot;, None) or (getattr(cfg, &quot;hidden_size&quot;, None) or cfg.n_embd) // hq
+    experts = getattr(cfg, &quot;n_routed_experts&quot;, None) or getattr(cfg, &quot;num_experts&quot;, None) or getattr(cfg, &quot;num_local_experts&quot;, None)
+    topk = getattr(cfg, &quot;num_experts_per_tok&quot;, None)
+    if getattr(cfg, &quot;kv_lora_rank&quot;, None):          # MLA caches one compressed latent plus a shared RoPE key per layer
+        kv = L * (cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2
+        note = &quot;MLA&quot;; hd = f&quot;{cfg.qk_nope_head_dim + cfg.qk_rope_head_dim}/{cfg.v_head_dim}&quot;
+    else:
+        kv = 2 * L * hkv * hd * 2
+        note = &quot;GQA&quot; if hkv &lt; hq else &quot;MHA&quot;
+    ex = f&quot;{experts} ({topk})&quot; if experts else &quot;dense&quot;
+    print(f&quot;{repo.split('/')[1]:&lt;28} {n / 1e9:&gt;8.2f}B {L:&gt;6} {f'{hq}/{hkv}':&gt;10} {hd:&gt;8} {ex:&gt;15} {kv / 1024:&gt;11.0f} KB {note}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">model                           params layers heads q/kv head dim experts (top-k)  KV cache per token
+gpt2                             0.12B     12      12/12       64           dense          36 KB MHA
+Mistral-7B-v0.1                  7.24B     32       32/8      128           dense         128 KB GQA
+Llama-3.1-8B                     8.03B     32       32/8      128           dense         128 KB GQA
+Qwen2.5-72B                     72.71B     80       64/8      128           dense         320 KB GQA
+Qwen3-30B-A3B                   30.53B     48       32/4      128         128 (8)          96 KB GQA
+DeepSeek-V3                    671.03B     61    128/128  192/128         256 (8)          69 KB MLA</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Building each model from its real config gives its exact size: Mistral 7B at 7.24B, Llama 3.1 8B at 8.03B, Qwen2.5-72B at 72.71B, DeepSeek-V3 at 671.03B (the multi-token-prediction module, another 14B, is not part of the Hugging Face model). The KV column is the story of this lesson in one line. GPT-2's full multi-head attention needs 36 KB per token at 124M parameters. GQA keeps Mistral and Llama 3 8B at 128 KB and Qwen2.5-72B at 320 KB. Qwen3-30B-A3B, an MoE model with 128 experts of which 8 run per token, uses only 4 key/value heads: 96 KB. DeepSeek-V3, ten times larger than Qwen2.5-72B, needs only 69 KB per token: MLA caches one 512-number latent and a 64-number RoPE key per layer instead of keys and values for every head.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the parameter formula, forget the separate output layer for a model with <code>tie_word_embeddings: false</code> (count the vocabulary matrix once). How far off is Llama 3 8B, and what memory estimate would go wrong? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Dense models</strong> (Llama 3.x, Qwen3 dense, Gemma 3, Mistral Small) use RMSNorm, SwiGLU/GeGLU, RoPE and GQA; Gemma 3 interleaves 5 local sliding-window layers per global layer.</li>
+<li><strong>MoE dominates the largest open models</strong>: DeepSeek-V3/R1 (MLA, 256 experts), Qwen3-235B-A22B and Qwen3-30B-A3B, Llama 4, Kimi K2, gpt-oss.</li>
+<li><strong>Long context and attention variants</strong>: YaRN/NTK RoPE scaling, hybrid attention (sliding plus global, linear-attention layers in Qwen3-Next, Mamba layers in Jamba and Nemotron-H) to cut KV memory.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2407.21783">Llama 3 paper</a>, <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a>, <a href="https://arxiv.org/abs/2505.09388">Qwen3 technical report</a>, <a href="https://arxiv.org/abs/2503.19786">Gemma 3 report</a>, <a href="https://arxiv.org/abs/2305.13245">GQA</a>, <a href="https://arxiv.org/abs/2104.09864">RoFormer (RoPE)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Modern open models = GPT-2 plus RMSNorm, RoPE, SwiGLU, GQA/MLA and (at the top) MoE.</li>
+<li>Parameters, active parameters and KV cache all follow from <code>config.json</code>.</li>
+<li>GQA divides the KV cache by query heads per KV head; MLA shrinks it further.</li>
+<li>MoE: total parameters set memory, active parameters set compute.</li>
+<li>RoPE makes attention depend on relative position.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-moe-hybrid-architectures"><span class="t" style="--cs-hue:168">MH</span>Cheat sheet · Mixture of Experts and Hybrid Architectures</a><a href="#cs-positional-encoding"><span class="t" style="--cs-hue:285">PR</span>Cheat sheet · Positional Encoding: Sinusoidal, RoPE, ALiBi</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-open-model-picker.md</code>. Given a deployment target (GPU type, VRAM, context length, latency budget) and a task profile (chat, code, reasoning, long-context), it recommends an open model, a quantization scheme from <a href="#a1011">Lesson 10.11</a>, and an inference stack from <a href="#a1012">Lesson 10.12</a>, with explicit reasoning about the six architectural knobs.</p>
+<p><strong><code>outputs/skill-open-model-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: open-model-picker
+description: Pick an open LLM family, quantization, and inference stack for a given deployment target.
+version: 1.0.0
+phase: 10
+lesson: 14
+tags: [open-models, llama, deepseek, mixtral, qwen, gemma, moe, gqa, mla, quantization]
+---
+
+Given a deployment target (GPU type, VRAM per GPU, number of GPUs, target context length, target p50/p99 latency, peak concurrent requests) and a task profile (chat, code, reasoning, long-context retrieval, tool use), recommend an open model plus serving stack with explicit reasoning about each of the six architectural knobs from Lesson 14.
+
+Produce:
+
+1. Model shortlist. Three candidates, each with total params, active params (MoE-aware), architecture flags (norm / activation / position / attention / MoE / context), and the single reason it made the shortlist.
+2. Memory budget check. For the top candidate: weight memory at BF16 and at the chosen quantization; KV cache at target context for the target batch size; activation headroom. Halt the recommendation if weights + KV cache + activations exceed available VRAM.
+3. Quantization choice. GPTQ-4bit, AWQ-4bit, FP8, or BF16. Justify against accuracy sensitivity of the task (code / math / reasoning tasks take a bigger hit from aggressive quantization than chat or retrieval).
+4. Inference stack. vLLM, TensorRT-LLM, SGLang, or llama.cpp. Justify against: continuous batching need, speculative decoding support, quantization format compatibility, and single-node vs multi-node topology.
+5. Throughput sanity check. Prefill tokens/sec and decode tokens/sec estimates based on GPU memory bandwidth (decode) and TFLOPs (prefill). Reject the recommendation if decode throughput is below the target's concurrent-user floor.
+6. Fallback. Second choice if the top candidate exceeds VRAM or throughput budget. Always name one.
+
+Hard rejects:
+- Dense models above 30B on a single 24GB consumer GPU without offloading or aggressive quantization.
+- MoE models on a serving stack without expert-parallel support.
+- Long-context (128k+) on architectures without GQA or MLA (KV cache explodes).
+- Any recommendation that does not name the specific model revision (e.g., &quot;Llama 3 8B Instruct v3.1&quot;, not &quot;Llama 3&quot;).
+
+Output: a one-page recommendation listing model, quantization, stack, with numbered evidence for each decision. End with a &quot;worth reconsidering if...&quot; paragraph naming the specific capability or deployment parameter that would flip the choice.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Read the Qwen 2.5 72B config from HuggingFace. Compute total parameters from scratch. Compare to the HF-reported value and identify where any delta comes from (head dim rounding, KV sharing factor, etc.).</p>
+</li>
+<li>
+<p>DeepSeek V3 uses 256 experts with top-8 routing. Compute the ratio of activated experts to total experts and compare to Mixtral 8x7B's top-2 of 8. What does the shift from sparse (25%) to denser sparse (3%) imply about capacity per FLOP?</p>
+</li>
+<li>
+<p>Compute the KV cache for Llama 3 405B at 128k context in FP8 and BF16. At FP8 it is half the BF16 number. How many parallel sequences can you serve on a single 8xH100 node (80GB each = 640GB total, minus weight memory)?</p>
+</li>
+<li>
+<p>Gemma 2 alternates full-attention and sliding-window-attention layers. Write the math for the KV cache when half the layers use a 4096-token sliding window instead of full context. How much memory does that save at 8k total context?</p>
+</li>
+<li>
+<p>Find a recent frontier open model that was released after this lesson was written. Identify which of the six knobs it picked and whether it introduced a seventh knob. The curriculum will feel out of date the moment a new architecture ships -- the goal is to update your table without rebuilding your mental model.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1014-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Qwen2.5-72B</span></summary><div class="qa-a"><p>Qwen2.5-72B: 320 KB per token against DeepSeek-V3's 69 KB, more than four times as much despite a tenth of the parameters. KV-cache size depends on the attention design, not the parameter count. Qwen2.5-72B caches keys and values for 8 GQA heads of 128 dimensions in each of 80 layers (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">80</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span></span></span></span> values); DeepSeek-V3's MLA caches one compressed latent of 512 values plus a 64-value RoPE key in each of 61 layers (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">61</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">576</span></span></span></span> values). That is why DeepSeek can serve long contexts cheaply despite its size.</p></div></details>
+<details class="qa" id="a1014-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · 525M parameters and 1 GB missing</span></summary><div class="qa-a"><p>Llama 3 8B would come out at about 7.5B instead of 8.03B: the output layer is a separate <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">128</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">256</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">096</span></span></span></span> matrix, 525M parameters. In BF16 that is about 1 GB of weights missing from a memory plan, enough to make a model that "fits" on a GPU fail to load, and for training another 8 GB of gradient and optimizer state at 16 bytes per parameter. Always check <code>tie_word_embeddings</code>: small models usually tie (GPT-2, Gemma, SmolLM2), many larger ones do not (Llama 3, Qwen2.5-72B).</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2407.21783">Dubey et al., 2024 -- "The Llama 3 Herd of Models"</a> -- the architectural and training reference for the dense Llama 3 family</li>
+<li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI, 2024 -- "DeepSeek-V3 Technical Report"</a> -- MLA plus auxiliary-loss-free load balancing plus 671B MoE</li>
+<li><a href="https://arxiv.org/abs/2401.04088">Jiang et al., 2024 -- "Mixtral of Experts"</a> -- the canonical MoE open model paper</li>
+<li><a href="https://arxiv.org/abs/2104.09864">Su et al., 2021 -- "RoFormer: Enhanced Transformer with Rotary Position Embedding"</a> -- the RoPE paper</li>
+<li><a href="https://arxiv.org/abs/2002.05202">Shazeer, 2020 -- "GLU Variants Improve Transformer"</a> -- SwiGLU, GeGLU, and friends</li>
+<li><a href="https://arxiv.org/abs/2305.13245">Ainslie et al., 2023 -- "GQA: Training Generalized Multi-Query Transformer Models"</a> -- the GQA paper</li>
+<li><a href="https://arxiv.org/abs/2408.00118">Gemma 2 Team, 2024 -- "Gemma 2: Improving Open Language Models at a Practical Size"</a> -- hybrid full+sliding attention, pre+post-norm</li>
+<li><a href="https://arxiv.org/abs/2412.15115">Qwen Team, 2024 -- "Qwen 2.5 Technical Report"</a> -- YaRN context extension and long-context training recipes</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/14-open-models-architecture-walkthroughs" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1014" id="done-a1014">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1014" id="undo-a1014" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1013"><span class="pn-dir">Previous</span><span class="pn-t">10.13 · Building a Complete LLM Pipeline</span></a><a class="pn next" href="#a1015"><span class="pn-dir">Next</span><span class="pn-t">10.15 · Speculative Decoding and EAGLE-3</span></a></div></footer>

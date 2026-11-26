@@ -1,0 +1,788 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>MCP Reliability, Cancellation, and Flow Control</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.29</span><span class="chip">120 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1329" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Implement the correct cancellation signal for stdio and Streamable HTTP.</li>
+<li>Resolve completion and cancellation races without sending messages after cancellation.</li>
+<li>Separate request cancellation from durable <code>tasks/cancel</code> semantics.</li>
+<li>Build retry decisions from side effects and explicit idempotency keys.</li>
+<li>Bound progress queues while preserving final responses.</li>
+<li>Recover streams through reconnect, refetch, and jittered backoff.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13, Lessons 09 and 13</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 120 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A request ID correlates a message. It does not make a side effect safe, stop a worker, or protect a stream from a slow consumer.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request cancellation</td>
+<td>Abandonment of one in-flight MCP request</td>
+</tr>
+<tr>
+<td>Cancellation race</td>
+<td>Competition between terminal completion and cancellation events</td>
+</tr>
+<tr>
+<td>Idle timeout</td>
+<td>Limit since the last useful request activity</td>
+</tr>
+<tr>
+<td>Maximum timeout</td>
+<td>Absolute limit from request start, unaffected by progress</td>
+</tr>
+<tr>
+<td>Idempotency key</td>
+<td>Application identifier that deduplicates one business intent</td>
+</tr>
+<tr>
+<td>Atomic ledger</td>
+<td>Durable boundary that commits the key claim, effect record, and result as one unit</td>
+</tr>
+<tr>
+<td>Backpressure</td>
+<td>Control applied when producers outpace consumers</td>
+</tr>
+<tr>
+<td>Progress coalescing</td>
+<td>Replacing older progress with a newer authoritative value</td>
+</tr>
+<tr>
+<td>Refetch</td>
+<td>Reading current state again after a stream gap</td>
+</tr>
+<tr>
+<td>Jitter</td>
+<td>Deliberate variation that spreads retries across time</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Real tool calls fail in the middle. A user gives up and cancels; a request takes too long; a network connection drops after the server already did the work but before the answer arrived. Each case needs a precise rule. Cancelling means telling the server to stop (on stdio with a message, on HTTP by closing the response stream), and both sides must accept that the server might finish anyway. A timeout needs two clocks: one that progress updates can reset, and one hard deadline that nothing resets. Retrying is only safe for reads, or for changes that carry an idempotency key, a name the server uses to recognise a repeat. This lesson cancels real calls to an SDK server under a two-clock policy and then retries a payment through the lesson's durable ledger, with and without a key.</p></div></aside>
+<p>The happy path hides the most expensive distributed-systems bugs.</p>
+<p>A client calls a tool. The server starts work. Progress arrives. A proxy buffers the stream. The client reaches its timeout and disconnects. The server finishes one millisecond later. The client retries with a new JSON-RPC id. The mutation runs twice.</p>
+<p>Every component behaved locally. The system failed globally.</p>
+<p>MCP defines message and transport behavior, but your application still owns:</p>
+<ul>
+<li>time budgets;</li>
+<li>business idempotency;</li>
+<li>bounded queues;</li>
+<li>retry classification;</li>
+<li>durable task state;</li>
+<li>reconnect and refetch policy.</li>
+</ul>
+<p>This lesson builds those decisions into a deterministic simulator. There are
+no sleeps, sockets, or random failures. You control cancellation event order
+directly. One synchronized thread test forces two ledger clients to compete
+for the same idempotency key.</p>
+<h2>Request Cancellation Is Transport-Specific</h2>
+<p>The intent is the same on every transport: the client no longer needs an in-flight result. The wire signal is different.</p>
+<h3>stdio</h3>
+<p>stdio uses one shared bidirectional channel. A client sends a notification:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;method&quot;: &quot;notifications/cancelled&quot;,
+  &quot;params&quot;: {
+    &quot;requestId&quot;: 41,
+    &quot;reason&quot;: &quot;User closed the operation&quot;
+  }
+}
+</code></pre></div>
+<p>The notification is fire-and-forget. The server emits no JSON-RPC response to it.</p>
+<p>The server should stop work, free resources, and avoid sending a response for the cancelled request. It may ignore cancellation when the request is unknown, already finished, or cannot be stopped safely.</p>
+<p>Malformed, unknown, and already completed cancellation notifications are ignored. Turning those races into new errors would create more races.</p>
+<h3>Streamable HTTP</h3>
+<p>Modern Streamable HTTP gives each request its own HTTP response or SSE response stream. The client cancels by closing that request's response stream.</p>
+<p>Do not POST <code>notifications/cancelled</code> for an ordinary HTTP request. Stream closure is the cancellation signal.</p>
+<p>Once the server observes the disconnect, it should stop work and must not send more messages for that request.</p>
+<h3>Server-sent cancellation is narrow</h3>
+<p>A server does not use <code>notifications/cancelled</code> to cancel arbitrary client calls. On stdio, server-sent cancellation is reserved for terminating a <code>subscriptions/listen</code> request. Keep that path separate from ordinary client-request cancellation.</p>
+<h2>Cancellation Is a Race</h2>
+<p>Two event orders are both valid.</p>
+<h3>Cancellation wins</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">request starts
+client sends cancellation signal
+server marks request cancelled
+worker reaches completion
+server suppresses the response
+</code></pre></div>
+<h3>Completion wins</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">request starts
+worker commits the result
+server sends the response
+cancellation arrives late
+server ignores the late notification
+</code></pre></div>
+<p>The client must also ignore a late response for a request it already abandoned. Network latency means neither side can prove which event the other side observed first.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="mcp-reliability-race"></div></figure></p>
+<p>The lesson's <code>RequestCoordinator</code> stores one terminal state. <code>complete()</code> returns no response after cancellation. A late cancellation cannot change a completed record.</p>
+<h2>Timeouts Need Two Clocks</h2>
+<p>A single inactivity timer is not enough.</p>
+<p>Use two limits:</p>
+<ol>
+<li><strong>Idle timeout.</strong> How long the request may produce no useful activity.</li>
+<li><strong>Maximum timeout.</strong> The absolute wall-clock budget from request start.</li>
+</ol>
+<p>Progress may reset the idle clock. It must never remove the maximum deadline.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">start: 0 ms
+progress: 400 ms
+progress: 800 ms
+progress: 1200 ms
+idle timeout: 500 ms
+maximum timeout: 2000 ms
+</code></pre></div>
+<p>At 1500 ms, the request is still active because the latest progress is only 300 ms old. At 2000 ms, the maximum deadline cancels it even if another progress event arrived at 1999 ms.</p>
+<p>Progress is optional. A server can accept a progress token and emit no updates. Never turn the presence of a token into an infinite timeout.</p>
+<p>MCP progress values must increase. Notifications stop after completion or cancellation. Rate-limit progress so a fast worker cannot flood the transport.</p>
+<h2>Request Cancellation Is Not <code>tasks/cancel</code></h2>
+<p>These mechanisms solve different lifetimes.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Target</th>
+<th>Signal</th>
+<th>What success means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Request cancellation on stdio</td>
+<td>One in-flight RPC</td>
+<td><code>notifications/cancelled</code></td>
+<td>Client abandoned the request; server should stop if practical</td>
+</tr>
+<tr>
+<td>Request cancellation on HTTP</td>
+<td>One in-flight response stream</td>
+<td>Close the stream</td>
+<td>Client abandoned the request; server should stop if practical</td>
+</tr>
+<tr>
+<td><code>tasks/cancel</code></td>
+<td>One durable Task</td>
+<td>Ordinary MCP request</td>
+<td>Server acknowledged cancellation intent</td>
+</tr>
+</tbody>
+</table></div>
+<p>A successful <code>tasks/cancel</code> result does not prove the worker stopped. The task may remain <code>working</code> until a worker checkpoint observes the flag. Work may complete before that checkpoint.</p>
+<p>Do not erase durable task state when the HTTP connection closes. The reason to create a Task is that its lifecycle outlives one request and one connection.</p>
+<h2>A New JSON-RPC ID Is Not Idempotency</h2>
+<p>JSON-RPC ids correlate requests and responses. They do not identify a business operation.</p>
+<p>Suppose a client submits a charge with id <code>41</code>, loses the response, and retries with id <code>42</code>. The server sees two different messages. Without an application key, it cannot know they represent one checkout.</p>
+<p>An idempotency key identifies the business intent:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;name&quot;: &quot;charge_account&quot;,
+  &quot;arguments&quot;: {
+    &quot;account&quot;: &quot;acct-7&quot;,
+    &quot;cents&quot;: 1200,
+    &quot;idempotencyKey&quot;: &quot;checkout-7&quot;
+  }
+}
+</code></pre></div>
+<p>The server stores:</p>
+<ul>
+<li>the key;</li>
+<li>a fingerprint of operation arguments;</li>
+<li>the committed result.</li>
+</ul>
+<p>The same key and same arguments return the stored result. The same key with different arguments is rejected. This prevents accidental key reuse from mutating a different business operation.</p>
+<h3>The ledger boundary must be atomic and durable</h3>
+<p>This sequence is unsafe:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">check key
+run mutation
+store result
+</code></pre></div>
+<p>Two workers can both observe a missing key and both run the mutation. A crash
+after the effect but before the store creates the same ambiguity on retry.</p>
+<p>The lesson uses a file-backed SQLite ledger. <code>BEGIN IMMEDIATE</code> serializes the
+key check, simulated business effect, execution counter, and stored result into
+one transaction. Two independent ledger connections racing with the same key
+therefore observe one committed result and one execution. Closing and reopening
+the ledger keeps that record.</p>
+<p>Every return value is reconstructed from stored JSON. The caller never receives
+the mutable object held by the ledger, so changing a returned dictionary cannot
+corrupt later replay results.</p>
+<p>The simulator's business effect is the receipt and execution counter inside the
+same SQLite transaction. A real payment, deployment, or external API call is
+not made atomic merely by writing a local table. Production needs a durable
+shared database transaction, a transactional outbox, or an upstream provider
+that enforces the same idempotency key. A process lock alone does not protect
+multiple replicas or survive a restart.</p>
+<h3>Retry matrix</h3>
+<p>Classify retries before implementing them.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Example</th>
+<th>Retry rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Safe</td>
+<td>Deterministic read with no side effect</td>
+<td>Retry with a new JSON-RPC id after the failure boundary is understood</td>
+</tr>
+<tr>
+<td>Conditional</td>
+<td>Mutation with a durable idempotency key</td>
+<td>Retry with the same key and identical arguments</td>
+</tr>
+<tr>
+<td>Unsafe</td>
+<td>Mutation without business deduplication</td>
+<td>Do not retry automatically; reconcile first</td>
+</tr>
+</tbody>
+</table></div>
+<p>Tool annotations such as <code>readOnlyHint</code> and <code>idempotentHint</code> remain untrusted hints. The application contract and server implementation decide retry safety.</p>
+<h2>Backpressure Is Part of Correctness</h2>
+<p>An SSE producer can generate progress faster than a client, proxy, or network can consume it. An unbounded queue converts slowness into memory exhaustion.</p>
+<p>Use a bounded queue and define what can be lost.</p>
+<p>Progress is replaceable. A later progress value supersedes an earlier one for the same token. A final JSON-RPC response is not replaceable.</p>
+<p>The lesson buffer applies this policy:</p>
+<ol>
+<li>Coalesce adjacent progress for the same token.</li>
+<li>Drop the oldest progress when capacity is reached.</li>
+<li>Mark the stream as needing authoritative refetch.</li>
+<li>Preserve the final response.</li>
+<li>Refuse a state where preserving the final response would require dropping another final response.</li>
+</ol>
+<p>This is bounded loss with explicit recovery. Silent loss is not a strategy.</p>
+<h3>Proxy buffering</h3>
+<p>A server can stream correctly while a reverse proxy holds events in a buffer.</p>
+<p>For an SSE response, send:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-http">Content-Type: text/event-stream
+Cache-Control: no-cache
+X-Accel-Buffering: no
+</code></pre></div>
+<p>The 2026 Streamable HTTP specification recommends <code>X-Accel-Buffering: no</code> so compatible proxies deliver events immediately.</p>
+<p>For quiet long-lived streams, periodically emit an SSE comment:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">:
+</code></pre></div>
+<p>The client ignores comment lines. Intermediaries see traffic and are less likely to close an idle connection.</p>
+<p>Keepalive is not progress. Do not reset an operation's semantic idle timeout merely because a transport comment arrived.</p>
+<h2>Reconnect Means Refetch</h2>
+<p>Modern Streamable HTTP does not support resumable SSE through <code>Last-Event-ID</code>.</p>
+<p>After a <code>subscriptions/listen</code> stream drops:</p>
+<ol>
+<li>Open a new listen request with a new JSON-RPC id.</li>
+<li>Restore the desired subscription filter.</li>
+<li>Refetch affected tools, resources, prompts, or Tasks from authoritative methods.</li>
+<li>Deduplicate application state by stable identifiers.</li>
+<li>Do not replay an unsafe mutation just because its response was lost.</li>
+</ol>
+<p>The sample recovery plan explicitly sets <code>sendLastEventId</code> to false and lists resources to refetch.</p>
+<h3>Prevent a reconnect herd</h3>
+<p>If 10,000 clients reconnect at exactly one second, the recovering server fails again.</p>
+<p>Use exponential backoff with jitter and a cap. The lesson computes deterministic jitter from client id and attempt number so tests remain reproducible:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">attempt 0: up to 250 ms
+attempt 1: up to 500 ms
+attempt 2: up to 1000 ms
+...
+cap: 8000 ms
+</code></pre></div>
+<p>Production can use cryptographically secure or runtime randomness. The invariant is distribution, not a specific formula.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Two clocks.</strong> With request start <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, last progress time <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>, idle limit <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">I</span></span></span></span> and maximum <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span>, the request stays alive at time <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> only if
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6984em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">I</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">and</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mord">.</span></span></span></span></span></div>
+Progress moves <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> forward; nothing moves <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>. So the latest cancellation time is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span>, however chatty the server is.</p>
+<p><strong>Idempotency.</strong> A mutation with key <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> and arguments <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> is applied at most once:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">charge</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">stored result</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">)</span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">error</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">apply, then store </span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">result</span></span><span class="mclose">)</span><span class="mord text"><span class="mord"> atomically</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">if </span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord text"><span class="mord"> seen with the same </span></span><span class="mord mathnormal">a</span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">if </span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord text"><span class="mord"> seen with different </span></span><span class="mord mathnormal">a</span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">otherwise.</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div>
+A new JSON-RPC id is not a key: it identifies the message, not the business operation.</p>
+<p><strong>Backoff with jitter.</strong> Attempt <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> waits a random time in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mopen">[</span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">min</span><span class="mopen">(</span><span class="mord">8000</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">250</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> ms, so clients that failed together do not all reconnect together.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Applying the two clocks to three jobs</div><div class="co-body"><ul>
+<li>Idle limit 0.5 s, maximum 2.0 s. Each row takes 0.2 s.</li>
+<li>5 rows with progress after each: done at about 1.0 s, both clocks fine → completes.</li>
+<li>30 rows with steady progress: the idle clock never fires (gaps of 0.2 s), but at 2.0 s the maximum fires → cancelled during row 11.</li>
+<li>30 rows, progress stops after row 3 (0.6 s): the idle clock fires at about 0.6 + 0.5 = 1.1 s → cancelled, while the server is in row 6.</li>
+<li>A lost-response retry of a 500-cent charge: with key <code>order-77</code> there is 1 side effect; without a key, 2; reusing the key for 900 cents is rejected.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "After I cancel, the server did not do the work."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Cancellation races completion; the work may already be committed.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Progress updates mean the request may run forever."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Progress resets only the idle clock; the maximum deadline always applies.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Retrying with a new JSON-RPC id is safe."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> For side effects, only a durable idempotency key with identical arguments makes a retry safe.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "<code>tasks/cancel</code> returning success means the work stopped."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It acknowledges the intent; the worker stops at its next checkpoint, or finishes first.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 30-row export reports progress every 0.2 s. The client uses an idle limit of 0.5 s and a maximum of 2.0 s. Will it finish? And when a job stops reporting progress after 3 rows, roughly when is it cancelled? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Cancelling real calls under two clocks</div><div class="co-body"><p>The official SDK client starts the server below as a subprocess over stdio. A watchdog cancels each call when either clock expires; on stdio the SDK then sends <code>notifications/cancelled</code>, and the server's task is cancelled. The server writes where each export stopped. About 5 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Real stdio cancellation with the official SDK, under a two-clock policy: an idle timeout that
+# progress resets, and a maximum deadline that nothing resets. The server logs where it stopped.
+import anyio, pathlib, sys, time
+from mcp import Client, StdioServerParameters
+from mcp.client.stdio import stdio_client
+pathlib.Path(&quot;slow_server.py&quot;).write_text('''
+import anyio, time
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+s = MCPServer(&quot;slow&quot;, log_level=&quot;WARNING&quot;)
+def log(m):
+    with open(&quot;server.log&quot;, &quot;a&quot;) as f: f.write(m + &quot;\\n&quot;)
+@s.tool()
+async def export(rows: int, stall_after: int, ctx: Context) -&gt; str:
+    &quot;&quot;&quot;Export rows, reporting progress; stops reporting after stall_after rows.&quot;&quot;&quot;
+    done = 0
+    try:
+        for done in range(1, rows + 1):
+            await anyio.sleep(0.2)
+            if done &lt;= stall_after: await ctx.report_progress(done, rows)
+        log(f&quot;export(rows={rows}): finished&quot;); return f&quot;exported {rows} rows&quot;
+    except BaseException as e:
+        log(f&quot;export(rows={rows}): stopped during row {done} ({type(e).__name__})&quot;); raise
+s.run()
+''')
+open(&quot;server.log&quot;, &quot;w&quot;).close()
+
+async def call_with_two_clocks(c, args, idle=0.5, maximum=2.0):
+    t0 = time.monotonic(); last = [t0]; why = [None]
+    async def on_progress(progress, total, message): last[0] = time.monotonic()
+    async with anyio.create_task_group() as tg:
+        async def watchdog():
+            while True:
+                await anyio.sleep(0.05); now = time.monotonic()
+                if now - t0 &gt;= maximum: why[0] = &quot;maximum deadline&quot;; tg.cancel_scope.cancel(); return
+                if now - last[0] &gt;= idle: why[0] = &quot;idle timeout&quot;; tg.cancel_scope.cancel(); return
+        tg.start_soon(watchdog)
+        result = await c.call_tool(&quot;export&quot;, args, progress_callback=on_progress)
+        tg.cancel_scope.cancel()                   # finished first: stop the watchdog
+        return f&quot;completed in {time.monotonic() - t0:.1f}s: {result.content[0].text}&quot;
+    return f&quot;cancelled by {why[0]} after {time.monotonic() - t0:.1f}s&quot;
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=[&quot;slow_server.py&quot;])
+    async with Client(stdio_client(params, errlog=sys.__stderr__)) as c:
+        for label, args in [(&quot;short job, steady progress&quot;, {&quot;rows&quot;: 5, &quot;stall_after&quot;: 5}),
+                            (&quot;long job, steady progress&quot;, {&quot;rows&quot;: 30, &quot;stall_after&quot;: 30}),
+                            (&quot;job that stalls after 3 rows&quot;, {&quot;rows&quot;: 30, &quot;stall_after&quot;: 3})]:
+            print(f&quot;{label:&lt;30} -&gt; {await call_with_two_clocks(c, args)}&quot;)
+        await anyio.sleep(0.4)                     # let the server write its last log line
+anyio.run(main)
+print(&quot;\nserver log:&quot;, *open(&quot;server.log&quot;).read().split(&quot;\n&quot;)[:-1], sep=&quot;\n   &quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">short job, steady progress     -&gt; completed in 1.0s: exported 5 rows
+long job, steady progress      -&gt; cancelled by maximum deadline after 2.0s
+job that stalls after 3 rows   -&gt; cancelled by idle timeout after 1.1s
+
+server log:
+   export(rows=5): finished
+   export(rows=30): stopped during row 11 (CancelledError)
+   export(rows=30): stopped during row 6 (CancelledError)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The short job finishes.</strong> Five rows take about 1.1 s with progress after each, well inside both clocks.</p>
+<p><strong>Steady progress cannot buy unlimited time.</strong> The 30-row job keeps reporting every 0.2 s, so the idle clock never fires, but the maximum deadline cancels it at 2.0 s. The server log shows it was stopped during row 11: the SDK client sent <code>notifications/cancelled</code> over stdio, and the server's task received <code>CancelledError</code>.</p>
+<p><strong>A stalled job is caught early.</strong> After three progress updates the job keeps running silently; 0.5 s after the last update the idle clock cancels it, at about 1.1 s, while the server was in row 6. Without the idle clock the client would have waited for the full maximum.</p>
+<p><strong>Cancellation is cooperative.</strong> The server stopped because its code awaits regularly; a tool that blocks in a long CPU loop or an external call would keep running until its next await, and might finish the work anyway.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Retrying a payment after a lost response</div><div class="co-body"><p>This block continues from the one above. An <code>MCPServer</code> tool <code>charge</code> is backed by the lesson's <code>MutationLedger</code>, an SQLite table that stores each idempotency key with its arguments and result in one transaction. Each case calls the tool, treats the answer as lost, and retries. Then <code>classify_retry</code> and the reconnect backoff from <code>code/main.py</code>. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above. A charge tool backed by the lesson's MutationLedger (SQLite):
+# the response is &quot;lost&quot; and the client retries, with and without an idempotency key.
+import json, tempfile
+from mcp.server import MCPServer
+from main import MutationLedger, ReliabilityError, classify_retry, retry_delay_ms
+ledger = MutationLedger(pathlib.Path(tempfile.mkdtemp()) / &quot;ledger.sqlite3&quot;)
+pay = MCPServer(&quot;payments&quot;, log_level=&quot;WARNING&quot;)
+@pay.tool()
+def charge(account: str, cents: int, idempotency_key: str | None = None) -&gt; str:
+    &quot;&quot;&quot;Charge an account once per idempotency key.&quot;&quot;&quot;
+    try: return json.dumps(ledger.charge(account, cents, rpc_id=&quot;mcp&quot;, idempotency_key=idempotency_key))
+    except ReliabilityError as e: return json.dumps({&quot;error&quot;: str(e)})
+
+async def retries():
+    async with Client(pay) as c:
+        async def call(**a): return json.loads((await c.call_tool(&quot;charge&quot;, a)).content[0].text)
+        for label, first, retry in [
+            (&quot;same key, same arguments&quot;, dict(account=&quot;acct-1&quot;, cents=500, idempotency_key=&quot;order-77&quot;), None),
+            (&quot;no key (new JSON-RPC id only)&quot;, dict(account=&quot;acct-2&quot;, cents=500), None),
+            (&quot;same key, different amount&quot;, dict(account=&quot;acct-3&quot;, cents=500, idempotency_key=&quot;order-78&quot;),
+                                            dict(account=&quot;acct-3&quot;, cents=900, idempotency_key=&quot;order-78&quot;))]:
+            before = ledger.executions
+            await call(**first)                    # suppose this response is lost in transit
+            again = await call(**(retry or first)) # the client retries
+            print(f&quot;{label:&lt;32} side effects: {ledger.executions - before}  retry answer: {again}&quot;)
+anyio.run(retries)
+
+print()
+for side, key in [(False, None), (True, &quot;order-79&quot;), (True, None)]:
+    d = classify_retry(side_effect=side, idempotency_key=key)
+    print(f&quot;side_effect={side!s:&lt;5} key={key!s:&lt;9} -&gt; {d.classification:&lt;11} {d.reason}&quot;)
+print(&quot;\nreconnect delays (ms) for attempts 0-4, five clients:&quot;)
+for cid in (&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;, &quot;c4&quot;, &quot;c5&quot;): print(f&quot;   {cid}: {[retry_delay_ms(cid, a) for a in range(5)]}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">same key, same arguments         side effects: 1  retry answer: {&#x27;account&#x27;: &#x27;acct-1&#x27;, &#x27;cents&#x27;: 500, &#x27;receipt&#x27;: &#x27;charge-001&#x27;, &#x27;rpcId&#x27;: &#x27;mcp&#x27;}
+no key (new JSON-RPC id only)    side effects: 2  retry answer: {&#x27;account&#x27;: &#x27;acct-2&#x27;, &#x27;cents&#x27;: 500, &#x27;receipt&#x27;: &#x27;charge-003&#x27;, &#x27;rpcId&#x27;: &#x27;mcp&#x27;}
+same key, different amount       side effects: 1  retry answer: {&#x27;error&#x27;: &#x27;idempotency key was reused with different arguments&#x27;}
+
+side_effect=False key=None      -&gt; safe        operation is read-only by application contract
+side_effect=True  key=order-79  -&gt; conditional retry only with the same idempotency key and identical arguments
+side_effect=True  key=None      -&gt; unsafe      a new JSON-RPC id cannot deduplicate a side effect
+
+reconnect delays (ms) for attempts 0-4, five clients:
+   c1: [222, 349, 558, 1632, 2939]
+   c2: [158, 333, 780, 1587, 2216]
+   c3: [191, 387, 970, 1495, 3575]
+   c4: [130, 297, 524, 1145, 3150]
+   c5: [139, 357, 984, 1414, 2499]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>With a key, a retry is a replay.</strong> The first call charged 500 cents; the retry with the same key and arguments returned the stored receipt (<code>charge-001</code>) and made no new charge: 1 side effect.</p>
+<p><strong>Without a key, the retry charges again.</strong> The second call is a new request with a new JSON-RPC id, so the ledger cannot know it is a repeat: 2 side effects, receipt <code>charge-003</code>. This is the double charge that idempotency keys exist to prevent.</p>
+<p><strong>Reusing a key for different arguments is refused.</strong> The ledger binds the key to the account and amount; a retry asking for 900 cents under the same key is an error, not a silent second operation.</p>
+<p><strong>The classification follows from the contract</strong>, not from tool hints: reads are safe, keyed mutations are conditional, unkeyed mutations are unsafe. The backoff table shows each client's delays doubling with attempts while spreading out within each band, so five clients that fail together do not reconnect together.</p></div></aside>
+<h2>Build · <code>RequestCoordinator</code></h2>
+<p><code>code/main.py</code> builds five small reliability components.</p>
+<ul>
+<li>starts an in-flight request with idle and maximum deadlines;</li>
+<li>emits monotonic progress notifications;</li>
+<li>produces the correct stdio or HTTP cancellation signal;</li>
+<li>ignores invalid cancellation notifications;</li>
+<li>makes cancellation and completion terminal races explicit;</li>
+<li>reserves server-sent cancellation for stdio subscriptions.</li>
+</ul>
+<h2>Build · <code>MutationLedger</code></h2>
+<ul>
+<li>proves that two JSON-RPC ids execute twice without a business key;</li>
+<li>uses a file-backed SQLite transaction for the key check, simulated effect,
+  execution counter, and result commit;</li>
+<li>deduplicates matching arguments under one idempotency key across independent
+  ledger connections;</li>
+<li>rejects one key reused with different arguments;</li>
+<li>returns defensive copies and preserves committed records across reopen.</li>
+</ul>
+<h2>Build · <code>DurableTaskService</code></h2>
+<ul>
+<li>acknowledges a cancellation request;</li>
+<li>keeps the task <code>working</code> until a worker checkpoint;</li>
+<li>demonstrates why acknowledgement is not final status.</li>
+</ul>
+<h2>Build · <code>BoundedSseBuffer</code></h2>
+<ul>
+<li>coalesces or drops progress under pressure;</li>
+<li>records that authoritative refetch is required;</li>
+<li>never drops the final response.</li>
+</ul>
+<h2>Build · Recovery helpers</h2>
+<ul>
+<li>return proxy-safe SSE headers and keepalive comments;</li>
+<li>create a reconnect and refetch plan;</li>
+<li>spread retries with deterministic exponential backoff and jitter.</li>
+</ul>
+<h2>Use it: the same idea with real libraries</h2>
+<p>From the repository root:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/29-mcp-reliability-cancellation-and-flow-control/code
+python3 main.py
+npx tsx main.ts
+python3 -m unittest discover tests -v
+</code></pre></div>
+<p>The demo runs both sides of the central race, executes a transactionally
+deduplicated mutation in a temporary file-backed ledger, overloads a bounded
+progress buffer, and shows a durable Task moving from acknowledged cancellation
+to worker-observed cancellation.</p>
+<h2>Interactive Lab</h2>
+<p>Run four event orderings without adding sleeps.</p>
+<ol>
+<li>Start request <code>A</code>, cancel it, then call <code>complete()</code>.</li>
+<li>Start request <code>B</code>, complete it, then deliver cancellation.</li>
+<li>Start request <code>C</code>, emit progress before every idle deadline, then cross the maximum deadline.</li>
+<li>Start request <code>D</code> over Streamable HTTP and close its response stream.</li>
+</ol>
+<p>Record for each scenario:</p>
+<ul>
+<li>the terminal request state;</li>
+<li>whether a final response exists;</li>
+<li>the cancellation signal placed on the wire;</li>
+<li>which event the client should ignore.</li>
+</ul>
+<p>Then change <code>D</code> to stdio. The operation is identical, but the cancellation signal must change.</p>
+<h2>Practice Lab</h2>
+<p>Add a <code>reserve_inventory</code> mutation to <code>MutationLedger</code>.</p>
+<p>Requirements:</p>
+<ol>
+<li>The key binds SKU, quantity, tenant, and operation name.</li>
+<li>A retry with the same key and same arguments returns the first reservation.</li>
+<li>A retry with changed quantity fails without another reservation.</li>
+<li>An execution that committed but lost its response can be reconciled by key.</li>
+<li>The result records no secret or payment data.</li>
+<li>Automatic retry is disabled when the client did not provide a key.</li>
+<li>Add a simulated subscription drop and refetch the inventory record before deciding what to do next.</li>
+<li>Start two ledger connections at a barrier and submit the same key
+   concurrently. Assert one reservation was committed.</li>
+<li>Mutate the first returned reservation object. Replay the key and prove the
+   stored result did not change.</li>
+<li>Close and reopen the ledger file, then reconcile the reservation by key.</li>
+</ol>
+<p>Keep the lab honest: if inventory lives in another service, explain whether
+that service accepts the same idempotency key or whether a transactional outbox
+bridges the local commit to the remote effect.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An agent framework wraps every tool call in "retry up to 3 times on timeout, with a new request each time", and its HTTP client closes the stream when the user presses Stop but keeps the server's task id in memory only. What can happen to a <code>send_invoice</code> tool and to a long-running Task? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>2026-07-28 cancellation</strong>: on stdio, <code>notifications/cancelled</code>; on Streamable HTTP, closing the request's SSE stream is the cancellation, and no notification is sent. Durable work uses the Tasks extension's <code>tasks/cancel</code>, which is a request for cancellation, not a guarantee.</li>
+<li><strong>SDK support</strong>: the Python SDK 2.x maps anyio cancellation to these signals, as the run shows, and supports <code>progress_callback</code> and read timeouts per call.</li>
+<li><strong>Idempotency in production</strong> follows the payment-API pattern (Stripe-style <code>Idempotency-Key</code> headers), stored transactionally with the result; for remote effects, a transactional outbox keeps the local record and the remote call consistent.</li>
+<li><strong>Proxies</strong>: servers send <code>X-Accel-Buffering: no</code> on SSE and periodic comment keep-alives so buffering proxies do not delay progress or close idle streams.</li>
+<li><strong>On your laptop</strong>: nothing here needs a GPU; the timings are wall-clock sleeps.</li>
+</ul>
+<p>Sources: <a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation">MCP cancellation, 2026-07-28</a>, <a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http">Streamable HTTP</a>, <a href="https://docs.stripe.com/api/idempotent_requests">Stripe idempotent requests</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Cancellation is transport-specific and races completion; both sides handle late messages.</li>
+<li>Use two clocks: idle (reset by progress) and maximum (never reset).</li>
+<li>Request cancellation and <code>tasks/cancel</code> have different lifetimes.</li>
+<li>Retry reads freely; retry mutations only with the same idempotency key and arguments.</li>
+<li>Bound buffers, keep progress small, reconnect with jitter, and refetch state after reconnecting.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a1329-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Cancelled at the maximum; idle fires near 1.1 s</span></summary><div class="qa-a"><p>It will not finish. The progress every 0.2 s keeps the idle clock (0.5 s) from firing, but the maximum deadline of 2.0 s still applies, so the job is cancelled at 2.0 s, about 10 rows in, of 30.</p>
+<p>The stalling job reports its last progress at about 0.6 s (after row 3). The idle clock fires 0.5 s later, at about 1.1 s, long before the maximum. The run shows exactly these two outcomes.</p></div></details>
+<details class="qa" id="a1329-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Three invoices and an orphaned task</span></summary><div class="qa-a"><p><strong><code>send_invoice</code> can run up to four times.</strong> A timeout does not mean the server did nothing: the first call may have sent the invoice and only the response was slow or lost. Each retry is a new request, so without an idempotency key the server cannot tell it is a repeat, and the customer gets duplicate invoices (or duplicate charges, emails, tickets). Retries of side effects need the same idempotency key and identical arguments, and many should not be automatic at all.</p>
+<p><strong>The long-running Task is orphaned.</strong> Closing the HTTP stream cancels only the in-flight request, not the durable Task, which keeps running on the server. Because the client kept the task id only in memory, a restart loses it: the work continues (and is billed) with nobody polling, and the user cannot cancel it. Store task ids durably, call <code>tasks/cancel</code> when the user means "stop the job", and poll or refetch its state after reconnecting.</p></div></details>
+<h2>Shipped Artifact</h2>
+<p><code>outputs/skill-mcp-reliability-reviewer.md</code> is a flat reliability review skill. Give it an MCP operation, transport, timeout policy, retry behavior, queue policy, and recovery plan. It returns a race table, retry classification, idempotency boundary, flow-control checks, and failure fixtures.</p>
+<h2>Verify It</h2>
+<p>The lesson is complete when these statements are true:</p>
+<ul>
+<li>stdio cancellation sends <code>notifications/cancelled</code> and receives no response.</li>
+<li>Streamable HTTP cancellation closes the request stream and sends no cancellation POST.</li>
+<li>Cancel-before-complete suppresses the final response.</li>
+<li>Complete-before-cancel preserves the response and ignores the late cancellation.</li>
+<li>Progress can reset idle timeout but never maximum timeout.</li>
+<li>A new JSON-RPC id alone executes the mutation again.</li>
+<li>One idempotency key and identical arguments execute once under a concurrent
+  two-connection race.</li>
+<li>A committed record survives reopen and replay returns a defensive copy.</li>
+<li>Mutating one returned result cannot alter the stored result.</li>
+<li>The bounded buffer stays within capacity and preserves the final response.</li>
+<li>Reconnect uses a new request, does not send <code>Last-Event-ID</code>, and refetches affected state.</li>
+<li><code>tasks/cancel</code> acknowledgement leaves the task non-terminal until the worker observes it.</li>
+</ul>
+<h2>Production Failure Modes</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>Observable symptom</th>
+<th>Correct response</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HTTP client POSTs cancellation notification</td>
+<td>Server and client disagree about request lifetime</td>
+<td>Close the request's SSE response stream</td>
+</tr>
+<tr>
+<td>Server responds after accepted cancellation</td>
+<td>Client receives an unusable late result</td>
+<td>Stop work and suppress further messages when cancellation wins</td>
+</tr>
+<tr>
+<td>Progress resets every deadline</td>
+<td>Hung work survives forever</td>
+<td>Keep a separate absolute maximum timeout</td>
+</tr>
+<tr>
+<td>New RPC id treated as deduplication</td>
+<td>Charge, deployment, or deletion runs twice</td>
+<td>Add a durable application idempotency key</td>
+</tr>
+<tr>
+<td>Key check and effect are separate</td>
+<td>Concurrent workers both observe a missing key</td>
+<td>Commit key claim, effect record, and result atomically</td>
+</tr>
+<tr>
+<td>In-memory ledger used across replicas</td>
+<td>Restart or another worker forgets prior commits</td>
+<td>Use shared durable storage or upstream idempotency</td>
+</tr>
+<tr>
+<td>Stored mutable result returned directly</td>
+<td>Caller mutation corrupts later replays</td>
+<td>Serialize committed results and return defensive copies</td>
+</tr>
+<tr>
+<td>Key reused with changed arguments</td>
+<td>One key aliases two business intents</td>
+<td>Store and compare an argument fingerprint</td>
+</tr>
+<tr>
+<td>Unbounded progress queue</td>
+<td>Memory rises with a slow consumer</td>
+<td>Coalesce and drop replaceable progress within a bound</td>
+</tr>
+<tr>
+<td>Final response dropped under pressure</td>
+<td>Client cannot know the request outcome</td>
+<td>Reserve capacity or evict progress, never the final response</td>
+</tr>
+<tr>
+<td>Proxy buffers SSE</td>
+<td>Progress arrives in bursts or after timeout</td>
+<td>Disable buffering and configure compatible proxy timeouts</td>
+</tr>
+<tr>
+<td><code>Last-Event-ID</code> assumed</td>
+<td>Client resumes from state the server does not support</td>
+<td>Reconnect with a new request and refetch</td>
+</tr>
+<tr>
+<td>Every client reconnects immediately</td>
+<td>Recovery creates another outage</td>
+<td>Use capped exponential backoff with jitter</td>
+</tr>
+<tr>
+<td>Task ack treated as final cancellation</td>
+<td>Worker keeps running after UI says stopped</td>
+<td>Poll the Task until a terminal status</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Capstone Connection</h2>
+<p>The tool-ecosystem capstone should treat reliability as executable evidence, not a paragraph in an architecture diagram.</p>
+<p>Require these artifacts:</p>
+<ul>
+<li>one cancellation race transcript for each transport;</li>
+<li>a retry table for every exposed mutation;</li>
+<li>an idempotency-key record and mismatch fixture;</li>
+<li>a concurrent same-key transcript, a reopen check, and a mutation-alias check;</li>
+<li>a bounded-buffer overload result;</li>
+<li>reverse-proxy SSE headers and idle policy;</li>
+<li>a reconnect plan that names authoritative refetch methods;</li>
+<li>a durable Task cancellation trace when the capstone uses Tasks.</li>
+</ul>
+<p>A green request in a local process proves only the happy path. The capstone is production-ready when lost responses, late cancellation, slow consumers, and reconnect herds have deterministic outcomes.</p>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-tasks-elicitation-apps"><span class="t" style="--cs-hue:280">MT</span>Cheat sheet · MCP Tasks, Elicitation and Apps</a><a href="#cs-mcp"><span class="t" style="--cs-hue:160">MC</span>Cheat sheet · Model Context Protocol (MCP)</a></div>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1329-qa3"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">A client library exposes one <code>cancel(request)</code> method that behaves the same on stdio and on Streamable HTTP: it writes or POSTs a <code>notifications/cancelled</code> notification for the request id. Over HTTP, servers keep running the work and sometimes send a response after the cancel. A second method, <code>cancelTask</code>, returns success, the UI shows "stopped", and the worker keeps going. What is wrong with both methods?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Cancellation is transport-specific, and a durable task is a third thing. On stdio the client sends <code>notifications/cancelled</code> with the request id and receives no response. On Streamable HTTP the signal is closing that request's response stream, and a POSTed cancellation notification is the wrong signal. <code>tasks/cancel</code> acknowledges intent for a durable task that may stay <code>working</code> until a worker checkpoint observes the flag, so the UI must poll until a terminal status.</p>
+<p><strong>Three mechanisms.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Mechanism</th>
+<th>Target</th>
+<th>Signal</th>
+<th>What success means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>request cancellation on stdio</td>
+<td>one in-flight RPC</td>
+<td><code>notifications/cancelled</code></td>
+<td>the client abandoned the request; the server should stop if practical</td>
+</tr>
+<tr>
+<td>request cancellation on HTTP</td>
+<td>one in-flight response stream</td>
+<td>close the stream</td>
+<td>the same</td>
+</tr>
+<tr>
+<td><code>tasks/cancel</code></td>
+<td>one durable Task</td>
+<td>an ordinary MCP request</td>
+<td>the server acknowledged the intent</td>
+</tr>
+</tbody>
+</table></div>
+<p>The intent is the same on both transports: the client no longer needs the result. The wire signal differs because stdio shares one channel for everything, while each HTTP request owns its own response or SSE stream.</p>
+<p><strong>Cancellation is a race.</strong></p>
+<p>Two orders are both valid. If the cancellation arrives first, the server marks the request cancelled and suppresses the response when the worker finishes. If the worker commits first, the server sends the response and ignores the late notification, and the client ignores a late response for a request it abandoned. Neither side can prove which event the other saw first. Malformed, unknown and already-completed cancellations are ignored, because turning those races into errors would create more races.</p>
+<p><strong>What a server may send.</strong></p>
+<p>A server does not use <code>notifications/cancelled</code> to cancel arbitrary client calls. On stdio, server-sent cancellation is reserved for terminating a <code>subscriptions/listen</code> request. Progress notifications must increase and stop after completion or cancellation.</p>
+<p><strong>Why the task outlives the connection.</strong></p>
+<p>The reason to create a Task is that its lifecycle outlives one request and one connection. Do not erase task state when the HTTP connection closes, and do not treat a <code>tasks/cancel</code> result as proof the worker stopped. Poll the Task until a terminal status.</p>
+<p><strong>Two timeouts, not one.</strong></p>
+<p>A cancel often comes from a timeout. Use an idle timeout that progress may reset and a maximum timeout from request start that nothing resets. A keepalive comment on the stream is not progress.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"POST <code>notifications/cancelled</code> over HTTP too, for symmetry." Each HTTP request owns its response stream, and closing it is the signal that matches the request lifetime.</li>
+<li>"A successful <code>tasks/cancel</code> means the worker stopped." It acknowledges the request. The task can stay <code>working</code> until a checkpoint, and the work can finish first.</li>
+<li>"Return an error for a cancellation of an unknown request id." Unknown, malformed and completed cancellations are ignored by design.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> The server receives a cancellation for a request that already finished. Does it return an error? Expected: no, it ignores the notification; a notification receives no response in any case.</li>
+<li><em>(level 3)</em> The worker commits a mutation just before the cancel reaches the server. What does each side do? Expected: the server has sent the response and ignores the late notification; the client ignores the late response, and the idempotency contract decides whether a retry is safe.</li>
+<li><em>(level 3)</em> When may a server itself send <code>notifications/cancelled</code>? Expected: on stdio only, to terminate a <code>subscriptions/listen</code> request; never for ordinary client calls.</li>
+<li><em>(level 4)</em> A <code>subscriptions/listen</code> stream drops mid-task. Does the Task behind it change state? Expected: no; the client opens a new listen request with a new id and refetches the Task, and durable state is untouched by the dropped stream.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1329">reliability lesson</a> gives the three mechanisms and both orders of the race.</p></div></details>
+<details class="qa" id="a1329-qa4"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Over Streamable HTTP, a client calls <code>charge_account</code>. A reverse proxy buffers the response stream, the client reaches its timeout and disconnects, and the server commits the charge a moment later. The client sends the call again with a fresh JSON-RPC id, and the customer is charged twice. The team proposes to deduplicate on the JSON-RPC id. Design the fix.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> A JSON-RPC id correlates one message and never identifies a business operation, so two ids are two charges to the server. Add an application idempotency key to the arguments, and make the server store the key, a fingerprint of the arguments and the committed result in one atomic durable transaction. The same key with the same arguments returns the stored result, and the same key with different arguments is rejected.</p>
+<p><strong>The key, not the id.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;name&quot;: &quot;charge_account&quot;,
+  &quot;arguments&quot;: {&quot;account&quot;: &quot;acct-7&quot;, &quot;cents&quot;: 1200, &quot;idempotencyKey&quot;: &quot;checkout-7&quot;}
+}
+</code></pre></div>
+<p>The lesson shows the two-id case: a charge with id <code>41</code> loses its response, the retry carries id <code>42</code>, and the server sees two different messages. Without an application key it cannot know they are one checkout.</p>
+<p><strong>The ledger boundary must be atomic and durable.</strong></p>
+<p>This sequence is unsafe:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">check key
+run mutation
+store result
+</code></pre></div>
+<p>Two workers can both observe a missing key and both run the mutation. A crash after the effect and before the store creates the same ambiguity on retry. The lesson uses a file-backed SQLite ledger with <code>BEGIN IMMEDIATE</code>, so the key check, the business effect, the execution counter and the stored result commit as one unit, and two connections racing on one key produce one execution. Return defensive copies of stored results so that a caller's mutation cannot corrupt a later replay.</p>
+<p>A local table does not make a real payment atomic. Production needs a shared durable transaction, a transactional outbox, or an upstream provider that enforces the same key. A process lock protects neither replicas nor restarts.</p>
+<p><strong>Classify every mutation before you retry.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Example</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>safe</td>
+<td>a deterministic read</td>
+<td>retry with a new id once the failure boundary is understood</td>
+</tr>
+<tr>
+<td>conditional</td>
+<td>a mutation with a durable key</td>
+<td>retry with the same key and identical arguments</td>
+</tr>
+<tr>
+<td>unsafe</td>
+<td>a mutation with no deduplication</td>
+<td>do not retry automatically; reconcile first</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>idempotentHint</code> and <code>readOnlyHint</code> are untrusted hints. The application contract and the server implementation decide.</p>
+<p><strong>Fix the timeout too.</strong></p>
+<p>Use two clocks: an idle timeout that progress may reset, and a maximum timeout from request start that nothing resets. In the lesson's example, progress at <code>400</code>, <code>800</code> and <code>1200</code> ms keeps a <code>500</code> ms idle clock alive, and the <code>2000</code> ms maximum still cancels the request. For the buffering proxy, send <code>Content-Type: text/event-stream</code>, <code>Cache-Control: no-cache</code> and <code>X-Accel-Buffering: no</code>, and emit SSE comment keepalives on quiet streams. A keepalive is not progress and must not reset the idle clock.</p>
+<p><strong>The race the fix must respect.</strong></p>
+<p>Cancellation and completion race. If cancellation wins, the server suppresses the response. If completion wins, the client ignores the late cancellation and the server ignores the late notification. On HTTP the cancellation signal is closing the request's response stream, so the disconnect in the scenario was a cancellation the server observed too late to stop the commit. The key makes that harmless.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Deduplicate on the JSON-RPC id." Ids correlate messages, and a retry carries a new id by design.</li>
+<li>"Set <code>idempotentHint</code> and let clients retry freely." Annotations are untrusted hints. The application contract and the ledger decide retry safety.</li>
+<li>"Check the key, run the charge, then store the result." Two workers can both miss the key, and a crash between the effect and the store leaves the retry ambiguous.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> The same key arrives with a different <code>cents</code> value. What happens? Expected: the server compares the argument fingerprint and rejects the call, because one key must not alias two business intents.</li>
+<li><em>(level 3)</em> Two workers see the key missing at the same instant. What prevents two charges? Expected: the key claim, the effect and the result commit in one atomic durable transaction; a check-then-write sequence cannot.</li>
+<li><em>(level 4)</em> The charge is executed by an external payment provider. Does the local ledger make it atomic? Expected: no; either the provider accepts the same idempotency key, or a transactional outbox bridges the local commit to the remote effect.</li>
+<li><em>(level 4)</em> The client reconnects a dropped <code>subscriptions/listen</code> stream. Does it resend the lost charge? Expected: no; it opens a new listen request, refetches authoritative state, deduplicates by stable identifiers, and never replays an unsafe mutation because a response was lost.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1329">reliability lesson</a> builds the atomic ledger, the two clocks and the retry matrix.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/cancellation">MCP Cancellation</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/progress">MCP Progress</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http">MCP Streamable HTTP</a></li>
+<li><a href="https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks">MCP Tasks Extension</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/29-mcp-reliability-cancellation-and-flow-control" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1329" id="done-a1329">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1329" id="undo-a1329" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1328"><span class="pn-dir">Previous</span><span class="pn-t">13.28 · MCP Tool Contracts and Content</span></a><a class="pn next" href="#a1330"><span class="pn-dir">Next</span><span class="pn-t">13.30 · MCP Registry Supply Chain: Admission, Drift, and Rollback</span></a></div></footer>

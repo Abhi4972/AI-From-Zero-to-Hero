@@ -1,0 +1,497 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>Building an MCP Client: Discovery, Routing, and Dual-Era Fallback</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.8</span><span class="chip">85 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1308" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Build every MCP <code>2026-07-28</code> request with current metadata.</li>
+<li>Probe stdio servers with <code>server/discover</code> and select a mutually supported version.</li>
+<li>Authorize a bounded legacy probe only for explicitly allowlisted peers.</li>
+<li>Accept a legacy era only after validating a positive <code>initialize</code> result for a supported revision.</li>
+<li>Merge deterministic tool lists without silently overwriting collisions.</li>
+<li>Route calls to the peer that owns each tool without inventing protocol sessions.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13, Lesson 07</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 85 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A modern MCP client repeats its contract on every request. Its hardest compatibility decision is knowing when an old server is truly old and when a modern server is reporting a correctable error.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Peer</td>
+<td>Client-side record for one server transport and its discovered data</td>
+</tr>
+<tr>
+<td>Protocol era</td>
+<td>Modern per-request metadata or legacy initialization semantics</td>
+</tr>
+<tr>
+<td>Discovery probe</td>
+<td>Initial <code>server/discover</code> used to identify the stdio era</td>
+</tr>
+<tr>
+<td>Recognized modern error</td>
+<td>Error that proves modern behavior and forbids legacy fallback</td>
+</tr>
+<tr>
+<td>Legacy allowlist</td>
+<td>Operator configuration permitting one bounded compatibility probe for a pinned peer</td>
+</tr>
+<tr>
+<td>Positive legacy evidence</td>
+<td>Valid, correlated <code>initialize</code> result for an explicitly supported legacy revision</td>
+</tr>
+<tr>
+<td>Merged namespace</td>
+<td>Canonical tool names across all active peers</td>
+</tr>
+<tr>
+<td>Collision policy</td>
+<td>Prefix or reject rule for duplicate tool names</td>
+</tr>
+<tr>
+<td>Era cache</td>
+<td>Selected modern or legacy behavior stored for one transport peer</td>
+</tr>
+<tr>
+<td>Transport recovery</td>
+<td>Restart or reconnect, rediscover, relist, and retry safely with a new id</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>An AI application usually connects to several MCP servers at once: notes, a CRM, a file system. The client side has three jobs. First, find out what each server speaks: modern MCP (2026-07-28, no handshake) or the older 2025 protocol with its <code>initialize</code> handshake. Second, merge all the servers' tools into one list for the model, even when two servers both offer a tool called <code>search</code>. Third, send each call to the server that owns the tool. This lesson covers each job and the safety questions inside them, such as when an error really means "old server" and when it does not. It then runs a host that merges two real SDK servers with a name collision and routes calls between them, and watches the official client choose an era for a modern, a legacy and a too-new server. No model is trained.</p></div></aside>
+<p>An agent host usually talks to more than one MCP server. It must discover each server, merge tool catalogs, resolve duplicate names, route calls, and recover from transport failure.</p>
+<p>The <code>2026-07-28</code> revision makes the steady state simpler because each request is self-contained. Compatibility makes startup more subtle. A client may encounter:</p>
+<ul>
+<li>a modern server that supports the preferred version;</li>
+<li>a modern server that returns a recognized version or header error;</li>
+<li>a legacy server that has never heard of <code>server/discover</code>;</li>
+<li>a legacy server that stays silent until it receives <code>initialize</code>.</li>
+</ul>
+<p>Treating every probe error as legacy is dangerous. A malformed modern request, an overloaded server, a dead process, and an old server can all produce the same timeout or connection close. Those signals are ambiguous. The client must combine explicit operator intent with positive protocol evidence before it chooses the legacy era.</p>
+<h2>Idea 1 · A peer, not a protocol session</h2>
+<p>Keep one transport peer record for each server process or endpoint:</p>
+<ul>
+<li>transport handle or send function;</li>
+<li>selected protocol era and version;</li>
+<li>last discovered server capabilities;</li>
+<li>last deterministic tool list;</li>
+<li>pending request ids for correlation;</li>
+<li>transport health.</li>
+</ul>
+<p>This is client bookkeeping. It is not protocol session state. On modern MCP, the server still receives current version and capabilities on every request.</p>
+<h2>Idea 2 · Build every modern request from scratch</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def modern_request(request_id, method, params, version, capabilities):
+    return {
+        &quot;jsonrpc&quot;: &quot;2.0&quot;,
+        &quot;id&quot;: request_id,
+        &quot;method&quot;: method,
+        &quot;params&quot;: {
+            **params,
+            &quot;_meta&quot;: {
+                &quot;io.modelcontextprotocol/protocolVersion&quot;: version,
+                &quot;io.modelcontextprotocol/clientCapabilities&quot;: capabilities,
+                &quot;io.modelcontextprotocol/clientInfo&quot;: CLIENT_INFO,
+            },
+        },
+    }
+</code></pre></div>
+
+<p>Do not attach metadata once to a connection object and assume it reached the wire. Stamp and inspect the final serialized request.</p>
+<h2>Idea 3 · Modern discovery</h2>
+<p><code>server/discover</code> returns supported versions, server capabilities, instructions, cache hints, and recommended server identity. A client chooses the highest mutually supported modern version.</p>
+<p>Discovery is optional for a modern-only client, but it is recommended on stdio. Some legacy servers accept an operation before initialization, so sending <code>tools/list</code> first can produce an ambiguous success. <code>server/discover</code> creates a clean era boundary.</p>
+<h2>Idea 4 · The stdio compatibility probe</h2>
+<p>A dual-era stdio client sends <code>server/discover</code> with its preferred modern metadata before any other request. There are three outcome classes:</p>
+<ol>
+<li><strong>DiscoverResult.</strong> The server is modern. Select a mutually supported version and continue with per-request metadata.</li>
+<li><strong>Recognized modern error.</strong> The server is modern. For <code>-32022</code>, choose from <code>data.supported</code> and retry with a new request id. For header or capability errors, correct the request. Do not send <code>initialize</code>.</li>
+<li><strong>Ambiguous signal.</strong> An unrecognized JSON-RPC error, timeout, connection close, or empty response does not identify an era. Fail closed unless that exact peer is configured for legacy compatibility.</li>
+</ol>
+<p>Recognized modern protocol errors include:</p>
+<ul>
+<li><code>-32020</code> HeaderMismatch</li>
+<li><code>-32021</code> MissingRequiredClientCapability</li>
+<li><code>-32022</code> UnsupportedProtocolVersion</li>
+</ul>
+<p>Recognized modern errors remain modern even when the peer is on the legacy allowlist. Once a server proves that it understands the modern error vocabulary, sending <code>initialize</code> would be a downgrade.</p>
+<p>Do not treat <code>-32601</code> as positive legacy evidence. It only makes an explicitly allowlisted peer eligible for one legacy probe. The same rule applies to a timeout, connection close, or empty response. The official Python SDK 2.x makes a more permissive choice in <code>mode="auto"</code>: any JSON-RPC error from the probe, except a version mismatch with no common modern version, falls back to <code>initialize</code> (the second run below shows it). The stricter allowlist in this lesson is a policy for hosts that cannot afford a silent downgrade.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Choosing a version.</strong> With client versions <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> and server versions <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (from <code>server/discover</code> or from the <code>-32022</code> error data), pick
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7387em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">∗</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">fail if </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6633em;vertical-align:-0.0817em;"></span><span class="mord amsrm">∅</span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Era decision on stdio</strong>, for probe outcome <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">era</span></span><span class="mopen">(</span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:4.32em;vertical-align:-1.91em;"></span><span class="minner"><span class="mopen"><span class="delimsizing mult"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.35em;"><span style="top:-2.2em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎩</span></span></span><span style="top:-2.192em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-3.15em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎨</span></span></span><span style="top:-4.292em;"><span class="pstrut" style="height:3.15em;"></span><span style="height:0.316em;width:0.8889em;"><svg xmlns="http://www.w3.org/2000/svg" width="0.8889em" height="0.316em" style="width:0.8889em" viewBox="0 0 888.89 316" preserveAspectRatio="xMinYMin"><path d="M384 0 H504 V316 H384z M384 0 H504 V316 H384z"/></svg></span></span><span style="top:-4.6em;"><span class="pstrut" style="height:3.15em;"></span><span class="delimsizinginner delim-size4"><span>⎧</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.85em;"><span></span></span></span></span></span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">modern</span></span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">legacy</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">unavailable</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:2.41em;"><span style="top:-4.41em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">DiscoverResult, or a recognised modern error </span></span><span class="mopen">(</span><span class="mord">−</span><span class="mord">32020</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">32021</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">−</span><span class="mord">32022</span><span class="mclose">)</span></span></span><span style="top:-2.97em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="mord text"><span class="mord"> ambiguous, peer allowlisted, and a valid </span></span><span class="mord text"><span class="mord texttt">initialize</span></span><span class="mord text"><span class="mord"> result</span></span></span></span><span style="top:-1.53em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">otherwise.</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.91em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p><strong>Merging names.</strong> With peers sorted by name, tool <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> of peer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> gets the canonical name
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal">t</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="mord" style="margin-right:0.02778em;">__</span><span class="mord mathnormal">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">if </span></span><span class="mord mathnormal">t</span><span class="mord text"><span class="mord"> is not yet taken</span></span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">otherwise,</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div>
+and the router stores <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.522em;vertical-align:-0.011em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">↦</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mclose">)</span></span></span></span>, so every call goes back under the name the server declared.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Three servers, three verdicts</div><div class="co-body"><ul>
+<li>Modern server: <code>server/discover</code> answers with <code>supportedVersions: ["2026-07-28"]</code>. <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">2026</span><span class="mord text"><span class="mord">-</span></span><span class="mord">07</span><span class="mord text"><span class="mord">-</span></span><span class="mord">28</span><span class="mclose">}</span></span></span></span>, so $v^* = $ <code>2026-07-28</code> and every later request carries it.</li>
+<li>Legacy server: <code>server/discover</code> gets <code>-32601</code> (method not found). That is ambiguous: a modern server with a bug could say the same. Only an allowlisted peer gets one <code>initialize</code> probe; a valid result naming <code>2025-11-25</code> selects the legacy era.</li>
+<li>Future server: <code>-32022</code> with <code>supported: ["2027-01-01"]</code>. <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∩</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.2222em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6633em;vertical-align:-0.0817em;"></span><span class="mord amsrm">∅</span></span></span></span>: fail. The error proves the server is modern, so falling back to <code>initialize</code> would be a downgrade.</li>
+<li>Collision: <code>notes</code> and <code>crm</code> both offer <code>search</code>. Sorted, <code>crm</code> comes first and keeps <code>search</code>; the notes tool becomes <code>notes__search</code>, still routed to <code>notes</code> as <code>search</code>.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Any error from <code>server/discover</code> means the server is old."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Timeouts, crashes and unknown errors are ambiguous; recognised modern errors prove the server is modern.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The client must keep a session per server."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It keeps bookkeeping (era, tool list, transport); the protocol itself has no session.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "When two servers have the same tool name, the later one can replace the earlier."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Silent overwrite hides where a model's action goes; prefix or reject.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Any prefix will do."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The merged names go to a model API, which allows only letters, digits, <code>_</code> and <code>-</code>.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Two SDK servers both expose <code>search</code>, and a host merges them with peers sorted by name. Which server keeps the plain name, and what happens when the model calls the prefixed one? In the second run, how will the official client treat a server that answers <code>server/discover</code> with "method not found"? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A host that merges two servers and routes calls</div><div class="co-body"><p>Two <code>MCPServer</code> instances (<code>notes</code> with <code>search</code> and <code>add_note</code>, <code>crm</code> with its own <code>search</code>) are connected in-process with the SDK's <code>Client</code>. The host merges their sorted tool lists with prefix-on-collision, checks every canonical name against the model APIs' character rule, and routes two calls. About a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import asyncio, json, re
+from contextlib import AsyncExitStack
+from mcp import Client
+from mcp.server import MCPServer
+
+# Two independent servers. Both expose a tool called `search`.
+notes, crm = MCPServer(&quot;notes&quot;), MCPServer(&quot;crm&quot;)
+@notes.tool()
+def search(query: str) -&gt; list[str]:
+    &quot;&quot;&quot;Use to find notes containing a word.&quot;&quot;&quot;
+    return [n for n in (&quot;Call Priya&quot;, &quot;Buy paper&quot;) if query.lower() in n.lower()]
+@notes.tool()
+def add_note(text: str) -&gt; str:
+    &quot;&quot;&quot;Use to save a new note.&quot;&quot;&quot;
+    return &quot;saved&quot;
+@crm.tool()
+def search(query: str) -&gt; list[str]:
+    &quot;&quot;&quot;Use to find customers by name.&quot;&quot;&quot;
+    return [c for c in (&quot;Priya Sharma (CUST-0042)&quot;, &quot;Lee Wong (CUST-0101)&quot;) if query.lower() in c.lower()]
+
+async def main():
+    async with AsyncExitStack() as stack:
+        peers = {name: await stack.enter_async_context(Client(srv)) for name, srv in ((&quot;notes&quot;, notes), (&quot;crm&quot;, crm))}
+        registry = {}                                   # canonical name -&gt; (peer, local name)
+        for peer in sorted(peers):                      # sorted: the merge never depends on startup order
+            listed = await peers[peer].list_tools()
+            for tool in sorted(listed.tools, key=lambda t: t.name):
+                # &quot;peer__tool&quot;: model APIs accept only [a-zA-Z0-9_-] in tool names, so no &quot;/&quot; or &quot;.&quot;
+                canonical = tool.name if tool.name not in registry else f&quot;{peer}__{tool.name}&quot;
+                if canonical != tool.name:
+                    print(f&quot;collision: '{tool.name}' from {peer} exposed as '{canonical}'&quot;)
+                registry[canonical] = (peer, tool.name)
+        print(&quot;\nwhat the model sees -&gt; where the call goes&quot;)
+        for canonical, (peer, local) in registry.items():
+            ok = bool(re.fullmatch(r&quot;[a-zA-Z0-9_-]{1,64}&quot;, canonical))
+            print(f&quot;  {canonical:&lt;14} -&gt; {peer}: tools/call name={local!r}   valid model-API name: {ok}&quot;)
+
+        async def route(canonical, args):               # routing is a pure lookup
+            peer, local = registry[canonical]
+            r = await peers[peer].call_tool(local, args)
+            return r.structured_content[&quot;result&quot;]
+        print(&quot;\nmodel calls 'search' with priya      -&gt;&quot;, await route(&quot;search&quot;, {&quot;query&quot;: &quot;priya&quot;}))
+        print(&quot;model calls 'notes__search' with priya -&gt;&quot;, await route(&quot;notes__search&quot;, {&quot;query&quot;: &quot;priya&quot;}))
+
+asyncio.run(main())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">collision: &#x27;search&#x27; from notes exposed as &#x27;notes__search&#x27;
+
+what the model sees -&gt; where the call goes
+  search         -&gt; crm: tools/call name=&#x27;search&#x27;   valid model-API name: True
+  add_note       -&gt; notes: tools/call name=&#x27;add_note&#x27;   valid model-API name: True
+  notes__search  -&gt; notes: tools/call name=&#x27;search&#x27;   valid model-API name: True
+
+model calls &#x27;search&#x27; with priya      -&gt; [&#x27;Priya Sharma (CUST-0042)&#x27;]
+model calls &#x27;notes__search&#x27; with priya -&gt; [&#x27;Call Priya&#x27;]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The collision was detected and resolved by policy.</strong> Both servers declare <code>search</code>. Peers are merged in sorted order, so <code>crm</code> comes first and keeps the plain name; the notes server's tool is exposed as <code>notes__search</code>. Sorting makes the outcome the same on every start, whatever order the connections happen to finish in.</p>
+<p><strong>The model sees canonical names; servers see their own.</strong> The routing table maps <code>notes__search</code> back to the notes server under its declared name <code>search</code>. All three canonical names pass the model APIs' rule (letters, digits, <code>_</code>, <code>-</code>); a <code>notes/search</code> prefix would not.</p>
+<p><strong>Routing is a lookup.</strong> "search priya" went to the CRM and found the customer; "notes__search priya" went to the notes server and found the note. One caveat: a model that wanted notes but called the plain <code>search</code> now gets customers. If that is a risk, prefix both colliding tools or reject the collision at startup.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Era negotiation against three real processes</div><div class="co-body"><p>Three stdio servers are written to files: a modern SDK server, a 2025-era server that only knows <code>initialize</code>, and a "future" server that speaks only <code>2027-01-01</code>. The official SDK client connects to each in <code>mode="auto"</code> and reports the era and version it chose, or why it refused. About 3 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># How the official SDK client chooses an era on stdio, against three servers.
+import asyncio, pathlib, sys, tempfile, textwrap
+from mcp import Client, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.shared.exceptions import MCPError
+
+d = pathlib.Path(tempfile.mkdtemp())
+(d / &quot;modern.py&quot;).write_text(textwrap.dedent('''
+    from mcp.server import MCPServer
+    mcp = MCPServer(&quot;modern-server&quot;)
+    @mcp.tool()
+    def ping_me() -&gt; str:
+        &quot;&quot;&quot;Answer with pong.&quot;&quot;&quot;
+        return &quot;pong&quot;
+    mcp.run()'''))
+# A 2025-era server: it knows `initialize` but answers server/discover with &quot;method not found&quot;.
+(d / &quot;legacy.py&quot;).write_text(textwrap.dedent('''
+    import json, sys
+    for line in sys.stdin:
+        m = json.loads(line); mid = m.get(&quot;id&quot;)
+        if mid is None: continue                       # notifications get no reply
+        if m[&quot;method&quot;] == &quot;initialize&quot;:
+            r = {&quot;protocolVersion&quot;: &quot;2025-11-25&quot;, &quot;capabilities&quot;: {&quot;tools&quot;: {}},
+                 &quot;serverInfo&quot;: {&quot;name&quot;: &quot;legacy-server&quot;, &quot;version&quot;: &quot;0.9&quot;}}
+        elif m[&quot;method&quot;] == &quot;tools/list&quot;:
+            r = {&quot;tools&quot;: [{&quot;name&quot;: &quot;old_tool&quot;, &quot;inputSchema&quot;: {&quot;type&quot;: &quot;object&quot;}}]}
+        else:
+            print(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: mid,
+                              &quot;error&quot;: {&quot;code&quot;: -32601, &quot;message&quot;: &quot;Method not found&quot;}}), flush=True); continue
+        print(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: mid, &quot;result&quot;: r}), flush=True)'''))
+# A server from the future: modern, but only speaks a version this client does not know.
+(d / &quot;future.py&quot;).write_text(textwrap.dedent('''
+    import json, sys
+    for line in sys.stdin:
+        m = json.loads(line)
+        if m.get(&quot;id&quot;) is None: continue
+        print(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: m[&quot;id&quot;], &quot;error&quot;: {&quot;code&quot;: -32022,
+              &quot;message&quot;: &quot;Unsupported protocol version&quot;,
+              &quot;data&quot;: {&quot;requested&quot;: &quot;2026-07-28&quot;, &quot;supported&quot;: [&quot;2027-01-01&quot;]}}}), flush=True)'''))
+
+def first_mcp_error(exc):
+    if isinstance(exc, MCPError):
+        return exc
+    for inner in getattr(exc, &quot;exceptions&quot;, ()):
+        if (found := first_mcp_error(inner)):
+            return found
+
+async def connect(name):
+    params = StdioServerParameters(command=sys.executable, args=[str(d / f&quot;{name}.py&quot;)])
+    try:
+        async with Client(stdio_client(params, errlog=sys.__stderr__), mode=&quot;auto&quot;) as c:
+            tools = await c.list_tools()
+            era = &quot;modern&quot; if c.protocol_version &gt;= &quot;2026&quot; else &quot;legacy&quot;
+            print(f&quot;{name:&lt;7} -&gt; {era} era, protocol {c.protocol_version}, tools {[t.name for t in tools.tools]}&quot;)
+    except Exception as exc:                       # anyio wraps the error in (nested) exception groups
+        e = first_mcp_error(exc)
+        print(f&quot;{name:&lt;7} -&gt; refused to connect: {e.error.code} {e.error.message} &quot;
+              f&quot;(server supports {e.error.data['supported']})&quot;)
+
+for name in (&quot;modern&quot;, &quot;legacy&quot;, &quot;future&quot;):
+    asyncio.run(connect(name))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">modern  -&gt; modern era, protocol 2026-07-28, tools [&#x27;ping_me&#x27;]
+legacy  -&gt; legacy era, protocol 2025-11-25, tools [&#x27;old_tool&#x27;]
+future  -&gt; refused to connect: -32022 Unsupported protocol version (server supports [&#x27;2027-01-01&#x27;])</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Modern server: modern era.</strong> <code>server/discover</code> succeeded, the client adopted <code>2026-07-28</code>, and <code>tools/list</code> worked with per-request metadata.</p>
+<p><strong>2025-era server: legacy era.</strong> The probe got "method not found" (-32601), and the official client fell back to <code>initialize</code>, negotiated <code>2025-11-25</code> and listed <code>old_tool</code>. This is the SDK's default in <code>mode="auto"</code>: every probe error except an unbridgeable version mismatch counts as "old server". This lesson's stricter policy would only do this for a server on an explicit allowlist.</p>
+<p><strong>Future server: refused.</strong> <code>-32022</code> with <code>supported: ["2027-01-01"]</code> shares no version with this client. That error is proof of a modern server, so the client correctly did not try <code>initialize</code>; it failed and reported the versions the server supports.</p></div></aside>
+<h2>Idea 5 · Allowlisting is operator intent, not evidence</h2>
+<p>Legacy compatibility must be an explicit property of one pinned peer configuration:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">client.add_server(&quot;archive&quot;, archive_transport, allow_legacy=True)
+</code></pre></div>
+
+<p>Bind that choice to the configured command or endpoint. Do not use a wildcard that lets an arbitrary server opt itself into weaker semantics. A peer without <code>allow_legacy=True</code> fails after an ambiguous discovery outcome and never receives <code>initialize</code>.</p>
+<p>The allowlist grants permission to probe. It does not select the era. The client sends one <code>initialize</code> under a transport-enforced deadline, then requires all of the following:</p>
+<ul>
+<li>a JSON-RPC <code>2.0</code> response with the matching request id;</li>
+<li>exactly one <code>result</code> and no <code>error</code>;</li>
+<li>a <code>protocolVersion</code> in the client's configured legacy revision set;</li>
+<li>an object-valued <code>capabilities</code> field;</li>
+<li>a <code>serverInfo</code> object with non-empty string <code>name</code> and <code>version</code> fields.</li>
+</ul>
+<p>A timeout, connection close, error response, malformed result, mismatched id, or unsupported revision fails closed. Only a structurally valid positive result selects the legacy era. The code passes <code>legacy_probe_timeout_ms</code> to the transport adapter; a real stdio or HTTP adapter must enforce that deadline rather than merely record it.</p>
+<p>Cache the selected era for the transport peer. Do not probe again before every call.</p>
+<h2>Idea 6 · Legacy is a compatibility branch</h2>
+<p>Once the bounded probe returns valid positive legacy evidence, the client uses the selected legacy version exactly as defined by that revision:</p>
+<ol>
+<li>Verify the response envelope and correlation id.</li>
+<li>Verify the negotiated revision is in the configured legacy set.</li>
+<li>Record validated capabilities and server identity.</li>
+<li>Send <code>notifications/initialized</code> only after all checks pass.</li>
+<li>Use legacy request shapes for that transport lifetime.</li>
+</ol>
+<p>This branch exists for interoperability with known peers. It is not the default design for new servers or new requests. If the transport restarts or its endpoint changes, discard the peer-era cache and negotiate again.</p>
+<h2>Idea 7 · Discovering and caching tools</h2>
+<p>For each active peer, call <code>tools/list</code>. A modern result includes <code>resultType</code>, <code>ttlMs</code>, and <code>cacheScope</code>. Honor the freshness hint within the correct authorization context. Re-fetch after expiry or a subscribed list-change event.</p>
+<p>Clients must treat a missing <code>resultType</code> from a legacy server as <code>"complete"</code>. Do not require modern cache fields on a response from an earlier negotiated era.</p>
+<p>The server should return deterministic ordering. The client should also sort before merging so local registry order does not depend on process startup timing.</p>
+<h2>Idea 8 · Collision-safe namespace merge</h2>
+<p>Two servers may both expose <code>search</code>. Choose a declared policy:</p>
+<ol>
+<li><strong>Prefix on collision.</strong> Keep the first canonical name and expose later collisions as <code>&lt;server&gt;__&lt;tool&gt;</code>. Model APIs accept only letters, digits, <code>_</code> and <code>-</code> in tool names (OpenAI's limit is 64 characters), so separators such as <code>/</code> or <code>.</code> would be rejected when the merged list is sent to the model.</li>
+<li><strong>Reject on collision.</strong> Do not load the duplicate and surface a clear configuration error.</li>
+<li><strong>Silent overwrite.</strong> Never use this. It hides which server receives a model-selected action.</li>
+</ol>
+<p>Store both canonical and local names. The model sees the canonical name. The outgoing <code>tools/call</code> uses the local name the owning server declared.</p>
+<h2>Idea 9 · Routing a call</h2>
+<p>Routing is a pure lookup:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">canonical tool name
+  -&gt; peer name + local tool name
+  -&gt; new JSON-RPC request id
+  -&gt; modern request metadata or explicit legacy shape
+  -&gt; matching response id
+</code></pre></div>
+<p>Do not send a call when its owning transport is unavailable. Reconnect or restart the transport, then re-run discovery and <code>tools/list</code>. Modern in-flight requests lost on a broken transport can be retried with a new JSON-RPC id when the operation's safety policy permits it.</p>
+<h2>Idea 10 · Notifications and subscriptions</h2>
+<p>Modern list and resource changes arrive only on a client-opened <code>subscriptions/listen</code> stream. The client sends the notification filter, waits for <code>notifications/subscriptions/acknowledged</code>, and correlates events with the listen request id in notification metadata.</p>
+<p>On disconnect, open a new listen request and refetch relevant lists or resources. Modern streams do not resume with <code>Last-Event-ID</code>.</p>
+<h2>Idea 11 · No server-initiated requests</h2>
+<p>Modern servers do not call the client with independent JSON-RPC requests for sampling, elicitation, or roots. They return <code>input_required</code>, and the client retries the original request after fulfilling the embedded input requests.</p>
+<p>Do not block the peer's response reader while fulfilling input. Preserve correlation and create a new JSON-RPC id for the retry.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tp-client-merge"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> uses in-process peer functions so the protocol decisions stay visible. It connects to two modern peers and one intentionally allowlisted legacy peer, then merges and routes their tools. The transport callable receives a timeout budget so the compatibility branch cannot hide an unbounded probe.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd code
+python3 main.py
+npx tsx main.ts
+python3 -m unittest discover tests -v
+</code></pre></div>
+<p>The tests prove boundaries that normal demos miss:</p>
+<ul>
+<li>modern requests repeat metadata;</li>
+<li><code>-32022</code> retries modern discovery without initialization;</li>
+<li>recognized modern errors never downgrade, even for an allowlisted peer;</li>
+<li>timeouts, connection closes, empty responses, and unrecognized errors do not trigger <code>initialize</code> without an allowlist;</li>
+<li>an allowlisted peer becomes legacy only after a valid, supported <code>initialize</code> result;</li>
+<li>malformed and unsupported legacy results leave the peer unavailable;</li>
+<li>a successfully selected era is cached for the transport lifetime.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A host merges tools with "last one wins": when a second server also offers <code>delete_file</code>, it simply replaces the first in the registry. A user adds a new, untrusted MCP server that happens to define <code>delete_file</code>. What can go wrong, and what should the host do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Official SDK clients</strong> (Python <code>Client</code>, TypeScript, Go and others) probe <code>server/discover</code> and fall back to <code>initialize</code> for 2025-era servers; the Python SDK's <code>mode</code> setting (<code>auto</code>, <code>legacy</code>, <code>modern</code>) makes the policy explicit.</li>
+<li><strong>Hosts with many servers</strong>: Claude, ChatGPT, VS Code, Cursor and agent frameworks (LangChain's MCP adapters, the OpenAI Agents SDK, Pydantic AI) merge tools from several servers, usually prefixing names with the server's name.</li>
+<li><strong>Large tool catalogs</strong> push hosts to load tools on demand (tool search) instead of sending every merged tool to the model.</li>
+<li><strong>Gateways</strong> (Lesson 13.17) move merging and routing out of each host into shared infrastructure.</li>
+</ul>
+<p>Sources: <a href="https://modelcontextprotocol.io/specification/2026-07-28/">MCP 2026-07-28 specification</a>, <a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover">MCP server discovery</a>, <a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning">MCP versioning</a>, <a href="https://py.sdk.modelcontextprotocol.io/whats-new/">MCP Python SDK</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Stamp version and capabilities on every modern request, at the point of sending.</li>
+<li>Probe with <code>server/discover</code>; recognised modern errors are never a reason to downgrade.</li>
+<li>Fall back to <code>initialize</code> only by explicit policy, and only after a valid legacy result.</li>
+<li>Merge tool lists deterministically; prefix or reject collisions, never overwrite.</li>
+<li>Route by lookup to the owning server, under the name that server declared.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-client-transports"><span class="t" style="--cs-hue:190">MP</span>Cheat sheet · MCP Clients and Transports</a><a href="#cs-mcp"><span class="t" style="--cs-hue:160">MC</span>Cheat sheet · Model Context Protocol (MCP)</a></div>
+<h2>Ship it</h2>
+<p>This lesson ships <code>outputs/skill-mcp-client-harness.md</code>. It scaffolds modern request stamping, stdio era negotiation, deterministic namespace merge, routing, and a fail-closed legacy compatibility branch.</p>
+<p><strong><code>outputs/skill-mcp-client-harness.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: mcp-client-harness
+description: Scaffold a multi-server MCP client with modern metadata, safe era negotiation, deterministic merge, and routing.
+version: 2.1.0
+phase: 13
+lesson: 08
+tags: [mcp, client, stateless, compatibility, routing]
+---
+
+Given a list of MCP server transports, produce a client harness that prefers MCP `2026-07-28` and isolates legacy compatibility.
+
+Produce:
+
+1. Peer configuration. Map a stable server name to a pinned command or endpoint, arguments, environment allowlist, authorization context, transport kind, and an explicit `allow_legacy` flag that defaults to false.
+2. Modern request builder. Stamp protocol version, current client capabilities, and recommended client identity into every `params._meta` immediately before serialization.
+3. stdio era probe. Send `server/discover` first. Accept a valid DiscoverResult, retry `-32022` at a mutually supported modern version, and treat `-32020` plus `-32021` as correctable modern errors.
+4. Legacy compatibility probe. Treat an unrecognized error, timeout, connection close, or empty response as ambiguous. Send one deadline-bound `initialize` only when that exact peer has `allow_legacy: true`. Select legacy only after a correlated JSON-RPC success containing a configured legacy revision, object capabilities, and non-empty server identity. Otherwise fail closed.
+5. Tool cache. Honor `ttlMs` and `cacheScope` in the negotiated authorization context. Treat absent legacy `resultType` as `&quot;complete&quot;`.
+6. Namespace merge. Sort peers and tools. Prefix or reject collisions. Forbid silent overwrite.
+7. Router. Map canonical tool names to peer plus local name, create a new request id, send the era-correct request, and verify the response id.
+8. Recovery. On transport loss, fail in-flight work, restart or reconnect, repeat discovery and lists, re-open subscriptions, and retry only operations allowed by the safety policy.
+
+Hard rejects:
+
+- Sending modern requests without current `_meta`.
+- Falling back to initialization after a recognized modern error.
+- Sending `initialize` to a peer that is not explicitly allowlisted for legacy compatibility.
+- Treating a timeout, connection close, empty response, unrecognized error, malformed result, or unsupported revision as proof of legacy behavior.
+- Treating a process, connection, or `Mcp-Session-Id` as modern protocol state.
+- Sharing a private cached list across authorization contexts.
+- Silently overwriting a duplicate tool name.
+- Accepting a modern success without `resultType`.
+
+Refusal rules:
+
+- Refuse to spawn a command outside a pinned allowlist.
+- Refuse to route a tool when the owner is ambiguous.
+- Refuse to retry a non-idempotent call automatically without an application idempotency key or user decision.
+
+Output a complete Python harness, at least six conformance tests, and a startup report listing peer, selected era, selected version, cache scope, and canonical tool names.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Make a fake server return <code>-32022</code> with no mutually supported version. Confirm the client fails instead of sending <code>initialize</code>.</li>
+<li>Allowlist a fake legacy server, make its bounded <code>initialize</code> probe time out, and prove the peer stays <code>unknown</code> and unavailable.</li>
+<li>Add <code>cacheScope: "private"</code> tool lists for two authorization contexts. Confirm the client never shares one context's cached result with the other.</li>
+<li>Change the collision policy to rejection and make startup fail with both peer names in the error.</li>
+<li>Add a finite <code>subscriptions/listen</code> simulator. On stream loss, re-listen with a new request id and refetch tools.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1308-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · crm keeps <code>search</code>; the SDK falls back to legacy</span></summary><div class="qa-a"><p><code>crm</code> keeps the plain <code>search</code>, because peers are merged in sorted order and "crm" sorts before "notes". The notes tool becomes <code>notes__search</code>; when the model calls it, the router sends <code>search</code> to the notes server and the note "Call Priya" comes back.</p>
+<p>The official client treats "method not found" on <code>server/discover</code> as an old server: it falls back to the <code>initialize</code> handshake and connects in the legacy era (<code>2025-11-25</code>). The lesson's design would do that only for an allowlisted peer.</p></div></details>
+<details class="qa" id="a1308-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A hijacked action</span></summary><div class="qa-a"><p>The untrusted server takes over a dangerous action. The model keeps calling <code>delete_file</code> as before, but the host now routes the call to the new server, which can do anything with the path it receives: log it, delete something else, or report success without doing anything. Nothing in the model's view changed, so neither the model nor the user notices. The same trick works for any popular tool name, which makes "last one wins" an attack surface (shadowing; Lesson 13.15).</p>
+<p>What the host should do:</p>
+<ul>
+<li><strong>Never overwrite</strong>: keep the first owner, and prefix or reject the newcomer, with a visible warning naming both servers.</li>
+<li><strong>Pin trust</strong>: let only trusted, configured servers own sensitive names; tools from new servers get a server prefix and start untrusted.</li>
+<li><strong>Show provenance</strong>: confirmation prompts for destructive actions should name the server that will run them.</li>
+</ul></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1308-qa3"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Your agent host launches several MCP servers over stdio. One is current. One is an old archive server that understands only <code>initialize</code>. One is current but slow to start. A teammate proposes a simple rule: send <code>server/discover</code>, and on any error or timeout send <code>initialize</code>. Design the startup so that the slow server is never downgraded and the archive server still works.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Treat an ambiguous signal as ambiguous. A timeout, a connection close, an empty response or an unrecognized error does not identify an era, so the client fails closed unless that exact peer is configured with <code>allow_legacy=True</code>. A recognized modern error such as <code>-32022</code> proves the server is current and forbids <code>initialize</code>. For the archive peer on the allowlist, send one <code>initialize</code> under a transport-enforced deadline and select the legacy era only after a structurally valid positive result.</p>
+<p><strong>Three outcome classes for the probe.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Outcome of <code>server/discover</code></th>
+<th>Meaning</th>
+<th>Next step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a <code>DiscoverResult</code></td>
+<td>current server</td>
+<td>pick the highest mutually supported version and continue with per-request metadata</td>
+</tr>
+<tr>
+<td>a recognized modern error</td>
+<td>current server</td>
+<td>correct the request or retry an advertised version; never send <code>initialize</code></td>
+</tr>
+<tr>
+<td>an ambiguous signal</td>
+<td>unknown</td>
+<td>fail closed, unless this pinned peer allows one bounded legacy probe</td>
+</tr>
+</tbody>
+</table></div>
+<p>Recognized modern errors are <code>-32020</code> HeaderMismatch, <code>-32021</code> MissingRequiredClientCapability and <code>-32022</code> UnsupportedProtocolVersion. They remain modern even when the peer is on the legacy allowlist, because a server that speaks the modern error vocabulary would be downgraded by <code>initialize</code>.</p>
+<p><code>-32601</code> is not positive legacy evidence. It only makes an explicitly allowlisted peer eligible for one probe, and so does a timeout, a connection close or an empty response.</p>
+<p><strong>The allowlist is intent, not evidence.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">client.add_server(&quot;archive&quot;, archive_transport, allow_legacy=True)
+</code></pre></div>
+<p>Bind the choice to the configured command or endpoint. A wildcard would let an arbitrary server opt itself into weaker semantics. A peer without the flag fails after an ambiguous outcome and never receives <code>initialize</code>.</p>
+<p><strong>Positive legacy evidence.</strong></p>
+<p>The one <code>initialize</code> runs under <code>legacy_probe_timeout_ms</code>, which a real adapter must enforce. The client then requires all of:</p>
+<ul>
+<li>a JSON-RPC <code>2.0</code> response with the matching request id;</li>
+<li>exactly one <code>result</code> and no <code>error</code>;</li>
+<li>a <code>protocolVersion</code> in the client's configured legacy revision set;</li>
+<li>an object-valued <code>capabilities</code>;</li>
+<li>a <code>serverInfo</code> object with non-empty string <code>name</code> and <code>version</code>.</li>
+</ul>
+<p>Anything else leaves the peer <code>unknown</code> and unavailable. Only after all checks pass does the client send <code>notifications/initialized</code> and use legacy request shapes for that transport lifetime.</p>
+<p><strong>After the era is chosen.</strong></p>
+<p>Cache the era per transport peer and do not probe before every call. When the transport restarts or the endpoint changes, discard the cache and negotiate again. Then call <code>tools/list</code>, sort the result before merging, and apply a declared collision policy: prefix later duplicates as <code>&lt;server&gt;/&lt;tool&gt;</code> or reject the duplicate with both peer names in the error. Never overwrite silently.</p>
+<p><strong>Why the slow server survives.</strong></p>
+<p>Its first probe times out, which is an ambiguous signal. It is not allowlisted, so the client marks it unavailable instead of sending <code>initialize</code>. A later retry of <code>server/discover</code> succeeds and the peer joins as a current server with the correct era.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Any error from discovery means the server is old." A malformed request, an overloaded server, a dead process and an old server can all produce the same timeout or close.</li>
+<li>"Send <code>initialize</code> first; a current server will reject it." Sending <code>initialize</code> to a current server is a downgrade and must never be the default path.</li>
+<li>"A method-not-found error proves the server is legacy." It only makes an allowlisted peer eligible for one bounded probe; the positive evidence is a valid <code>initialize</code> result.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> The allowlisted archive peer answers <code>-32022</code> to discovery. Which era? Expected: current; a recognized modern error forbids the legacy probe, so choose from <code>data.supported</code> and retry with a new request id.</li>
+<li><em>(level 3)</em> The <code>initialize</code> probe times out. What state is the peer in? Expected: <code>unknown</code> and unavailable; no era is selected and <code>notifications/initialized</code> is never sent.</li>
+<li><em>(level 4)</em> A legacy server accepts <code>tools/list</code> before initialization. Why does that make discovery-first safer on stdio? Expected: the ambiguous success would hide the era; <code>server/discover</code> creates a clean era boundary before any operation.</li>
+<li><em>(level 4)</em> The archive process crashes and restarts. Do you reuse the cached legacy era? Expected: no; discard the peer-era cache, rediscover, relist, reopen subscriptions, and retry only safe operations with new ids.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1308">client lesson</a> defines the probe outcomes, the allowlist and the positive evidence checklist.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/">MCP Specification 2026-07-28</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover">MCP Server Discovery</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio">MCP stdio Transport</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning">MCP Versioning</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/tools">MCP Tools</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/08-building-an-mcp-client" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1308" id="done-a1308">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1308" id="undo-a1308" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1307"><span class="pn-dir">Previous</span><span class="pn-t">13.7 · Building an MCP Server: Stateless Python and TypeScript</span></a><a class="pn next" href="#a1309"><span class="pn-dir">Next</span><span class="pn-t">13.9 · MCP Transports: stdio and Stateless Streamable HTTP</span></a></div></footer>

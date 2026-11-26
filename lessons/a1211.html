@@ -1,0 +1,509 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-12">Phase 12 · Multimodal AI</a></nav><h1>Chameleon and Early-Fusion Token-Only Multimodal Models</h1><div class="m-meta"><span class="chip chip-num">Lesson 12.11</span><span class="chip">180 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1211" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why a shared vocabulary + single loss changes what the model can do.</li>
+<li>Describe how a VQ-VAE tokenizes an image into a discrete sequence compatible with a transformer's next-token objective.</li>
+<li>Name Chameleon's training-stability tricks: QK-Norm, z-loss, dropout, and reordered normalisation.</li>
+<li>Compare Chameleon vs BLIP-2's Q-Former approach and describe when each is the right choice.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 12 · 05, Phase 8 (Generative AI)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 180 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, VQ-VAE tokenizer + interleaved decoder). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Every VLM we have seen so far keeps images and text separate. Visual tokens come from a vision encoder, flow into a projector, then meet text inside the LLM. The vision and text vocabularies never overlap. Chameleon (Meta, May 2024) asked: what if they did? Train a VQ-VAE that turns an image into a sequence of discrete tokens from a shared vocabulary. Every multimodal document is now one sequence — text tokens and image tokens interleaved, a single autoregressive loss. Side effect: the model can generate mixed-modality outputs — alte</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Early fusion</td>
+<td>"Unified tokens"</td>
+<td>Images converted to discrete tokens sharing the transformer's vocabulary from step one</td>
+</tr>
+<tr>
+<td>VQ-VAE</td>
+<td>"Image tokenizer"</td>
+<td>CNN + ViT + codebook that maps images to integer indices the transformer can predict</td>
+</tr>
+<tr>
+<td>Shared vocabulary</td>
+<td>"One dictionary"</td>
+<td>A single token ID space covering text + image + modality separators</td>
+</tr>
+<tr>
+<td>QK-Norm</td>
+<td>"Attention stabilizer"</td>
+<td>LayerNorm applied to query and key before their dot product, prevents norm blowup</td>
+</tr>
+<tr>
+<td>Mixed-modality generation</td>
+<td>"Text + image output"</td>
+<td>Inference that autonomously produces interleaved text and image tokens in one pass</td>
+</tr>
+<tr>
+<td>Codebook size</td>
+<td>"K entries"</td>
+<td>Number of discrete vectors the VQ-VAE can quantize to; trades compression for fidelity</td>
+</tr>
+<tr>
+<td>Tokenizer ceiling</td>
+<td>"Reconstruction limit"</td>
+<td>Best PSNR achievable by decoding VQ tokens; bounds the model's image quality</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>The vision-language models so far read images but can only write text. Chameleon (Meta, May 2024) treats an image exactly like text. A separate "image tokenizer" (a VQ-VAE) turns every 512×512 image into 1,024 whole numbers, each picked from a list of 8,192 learned visual patterns. Those numbers get their own IDs in the same vocabulary as words. A single transformer then reads and writes one stream of tokens, words and image codes mixed, with one next-token loss. To make an image, the model writes image codes and a decoder turns them back into pixels. This lesson covers the tokenizer, the shared vocabulary, mixed generation and the training tricks that kept Chameleon stable. It runs the real tokenizer code (random weights, real shapes) to turn a photo into 1,024 codes, and measures why QK-Norm was needed. No model is trained.</p></div></aside>
+<p>Adapter-based VLMs (LLaVA, BLIP-2, Qwen-VL) treat text and image as two different things. A text token goes through <code>embed(text_token)</code>; an image goes through <code>visual_encoder(image) → projector → ... pseudo_tokens</code>. The model has two input paths that merge partway in.</p>
+<p>Three consequences:</p>
+<ol>
+<li>The LLM can only consume images, not emit them. Output is text only.</li>
+<li>Mixed-modality documents (alternating paragraphs and images, as in an article) are awkward — you either parse the multimodal input outside the model or chain generations.</li>
+<li>Distributional mismatch. Visual tokens and text tokens live in different regions of the hidden space, creating subtle alignment issues.</li>
+</ol>
+<p>Chameleon rejects the premise: images are just sequences of discrete tokens from a shared vocabulary. Train the model on interleaved documents, one loss, one autoregressive decoder, and you unlock mixed-modality generation for free.</p>
+<h2>Idea 1 · VQ-VAE as image tokenizer</h2>
+<p>The tokenizer is a vector-quantized variational autoencoder. The architecture:</p>
+<ul>
+<li>Encoder: a convolutional network (VQGAN-style, following Gafni et al.'s Make-A-Scene tokenizer) that maps a 512x512 image to a 32x32 feature map of dimension 256 (16x downsampling).</li>
+<li>Codebook: a learned vocabulary of K vectors (Chameleon uses 8192), also dim 256.</li>
+<li>Quantization: for each spatial feature, look up the nearest codebook entry by L2 distance. Replace the continuous feature with the integer index.</li>
+<li>Decoder: CNN that takes quantized features back to pixels.</li>
+</ul>
+<p>Training: VAE reconstruction loss + commitment loss + codebook loss. The codebook indices form a discrete alphabet for images.</p>
+<p>For Chameleon: one image becomes 32*32 = 1024 tokens drawn from a vocabulary of 8192. Put those image IDs in the same ID space as the text BPE tokens. Chameleon's single tokenizer has 65,536 entries, and that count already includes the 8192 image codes and the special tokens such as the image separators. The transformer sees one sequence, one loss.</p>
+<h2>Idea 2 · The shared vocabulary</h2>
+<p>Chameleon's vocabulary combines text tokens, image tokens, and modality separators. Each token has a single ID. The input embedding layer maps every ID to a D-dim hidden vector. The output projection maps hidden back to vocab logits. Softmax picks the next token, whatever modality.</p>
+<p>Separators matter: <code>&lt;image&gt;</code> and <code>&lt;/image&gt;</code> tags bracket the image-token sequence. At generation time, if the model emits <code>&lt;image&gt;</code>, downstream software knows the next 1024 tokens are VQ indices to send to the decoder for pixel rendering.</p>
+<h2>Idea 3 · Mixed-modality generation</h2>
+<p>Inference is next-token prediction in the shared vocabulary. Example prompt: "Draw a cat and describe it." Chameleon emits:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">&lt;image&gt; 4821 1029 2891 ... (1024 image tokens) &lt;/image&gt;
+The cat is orange, sitting on a windowsill...
+</code></pre></div>
+<p>The model picks the order autonomously — it may produce image then text, text then image, or interleave. Same decoder, same loss.</p>
+<p>Compare to adapter VLMs where generation is text-only. Chameleon reopens the question of model output modalities.</p>
+<h2>Idea 4 · Training stability — QK-Norm, dropout, LayerNorm ordering</h2>
+<p>Early-fusion training is unstable at scale. Chameleon's paper documents three tricks:</p>
+<ul>
+<li>QK-Norm. Apply LayerNorm to the query and key projections inside attention, before the dot product. This bounds the attention logits when activations grow (measured below). Used by many post-2024 large models.</li>
+<li>z-loss. A small penalty on <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">Z</span></span></span></span>, the log of the softmax normaliser of the output logits, which stops the logits drifting to very large values.</li>
+<li>Dropout and norm reordering. Chameleon-7B also needed dropout after attention and feed-forward layers. For Chameleon-34B, the paper moved the normalisation inside the residual branch, applied to the output of attention and feed-forward (as in Swin Transformer v2), so the residual stream cannot grow without bound.</li>
+</ul>
+<p>The paper traces the instability to the softmax and to norm growth when images and text share one model: without these changes, its training-loss curves diverge late in training. The training recipe is as much of the contribution as the architecture.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Vector quantisation.</strong> The encoder gives a feature <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8252em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.04398em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">ij</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">256</span></span></span></span></span></span></span></span></span></span></span></span> for each of the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">32</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span> positions; the code is the nearest codebook vector:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">ij</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.716em;vertical-align:-0.966em;"></span><span class="mop">ar<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-2.309em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mrel mtight">∈</span><span class="mopen mtight">{</span><span class="mord mtight">1</span><span class="mpunct mtight">,</span><span class="minner mtight">…</span><span class="mpunct mtight">,</span><span class="mord mtight">8192</span><span class="mclose mtight">}</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">min</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.966em;"><span></span></span></span></span></span><span class="mopen">∥</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.04398em;">z</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.044em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">ij</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">∥</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">bits per image</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">8192</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">13</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">312.</span></span></span></span></span></div></p>
+<p><strong>One sequence, one loss.</strong> Text ids and image ids <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">ij</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> (shifted into reserved vocabulary slots) form one sequence <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3em;vertical-align:-1.25em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span></span></span></span></span></div>
+whatever the modality of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>QK-Norm.</strong> With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">LN</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mclose">)</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9579em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9579em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span><span style="top:-3.2634em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">LN</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">)</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2079em;vertical-align:-0.25em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9579em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span><span style="top:-3.2634em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mord">∣/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="padding-left:0.833em;">d</span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2079em;vertical-align:-0.25em;"></span><span class="mopen">∥</span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mclose">∥</span><span class="mopen">∥</span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9579em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span><span style="top:-3.2634em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.25em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mclose">∥</span><span class="mord">/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="padding-left:0.833em;">d</span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1078em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="padding-left:0.833em;">d</span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span></span>, whatever the scale of the activations; without it, scaling activations by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> scales logits by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>z-loss</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathcal">L</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.04398em;">z</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">Z</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">Z</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1488em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0017em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mtight">ℓ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>, which keeps the output logits centred.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">One photo, one caption, one sequence</div><div class="co-body"><ul>
+<li>The photo: 512 × 512 pixels × 3 channels × 8 bits = 6,291,456 bits; the 1,024 codes are 13,312 bits, about 470 times fewer.</li>
+<li>The sequence for "caption, then image": about 20 caption tokens, an image-start token, 1,024 image ids, an image-end token: about 1,046 tokens. The image is 98% of it.</li>
+<li>Generating that image means 1,024 sequential decoding steps before the decoder can draw a single pixel; at 50 tokens per second, about 20 seconds.</li>
+<li>Attention logits: at an activation scale of 16 the largest logit is about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">6</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span> times its starting size, enough to put almost all attention weight on one token (measured below).</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Chameleon feeds image features into the LLM like LLaVA."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It feeds integer codes from the same vocabulary as words; there is no projector.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "More codebook entries always mean better images."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Quality is capped by the tokenizer's reconstruction; codebook usage, training and resolution matter as much as size.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Stability tricks are minor engineering details."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Without QK-Norm, z-loss and norm reordering, the paper's mixed-modal training diverged.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In the run below, a random-weight Chameleon tokenizer encodes one photo. How many codes does it produce, and how many of the 8,192 codebook entries will a single image use? And when activations grow 16-fold, what happens to the top attention weight without QK-Norm? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Chameleon&#x27;s image tokenizer, step by step</div><div class="co-body"><p>The transformers implementation of Chameleon's VQ-VAE, with its default configuration (the released model's shapes), random weights. One Imagenette photo goes through preprocessing, encoder and quantisation. A hand-written nearest-codebook lookup is checked against the library, and the compression is computed. The codes are meaningless with random weights; the code path and shapes are real. A few seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time, torch
+from datasets import load_dataset
+from transformers import ChameleonConfig, ChameleonImageProcessor, logging
+from transformers.models.chameleon.modeling_chameleon import ChameleonVQVAE
+logging.set_verbosity_error()
+torch.manual_seed(0)
+
+# Chameleon's image tokenizer: the transformers implementation with its default configuration, which matches the
+# released model's shape (512-px input, 16x downsampling, 8,192 codes of dim 256). Random weights: shapes and
+# arithmetic are real, the codes themselves are not meaningful.
+cfg = ChameleonConfig()
+vq = ChameleonVQVAE(cfg.vq_config).eval()
+v = cfg.vq_config
+print(f&quot;vocabulary {cfg.vocab_size:,} ids (text BPE, special tokens and {v.num_embeddings:,} image codes); &quot;
+      f&quot;tokenizer {sum(p.numel() for p in vq.parameters()) / 1e6:.0f}M parameters&quot;)
+
+image = load_dataset(&quot;Multimodal-Fatima/Imagenette_validation&quot;, split=&quot;validation&quot;)[3][&quot;image&quot;].convert(&quot;RGB&quot;)
+pixels = ChameleonImageProcessor()(image, return_tensors=&quot;pt&quot;).pixel_values
+with torch.no_grad():
+    t = time.time()
+    h = vq.quant_conv(vq.encoder(pixels))                       # continuous feature map
+    quant, _, codes = vq.quantize(h)                             # nearest codebook entry per position
+    enc_s = time.time() - t
+print(f&quot;photo {image.size[0]}x{image.size[1]} -&gt; pixels {tuple(pixels.shape)} -&gt; features {tuple(h.shape)} &quot;
+      f&quot;-&gt; {codes.numel():,} integer codes ({enc_s:.1f} s on CPU)&quot;)
+
+# the quantisation step by hand: L2 distance to all 8,192 codebook vectors, take the argmin
+flat = h.permute(0, 2, 3, 1).reshape(-1, v.embed_dim)
+book = vq.quantize.embedding.weight
+mine = torch.cdist(flat, book).argmin(1)
+print(f&quot;hand-written nearest-codebook lookup matches the library: {torch.equal(mine, codes.flatten())}; &quot;
+      f&quot;{mine.unique().numel()} distinct codes used out of {v.num_embeddings:,}&quot;)
+print(f&quot;first codes of the image: {mine[:12].tolist()}&quot;)
+
+print(f&quot;decoder in this implementation: {'yes' if hasattr(vq, 'decoder') else 'none (encoder only)'}&quot;)
+print(f&quot;bits per image: {codes.numel():,} codes x log2({v.num_embeddings:,}) = {codes.numel() * 13:,} bits, &quot;
+      f&quot;against {512 * 512 * 24:,} for raw 24-bit pixels ({512 * 512 * 24 / (codes.numel() * 13):.0f}x smaller)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">vocabulary 65,536 ids (text BPE, special tokens and 8,192 image codes); tokenizer 29M parameters
+photo 420x320 -&gt; pixels (1, 3, 512, 512) -&gt; features (1, 256, 32, 32) -&gt; 1,024 integer codes (3.6 s on CPU)
+hand-written nearest-codebook lookup matches the library: True; 429 distinct codes used out of 8,192
+first codes of the image: [73, 5197, 5197, 5197, 5197, 2199, 2199, 2466, 2466, 2466, 2466, 2466]
+decoder in this implementation: none (encoder only)
+bits per image: 1,024 codes x log2(8,192) = 13,312 bits, against 6,291,456 for raw 24-bit pixels (473x smaller)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>From photo to 1,024 integers.</strong> The 420 × 320 photo is resized and cropped to 512 × 512. The encoder reduces it 16-fold in each direction to a 32 × 32 grid of 256-dimensional features. Quantisation replaces each feature with the index of its nearest codebook vector. Result: 1,024 integers between 0 and 8,191, which Chameleon places in reserved slots of its 65,536-id vocabulary. To the transformer an image is now 1,024 "words".</p>
+<p><strong>Quantisation is a nearest-neighbour search.</strong> A hand-written L2 distance to all 8,192 codebook vectors, followed by argmin, gives exactly the library's codes (True). That is the whole operation.</p>
+<p><strong>One image uses a small part of the codebook.</strong> Only 429 distinct codes appear, and neighbouring positions often share a code (the run of 5197s and 2466s). With trained weights the numbers differ, but the pattern is typical: a single image uses a few hundred patterns, and codebook usage is something tokenizer papers measure and optimise.</p>
+<p><strong>The compression is extreme</strong>, about 470 times: 13,312 bits for an image that takes 6.3 million bits as raw pixels. That is what makes images affordable as tokens, and what limits their quality.</p>
+<p><strong>This implementation has no decoder.</strong> Meta released Chameleon with image generation disabled, and the Hugging Face model has only the tokenizer's encoder: it can read images as codes but cannot turn codes back into pixels.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Why QK-Norm and z-loss keep training stable</div><div class="co-body"><p>Random queries and keys for 1,024 tokens of width 128, with activations scaled from 1 to 64 to mimic growth during training. The run reports the largest attention logit and the average top attention weight with and without QK-Norm. Then it computes the z-loss for drifted and centred output logits over a 65,536-entry vocabulary. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, torch.nn.functional as F
+torch.manual_seed(0)
+# Why Chameleon needed QK-Norm: when activations grow during training, attention logits q.k grow with the
+# square of their scale and the softmax collapses onto one token. Normalising q and k first bounds the logits.
+d, n = 128, 1024
+x = torch.randn(n, d)
+Wq, Wk = torch.randn(d, d) / d ** 0.5, torch.randn(d, d) / d ** 0.5
+print(f&quot;{'activation scale':&gt;17}{'max logit, plain':&gt;18}{'top attention weight':&gt;22}{'max logit, QK-Norm':&gt;20}{'top weight':&gt;12}&quot;)
+for s in [1, 4, 16, 64]:
+    q, k = (s * x) @ Wq, (s * x) @ Wk
+    plain = q @ k.T / d ** 0.5
+    qn, kn = F.layer_norm(q, (d,)), F.layer_norm(k, (d,))
+    normed = qn @ kn.T / d ** 0.5
+    print(f&quot;{s:&gt;17}{plain.abs().max():&gt;18,.0f}{plain.softmax(-1).max(-1).values.mean():&gt;22.3f}&quot;
+          f&quot;{normed.abs().max():&gt;20.1f}{normed.softmax(-1).max(-1).values.mean():&gt;12.3f}&quot;)
+
+# z-loss, Chameleon's other stabiliser: penalise log Z, the log of the softmax normaliser of the output logits,
+# so logits cannot drift to huge values
+logits = torch.randn(4, 65536) * 3 + 40                  # logits that have drifted upward by 40
+logZ = torch.logsumexp(logits, -1)
+print(f&quot;\noutput logits drifted to about 40: log Z = {logZ.mean():.1f}, z-loss (1e-5 * log Z^2) = {(1e-5 * logZ ** 2).mean():.4f}&quot;)
+logits = logits - 40
+print(f&quot;same distribution, centred:       log Z = {torch.logsumexp(logits, -1).mean():.1f}, &quot;
+      f&quot;z-loss = {(1e-5 * torch.logsumexp(logits, -1) ** 2).mean():.4f}  (identical softmax, smaller penalty)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> activation scale  max logit, plain  top attention weight  max logit, QK-Norm  top weight
+                1                 5                 0.015                 4.7       0.014
+                4                82                 0.844                 4.7       0.014
+               16             1,309                 0.991                 4.7       0.014
+               64            20,949                 0.999                 4.7       0.014
+
+output logits drifted to about 40: log Z = 55.6, z-loss (1e-5 * log Z^2) = 0.0309
+same distribution, centred:       log Z = 15.6, z-loss = 0.0024  (identical softmax, smaller penalty)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Without QK-Norm, logits grow with the square of the activations.</strong> At scale 1 the largest logit is about 5 and attention is spread out (top weight 0.015, close to uniform over 1,024 tokens). At scale 4 the largest logit is 82 and the top token already takes 84% of the attention; at 16 it is 1,309 and 99%. Attention has collapsed onto single tokens, and gradients through the softmax vanish for everything else. In a deep model trained on mixed images and text, activation norms do grow like this. The Chameleon paper traced its divergences to exactly this effect.</p>
+<p><strong>With QK-Norm nothing changes.</strong> Because q and k are normalised before the dot product, the largest logit stays at 4.7 and the top weight at 0.014 at every scale. The model can still learn sharp attention, but only through its weights, not through runaway activations.</p>
+<p><strong>z-loss keeps output logits centred.</strong> Logits that have drifted up by 40 give the same probabilities as centred ones (softmax ignores a constant shift). The z-loss is still 13 times larger (0.031 against 0.002), so training pushes them back. Unbounded logit growth is a common start of numerical trouble in bf16.</p></div></aside>
+<h2>Idea 5 · The tokenizer's reconstruction ceiling</h2>
+<p>VQ-VAE is lossy. 1,024 codes from an 8,192-entry codebook store 13 bits each: 13,312 bits for a 512x512 image, about 470 times less than raw 24-bit pixels (measured below). Fine detail cannot survive that compression. The Chameleon paper names one visible weakness: images with a lot of text are reconstructed poorly.</p>
+<p>The tokenizer is the bottleneck. Better tokenizers (MAGVIT-v2, IBQ and others) raise the ceiling. Emu3 (Lesson 12.12) reports image generation that beats SDXL in human and automatic evaluations with next-token prediction alone, using its own, stronger tokenizer and much more data.</p>
+<h2>Idea 6 · Chameleon vs BLIP-2 / LLaVA</h2>
+<p>Chameleon (early fusion, shared vocab):
+- One loss, one decoder.
+- Generates mixed-modality output.
+- Tokenizer is the quality ceiling.
+- Expensive: VQ-VAE decoder per generated image on inference path.</p>
+<p>BLIP-2 / LLaVA (late fusion, separate towers):
+- Vision in, text out only.
+- Reuses pretrained LLM.
+- No tokenizer bottleneck for understanding.
+- Cheap: single forward pass.</p>
+<p>Pick by task. If you need image generation, Chameleon family. If you only need understanding, adapter-VLM is simpler and reuses more pretrained compute.</p>
+<h2>Idea 7 · Fuyu and AnyGPT</h2>
+<p>Fuyu (Adept, 2023) is a related approach: skip the separate vision encoder entirely, feed raw image patches through the LLM's input projection as if they were tokens, no tokenizer. Simpler than Chameleon, loses the shared-vocab output generation.</p>
+<p>AnyGPT (Zhan et al., 2024) extends the idea to four modalities: text, image, speech, music. Each modality gets its own discrete tokenizer (images, speech and music each have a dedicated one), and one shared transformer models all the tokens. Any-to-any generation. Covered more in Lesson 12.16.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="vq-codebook"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> builds a toy end-to-end early-fusion model:</p>
+<ul>
+<li>A tiny VQ-VAE-style quantizer that maps 8x8 patches to codebook indices (K=16).</li>
+<li>A shared vocabulary of (text ids 0..31) + (image ids 32..47) + (separators 48, 49).</li>
+<li>A toy autoregressive decoder (bigram table) trained on synthetic captions + image-token sequences.</li>
+<li>Sampling loop that emits alternating text + image tokens given a prompt.</li>
+</ul>
+<p>The code intentionally keeps the transformer tiny (bigrams) so you can trace the signal flow end to end.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>You fine-tune an early-fusion model on screenshots of dense spreadsheets, using its 8,192-code VQ tokenizer unchanged, and ask it to read cell values. What will go wrong, and where in the pipeline is the problem? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Chameleon's release</strong>: Meta released 7B and 34B weights for research under a restrictive licence, with image generation disabled; the Hugging Face implementation ships only the tokenizer's encoder.</li>
+<li><strong>Discrete-token unified models built on the idea</strong>: Emu3 (Lesson 12.12), Janus and Janus-Pro (12.15), Lumina-mGPT and Liquid generate images by next-token prediction over visual codes.</li>
+<li><strong>Hybrid designs</strong> add continuous diffusion for higher image quality: Transfusion (12.13), Show-o (12.14), and diffusion heads on top of LLMs (as in InternVL-U).</li>
+<li><strong>QK-Norm is now common</strong> in large transformers (for example the OLMo 2, Gemma 3 and Qwen3 families) as a cheap guard against logit growth.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2405.09818">Chameleon (arXiv 2405.09818)</a>, <a href="https://huggingface.co/docs/transformers/model_doc/chameleon">Hugging Face Chameleon documentation</a>, <a href="https://arxiv.org/abs/2203.13131">Make-A-Scene (arXiv 2203.13131)</a>, <a href="https://arxiv.org/abs/2409.18869">Emu3 (arXiv 2409.18869)</a>, <a href="https://arxiv.org/abs/2402.12226">AnyGPT (arXiv 2402.12226)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Early fusion: images become discrete codes in the same vocabulary as words.</li>
+<li>A VQ-VAE turns 512×512 pixels into 1,024 codes from 8,192; a decoder turns codes back into pixels.</li>
+<li>One transformer, one next-token loss, any order of text and images in and out.</li>
+<li>The tokenizer caps image quality, especially for text inside images.</li>
+<li>QK-Norm, z-loss and norm reordering made the training stable.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-unified-multimodal-v4"><span class="t" style="--cs-hue:290">UM</span>Cheat sheet · Unified Multimodal Models</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-tokenizer-vs-adapter-picker.md</code>. Given a product spec (understand only vs understand + generate, required image quality, cost budget), it picks between Chameleon-family (early fusion) and LLaVA-family (late fusion) and justifies with quantitative rules of thumb.</p>
+<p><strong><code>outputs/skill-tokenizer-vs-adapter-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: tokenizer-vs-adapter-picker
+description: Pick between Chameleon-style early fusion (shared-vocab tokenizer) and LLaVA-style late fusion (adapter on frozen LLM) for a VLM project.
+version: 1.0.0
+phase: 12
+lesson: 11
+tags: [chameleon, early-fusion, vq-vae, late-fusion, adapter]
+---
+
+Given a product specification (understanding-only or understanding+generation), target image quality (social-post / magazine / print / broadcast), and cost budget (training + inference), recommend Chameleon-family or LLaVA-family with a concrete architecture outline.
+
+Produce:
+
+1. Verdict. Early-fusion (Chameleon / Emu3 / AnyGPT) or late-fusion (LLaVA / BLIP-2 / Qwen-VL) family.
+2. Tokenizer pick (for early-fusion verdicts). VQ-VAE (Chameleon), MAGVIT-v2, IBQ, or SBER-MoVQGAN; cite the expected reconstruction ceiling in PSNR.
+3. Training-stability plan. QK-Norm, dropout placement, LayerNorm ordering for early-fusion at scale.
+4. Cost estimate. Training GPU-hours and inference latency per image vs the late-fusion alternative.
+5. Generation-quality ceiling. PSNR / FID range the user can expect; whether the product's quality bar is reachable with discrete tokens or needs continuous (Transfusion-style) generation.
+6. Migration path. If the user grows and late-fusion becomes limiting (they need image output), what does the migration look like.
+
+Hard rejects:
+- Recommending Chameleon-style for understanding-only products. Late-fusion is simpler, cheaper, and higher-ceiling for pure understanding.
+- Proposing VQ-VAE with K&lt;4096 for production image generation. Codebook is too small, artifacts are visible.
+- Claiming early-fusion inference is free. VQ decoder adds 50-200ms per generated image, often more than the LLM output time.
+
+Refusal rules:
+- If the user wants frontier-quality image generation (FID &lt; 15, print-ready), refuse discrete tokens and point to Transfusion / Stable Diffusion 3 / MMDiT (Lesson 12.13).
+- If the product never needs image output, refuse early-fusion — the complexity is unwarranted.
+- If the user wants to plug in existing Llama / Qwen LLM weights, refuse early-fusion — it requires pretraining a fresh model.
+
+Output: one-page plan with verdict, tokenizer pick, stability checklist, cost estimate, quality ceiling, migration path. End with arXiv 2405.09818 (Chameleon) and 2408.11039 (Transfusion) for comparison reading.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Chameleon uses K=8192 codebook entries and 1024 tokens per 512x512 image. Estimate the compression ratio vs a 24-bit RGB image. Is it lossy? How lossy?</p>
+</li>
+<li>
+<p>A 4K image (3840x2160) at the same VQ-VAE density produces how many image tokens? Can a Chameleon-style model generate a 4K image in one inference call? What breaks first — context, tokenizer quality, or KV cache?</p>
+</li>
+<li>
+<p>Implement QK-Norm in pure Python. Given a 64-dim query and key, show the dot product before and after LayerNorm. Why is magnitude control important at depth?</p>
+</li>
+<li>
+<p>Read Chameleon Section 2.3 on training stability. Describe the exact failure mode the paper observed at 34B without QK-Norm. What was the "norm explosion" signature?</p>
+</li>
+<li>
+<p>Extend the toy decoder to emit a mixed-modality response given a text-only prompt. Measure how often the model picks image-first vs text-first given training-data distribution 60% text-first / 40% image-first.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1211-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 1,024 codes, a few hundred distinct, and attention collapses</span></summary><div class="qa-a"><p>1,024 codes, one per position of the 32 × 32 grid. Only 429 distinct codebook entries were used out of 8,192: an image repeats a few hundred patterns. Without QK-Norm, scaling activations 16-fold makes the largest attention logit about 1,300 and puts 99% of each token's attention on a single other token. With QK-Norm the largest logit stays at 4.7 and attention stays spread out (top weight 0.014) at every scale.</p></div></details>
+<details class="qa" id="a1211-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The tokenizer cannot store the digits</span></summary><div class="qa-a"><p>The digits will be unreadable or invented. Each code stands for a 16 × 16-pixel patch, chosen from 8,192 general-purpose patterns learned mostly on natural photos. Small digits in a dense grid are thinner than that, and the nearest-pattern lookup replaces them with whatever texture is closest. The Chameleon paper itself notes that its tokenizer reconstructs text-heavy images poorly. Fine-tuning the transformer cannot help, because the information is lost before the transformer sees it. The fixes are upstream: raise the resolution (or crop) so the text is larger, use a tokenizer trained for documents, or use a continuous-feature encoder for understanding, as adapter VLMs do. Then keep discrete tokens only where you need to generate images.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1211-qa3"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">You pretrain an early-fusion model on interleaved text and image codes. The small runs are fine, but the large run's loss spikes and diverges after a while, and the attention scores climb from layer to layer. What is happening, and what did the published recipe change to make such a run converge?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Early-fusion training at scale is unstable because image codes and text tokens share one softmax and one residual stream, and their gradients and norms differ; the attention logits grow with depth until the softmax saturates and the loss blows up. The published recipe at 34B parameters diverged at several checkpoints without three changes: normalization of the query and key projections before the dot product, dropout after every residual addition rather than only after attention and the MLP, and pre-normalization on the residual branch plus an extra normalization on the skip connection of the last block. The training recipe is as much of the contribution as the architecture.</p>
+<p><strong>The signature.</strong></p>
+<p>Norm growth. The query and key vectors grow in magnitude through the layers, the attention logits grow with them, the softmax turns into a near one-hot, and the gradients become spiky. Small runs do not reach the depth or the step count where this compounds; the large run does.</p>
+<p><strong>Why early fusion makes it worse.</strong></p>
+<p>A shared vocabulary of 65,536 entries holds the text tokens and 8192 image codes, and one image is 1024 codes in a row. Long runs of image codes carry gradients on a different scale from text, and they can dominate an update. The two modalities also occupy different regions of the hidden space, which pushes the norms apart.</p>
+<p><strong>The three changes.</strong></p>
+<ol>
+<li>QK-Norm. Apply layer normalization to the query and key projections inside attention, before the dot product. It bounds the logit magnitude at every depth, and several large models after this adopted it.</li>
+<li>Dropout placement. Dropout after every residual addition, not only after attention and after the MLP. More regularization where image-code gradients can dominate.</li>
+<li>Normalization ordering. Pre-normalization on the residual branch, which is standard, plus an extra normalization on the skip connection of the last block, which stabilizes the gradient flow at the final layer.</li>
+</ol>
+<p><strong>How you would confirm it on your run.</strong></p>
+<ul>
+<li>Log the norm of the queries and keys and the maximum attention logit per layer over training; the divergence should follow growth in the deep layers.</li>
+<li>Log the gradient norm split by the modality of the token; a dominance of image-code gradients points at the second change.</li>
+<li>Restart from a checkpoint before the spike with QK-Norm on, and compare the logit curves.</li>
+</ul>
+<p><strong>The alternative family.</strong></p>
+<p>A continuous design that trains a diffusion loss on image patches next to the text loss avoids the shared softmax over image codes, but it has a balance problem of its own: the two losses live on different scales, and the weights between them are a search of their own.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Early fusion is unstable by nature; use smaller models." The published recipe converged at 34B with the three changes; the instability is a recipe problem.</li>
+<li>"Clip the gradients harder." Clipping bounds the update, not the logit growth that causes the saturation; the norms keep drifting under a clip.</li>
+<li>"Use post-normalization everywhere; it is more stable." The recipe kept pre-normalization on the residual branch and added normalization where the norms grew: the queries, the keys, and the skip of the last block.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why does normalizing the queries and keys bound the logits? Expected: the dot product of two normalized vectors is bounded by their scale, so the logits cannot grow without limit as the residual stream grows.</li>
+<li><em>(level 3)</em> Why not lower the learning rate instead? Expected: a lower rate slows the growth but does not remove the mechanism; the norms still drift with depth, and the run pays in steps for a problem that normalization removes.</li>
+<li><em>(level 4)</em> What did the paper report at 34B without the changes? Expected: repeated divergence at several checkpoints, driven by growth of the attention logits, a norm explosion, which the three changes removed.</li>
+<li><em>(level 4)</em> How does the two-loss continuous design trade this problem for another? Expected: it removes the shared softmax over image codes but introduces two losses of different magnitude, where one head can dominate without careful loss weights and schedules.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1211">Chameleon lesson</a> documents the three stability changes and the divergence at scale, and the <a href="#a1213">Transfusion lesson</a> gives the continuous alternative and its own balance problem.</p></div></details>
+<details class="qa" id="a1211-qa4"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">A product needs a model that reads screenshots and answers questions today, and might need to draw diagrams later. Two designs are on the table: an adapter model, where a vision encoder feeds projected tokens into a text-only decoder, and a model that turns images into discrete codes in the same vocabulary as text and trains one next-token loss over interleaved sequences. Compare them and pick for this product.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The adapter design is late fusion: images enter as projected continuous tokens or through cross-attention, the decoder reuses all its text pretraining, and the output is text only. The shared-vocabulary design is early fusion: a quantizer maps an image to discrete codes, the transformer trains one loss over text and image codes, and it can emit image codes, so it generates pictures. For a product that must read screenshots now, pick the adapter: it reuses more pretrained compute, has no quantizer ceiling for understanding, and is cheaper to serve; add the early-fusion model only when drawing becomes a real requirement, because its image quality is capped by the quantizer and each generated image costs a decoder pass over a thousand or more codes.</p>
+<p><strong>Two paths into the model.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>Late fusion, adapter</th>
+<th>Early fusion, shared vocabulary</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Image input</td>
+<td>encoder features projected into the embedding space, or read through cross-attention</td>
+<td>discrete codes from a learned quantizer, looked up like text tokens</td>
+</tr>
+<tr>
+<td>Loss</td>
+<td>language-modeling loss on text</td>
+<td>a single next-token loss on text and image codes together</td>
+</tr>
+<tr>
+<td>Output</td>
+<td>text only</td>
+<td>text and images, interleaved as the model chooses</td>
+</tr>
+<tr>
+<td>Reuse of the pretrained LLM</td>
+<td>full</td>
+<td>the model trains on the mixed stream from the start</td>
+</tr>
+<tr>
+<td>Ceiling for understanding</td>
+<td>the encoder</td>
+<td>the quantizer's reconstruction</td>
+</tr>
+<tr>
+<td>Serving cost per answer</td>
+<td>one decoder step per generated text token</td>
+<td>one decoder step per generated text token, plus 1024 sequential decoding steps per generated image, one per code, then a decoder pass for the pixels</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>What early fusion buys.</strong></p>
+<p>One sequence, one loss, and mixed-modality output. The reference model's quantizer maps a 512 by 512 image to 1024 codes from a codebook of 8192, inside a single vocabulary of 65,536 entries that also holds the text tokens and the separators. When the model emits the image-start separator, the next 1024 codes go to the decoder for pixels.</p>
+<p><strong>What it costs.</strong></p>
+<ul>
+<li>A quality ceiling. The quantizer is lossy; at that codebook and code count the reconstruction peaks around 26 to 28 dB, below the 32 and more of continuous latent diffusion. A better quantizer lifts the ceiling, but the ceiling is the quantizer.</li>
+<li>Training stability. Early-fusion training at scale diverged without normalization of the attention queries and keys, dropout after every residual, and an extra normalization on the last block.</li>
+<li>Compute. Every generated image is a decoder pass over its codes.</li>
+</ul>
+<p><strong>What late fusion buys.</strong></p>
+<p>It bolts onto any pretrained decoder, keeps the text stream clean so that text ability survives, and computes the image once; with cross-attention the image keys and values are cached across decode steps. It cannot emit images.</p>
+<p><strong>The pick.</strong></p>
+<p>Reading screenshots is understanding, and the adapter is the simpler and stronger tool for it today. When drawing arrives, measure whether a separate generation model behind a tool call meets the need before you move the whole stack to early fusion.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Early fusion is the future, so start there." For understanding alone it reuses less pretrained compute and caps quality at the quantizer; the adapter is the simpler, stronger choice until generation is required.</li>
+<li>"The adapter can draw if you add a decoder head." Its images never exist as predictable tokens; drawing needs either image codes in the vocabulary or a separate generation model.</li>
+<li>"The quantizer is a detail; the transformer does the work." In the early-fusion family the quantizer sets the ceiling on every image the model produces.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why can the adapter model not generate an image? Expected: its output head covers the text vocabulary only; images enter as embeddings and never exist as tokens it could predict.</li>
+<li><em>(level 2)</em> What is the shared vocabulary made of? Expected: text tokens, image codes and modality separators in one id space, so one embedding table and one output projection cover all of them.</li>
+<li><em>(level 3)</em> Where does the quality ceiling of the early-fusion model come from, and what moves it? Expected: the quantizer's reconstruction; a larger codebook and more codes per image raise it, as the next generation of tokenizers showed.</li>
+<li><em>(level 3)</em> A hybrid keeps images continuous and trains a diffusion loss on patches next to the text loss. What does it trade? Expected: no quantizer and higher image fidelity, against two losses on different scales to balance and a diffusion sampling loop at generation time.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1211">Chameleon lesson</a> sets out the early-fusion thesis and its costs, the cross-attention fusion capstone builds the late-fusion path, and the <a href="#a1212">Emu3 lesson</a> shows what a better quantizer changes.</p></div></details>
+<details class="qa" id="a1211-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">In the unified-generation family, the quality of a generated image is said to be capped by the tokenizer, not by the transformer. Explain why, show what moved the cap between two generations of models, and say which design avoids the cap entirely and at what cost.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> A discrete image tokenizer is lossy: the decoder can only render what the codes carry, so the best image the model can ever produce is the tokenizer's own reconstruction of a real image. The first shared-vocabulary model used 1024 codes per 512 by 512 image from a codebook of 8192 and reconstructed at about 26 to 28 dB; the next generation used four times the codes, 4096, and a codebook four times larger, 32768, and reached 30.5 dB, close to the 32 dB of continuous latent diffusion. The design that avoids the cap keeps image patches continuous and trains a diffusion loss on them next to the text loss in one transformer; it drops the quantizer and gains fidelity, and pays with two losses on different scales to balance and a sampling loop at generation time.</p>
+<p><strong>Why the cap exists.</strong></p>
+<p>The transformer predicts codes. The decoder turns codes into pixels with no other input. Whatever detail the quantizer threw away at encoding time cannot come back: a perfect transformer that predicts the exact codes of a real image renders the tokenizer's reconstruction of that image, nothing better. The reconstruction quality is therefore an upper bound on fidelity to a real image, which is what the dB figures below measure. Distribution metrics measure a different property and do not share this bound.</p>
+<p><strong>What moved the cap.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Model generation</th>
+<th>Codes per 512 by 512 image</th>
+<th>Codebook</th>
+<th>Reconstruction</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>the first shared-vocabulary model</td>
+<td>1024</td>
+<td>8192</td>
+<td>about 26 to 28 dB</td>
+</tr>
+<tr>
+<td>the next-token generation model</td>
+<td>4096</td>
+<td>32768</td>
+<td>30.5 dB</td>
+</tr>
+<tr>
+<td>continuous latent diffusion, for reference</td>
+<td>continuous</td>
+<td>none</td>
+<td>about 32 dB</td>
+</tr>
+</tbody>
+</table></div>
+<p>Four times the codes carry four times the spatial detail, and a codebook four times larger carries finer values per code. The newer model's main contribution is a better tokenizer, and with it next-token prediction matched a diffusion model on an image generation benchmark.</p>
+<p><strong>The cost of more codes.</strong></p>
+<p>Each code is one decode pass in plain next-token generation, so four times the codes is four times the generation time. Masked parallel decoding keeps discrete codes and predicts all masked positions at once in about 16 passes, which pays back the cost of the larger grid.</p>
+<p><strong>The design without a cap.</strong></p>
+<p>Keep the image continuous. Project patches with a linear layer, as a vision transformer does at its input, and train one transformer with two losses: cross-entropy on text tokens and a flow-matching loss on noisy image patches. There is no quantizer to bound the detail. The paper reports a better image score than a same-size discrete model by 3 to 5 points. The price: two losses of different magnitude whose weights need tuning, a block-triangular attention mask, and a denoising loop of a few dozen steps per image at generation time.</p>
+<p><strong>Which to pick.</strong></p>
+<p>Discrete codes when one next-token stack must handle understanding and the generation of images and video with one loss, and you accept the tokenizer's ceiling. Continuous patches when image fidelity is the priority and the two-loss plumbing is acceptable.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Scale the transformer and the images get sharper." The transformer predicts codes; sharpness beyond the tokenizer's reconstruction does not exist in the codes to predict.</li>
+<li>"A bigger codebook is enough." The code count sets the spatial detail and the codebook sets the value detail; the newer tokenizer raised both, and the quantizer design decides whether a large codebook is used.</li>
+<li>"Continuous patches are strictly better, so discrete codes are obsolete." Continuous patches cost two losses to balance and a denoising loop per image; the discrete family keeps one loss and one decoder for every modality, which is why both survive.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why is the reconstruction score of the tokenizer the right number to read before you train the transformer? Expected: it is the ceiling; no amount of transformer scale lifts a generated image above what the decoder can render from the codes.</li>
+<li><em>(level 3)</em> What else besides the codebook and the code count lifts a tokenizer? Expected: the quantizer design; the newer models use an inverse-bottleneck quantizer family that uses the larger codebook well, where a naive larger codebook leaves codes unused.</li>
+<li><em>(level 4)</em> How does the attention mask differ in the continuous design? Expected: causal over text tokens, bidirectional among the patches of one image, text attends to images that closed before it, and image patches attend to the preceding text; a block-triangular mask.</li>
+<li><em>(level 4)</em> Which side of this trade-off does the masked discrete design sit on? Expected: discrete, with the tokenizer ceiling, but with parallel decoding in a few passes; it trades the fidelity of continuous diffusion for simpler training and fast sampling.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1211">Chameleon lesson</a> names the tokenizer as the reconstruction ceiling, the <a href="#a1212">Emu3 lesson</a> shows how a better tokenizer moved it, and the <a href="#a1213">Transfusion lesson</a> gives the continuous design and its costs.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2405.09818">Chameleon Team — Chameleon: Mixed-Modal Early-Fusion Foundation Models (arXiv:2405.09818)</a></li>
+<li><a href="https://arxiv.org/abs/2201.07520">Aghajanyan et al. — CM3 (arXiv:2201.07520)</a></li>
+<li><a href="https://arxiv.org/abs/2309.02591">Yu et al. — CM3Leon (arXiv:2309.02591)</a></li>
+<li><a href="https://arxiv.org/abs/2402.12226">Zhan et al. — AnyGPT (arXiv:2402.12226)</a></li>
+<li><a href="https://www.adept.ai/blog/fuyu-8b">Adept — Fuyu-8B blog (adept.ai)</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/12-multimodal-ai/11-chameleon-early-fusion-tokens" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1211" id="done-a1211">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1211" id="undo-a1211" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1210"><span class="pn-dir">Previous</span><span class="pn-t">12.10 · InternVL3: Native Multimodal Pretraining</span></a><a class="pn next" href="#a1212"><span class="pn-dir">Next</span><span class="pn-t">12.12 · Emu3: Next-Token Prediction for Image and Video Generation</span></a></div></footer>

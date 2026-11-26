@@ -1,0 +1,922 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-07">Phase 7 · Transformers Deep Dive</a></nav><h1>The Full Transformer — Encoder + Decoder</h1><div class="m-meta"><span class="chip chip-num">Lesson 7.5</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a0705" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 7 · 02 (Self-Attention), Phase 7 · 03 (Multi-Head Attention), Phase 7 · 04 (Positional Encoding)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Attention is the star. Everything else — residuals, normalization, feed-forward, cross-attention — is the scaffolding that lets you stack it deep.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Block</td>
+<td>"One transformer layer"</td>
+<td>Stack of norm + attention + norm + FFN, wrapped in residual connections.</td>
+</tr>
+<tr>
+<td>Residual</td>
+<td>"Skip connection"</td>
+<td><code>x + f(x)</code> output; enables gradient flow through deep stacks.</td>
+</tr>
+<tr>
+<td>Pre-norm</td>
+<td>"Normalize before, not after"</td>
+<td>Modern: <code>x + sublayer(LN(x))</code>. Trains deeper without warmup gymnastics.</td>
+</tr>
+<tr>
+<td>RMSNorm</td>
+<td>"LayerNorm without the mean"</td>
+<td>Divide by RMS; one less op, same empirical stability.</td>
+</tr>
+<tr>
+<td>SwiGLU</td>
+<td>"The FFN everyone switched to"</td>
+<td><code>Swish(W1 x) ⊙ W3 x → W2</code>. Beats ReLU/GELU on LM ppl.</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>"How the decoder sees the encoder"</td>
+<td>MHA with Q from decoder, K/V from encoder outputs.</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>"How wide the middle MLP is"</td>
+<td>Ratio of hidden-size to d_model, usually 4 (LayerNorm) or 2.6 (SwiGLU).</td>
+</tr>
+<tr>
+<td>Bias-free</td>
+<td>"Drop the +b terms"</td>
+<td>Modern stacks omit biases in linear layers; slight ppl improvement, smaller model.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>One attention layer only lets words look at each other. A model needs much more: it has to stack dozens of layers, and each layer also needs a step that works on every word separately. The transformer block packages this: attention (words exchange information), a small feed-forward network (each word's vector is transformed on its own), a <em>residual connection</em> around each (the input is added back to the output, so each step only adds a correction), and a normalisation in front of each so the numbers stay in range. An encoder stacks blocks that see the whole input; a decoder stacks blocks that see only earlier words and, in translation-style models, also read the encoder's output through <em>cross-attention</em>. This lesson builds both from the lesson's code, counts where the parameters of real models sit, shows what happens without residuals, and rebuilds all 30 blocks of a real model, SmolLM-135M, from its weights. Nothing is trained.</p></div></aside>
+<p>A single attention layer is a feature extractor, not a model. One matmul per layer is not enough capacity for language. You need depth — and depth breaks without the right plumbing.</p>
+<p>The 2017 Vaswani paper packaged six design decisions that turned one attention layer into a stackable block. Every transformer since — encoder-only (BERT), decoder-only (GPT), encoder-decoder (T5) — inherits the same skeleton. In 2026 the blocks have been refined (RMSNorm, SwiGLU, pre-norm, RoPE) but the skeleton is identical.</p>
+<p>This lesson is the skeleton. Next lessons specialize it — 06 for encoders, 07 for decoders, 08 for encoder-decoder.</p>
+<h2>The idea</h2>
+<p><img alt="Encoder and decoder block internals, wired" src="repo-assets/phases/07-transformers-deep-dive/05-full-transformer/assets/full-transformer.svg" /></p>
+<h2>Idea 1 · The six pieces</h2>
+<ol>
+<li><strong>Embedding + positional signal.</strong> Tokens → vectors. Position injected via RoPE (modern) or sinusoidal (classic).</li>
+<li><strong>Self-attention.</strong> Every position attends to every other. Masked in decoders.</li>
+<li><strong>Feed-forward network (FFN).</strong> Position-wise two-layer MLP: <code>W_2 · activation(W_1 · x)</code>. Expansion ratio 4× by default.</li>
+<li><strong>Residual connection.</strong> <code>x + sublayer(x)</code>. Without this, gradients vanish past ~6 layers.</li>
+<li><strong>Layer normalization.</strong> <code>LayerNorm</code> or <code>RMSNorm</code> (modern). Stabilizes the residual stream.</li>
+<li><strong>Cross-attention (decoder only).</strong> Queries come from the decoder, keys and values from the encoder output.</li>
+</ol>
+<p>Watch a vector flow through one block: attention mixes across positions, the residual carries it forward, the FFN transforms it, and norm keeps the stream stable.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="transformer-block"></div></figure></p>
+<h2>Idea 2 · Encoder block (used by BERT, T5 encoder)</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">x → LN → MHA(self) → + → LN → FFN → + → out
+                     ^              ^
+                     |              |
+                     └── residual ──┘
+</code></pre></div>
+<p>Encoder is bidirectional. No masking. All positions see all positions.</p>
+<h2>Idea 3 · Decoder block (used by GPT, T5 decoder)</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">x → LN → MHA(masked self) → + → LN → MHA(cross to encoder) → + → LN → FFN → + → out
+</code></pre></div>
+<p>Decoder has three sublayers per block. The middle one — cross-attention — is the only place information flows from encoder to decoder. In a pure decoder-only architecture (GPT), cross-attention is omitted and you just have masked self-attention + FFN.</p>
+<h2>Idea 4 · Pre-norm vs post-norm</h2>
+<p>Original paper: <code>x + sublayer(LN(x))</code> vs <code>LN(x + sublayer(x))</code>. Post-norm lost favor around 2019 — it is harder to train deeply without careful warmup. Pre-norm (<code>LN</code> <em>before</em> sublayer) is the 2026 default: Llama, Qwen, GPT-3+, Mistral all use it.</p>
+<h2>Idea 5 · The 2026 modernized block</h2>
+<p>Vaswani 2017 shipped LayerNorm + ReLU. Modern stacks replaced both. What production blocks actually look like:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Component</th>
+<th>2017</th>
+<th>2026</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm</td>
+<td>RMSNorm</td>
+</tr>
+<tr>
+<td>FFN activation</td>
+<td>ReLU</td>
+<td>SwiGLU</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>4×</td>
+<td>about 2.7× (8/3) keeps SwiGLU's three matrices at the parameters of a 4× two-matrix FFN; real models use 2.7× to 5.4×</td>
+</tr>
+<tr>
+<td>Position</td>
+<td>Sinusoidal absolute</td>
+<td>RoPE</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>Full MHA</td>
+<td>GQA (or MLA)</td>
+</tr>
+<tr>
+<td>Bias terms</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+</tbody>
+</table></div>
+<p>RMSNorm drops the mean-centering of LayerNorm (one fewer subtraction), which saves compute and is empirically at least as stable. SwiGLU (<code>Swish(W1 x) ⊙ W3 x</code>) gave lower perplexity than ReLU and GELU feed-forward layers at the same parameter count in Shazeer's 2020 comparison, and PaLM, Llama and Qwen adopted it.</p>
+<h2>Idea 6 · Parameter count</h2>
+<p>For one block with <code>d_model = d</code> and FFN expansion <code>r</code>:</p>
+<ul>
+<li>MHA: <code>4 · d²</code> (Q, K, V, O projections)</li>
+<li>FFN (SwiGLU): <code>3 · d · (r · d)</code> ≈ <code>3rd²</code></li>
+<li>Norms: negligible</li>
+</ul>
+<p>At <code>d = 4096, r = 2.6, layers = 32</code> (roughly Llama 3 8B), total: <code>32 · (4·4096² + 3·2.6·4096²) ≈ 32 · (67M + 131M) ≈ 32 · 198M ≈ 6.3B</code> parameters in the blocks, plus about 1B for the embeddings and output head (128K vocab × 4096, untied). That lands near the published 8B. The real model uses GQA (smaller K and V projections) and a wider FFN (<code>r = 3.5</code>), which moves parameters from attention to the FFN but keeps the total close to 8B.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>One pre-norm block</strong> on a sequence of vectors <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span></span></span></span> (one row per token):</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8019em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathrm">Attn</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">Norm</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8852em;vertical-align:-0.0833em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathrm">FFN</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">Norm</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></div></p>
+<p>A decoder in an encoder–decoder model inserts a third step, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">CrossAttn</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathrm">Norm</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span><span class="mclose">)</span></span></span></span>, whose queries come from <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span></span></span></span> and whose keys and values come from the encoder output <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span></span></span></span>. Only attention moves information between positions; the norms and the FFN act on each row separately.</p>
+<p><strong>The two modern pieces.</strong></p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">RMSNorm</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊙</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.8376em;vertical-align:-1.73em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.11em;"><span class="pstrut" style="height:3.2351em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2351em;"><span class="svg-align" style="top:-3.8em;"><span class="pstrut" style="height:3.8em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7959em;"><span style="top:-2.4231em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.0448em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2769em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-3.1951em;"><span class="pstrut" style="height:3.8em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.88em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.88em" viewBox="0 0 400000 1944" preserveAspectRatio="xMinYMin slice"><path d="M983 90
+l0 -0
+c4,-6.7,10,-10,18,-10 H400000v40
+H1013.1s-83.4,268,-264.1,840c-180.7,572,-277,876.3,-289,913c-4.7,4.7,-12.7,7,-24,7
+s-12,0,-12,0c-1.3,-3.3,-3.7,-11.7,-7,-25c-35.3,-125.3,-106.7,-373.3,-214,-744
+c-10,12,-21,25,-33,39s-32,39,-32,39c-6,-5.3,-15,-14,-27,-26s25,-30,25,-30
+c26.7,-32.7,52,-63,76,-91s52,-60,52,-60s208,722,208,722
+c56,-175.3,126.3,-397.3,211,-666c84.7,-268.7,153.8,-488.2,207.5,-658.5
+c53.7,-170.3,84.5,-266.8,92.5,-289.5z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.6049em;"><span></span></span></span></span></span></span></span><span style="top:-3.4651em;"><span class="pstrut" style="height:3.2351em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.9121em;"><span class="pstrut" style="height:3.2351em;"></span><span class="mord"><span class="mord mathnormal">x</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.73em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">SwiGLU</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathrm">SiLU</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⊙</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal">x</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p><strong>Why the residual matters.</strong> Unrolled over <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> blocks, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0785em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0785em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0785em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>: the output is the input plus a sum of corrections, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0785em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord" style="margin-right:0.05556em;">∂</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0785em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> contains the identity, so gradients always have a direct path back to the first layer.</p>
+<p><strong>Parameters</strong> of a decoder-only model with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> blocks, width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>, key/value width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (smaller than <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> with grouped-query attention), FFN width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10764em;">ff</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>, vocabulary <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span></span></span>, no biases:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4843em;vertical-align:-1.6202em;"></span><span class="mord mathnormal">L</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-1.5159em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">Q</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.02778em;">O</span><span class="mord text mtight"><span class="mord mtight"> and </span></span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span class="svg-align" style="top:-2.202em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">2</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.798em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6202em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.4624em;vertical-align:-1.6124em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-1.3876em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">SwiGLU</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span class="svg-align" style="top:-2.0659em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">3</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10764em;">ff</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.9341em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6124em;"><span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mord text"><span class="mord"> if the output head is tied to the embeddings, else </span></span><span class="mord">2</span><span class="mclose">)</span></span></span></span></span></div></p>
+<p><strong>SwiGLU width.</strong> A classic FFN with width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">d</span></span></span></span> has <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">8</span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> weights; SwiGLU's three matrices match that at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10764em;">ff</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mord mathnormal">d</span><span class="mord">/3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">2.67</span><span class="mord mathnormal">d</span></span></span></span>.</p>
+<p><strong>Compute.</strong> A forward pass costs about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> FLOPs per token for the matrix products, plus attention's <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">4</span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span></span></span></span> for a context of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> tokens.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting Llama 3.1 8B by hand</div><div class="co-body"><p>Configuration: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4096</span></span></span></span>, 32 query heads and 8 key/value heads of size 128 (so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1024</span></span></span></span>), <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10764em;">ff</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">14</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">336</span></span></span></span>, vocabulary 128,256, untied output head.</p>
+<ul>
+<li>Attention per block: $2 \times 4096^2 + 2 \times 4096 \times 1024 = 33.6\text{M} + 8.4\text{M} = 41.9$M.</li>
+<li>SwiGLU per block: $3 \times 4096 \times 14{,}336 = 176.2$M, four times the attention.</li>
+<li>One block: 218.1M; 32 blocks: <strong>6.98 billion</strong>.</li>
+<li>Embeddings and output head: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">128</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">256</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4096</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.05</span></span></span></span> billion.</li>
+<li>Total: <strong>8.03 billion</strong>, the published "8B". About 70% of it is feed-forward weights; only 17% is attention.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The feed-forward layer mixes information between tokens."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is applied to each position separately; only attention (self or cross) moves information between positions.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Pre-norm keeps the residual stream normalised."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only the copy entering each sublayer is normalised; the stream itself grows freely (into the thousands in SmolLM, under "Use it"), and one final norm sits before the output head.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Most of a large language model's parameters are in attention."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> In Llama 3.1 8B about 70% are in the feed-forward layers, 17% in attention, 13% in the embeddings and head.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Under Step 4, 48 randomly initialised blocks process 64 random token vectors, once with the residual connections and once without them (each block outputs only its sublayer's result). After 48 layers, how similar will the 64 token vectors be to each other in each case: still unrelated (cosine similarity near 0), somewhat similar, or practically identical? (Solution P1.)</p></div></aside>
+<h2>Step 1 · the building blocks</h2>
+<p>Using the tiny <code>Matrix</code> class from <a href="#a0703">Lesson 7.3</a> (copied to this file for independence):</p>
+<ul>
+<li><code>layer_norm(x, eps=1e-5)</code> — subtract mean, divide by std.</li>
+<li><code>rms_norm(x, eps=1e-6)</code> — divide by RMS. No mean subtraction.</li>
+<li><code>gelu(x)</code> and <code>silu(x) * W3 x</code> (SwiGLU).</li>
+<li><code>ffn_swiglu(x, W1, W2, W3)</code>.</li>
+<li><code>encoder_block(x, params)</code> and <code>decoder_block(x, enc_out, params)</code>.</li>
+</ul>
+<p>See <code>code/main.py</code> for the full wiring.</p>
+<h2>Step 2 · wire a 2-layer encoder and a 2-layer decoder</h2>
+<p>Stack them. Pass the encoder output into every decoder cross-attention. Add a final LN before the output projection.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def encode(tokens, params):
+    x = embed(tokens, params.emb) + sinusoidal(len(tokens), params.d)
+    for block in params.encoder_blocks:
+        x = encoder_block(x, block)
+    return x
+
+def decode(target_tokens, encoder_out, params):
+    x = embed(target_tokens, params.emb) + sinusoidal(len(target_tokens), params.d)
+    for block in params.decoder_blocks:
+        x = decoder_block(x, encoder_out, block)
+    return x
+</code></pre></div>
+
+<h2>Step 3 · run forward on a toy example</h2>
+<p>Feed a 6-token source and a 5-token target through. Verify the output shape is <code>(5, vocab)</code>. No training — this lesson is about the architecture, not the loss.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s forward pass</div><div class="co-body"><p><code>main.py</code>'s <code>main()</code>: a 6-token source through 2 encoder blocks, a 5-token target through 2 decoder blocks, all pre-norm with RMSNorm and SwiGLU, width 8.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== full transformer forward pass ===
+source shape:           (6, 8)
+encoder output shape:   (6, 8)
+target shape:           (5, 8)
+decoder output shape:   (5, 8)
+
+first 3 cells of encoder output:
+  +0.263  -1.338  -0.318  -0.039
+  +0.442  -1.696  +1.820  -0.824
+  +0.139  -1.107  +0.876  -1.022
+
+first 3 cells of decoder output:
+  +0.578  -1.118  +2.352  -1.453
+  -0.231  -1.505  +0.736  -1.752
+  +1.638  -2.015  +0.222  -0.162
+
+stack: 2-layer encoder + 2-layer decoder, pre-norm, RMSNorm, SwiGLU.
+this is the 2026 block skeleton (minus RoPE).</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Every block maps an <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> matrix to an <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> matrix, so blocks stack without any reshaping: the encoder keeps the source's 6 rows, the decoder the target's 5. The values themselves mean nothing yet, because the weights are random. What the wiring already guarantees is checked in the next run.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">What each block is allowed to see</div><div class="co-body"><p>The same functions, run twice more: once after changing only the last target token, once after changing only the last source token. Which output rows change?</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random, runpy
+m = runpy.run_path(&quot;main.py&quot;)                       # the lesson's functions, without running its demo
+rng = random.Random(0)
+d, heads = 8, 2
+enc_p = [m[&quot;BlockParams&quot;](d, heads, 2.0, rng) for _ in range(2)]
+dec_p = [m[&quot;BlockParams&quot;](d, heads, 2.0, rng) for _ in range(2)]
+
+def run(src, tgt):
+    e = src
+    for p in enc_p: e = m[&quot;encoder_block&quot;](e, p)
+    out = tgt
+    for p in dec_p: out = m[&quot;decoder_block&quot;](out, e, p)
+    return e, out
+
+def changed(A, B):                                  # which rows differ
+    return [i for i in range(A.rows) if max(abs(a - b) for a, b in zip(A.row(i), B.row(i))) &gt; 1e-9]
+
+src, tgt = m[&quot;randn&quot;](6, d, rng, 0.5), m[&quot;randn&quot;](5, d, rng, 0.5)
+e0, out0 = run(src, tgt)
+tgt2 = tgt.copy(); tgt2.set(4, 0, tgt2.get(4, 0) + 1.0)          # edit the LAST target token
+src2 = src.copy(); src2.set(5, 0, src2.get(5, 0) + 1.0)          # edit the LAST source token
+e1, out1 = run(src, tgt2)
+e2, out2 = run(src2, tgt)
+print(&quot;edit target token 4 -&gt; decoder rows that change:&quot;, changed(out0, out1), &quot;(causal mask: earlier rows cannot see it)&quot;)
+print(&quot;edit source token 5 -&gt; encoder rows that change:&quot;, changed(e0, e2), &quot;(no mask: every row sees every token)&quot;)
+print(&quot;                    -&gt; decoder rows that change:&quot;, changed(out0, out2), &quot;(cross-attention: every target row reads the source)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">edit target token 4 -&gt; decoder rows that change: [4] (causal mask: earlier rows cannot see it)
+edit source token 5 -&gt; encoder rows that change: [0, 1, 2, 3, 4, 5] (no mask: every row sees every token)
+                    -&gt; decoder rows that change: [0, 1, 2, 3, 4] (cross-attention: every target row reads the source)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Changing the last target token changes only the last decoder row: the causal mask hides it from every earlier position, which is what lets a decoder be trained on all positions at once without seeing its answers. Changing one source token changes every encoder row (no mask) and, through cross-attention, every decoder row: cross-attention is the only route from source to target, and it is not masked, because the whole source is known before decoding starts.</p></div></aside>
+<h2>Step 4 · swap in RMSNorm + SwiGLU</h2>
+<p>Replace LayerNorm and ReLU-FFN with RMSNorm and SwiGLU. Confirm shapes still match. This is the 2026 modernization with one function substitution.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Take the residuals away</div><div class="co-body"><p>48 pre-norm blocks (PyTorch attention and a GELU feed-forward, random initialisation) on 64 random token vectors, with and without the two residual connections in each block. After selected layers: the average cosine similarity between different tokens' vectors.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, torch.nn as nn, torch.nn.functional as F
+
+class Block(nn.Module):
+    &quot;&quot;&quot;One pre-norm transformer block; residual=False drops the two skip connections.&quot;&quot;&quot;
+    def __init__(self, d, heads, residual):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+        self.residual = residual
+    def forward(self, x):
+        h = self.n1(x); a = self.attn(h, h, h, need_weights=False)[0]
+        x = x + a if self.residual else a
+        f = self.ffn(self.n2(x))
+        return x + f if self.residual else f
+
+def token_similarity(x):                      # mean cosine similarity between different positions
+    z = F.normalize(x[0], dim=-1); s = z @ z.T
+    n = s.shape[0]; return ((s.sum() - n) / (n * n - n)).item()
+
+torch.manual_seed(0)
+d, L = 256, 48
+x0 = torch.randn(1, 64, d)
+for residual in (True, False):
+    torch.manual_seed(1)
+    blocks = [Block(d, 4, residual) for _ in range(L)]
+    x, sims = x0, []
+    with torch.no_grad():
+        for b in blocks:
+            x = b(x); sims.append(token_similarity(x))
+    label = &quot;with residuals   &quot; if residual else &quot;without residuals&quot;
+    print(f&quot;{label}  token similarity after layers 1, 2, 6, 24, 48: &quot; + &quot;, &quot;.join(f&quot;{sims[i]:.3f}&quot; for i in (0, 1, 5, 23, 47)))
+print(f&quot;(the 64 input vectors are random: similarity {token_similarity(x0):.3f})&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">with residuals     token similarity after layers 1, 2, 6, 24, 48: 0.007, 0.016, 0.045, 0.204, 0.501
+without residuals  token similarity after layers 1, 2, 6, 24, 48: 0.762, 1.000, 1.000, 1.000, 1.000
+(the 64 input vectors are random: similarity 0.000)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Without residuals, the 64 random vectors are already strongly aligned after one block (0.76) and identical to three decimals after two. Each block's output is an attention average of its inputs, and repeated averaging pulls every row towards the same mixture; with nothing carrying the original signal forward, the differences between tokens are erased ("rank collapse"), and a deep network would see one token repeated 64 times. With residuals, each block only adds a correction to its input, so the tokens stay distinct: similarity creeps up to 0.5 after 48 random blocks, and trained models, with smaller residual updates at initialisation, keep their tokens apart through every layer.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>The PyTorch/TF reference implementations: <code>nn.TransformerEncoderLayer</code>, <code>nn.TransformerDecoderLayer</code>. But most 2026 production code rolls its own block because:</p>
+<ul>
+<li>Flash Attention is called inside attention, not via <code>nn.MultiheadAttention</code>.</li>
+<li>GQA / MLA are not in the stdlib reference.</li>
+<li>RoPE, RMSNorm, SwiGLU are not the PyTorch defaults.</li>
+</ul>
+<p>HF <code>transformers</code> has clean reference blocks you should read: <code>modeling_llama.py</code> is the canonical 2026 decoder-only block. It's ~500 lines and worth walking through once.</p>
+<p><strong>Encoder vs decoder vs encoder-decoder — when to pick:</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Pick</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classification, embeddings, QA over text</td>
+<td>Encoder-only</td>
+<td>BERT, DeBERTa, ModernBERT</td>
+</tr>
+<tr>
+<td>Text generation, chat, code, reasoning</td>
+<td>Decoder-only</td>
+<td>GPT, Llama, Claude, Qwen</td>
+</tr>
+<tr>
+<td>Structured input → structured output (translation, summarization)</td>
+<td>Encoder-decoder</td>
+<td>T5, BART, Whisper</td>
+</tr>
+</tbody>
+</table></div>
+<p>Decoder-only won language because it scales cleanest and handles both comprehension and generation. Encoder-decoder is still best when the input has a clear "source sequence" identity (translation, speech recognition, structured tasks).</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Where the parameters of real models are</div><div class="co-body"><p>Three models built from their configuration files on PyTorch's <code>meta</code> device (shapes only, nothing downloaded but <code>config.json</code>), every parameter counted by component, and the formula box's block count next to the real one.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+from transformers import AutoConfig, AutoModelForCausalLM
+
+# Build each model on PyTorch's &quot;meta&quot; device: shapes only, no memory, no download of weights.
+def count(repo):
+    cfg = AutoConfig.from_pretrained(repo)
+    with torch.device(&quot;meta&quot;):
+        model = AutoModelForCausalLM.from_config(cfg)
+    groups = {&quot;embeddings&quot;: 0, &quot;attention&quot;: 0, &quot;feed-forward&quot;: 0, &quot;norms&quot;: 0, &quot;output head&quot;: 0}
+    seen = set()
+    for name, p in model.named_parameters():
+        if id(p) in seen:
+            continue
+        seen.add(id(p))
+        key = (&quot;embeddings&quot; if &quot;embed&quot; in name else &quot;attention&quot; if &quot;self_attn&quot; in name else
+               &quot;feed-forward&quot; if &quot;mlp&quot; in name else &quot;norms&quot; if &quot;norm&quot; in name else &quot;output head&quot;)
+        groups[key] += p.numel()
+    return cfg, groups
+
+for repo in [&quot;HuggingFaceTB/SmolLM-135M&quot;, &quot;Qwen/Qwen2.5-0.5B&quot;, &quot;unsloth/Meta-Llama-3.1-8B&quot;]:
+    cfg, g = count(repo)
+    total = sum(g.values())
+    d, L, ff = cfg.hidden_size, cfg.num_hidden_layers, cfg.intermediate_size
+    kv = cfg.num_key_value_heads * (d // cfg.num_attention_heads)
+    formula = L * (2 * d * d + 2 * d * kv + 3 * d * ff)            # Q, O, K, V and SwiGLU's three matrices, no biases
+    print(f&quot;{repo}  ({L} layers, d={d}, FFN {ff} = {ff / d:.2f}d, KV width {kv}, tied embeddings: {cfg.tie_word_embeddings})&quot;)
+    for k, v in g.items():
+        print(f&quot;    {k:13s} {v / 1e6:9.1f} M  {v / total:6.1%}&quot;)
+    print(f&quot;    {'total':13s} {total / 1e6:9.1f} M   blocks by the formula: {formula / 1e6:.1f} M&quot;
+          f&quot; (counted: {(g['attention'] + g['feed-forward']) / 1e6:.1f} M)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">HuggingFaceTB/SmolLM-135M  (30 layers, d=576, FFN 1536 = 2.67d, KV width 192, tied embeddings: True)
+    embeddings         28.3 M   21.0%
+    attention          26.5 M   19.7%
+    feed-forward       79.6 M   59.2%
+    norms               0.0 M    0.0%
+    output head         0.0 M    0.0%
+    total             134.5 M   blocks by the formula: 106.2 M (counted: 106.2 M)
+Qwen/Qwen2.5-0.5B  (24 layers, d=896, FFN 4864 = 5.43d, KV width 128, tied embeddings: True)
+    embeddings        136.1 M   27.6%
+    attention          44.1 M    8.9%
+    feed-forward      313.8 M   63.5%
+    norms               0.0 M    0.0%
+    output head         0.0 M    0.0%
+    total             494.0 M   blocks by the formula: 357.8 M (counted: 357.9 M)
+unsloth/Meta-Llama-3.1-8B  (32 layers, d=4096, FFN 14336 = 3.50d, KV width 1024, tied embeddings: False)
+    embeddings        525.3 M    6.5%
+    attention        1342.2 M   16.7%
+    feed-forward     5637.1 M   70.2%
+    norms               0.3 M    0.0%
+    output head       525.3 M    6.5%
+    total            8030.3 M   blocks by the formula: 6979.3 M (counted: 6979.3 M)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The formula box's block count matches the counted parameters exactly for SmolLM and Llama (6,979.3M); Qwen2.5 is 0.1M higher because it keeps biases on its query, key and value projections. The split shifts with size. In Llama 3.1 8B the feed-forward layers hold 70% of all weights and attention 17%; in the two small models the embedding table is a fifth to a quarter of the model, because a vocabulary of 49,152 or 151,936 tokens times the width is large next to a few hundred million block parameters, which is why small models tie their output head to the embeddings. The feed-forward widths also show that "2.6×" is not a rule: 2.67× (SmolLM), 3.5× (Llama), 5.43× (Qwen2.5-0.5B).</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">This lesson&#x27;s block, inside a real model</div><div class="co-body"><p>All 30 blocks of SmolLM-135M (a Llama-architecture model) rebuilt in about 25 lines from its weights: RMSNorm, RoPE, grouped-query attention, SwiGLU and the two residual additions, then compared with <code>transformers</code> on a real sentence. The table follows the residual stream through the layers.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+repo = &quot;HuggingFaceTB/SmolLM-135M&quot;                        # a Llama-architecture model, 30 blocks
+tok = AutoTokenizer.from_pretrained(repo)
+hf = AutoModelForCausalLM.from_pretrained(repo, dtype=torch.float32).eval()
+cfg, W = hf.config, dict(hf.named_parameters())
+ids = tok(&quot;The cat sat on the mat because it was tired, so the cat&quot;, return_tensors=&quot;pt&quot;).input_ids
+n, d, H, KV = ids.shape[1], cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads
+dh = d // H
+
+def rms_norm(x, w, eps=cfg.rms_norm_eps):
+    return w * x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+theta = cfg.rope_parameters[&quot;rope_theta&quot;]
+inv_freq = 1.0 / theta ** (torch.arange(0, dh, 2).float() / dh)
+ang = torch.outer(torch.arange(n).float(), inv_freq)            # (n, dh/2)
+cos, sin = torch.cat([ang, ang], -1).cos(), torch.cat([ang, ang], -1).sin()
+def rope(x):                                                    # Llama's layout: first half and second half form the pairs
+    x1, x2 = x[..., : dh // 2], x[..., dh // 2 :]
+    return x * cos + torch.cat([-x2, x1], -1) * sin
+
+def block(x, i):
+    p = f&quot;model.layers.{i}.&quot;
+    h = rms_norm(x, W[p + &quot;input_layernorm.weight&quot;])
+    q = (h @ W[p + &quot;self_attn.q_proj.weight&quot;].T).view(n, H, dh).transpose(0, 1)
+    k = (h @ W[p + &quot;self_attn.k_proj.weight&quot;].T).view(n, KV, dh).transpose(0, 1)
+    v = (h @ W[p + &quot;self_attn.v_proj.weight&quot;].T).view(n, KV, dh).transpose(0, 1)
+    q, k = rope(q), rope(k)
+    k, v = k.repeat_interleave(H // KV, 0), v.repeat_interleave(H // KV, 0)       # grouped-query attention
+    s = q @ k.transpose(-1, -2) / dh ** 0.5 + torch.triu(torch.full((n, n), float(&quot;-inf&quot;)), 1)
+    a = (s.softmax(-1) @ v).transpose(0, 1).reshape(n, d) @ W[p + &quot;self_attn.o_proj.weight&quot;].T
+    x = x + a                                                   # residual 1
+    h = rms_norm(x, W[p + &quot;post_attention_layernorm.weight&quot;])
+    f = (F.silu(h @ W[p + &quot;mlp.gate_proj.weight&quot;].T) * (h @ W[p + &quot;mlp.up_proj.weight&quot;].T)) @ W[p + &quot;mlp.down_proj.weight&quot;].T
+    return x + f, a.norm(dim=-1).mean().item(), f.norm(dim=-1).mean().item()   # residual 2
+
+with torch.no_grad():
+    x = W[&quot;model.embed_tokens.weight&quot;][ids[0]]
+    rows = []
+    for i in range(cfg.num_hidden_layers):
+        x, an, fn = block(x, i)
+        nrm = x.norm(dim=-1); rows.append((i, nrm[0].item(), nrm[1:].median().item(), an, fn))
+    ours = rms_norm(x, W[&quot;model.norm.weight&quot;]) @ W[&quot;model.embed_tokens.weight&quot;].T     # tied output head
+    ref = hf(ids).logits[0]
+print(f&quot;our 30 blocks vs transformers: max logit difference {(ours - ref).abs().max():.1e}; &quot;
+      f&quot;same next token: {tok.decode(ours[-1].argmax())!r} = {tok.decode(ref[-1].argmax())!r}&quot;)
+print(&quot;\n          residual-stream norm         mean size of the update added by&quot;)
+print(&quot;layer   first token   other tokens   attention   feed-forward&quot;)
+for i, s0, s, a, f in rows:
+    if i in (0, 1, 2, 3, 5, 10, 15, 20, 25, 28, 29):
+        print(f&quot;{i:5d} {s0:13.1f} {s:14.1f} {a:11.1f} {f:14.1f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">our 30 blocks vs transformers: max logit difference 7.1e-05; same next token: &#x27; sat&#x27; = &#x27; sat&#x27;
+
+          residual-stream norm         mean size of the update added by
+layer   first token   other tokens   attention   feed-forward
+    0          69.6           59.4         3.9           69.6
+    1         158.3           99.1        27.5           37.7
+    2         465.8          113.6        11.3           51.5
+    3         529.5          120.8         5.6           20.2
+    5         536.0          134.4         9.0           21.3
+   10         172.5          176.6        22.3           36.4
+   15       31462.1          221.2        33.8           43.9
+   20       31477.6          399.2        43.9           84.5
+   25       31467.0          858.8       130.9          152.6
+   28        4650.2         1293.0        95.4         2144.5
+   29         989.2         1589.2       112.9          963.4</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The rebuild agrees with <code>transformers</code> to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span> in the logits, rounding error over 30 blocks, and predicts the same next token, " sat": the whole architecture is the formula box plus RoPE. The table shows what pre-norm allows. The residual stream is never normalised, and it grows from about 60 to over 1,500 for ordinary tokens. The first token is different: in the middle layers (15 to 25 in the table) its vector has a norm above 31,000, hundreds of times the others. These "massive activations" appear in most large language models: the model parks a huge, nearly constant value on the first position and uses it as an attention sink (Lesson 7.2 found 63–78% of attention landing there). The feed-forward layers usually write larger updates than attention, and the last layers' large feed-forward updates are where the stream is reshaped for the output head.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In <code>decoder_block</code>, pass <code>kv_source=x</code> instead of <code>kv_source=enc_out</code> to the cross-attention call. Shapes still match and the forward pass runs. Name two things that are now wrong, and say which one would make the training loss look misleadingly good. (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>The Llama-style block is the open-model standard.</strong> Pre-norm RMSNorm, RoPE, grouped-query attention, SwiGLU and no biases: Llama 3, Qwen2.5 and Qwen3, Mistral and SmolLM all follow it, and <code>transformers</code>, vLLM and llama.cpp share one implementation pattern for them.</li>
+<li><strong>Extra normalisation for stability.</strong> Qwen3 and Gemma 3 add QK-norm (RMSNorm on queries and keys before the dot product), and Gemma 3 normalises both before and after each sublayer, to keep very large or long-context training stable.</li>
+<li><strong>Encoders and encoder–decoders still ship.</strong> ModernBERT (December 2024) brought the modern block to encoders for retrieval and classification; Whisper's encoder–decoder remains the common speech-recognition backbone.</li>
+</ul>
+<p>Sources: <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">modeling_llama.py</a>, <a href="https://arxiv.org/abs/2505.09388">Qwen3 technical report</a>, <a href="https://arxiv.org/abs/2503.19786">Gemma 3 technical report</a>, <a href="https://arxiv.org/abs/2412.13663">ModernBERT</a>, <a href="https://github.com/openai/whisper">Whisper</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A block is attention plus a per-position FFN, each wrapped as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mopen">(</span><span class="mord"><span class="mord mathrm">Norm</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">))</span></span></span></span>.</li>
+<li>Encoders see everything; decoders are causally masked; cross-attention is the only bridge from encoder to decoder.</li>
+<li>Residuals keep a direct path through depth; without them token vectors collapse to the same direction within a few layers.</li>
+<li>Parameters: about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mopen">(</span><span class="mord">2</span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">2</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord">3</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10764em;">ff</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> plus embeddings; the FFN holds most of them.</li>
+<li>The whole modern block fits in 25 lines and reproduces a real model to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></span>.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-bert-gpt-t5"><span class="t" style="--cs-hue:32">BG</span>Cheat sheet · BERT, GPT and T5 Compared</a><a href="#cs-transformers-attention-v3"><span class="t" style="--cs-hue:12">TA</span>Cheat sheet · Transformers and Attention</a></div><h3 class="px-h">Practice problem · LayerNorm and RMSNorm</h3><p class="ref-lead">From the source repository: write the function, then press "Run the checks". They run as real Python in your browser (the first run loads Python, about 10 MB) and tell you which part is wrong and why. Hints open one at a time; the reference solution opens when every check passes.</p><div class="px" data-px="layer-norm-rms-norm"><div class="px-meta"><span class="chip">easy</span><span class="chip">15 min</span><span class="chip">implement</span></div><div class="px-problem"><p>A transformer normalizes the vector of each token before attention and before the feed forward block. LayerNorm centers each vector and divides it by its standard deviation. RMSNorm skips the centering and divides by the root mean square. Modern LLMs use RMSNorm because it is cheaper and works as well.</p>
+<h2>Task</h2>
+<p>Write two functions.</p>
+<ol>
+<li><code>layer_norm(x, gamma, beta, eps=1e-5)</code> returns LayerNorm of <code>x</code> over the last axis.</li>
+<li><code>rms_norm(x, weight, eps=1e-6)</code> returns RMSNorm of <code>x</code> over the last axis.</li>
+</ol>
+<p>For each vector <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span> of length <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span> along the last axis:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">μ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.7352em;vertical-align:-1.4138em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.7352em;vertical-align:-1.4138em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4138em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1502em;vertical-align:-0.2861em;"></span><span class="mord mathnormal">μ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">LayerNorm</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1903em;vertical-align:-0.93em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0556em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603em;"><span style="top:-2.1966em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9134em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-2.8734em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1266em;"><span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">μ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.93em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05278em;">β</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0528em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord text"><span class="mord">RMSNorm</span></span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.8376em;vertical-align:-1.73em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0269em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.11em;"><span class="pstrut" style="height:3.2351em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2351em;"><span class="svg-align" style="top:-3.8em;"><span class="pstrut" style="height:3.8em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">D</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.7959em;"><span style="top:-2.3987em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span><span style="top:-3.0448em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3013em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-3.1951em;"><span class="pstrut" style="height:3.8em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.88em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.88em" viewBox="0 0 400000 1944" preserveAspectRatio="xMinYMin slice"><path d="M983 90
+l0 -0
+c4,-6.7,10,-10,18,-10 H400000v40
+H1013.1s-83.4,268,-264.1,840c-180.7,572,-277,876.3,-289,913c-4.7,4.7,-12.7,7,-24,7
+s-12,0,-12,0c-1.3,-3.3,-3.7,-11.7,-7,-25c-35.3,-125.3,-106.7,-373.3,-214,-744
+c-10,12,-21,25,-33,39s-32,39,-32,39c-6,-5.3,-15,-14,-27,-26s25,-30,25,-30
+c26.7,-32.7,52,-63,76,-91s52,-60,52,-60s208,722,208,722
+c56,-175.3,126.3,-397.3,211,-666c84.7,-268.7,153.8,-488.2,207.5,-658.5
+c53.7,-170.3,84.5,-266.8,92.5,-289.5z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.6049em;"><span></span></span></span></span></span></span></span><span style="top:-3.4651em;"><span class="pstrut" style="height:3.2351em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.9121em;"><span class="pstrut" style="height:3.2351em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.73em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>The variance is the biased variance. It divides by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span>, not by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>. The <code>eps</code> goes inside the square root in both functions.</p>
+<h2>Input and output</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Type</th>
+<th>Shape</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>x</code></td>
+<td>float array</td>
+<td><code>(..., D)</code></td>
+<td>the vectors to normalize, with zero or more leading axes</td>
+</tr>
+<tr>
+<td><code>gamma</code></td>
+<td>float array</td>
+<td><code>(D,)</code></td>
+<td>the LayerNorm scale of each feature</td>
+</tr>
+<tr>
+<td><code>beta</code></td>
+<td>float array</td>
+<td><code>(D,)</code></td>
+<td>the LayerNorm shift of each feature</td>
+</tr>
+<tr>
+<td><code>weight</code></td>
+<td>float array</td>
+<td><code>(D,)</code></td>
+<td>the RMSNorm scale of each feature</td>
+</tr>
+<tr>
+<td><code>eps</code></td>
+<td>float</td>
+<td></td>
+<td>the small number added inside the square root</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li>Both functions return a float array with the shape of <code>x</code>.</li>
+</ul>
+<h2>Constraints</h2>
+<ul>
+<li><code>x</code> has 1 to 4 axes. <code>1 &lt;= D &lt;= 1024</code>.</li>
+<li>A vector can be constant or all zeros. The output must not contain NaN.</li>
+<li>Do not change the input arrays.</li>
+<li>Use numpy only.</li>
+</ul>
+<h2>Examples</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">x = np.array([[1.0, 2.0, 3.0, 4.0], [2.0, -2.0, 0.0, 4.0]])
+gamma = np.array([1.0, 1.0, 2.0, 0.5])
+beta = np.array([0.0, 0.5, 0.0, -1.0])
+layer_norm(x, gamma, beta)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[[-1.34163542  0.05278819  0.89442361 -0.32918229]
+ [ 0.44721315 -0.84163944 -0.8944263  -0.32918028]]
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">rms_norm(x, gamma)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[[ 0.36514835  0.73029669  2.19089008  0.73029669]
+ [ 0.81649651 -0.81649651  0.          0.81649651]]
+</code></pre></div></div><div class="px-editor"><div class="px-bar"><span>Your code</span><span class="px-actions"><button type="button" class="px-run">Run the checks</button><button type="button" class="px-reset">Reset</button></span></div><textarea class="px-src" spellcheck="false" aria-label="Your solution">import numpy as np
+
+
+def layer_norm(x, gamma, beta, eps=1e-5):
+    raise NotImplementedError
+
+
+def rms_norm(x, weight, eps=1e-6):
+    raise NotImplementedError
+</textarea></div><div class="px-out" aria-live="polite"></div><details class="px-mut"><summary>Common mistakes the checks catch</summary><ul><li>Uses a fixed eps of 1e-5 in LayerNorm and ignores the eps that the caller passes.</li><li>Takes the LayerNorm mean over axis 0, not over the last axis.</li><li>Adds eps after the square root in RMSNorm.</li><li>Uses the variance in RMSNorm, so it subtracts the mean as LayerNorm does.</li><li>Uses the unbiased variance with D - 1 in LayerNorm.</li></ul></details><details class="px-hint"><summary>Hint 1</summary><p>Use <code>axis=-1</code> and <code>keepdims=True</code> for every mean. The statistics then have shape <code>(..., 1)</code> and broadcast against <code>x</code> for any number of leading axes.</p></details><details class="px-hint"><summary>Hint 2</summary><p><code>gamma</code>, <code>beta</code> and <code>weight</code> have shape <code>(D,)</code>. numpy broadcasts them over the leading axes, so you can multiply and add them directly.</p></details><details class="px-hint"><summary>Hint 3</summary><p>For LayerNorm, compute the mean, then the mean of the squared differences from it. Divide by <code>np.sqrt(var + eps)</code>.</p></details><details class="px-hint"><summary>Hint 4</summary><p>RMSNorm has no mean subtraction. The denominator is the square root of the mean of <code>x * x</code> plus <code>eps</code>. A row of zeros then gives <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0503em;vertical-align:-0.25em;"></span><span class="mord">0/</span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">ϵ</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>.</p></details><details class="px-sol" hidden><summary>Reference solution and notes</summary><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code>import numpy as np
+
+
+def layer_norm(x, gamma, beta, eps=1e-5):
+    mean = np.mean(x, axis=-1, keepdims=True)
+    var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)
+    return (x - mean) / np.sqrt(var + eps) * gamma + beta
+
+
+def rms_norm(x, weight, eps=1e-6):
+    rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
+    return x / rms * weight
+</code></pre></div><h2>What each norm removes</h2>
+<p>LayerNorm removes the mean and the scale of each vector. RMSNorm removes only the scale. The residual stream of a transformer has a mean close to 0 in practice, so the centering adds little. RMSNorm saves one reduction over the vector and one subtraction for each entry.</p>
+<h2>Why eps goes inside the square root</h2>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1266em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9134em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">ϵ</span></span></span><span style="top:-2.8734em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1266em;"><span></span></span></span></span></span></span></span></span> is at least <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.2397em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8003em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">ϵ</span></span></span><span style="top:-2.7603em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2397em;"><span></span></span></span></span></span></span></span></span>, so a constant vector does not cause a division by 0. LayerNorm of a constant vector gives <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05278em;">β</span></span></span></span>, and RMSNorm of a zero vector gives 0.</p>
+<h2>The difference from BatchNorm</h2>
+<p>BatchNorm normalizes each feature over the batch axis. LayerNorm and RMSNorm normalize each example over the feature axis. They do not need running statistics, and they act the same way in training and in inference. They also work for a batch of one token, which is the case during generation.</p>
+<h2>Where this goes next</h2>
+<p>The full transformer lesson uses pre-norm blocks: <code>x + attention(norm(x))</code> and <code>x + ffn(norm(x))</code>. Llama, Mistral and Qwen use RMSNorm with eps from 1e-6 to 1e-5. The capstone lesson builds the same RMSNorm as a module with a learned <code>weight</code>.</p></details><script type="application/json" class="px-files">{"tests.py": "import numpy as np\n\nfrom practice_check import check, close, fixture, fixtures, shape, true\n\nX = np.array([[1.0, 2.0, 3.0, 4.0], [2.0, -2.0, 0.0, 4.0]])\nGAMMA = np.array([1.0, 1.0, 2.0, 0.5])\nBETA = np.array([0.0, 0.5, 0.0, -1.0])\n\n\n@check(\"examples\", \"LayerNorm of a 2 by 4 batch\", \"Each row is centered by its own mean and divided by sqrt(var + eps). Then each feature is scaled by gamma and shifted by beta.\")\ndef example_layer_norm(sub):\n    close(sub.layer_norm(X, GAMMA, BETA), [[-1.34163542, 0.05278819, 0.89442361, -0.32918229], [0.44721315, -0.84163944, -0.8944263, -0.32918028]], rtol=1e-6, what=\"the LayerNorm output\")\n\n\n@check(\"examples\", \"RMSNorm of the same batch\", \"Each row is divided by sqrt(mean(x^2) + eps), with no mean subtraction. Then each feature is scaled by weight.\")\ndef example_rms_norm(sub):\n    close(sub.rms_norm(X, GAMMA), [[0.36514835, 0.73029669, 2.19089008, 0.73029669], [0.81649651, -0.81649651, 0.0, 0.81649651]], rtol=1e-6, atol=1e-12, what=\"the RMSNorm output\")\n\n\n@check(\"properties\", \"LayerNorm rows have mean 0 and variance close to 1\", \"With gamma = 1 and beta = 0, each row of the output has mean 0 and variance var / (var + eps).\")\ndef layer_norm_stats(sub):\n    rng = np.random.default_rng(1)\n    x = rng.normal(size=(7, 12)) * 3 + 2\n    out = sub.layer_norm(x, np.ones(12), np.zeros(12))\n    shape(out, x.shape, what=\"the LayerNorm output\")\n    close(np.mean(out, axis=-1), np.zeros(7), atol=1e-12, what=\"the row means\")\n    var = np.var(x, axis=-1)\n    close(np.var(out, axis=-1), var / (var + 1e-5), rtol=1e-9, what=\"the row variances\")\n\n\n@check(\"properties\", \"RMSNorm rows have a root mean square close to 1\", \"With weight = 1, each output row has mean(out^2) = ms / (ms + eps), where ms is mean(x^2) of the input row.\")\ndef rms_norm_stats(sub):\n    rng = np.random.default_rng(2)\n    x = rng.normal(size=(6, 10)) + 1.5\n    out = sub.rms_norm(x, np.ones(10))\n    shape(out, x.shape, what=\"the RMSNorm output\")\n    ms = np.mean(x * x, axis=-1)\n    close(np.mean(out * out, axis=-1), ms / (ms + 1e-6), rtol=1e-9, what=\"the mean square of each output row\")\n\n\n@check(\"properties\", \"the norms normalize over the last axis only\", \"Each row is normalized on its own. The output of one row does not change when the other rows change.\")\ndef row_independence(sub):\n    rng = np.random.default_rng(3)\n    x = rng.normal(size=(5, 6))\n    gamma, beta = rng.normal(size=6), rng.normal(size=6)\n    y = x.copy()\n    y[1:] = rng.normal(size=(4, 6)) * 10\n    close(sub.layer_norm(y, gamma, beta)[0], sub.layer_norm(x, gamma, beta)[0], rtol=1e-12, what=\"LayerNorm of row 0\")\n    close(sub.rms_norm(y, gamma)[0], sub.rms_norm(x, gamma)[0], rtol=1e-12, what=\"RMSNorm of row 0\")\n\n\n@check(\"properties\", \"LayerNorm ignores a shift of a row and RMSNorm ignores a scale\", \"LayerNorm subtracts the mean, so adding a constant to a row does nothing. Both norms divide by a size of the row, so a positive scale nearly does nothing.\")\ndef invariances(sub):\n    rng = np.random.default_rng(4)\n    x = rng.normal(size=(4, 8)) * 2\n    gamma, beta = rng.normal(size=8), rng.normal(size=8)\n    close(sub.layer_norm(x + 5.0, gamma, beta), sub.layer_norm(x, gamma, beta), atol=1e-9, what=\"LayerNorm of x + 5\")\n    close(sub.rms_norm(x * 10.0, gamma), sub.rms_norm(x, gamma), atol=1e-5, what=\"RMSNorm of 10 x\")\n\n\n@check(\"properties\", \"works for any number of leading axes\", \"A transformer input has shape (batch, seq, d_model). The norms act on the last axis, and the output has the shape of the input.\")\ndef leading_axes(sub):\n    rng = np.random.default_rng(5)\n    x = rng.normal(size=(2, 3, 4))\n    gamma, beta = rng.normal(size=4), rng.normal(size=4)\n    out = sub.layer_norm(x, gamma, beta)\n    shape(out, (2, 3, 4), what=\"the LayerNorm output\")\n    close(out.reshape(6, 4), sub.layer_norm(x.reshape(6, 4), gamma, beta), rtol=1e-12, what=\"LayerNorm of the 3D input\")\n    out = sub.rms_norm(x, gamma)\n    shape(out, (2, 3, 4), what=\"the RMSNorm output\")\n    close(out.reshape(6, 4), sub.rms_norm(x.reshape(6, 4), gamma), rtol=1e-12, what=\"RMSNorm of the 3D input\")\n\n\n@check(\"properties\", \"the inputs are not changed\", \"A function that writes into its input array breaks the code that calls it.\")\ndef inputs_unchanged(sub):\n    x, gamma, beta = X.copy(), GAMMA.copy(), BETA.copy()\n    sub.layer_norm(x, gamma, beta)\n    sub.rms_norm(x, gamma)\n    for name, after, before in ((\"x\", x, X), (\"gamma\", gamma, GAMMA), (\"beta\", beta, BETA)):\n        close(after, before, atol=0, rtol=0, what=f\"{name} after the calls\")\n\n\n@check(\"edge\", \"a constant row and a zero row\", \"LayerNorm of a constant row gives beta. RMSNorm of a row of zeros gives zeros. Neither can give NaN.\")\ndef degenerate_rows(sub):\n    gamma, beta = np.array([2.0, 3.0, 4.0]), np.array([0.1, 0.2, 0.3])\n    out = sub.layer_norm(np.array([[5.0, 5.0, 5.0]]), gamma, beta)\n    close(out, [[0.1, 0.2, 0.3]], atol=1e-12, what=\"LayerNorm of a constant row\")\n    out = sub.rms_norm(np.zeros((1, 3)), gamma)\n    close(out, [[0.0, 0.0, 0.0]], atol=0, what=\"RMSNorm of a zero row\")\n\n\n@check(\"edge\", \"small values use eps inside the square root\", \"The denominators are sqrt(var + eps) and sqrt(mean(x^2) + eps). With values near sqrt(eps), sqrt(var) + eps gives a very different result.\")\ndef small_values(sub):\n    x = np.array([[0.001, -0.002, 0.003, 0.0]])\n    ones, zeros = np.ones(4), np.zeros(4)\n    mean = np.mean(x, axis=-1, keepdims=True)\n    var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)\n    close(sub.layer_norm(x, ones, zeros), (x - mean) / np.sqrt(var + 1e-5), rtol=1e-9, what=\"LayerNorm of small values\")\n    ms = np.mean(x * x, axis=-1, keepdims=True)\n    close(sub.rms_norm(x, ones), x / np.sqrt(ms + 1e-6), rtol=1e-9, what=\"RMSNorm of small values\")\n\n\n@check(\"edge\", \"a custom eps\", \"The eps argument changes the denominator. Use the eps that the caller passes.\")\ndef custom_eps(sub):\n    x = np.array([[0.0, 1.0]])\n    close(sub.layer_norm(x, np.ones(2), np.zeros(2), eps=0.75), [[-0.5, 0.5]], rtol=1e-12, what=\"LayerNorm with eps = 0.75\")\n    close(sub.rms_norm(x, np.ones(2), eps=1.5), [[0.0, 0.70710678]], rtol=1e-6, what=\"RMSNorm with eps = 1.5\")\n\n\n@check(\"edge\", \"one feature\", \"With D = 1, the row minus its mean is 0, so LayerNorm gives beta. RMSNorm gives x / sqrt(x^2 + eps), which is close to the sign of x.\")\ndef one_feature(sub):\n    x = np.array([[3.0], [-2.0]])\n    close(sub.layer_norm(x, np.array([5.0]), np.array([0.25])), [[0.25], [0.25]], atol=1e-12, what=\"LayerNorm with one feature\")\n    close(sub.rms_norm(x, np.array([1.0])), [[1.0], [-1.0]], atol=1e-6, what=\"RMSNorm with one feature\")\n\n\n@fixture(\"batches\")\ndef batches(ref):\n    rng = np.random.default_rng(42)\n    for shape_, scale in [((1, 3), 1.0), ((4, 8), 5.0), ((2, 3, 6), 0.5), ((6, 16), 20.0)]:\n        x = rng.normal(size=shape_) * scale + rng.normal()\n        d = shape_[-1]\n        gamma, beta = rng.normal(size=d), rng.normal(size=d)\n        yield {\"x\": x, \"gamma\": gamma, \"beta\": beta}, {\"layer\": ref.layer_norm(x, gamma, beta), \"rms\": ref.rms_norm(x, gamma)}\n\n\n@check(\"reference\", \"LayerNorm matches the reference\", \"Your LayerNorm agrees with the reference solution on random inputs of four shapes and scales.\")\ndef reference_layer(sub):\n    for case, expected in fixtures(\"batches\"):\n        close(sub.layer_norm(case[\"x\"], case[\"gamma\"], case[\"beta\"]), expected[\"layer\"], rtol=1e-7, atol=1e-12, what=f\"LayerNorm for x of shape {case['x'].shape}\")\n\n\n@check(\"reference\", \"RMSNorm matches the reference\", \"Your RMSNorm agrees with the reference solution on the same inputs.\")\ndef reference_rms(sub):\n    for case, expected in fixtures(\"batches\"):\n        close(sub.rms_norm(case[\"x\"], case[\"gamma\"]), expected[\"rms\"], rtol=1e-7, atol=1e-12, what=f\"RMSNorm for x of shape {case['x'].shape}\")\n", "fixtures.json": "{\"batches\":[[{\"__dict__\":[[\"x\",{\"__nd__\":[[1.2452817961456453,-0.09941938984928167,1.6910159121976711]],\"dtype\":\"float64\",\"shape\":[1,3]}],[\"gamma\",{\"__nd__\":[-1.9510351886538364,-1.302179506862318,0.12784040316728537],\"dtype\":\"float64\",\"shape\":[3]}],[\"beta\",{\"__nd__\":[-0.3162425923435822,-0.016801157504288795,-0.85304392757358],\"dtype\":\"float64\",\"shape\":[3]}]]},{\"__dict__\":[[\"layer\",{\"__nd__\":[[-1.0844520594926728,1.7713246781758218,-0.7278326045195838]],\"dtype\":\"float64\",\"shape\":[1,3]}],[\"rms\",{\"__nd__\":[[-2.0015890904293783,0.10665571542132266,0.17809757629225034]],\"dtype\":\"float64\",\"shape\":[1,3]}]]}],[{\"__dict__\":[[\"x\",{\"__nd__\":[[3.731480167025448,3.223449969856047,-0.33535621948261407,4.97069632755147,1.6720370039715338,-4.961972021704885,1.1782442131237998,-5.459922711433689],[3.7267417992476686,-0.9151392622199588,-1.589821525014997,-4.070157429308401,5.447196986081457,-1.438157117632705,-2.8071488181042303,-2.4261774597298422],[1.9960362204780493,1.1617106145316973,1.3981533506912474,1.4885953077507192,10.042728297063613,-2.6975847892117724,-3.226723352646381,-4.7343733485280834],[2.414387405588784,4.979351756315764,-1.2352469955630698,-4.866292092101335,-4.787915785744892,2.587454231834811,3.050761148728517,2.0502616342372804]],\"dtype\":\"float64\",\"shape\":[4,8]}],[\"gamma\",{\"__nd__\":[0.23216132306671977,0.11668580914072822,0.21868859672901295,0.8714287779481898,0.22359554877468227,0.6789135630718949,0.06757906948889146,0.28911939868998415],\"dtype\":\"float64\",\"shape\":[8]}],[\"beta\",{\"__nd__\":[0.6312882258385404,-1.4571558198556664,-0.31967121635730134,-0.4703726542927955,-0.6388778482433419,-0.27514225122668373,1.4949413112343959,-0.8658311156932432],\"dtype\":\"float64\",\"shape\":[8]}]]},{\"__dict__\":[[\"layer\",{\"__nd__\":[[0.8375027904169037,-1.3698170837624857,-0.3700618823067467,0.6007074938819399,-0.5669361024599178,-1.2955901872172682,1.5075057746974523,-1.3399958701681318],[0.9477450896478462,-1.4724030546317968,-0.3957272207196535,-1.4689912355884727,-0.21030473357680707,-0.4781214767414578,1.4449653248817356,-1.0441952183865022],[0.7026952889139926,-1.4439943418843835,-0.282932865077358,-0.3055781384166047,-0.1500644674446832,-0.810257877291535,1.4333276939400459,-1.2311916378090877],[0.7574741006313435,-1.3076759591970866,-0.430300058781371,-1.8210256474550912,-0.980396192074267,0.12765010160625795,1.544037972775231,-0.7389575747595074]],\"dtype\":\"float64\",\"shape\":[4,8]}],[\"rms\",{\"__nd__\":[[0.23605099520882444,0.10248818548393879,-0.019983305645408886,1.1802770369615094,0.10186942767788992,-0.9179174458545963,0.0216961338267258,-0.43012883226914006],[0.2747609945743413,-0.03391104206491347,-0.11041050994550855,-1.1263646464990464,0.3867872411161121,-0.3100678408790034,-0.06024396529824739,-0.22275922628724554],[0.10685310697183185,0.031256825370009546,0.07050335961388121,0.2991144612908664,0.517778166732,-0.42229744689064547,-0.050280872656153705,-0.31562296966917386],[0.15937228475262558,0.16519877438259095,-0.07680613577535624,-1.2057188282298625,-0.3043866691401101,0.49946278339151234,0.058618727463679465,0.16853980556917006]],\"dtype\":\"float64\",\"shape\":[4,8]}]]}],[{\"__dict__\":[[\"x\",{\"__nd__\":[[[-0.9629732951273469,-2.2885473582309896,-1.6145549874159748,-1.3657359398705844,-1.1540013067434483,-1.0914991825266598],[-1.0504388548231247,-1.621475008547306,-1.678288368755371,-1.0181245317945105,-1.5427646348638948,-2.084955634092048],[-2.0137560794248275,-1.906838615423893,-1.1985321003962053,-1.3758996043878047,-1.1018697953892032,-1.6607387955913544]],[[-1.3678426268847301,-1.1343172754394188,-1.6017857422832065,-1.2187248536443815,-1.778075442956413,-1.628639395705623],[-1.6379814194222517,-2.045032295217607,-1.2036262320302964,-1.6818136425244492,-1.4408654130592435,-1.2067391429701328],[-1.2238468844081152,-1.114419917936694,-1.496355214677799,-1.658761628445164,-1.4869715778762869,-2.290779689402102]]],\"dtype\":\"float64\",\"shape\":[2,3,6]}],[\"gamma\",{\"__nd__\":[-1.3226996123544024,-0.9972468276014818,0.3997742267234366,-0.9054790553600608,-0.3781625540393897,1.2992282977860654],\"dtype\":\"float64\",\"shape\":[6]}],[\"beta\",{\"__nd__\":[-0.35626397106142593,0.7375155684670865,-0.933617680009877,-0.20543755786763002,-0.9500220549105812,-0.3390330759005625],\"dtype\":\"float64\",\"shape\":[6]}]]},{\"__dict__\":[[\"layer\",{\"__nd__\":[[[-1.696772802846092,2.704586415805032,-1.115226170502064,-0.30160663648864644,-1.1705505050594867,0.6015420156755062],[-1.957609466391053,1.065996853796631,-1.1265529645359478,-1.3805813607212545,-0.9057351893583081,-2.3909946947493053],[1.4552371519658307,1.7931398896760085,-0.5331087830874945,-0.6454075664442007,-1.435210831429304,-0.784232633352703]],[[-0.8530125714646678,-0.6416662623573993,-1.1869459858354918,-1.1279880974939773,-0.4227895006012192,-1.3128379534239059],[0.10243593368458026,2.4638597068646075,-0.4817182045503856,0.2435510751590702,-1.0723846950449292,1.1158429918282589],[-1.4766904059656334,-0.3948889874759772,-0.8821551893883223,0.06564761899736488,-1.0080566414326064,-2.892558140022736]]],\"dtype\":\"float64\",\"shape\":[2,3,6]}],[\"rms\",{\"__nd__\":[[[0.8600526846019688,1.5410337610249334,-0.43583009748780366,0.8350158770352504,0.2946689726951557,-0.9575434103671013],[0.8995851474581695,1.046943380671432,-0.4344018331205084,0.5968835138006621,0.3777360807595073,-1.7538504631113416],[1.6849980836390788,1.202950957442915,-0.3031068719312544,0.7881274887819849,0.26359679240194117,-1.3649543367157455]],[[1.2280680756527909,0.7678250761677121,-0.4346546170946243,0.7490471547289502,0.45640856741011715,-1.4362680139505326],[1.3853567392021047,1.3040500456283706,-0.30767900370747386,0.9737505245180595,0.3484122077033432,-1.0025136526741685],[1.0174156903201763,0.6984923388649412,-0.37597555702232505,0.9440011157207255,0.35342015089679757,-1.870591312766106]]],\"dtype\":\"float64\",\"shape\":[2,3,6]}]]}],[{\"__dict__\":[[\"x\",{\"__nd__\":[[14.755990648116885,-36.596580564877996,6.638300769886125,2.7045399456145356,-13.933171214966912,-30.971329188800116,-0.6075819467536323,-12.640026282307073,2.603352126063057,-1.613129190562165,29.985405725387288,-6.837284650491508,-22.520121953468323,1.5353405980953005,2.349761578404281,25.13357940377771],[14.652052817260547,5.087249081959164,27.215885723360213,-25.82543318748804,-14.845202756025976,-20.581690929141523,-9.846368164146382,-29.5838950521572,10.652846835257062,-6.49462604300649,-31.466297991084183,-22.361753725181856,4.220104847972883,14.712359256856598,37.88444573280471,56.22707721911557],[6.2380165644889045,-21.840934501668308,-44.69109771565721,3.304057145845694,-18.308994007237544,-10.357317304624729,-14.292108082227184,-4.865989829358728,19.26943251472185,1.0907992478758697,-5.222868841804789,-22.763247157547255,-35.543830995118164,-11.77633028249764,-3.1258231173974327,33.308426170566634],[0.5553183284266945,17.60461811943013,-12.036084071814063,-25.749047429371515,-21.35250734567846,-16.55469339174609,40.519222547672264,-18.477905685518746,14.719611973695876,-20.10871566277155,16.58128815645386,5.648847221086241,-5.1829300541928305,-2.865422623739703,-15.14592600961883,6.8712719286105886],[-11.149841707846623,-26.562287376375988,-27.60892358742341,1.401586253411367,29.531653027177676,1.1496601704377425,-4.422938623228674,3.6663506910198356,24.069862733105474,2.3374779262461045,-10.268716717705765,20.075602100166755,6.524956668201248,28.664947738888817,1.6145166434071,-26.539552735441028],[-29.413356085944322,30.968386543593965,32.423142314634916,-5.640556366683036,-9.713918523750777,27.17871374381302,-24.191085741900782,-19.94471248014755,10.816363792749865,-9.942274558222813,-2.1526094354324483,-5.319030071521274,4.701318874947648,26.099465125243313,-0.23847396299611168,10.828603764506134]],\"dtype\":\"float64\",\"shape\":[6,16]}],[\"gamma\",{\"__nd__\":[-0.04871840193011795,-0.8432302702928711,-1.218813060423628,-0.8781523669287508,-0.33412344070081207,0.9159025423560131,-1.326392717739564,0.030631492594417446,-0.4841694333335785,-0.32767309436196085,1.0027578253046041,0.5381154370039261,1.3373981074427437,-0.15450567924990047,-0.695942611670703,-0.22385881688049952],\"dtype\":\"float64\",\"shape\":[16]}],[\"beta\",{\"__nd__\":[0.2424967912712216,0.17657335845371103,-1.0843880722333665,0.09048978162787422,0.22822833013890514,2.5174740375339204,1.8768446112816701,-0.8532433505588201,-0.2873833615491761,-1.4634420018370031,-0.5907070139634865,0.3156050035903405,1.2058536208882336,-0.7290838377436085,-0.6541464400677965,-2.147289029738655],\"dtype\":\"float64\",\"shape\":[16]}]]},{\"__dict__\":[[\"layer\",{\"__nd__\":[[0.1945719067631255,1.8154809651668846,-1.719351616122327,-0.17008209784874292,0.44597457021074804,1.031016782618002,1.7336974484968795,-0.8709477145576908,-0.42825694619141175,-1.4800227912662018,1.2662546874270677,0.18258404684771826,-0.32036808977082076,-0.7646321952305084,-0.846577016924119,-2.499929246191341],[0.2147491322571305,0.023278594135489522,-2.3993530957149773,1.0313473321465183,0.4374788654178197,1.7308745455516166,2.4387235894836383,-0.890729371653261,-0.48464563714340686,-1.3691590890192442,-1.8943789592782818,-0.1853741236382772,1.401970519300182,-0.8174605820683565,-1.7059894934831024,-2.652091525309907],[0.20511054050076005,0.7968395376692613,1.3028779148232257,-0.4454898123376442,0.4108367086510262,2.4067401797391206,2.3165681647355765,-0.8479431162145522,-0.9966556076933163,-1.6246179880900589,-0.4363529248082577,-0.1067897277085364,-0.7588597439157767,-0.6986683640432025,-0.8393909570947213,-2.6434472548912056],[0.2349382298930639,-0.7679600374925665,-0.4048700713353822,1.2616613979289226,0.5906965277580758,1.772591284784014,-1.3291815142547445,-0.8814895984469674,-0.7506588747485247,-1.1310390512114452,0.4744389657663155,0.5542276115973157,0.9789821932789757,-0.7231406706340058,-0.14364387091164543,-2.262045873077721],[0.2748763218555249,1.4610265497191863,0.8432394389365796,0.06009394728363811,-0.30695007695403215,2.5363220294903246,2.2613270161621255,-0.8483183164240208,-0.9155750007423485,-1.4918682627416768,-1.207943402355657,0.8940480311565567,1.633869441456965,-0.9691013740933425,-0.6864908881436556,-1.8065789024316656],[0.3242305769449946,-1.1040716350397015,-3.0293054320688837,0.45863099632645454,0.4403476481379452,3.724747081384413,3.735422862560122,-0.8892794149923984,-0.5062055947248525,-1.2514566524107587,-0.8259357612378766,0.09917394383506314,1.37736565404268,-0.9239142585978092,-0.5614095481016689,-2.2486079291094563]],\"dtype\":\"float64\",\"shape\":[6,16]}],[\"rms\",{\"__nd__\":[[-0.04056957432324845,1.7415090776471658,-0.45659701767657135,-0.13403009396107807,0.2627217113408433,-1.6008408363369278,0.04547953706996412,-0.021850188194582967,-0.07113270558738248,0.029829706344297397,1.6968561815109848,-0.2076338502179023,-1.6996930079049517,-0.01338715300398409,-0.0922860955889073,-0.3175174461404754],[-0.028929816700728743,-0.17385346983825664,-1.3443543117947274,0.919118830017389,0.20102369476620863,-0.7639843972470177,0.5293005820768497,-0.03672634291694455,-0.20903414060428435,0.0862480141885042,-1.2787801415002626,-0.4876806043039591,0.2287378937614223,-0.0921257298101167,-1.0685344749196566,-0.5101218020963443],[-0.014925140093751784,0.9044743672895442,2.6750812662889905,-0.1424939038913446,0.3004348343177293,-0.4658814350217823,0.9309948513975804,-0.0073201202401453535,-0.4581895199573651,-0.017553530200711105,-0.2572077428587362,-0.6015732597124139,-2.33455332365864,0.08935796787615984,0.10683577035903384,-0.36619058608836963],[-0.001519680899631698,-0.833854276569067,0.8240236477051576,1.2701306804488683,0.40074968362361657,-0.8517022006594513,-3.01891298844736,-0.03179349477707041,-0.400323507241537,0.37011993639651836,0.9339673403222575,0.17074682746510605,-0.3893618667556082,0.024868551867519965,0.592088495593358,-0.0864029764130334],[0.030233243887212224,1.2466216673862773,1.8728784204585738,-0.06850349306075847,-0.5491837948777832,0.058605956953239384,0.32651719212421515,0.006250649895882369,-0.6486254621860558,-0.04262960536997455,-0.5731063818161645,0.6012665475484662,0.4856924447173998,-0.2465009591909904,-0.06253727689529442,0.33066696955753716],[0.07531094037071935,-1.3724142645395023,-2.0768859943167493,0.2603228411712003,0.17057754404812447,1.3082737266994084,1.686350886712922,-0.03210823220412591,-0.27523211628455585,0.17121704219046022,-0.11344405849169759,-0.15042788599560283,0.33044628138821996,-0.21193198728617937,0.00872237698777322,-0.12739932364755732]],\"dtype\":\"float64\",\"shape\":[6,16]}]]}]]}\n", "solution.py": "import numpy as np\n\n\ndef layer_norm(x, gamma, beta, eps=1e-5):\n    mean = np.mean(x, axis=-1, keepdims=True)\n    var = np.mean((x - mean) ** 2, axis=-1, keepdims=True)\n    return (x - mean) / np.sqrt(var + eps) * gamma + beta\n\n\ndef rms_norm(x, weight, eps=1e-6):\n    rms = np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)\n    return x / rms * weight\n", "starter.py": "import numpy as np\n\n\ndef layer_norm(x, gamma, beta, eps=1e-5):\n    raise NotImplementedError\n\n\ndef rms_norm(x, weight, eps=1e-6):\n    raise NotImplementedError\n"}</script></div>
+<h2>Ship it</h2>
+<p>See <code>outputs/skill-transformer-block-reviewer.md</code>. The skill reviews a new transformer block implementation against the 2026 defaults and flags missing pieces (pre-norm, RoPE, RMSNorm, GQA, FFN expansion ratio).</p>
+<p><strong><code>outputs/skill-transformer-block-reviewer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: transformer-block-reviewer
+description: Review a transformer block implementation against 2026 defaults and flag drift.
+version: 1.0.0
+phase: 7
+lesson: 5
+tags: [transformers, architecture, review]
+---
+
+Given a transformer block source (PyTorch / JAX / numpy / pseudocode) and its intended role (encoder / decoder / encoder-decoder), output:
+
+1. Wiring check. Pre-norm or post-norm. Residual connections around each sublayer. Flag post-norm as non-default for 2026 unless the author states why.
+2. Normalization. LayerNorm vs RMSNorm. RMSNorm preferred. Flag if bias terms are present in Q/K/V/O projections — most 2026 models drop them.
+3. Attention shape. MHA / GQA / MQA / MLA. For decoder blocks: confirm causal mask is applied. For cross-attention: confirm Q from decoder, K/V from encoder.
+4. FFN. Activation (ReLU / GELU / SwiGLU / GeGLU). Expansion ratio. SwiGLU with ~2.67× is modern default; 4× ReLU/GELU is classic.
+5. Positional signal. Confirm RoPE / ALiBi / absolute is applied where expected (typically Q,K projections for RoPE).
+
+Refuse to sign off on a block that stacks more than 12 layers with post-norm and no warmup schedule — training will diverge. Refuse a decoder block without causal masking. Flag any block whose FFN expansion drops below 2× as likely under-capacity. Warn if the block hard-codes `d_model` without a config field for swap-in sizing.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Count the parameters in your encoder_block at <code>d_model=512, n_heads=8, ffn_expansion=4, swiglu=True</code>. Validate by implementing the block and using <code>sum(p.numel() for p in block.parameters())</code>.</li>
+<li><strong>Medium.</strong> Switch from post-norm to pre-norm. Initialize both and measure the activation norm after 12 stacked layers on random input. Post-norm's activations should explode; pre-norm's should stay bounded.</li>
+<li><strong>Hard.</strong> Implement a 4-layer encoder-decoder on a toy copy task (copy <code>x</code> reversed). Train 100 steps. Report loss. Swap in RMSNorm + SwiGLU + RoPE — does loss drop?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a0705-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Identical without residuals</span></summary><div class="qa-a"><p>With residuals, still mostly unrelated: similarity rises slowly, to about 0.2 after 24 blocks and 0.5 after 48. Without them, practically identical almost at once: 0.76 after one block and 1.000 from the second block on. Attention outputs are weighted averages of the inputs, and averaging again and again drives every row to the same vector. The residual connection adds each block's output to its input instead of replacing it, so the distinctive part of each token survives, and the gradient has the same direct path backwards.</p></div></details>
+<details class="qa" id="a0705-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · No source, and a view of the future</span></summary><div class="qa-a"><p>First, the decoder no longer reads the encoder at all: its "cross-attention" attends over its own states, so the output cannot depend on the source sentence, and a translation model becomes a language model that ignores its input. Second, that attention call has no causal mask, so every target position can now see the <em>later</em> target tokens. During training with teacher forcing, the model can copy the next token from the input, so the loss falls quickly and looks excellent, while generation, where future tokens do not exist yet, fails. The test from Step 3 catches both at once: editing the last target token would now change every decoder row, and editing the source would change none.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a0705-qa3"><summary><span class="qa-lvl qa-estimate">Estimate it</span><span class="qa-q">Count the parameters of a decoder stack with a model width of 4096, 32 layers and a SwiGLU feed-forward network at an expansion of 2.6. Then add an untied embedding and output head for a vocabulary of 128K. Where does the total land, and why is the published model of that size a little different?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Per block, attention takes <code>4 d^2</code> for the four projections and SwiGLU takes <code>3 d (r d)</code>, about <code>3 r d^2</code>. At the given width and expansion that is about 67M plus 131M, about 198M per block, and 32 blocks give about 6.3B. The untied embedding and head add about 1B, so the stack lands near the published 8B. The real model uses grouped-query attention, which shrinks the key and value projections, and a wider FFN at an expansion of 3.5, which moves parameters from attention to the FFN while the total stays close.</p>
+<p><strong>The per-block arithmetic.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">attention:  Q, K, V, O projections, each d x d        -&gt; 4 d^2
+FFN:        three matrices of d x (r d)               -&gt; 3 r d^2
+norms:      two vectors of length d                   -&gt; negligible
+</code></pre></div>
+<p>With <code>d = 4096</code> and <code>r = 2.6</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">4 * 4096^2        = about 67M
+3 * 2.6 * 4096^2  = about 131M
+per block         = about 198M
+32 blocks         = about 6.3B
+</code></pre></div>
+<p><strong>The embeddings.</strong></p>
+<p>An untied model has a token embedding of shape <code>(vocab, d)</code> and a separate head of the same size. At 128K by 4096 the pair adds about 1B. A tied model shares the matrix and saves half of that.</p>
+<p><strong>Why the published number differs.</strong></p>
+<p>Two architectural choices move the count without changing the total much:</p>
+<ol>
+<li><strong>Grouped-query attention.</strong> The key and value projections map <code>d</code> to <code>n_kv_heads * d_head</code> instead of <code>d</code> to <code>d</code>, so attention holds fewer than <code>4 d^2</code> parameters.</li>
+<li><strong>A wider FFN.</strong> The published model uses an expansion of about 3.5, so the FFN holds more than the <code>3 * 2.6 * d^2</code> counted above.</li>
+</ol>
+<p>The total still lands near 8B. The FFN holds about two thirds of the block parameters in either version.</p>
+<p><strong>What the count is for.</strong></p>
+<p>Memory for the weights at a given data type, the bound on the cache budget that remains on the card, and a sanity check when a config file or a model card looks wrong.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The parameter count grows with the sequence length." No weight depends on the sequence; the length changes activation memory and compute, not parameters.</li>
+<li>"The embedding is a rounding error." At 128K by 4096 it is about 1B, more than a tenth of the model.</li>
+<li>"Attention is where most of the parameters are." The FFN holds about two thirds of each block.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why are the norms negligible? Expected: each norm is one or two vectors of length d, thousands of parameters against millions per matrix.</li>
+<li><em>(level 3)</em> How does grouped-query attention change the per-block count? Expected: the K and V projections shrink to <code>d</code> by <code>n_kv_heads * d_head</code>, so attention holds less than <code>4 d^2</code>.</li>
+<li><em>(level 3)</em> Why does an expansion of 4 with two matrices equal an expansion of about 2.6 with three? Expected: <code>2 * 4 d^2 = 8 d^2</code> and <code>3 * 2.6 d^2</code> is about <code>8 d^2</code>; the modern block kept the parameter budget and changed the activation.</li>
+<li><em>(level 4)</em> The team ties the embedding and the head. What changes in the count and what do you check? Expected: about half of the 1B disappears; check that the output logits still use the transpose of the embedding and that quality holds.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a0705">full transformer lesson</a> does this count and explains the published difference.</p></div></details>
+<details class="qa" id="a0705-qa4"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">You inherit a decoder block written in the 2017 style: layer normalization after the residual add, a ReLU feed-forward network at four times the width, sinusoidal absolute positions summed into the input, bias terms on every linear layer, and full multi-head attention. Review it against what production decoders ship today and justify each change you ask for.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Move the normalization in front of each sublayer and switch it to RMSNorm; replace the ReLU network with SwiGLU at about 2.6 times the width so that its three matrices match the old parameter count; replace the sinusoid with rotation of the queries and keys; drop the biases; and use grouped-query attention to shrink the decode-time cache. Every change is one function substitution and the tensor shapes do not move. The evidence: pre-norm trains deep without warmup tricks, SwiGLU gains about half a point of perplexity in the published model papers, rotation gives relative position and a knob for long context, and grouped-query cuts cache memory by the ratio of query heads to key-value heads.</p>
+<p><strong>The review table.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Component</th>
+<th>As written</th>
+<th>Ask for</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Normalization</td>
+<td>LayerNorm after the add</td>
+<td>RMSNorm before the sublayer</td>
+<td>pre-norm trains deep stacks without warmup; RMSNorm drops the mean subtraction at equal stability</td>
+</tr>
+<tr>
+<td>FFN activation</td>
+<td>ReLU</td>
+<td>SwiGLU</td>
+<td>about 0.5 point of perplexity in the published comparisons</td>
+</tr>
+<tr>
+<td>FFN expansion</td>
+<td>4 with two matrices</td>
+<td>about 2.6 with three matrices</td>
+<td>same parameter budget</td>
+</tr>
+<tr>
+<td>Position</td>
+<td>sinusoid on the embedding</td>
+<td>rotation of Q and K</td>
+<td>relative position for free and a base to scale for long context</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>full multi-head</td>
+<td>grouped-query, or latent</td>
+<td>fewer key-value heads in the cache, nearly full quality</td>
+</tr>
+<tr>
+<td>Bias terms</td>
+<td>yes</td>
+<td>no</td>
+<td>slight perplexity gain and a smaller model</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>What stays.</strong></p>
+<p>The skeleton: embedding, a stack of blocks that each add attention and an FFN to the residual stream, a final norm and a head. The shift-by-one cross-entropy. The causal mask. The capstone architecture in the lesson is exactly this skeleton with the modern pieces plugged in, and its head is tied to the token embedding.</p>
+<p><strong>How to land the changes safely.</strong></p>
+<ol>
+<li>Make each substitution behind a flag and confirm the output shape after every swap, the way the lesson's build step does.</li>
+<li>Train the old and the new block on a small copy task for a fixed number of steps and compare the loss; the lesson's exercise uses 100 steps of a toy task.</li>
+<li>Use the fused attention call from the framework so that a tiled kernel is dispatched when the inputs allow it.</li>
+<li>Keep a final norm before the head, which pre-norm requires and post-norm did not.</li>
+</ol>
+<p><strong>What needs a retrain.</strong></p>
+<p>All of these change the function the block computes, so a checkpoint trained with the old block cannot adopt them by editing code. Grouped-query is the exception the literature treats specially: a trained multi-head checkpoint can be converted and fine-tuned.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"RMSNorm is a cheaper approximation that costs accuracy." The lesson records it as at least as stable with one fewer operation.</li>
+<li>"SwiGLU doubles the feed-forward parameters." At about 2.6 times the width its three matrices match the old two-matrix count.</li>
+<li>"Pre-norm removes the need for any final normalization." It adds the need: the residual stream is unnormalized, so the head needs a final norm.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why is the SwiGLU expansion about 2.6 and not 4? Expected: three matrices instead of two, chosen so that the total parameters match the old network.</li>
+<li><em>(level 3)</em> Which of the six changes can be applied to an existing checkpoint without retraining? Expected: none cleanly; grouped-query can be converted with a fine-tune, the rest change the function and need training.</li>
+<li><em>(level 4)</em> What would you refuse to change in the review? Expected: the residual skeleton, the causal mask and the next-token loss; the modern block refined the pieces, not the frame.</li>
+<li><em>(level 4)</em> The team wants to keep the sinusoid because it has no parameters. Your answer? Expected: rotation also has no parameters, applies inside attention, encodes relative distance and extends to longer contexts by scaling its base.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a0705">full transformer lesson</a> gives the 2017 against 2026 table, the <a href="#a0714">capstone</a> assembles the modern block, and the <a href="#a0704">positional encoding lesson</a> covers the rotation.</p></div></details>
+<details class="qa" id="a0705-qa5"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">Three products land on your desk: a search ranking model over documents, a coding assistant that writes code, and a speech-to-text system. Which transformer shape do you pick for each, and what does the pretraining loss have to do with the choice?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Encoder-only for ranking and embeddings, decoder-only for generation, and encoder-decoder when the input is a clear source sequence such as audio to transcribe. An encoder reads both sides of every position and trains on masked prediction, which gives strong representations and no way to generate. A decoder trains on next-token prediction behind a causal mask, so it can generate, and it scales cleanest, which is why it won language. The loss decides whether the model can produce text at all.</p>
+<p><strong>The three skeletons.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Need</th>
+<th>Shape</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Classification, embeddings, question answering over text</td>
+<td>Encoder-only</td>
+<td>Bidirectional attention sees the whole input at once</td>
+</tr>
+<tr>
+<td>Text generation, chat, code, reasoning</td>
+<td>Decoder-only</td>
+<td>Causal mask plus next-token loss; one pass of attention and FFN per layer</td>
+</tr>
+<tr>
+<td>Structured input to structured output, translation, speech recognition</td>
+<td>Encoder-decoder</td>
+<td>The encoder owns the source; the decoder generates and reads it through cross-attention</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>The one line that separates them.</strong></p>
+<p>A decoder predicts each token's probability given the tokens before it. An encoder predicts a masked token given the unmasked ones. Same block, same attention, different mask and different target. Only the first loss produces a model that can continue a sequence.</p>
+<p><strong>Cross-attention.</strong></p>
+<p>A decoder block in an encoder-decoder model has three sublayers: masked self-attention, cross-attention and the FFN. In cross-attention the queries come from the decoder and the keys and values come from the encoder output. It is the only place where information flows from the source to the output. A pure decoder drops it.</p>
+<p><strong>Why decoder-only won language.</strong></p>
+<p>It handles comprehension and generation with one architecture, it scales cleanly, and in-context learning let one model follow examples without a new head per task. Encoder-decoder is still the best fit when the input has a strong source identity: a waveform, a sentence in another language, a table to summarize.</p>
+<p><strong>The three answers.</strong></p>
+<ol>
+<li>Ranking: an encoder, or an embedding model built on one, because you need a representation of the whole document and no generation.</li>
+<li>Coding assistant: a decoder, because the product is generation and the causal loss is what makes generation possible.</li>
+<li>Speech-to-text: an encoder-decoder, because the audio is a source sequence of its own kind and the text is a different sequence.</li>
+</ol>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"A decoder-only model cannot classify." It can, by prompting or by adding a head; the point is that an encoder is often cheaper for that job.</li>
+<li>"An encoder generates text one token at a time." It has no causal loss and predicts masked positions; it is not trained to continue a sequence.</li>
+<li>"Every transformer block has cross-attention." Only the decoder blocks of an encoder-decoder model have it.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Which sublayer exists only in the encoder-decoder shape? Expected: cross-attention, with queries from the decoder and keys and values from the encoder.</li>
+<li><em>(level 3)</em> Why can a decoder-only model also do comprehension tasks? Expected: the same next-token model answers a question by continuing a prompt, and in-context learning lets it follow examples without a task head.</li>
+<li><em>(level 3)</em> When would you still choose encoder-decoder for a text task? Expected: when the input is a clear source sequence that the output transforms, such as translation or summarization of a fixed document.</li>
+<li><em>(level 4)</em> The ranking team wants to reuse the decoder they already serve. How? Expected: prompt it and read the logits of a label token, or attach a head and fine-tune; weigh the cost against an encoder that scores documents in one pass.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a0705">full transformer lesson</a> gives the three shapes and the picking table, and the <a href="#a0707">causal language modeling lesson</a> contrasts the two losses.</p></div></details>
+<details class="qa" id="a0705-qa6"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">The 2017 paper placed the layer normalization after the residual add. Almost every model since about 2019 places it before the sublayer. What changed, how would you demonstrate the difference in one afternoon, and what does RMSNorm change on top of that?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Post-norm sends the gradient of the skip path through a normalization at every layer, so at depth the gradient shrinks and the run needs a warmup schedule to survive. Pre-norm keeps the skip path unnormalized, so the gradient reaches the embeddings cleanly and a deep stack trains without warmup tricks. Demonstrate it by stacking twelve layers of each variant with the same initialization and printing the gradient norm at the embedding after one backward pass. RMSNorm then drops the mean subtraction, one fewer operation, with the same stability in practice.</p>
+<p><strong>The two placements.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">pre-norm:   x + sublayer(LN(x))
+post-norm:  LN(x + sublayer(x))
+</code></pre></div>
+<p>Same shapes, different training behavior. In the post-norm block the residual add is followed by the norm, so the signal that flows down the stack is normalized at each layer and the gradient that flows back must pass through every norm. At a depth of twelve and a learning rate of <code>3e-4</code> that gradient shrinks fast enough to need warmup. In the pre-norm block the norm sits inside the branch, before attention and before the MLP, and the skip path carries the raw signal.</p>
+<p><strong>The afternoon experiment.</strong></p>
+<ol>
+<li>Build a six-layer or twelve-layer stack with a <code>pre_ln</code> flag.</li>
+<li>Feed the same random input to both variants with identical weights.</li>
+<li>Run one backward pass and print the gradient norm at the embedding.</li>
+</ol>
+<p>The pre-norm stack shows an embedding gradient about an order of magnitude larger than the post-norm stack at the same learning rate.</p>
+<p><strong>What pre-norm needs that post-norm did not.</strong></p>
+<p>A final norm before the output head. The residual stream is unnormalized in a pre-norm model, so the head needs one normalization at the end.</p>
+<p><strong>RMSNorm.</strong></p>
+<p>LayerNorm subtracts the mean and divides by the standard deviation. RMSNorm divides by the root mean square and skips the mean subtraction. It is one operation cheaper and is empirically at least as stable, which is why the modern block uses it.</p>
+<p><strong>Where dropout goes.</strong></p>
+<p>After the attention softmax, on the attention output before the residual add, and after the second linear of the MLP. Never on the skip path itself, because that breaks the additive identity that lets the gradient flow at depth.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The two placements compute the same function in a different order." The composition differs: one normalizes the stream, the other normalizes only the branch input.</li>
+<li>"Warmup is a learning-rate detail unrelated to the norm." The lesson ties the need for warmup directly to the post-norm gradient path.</li>
+<li>"RMSNorm needs the mean to be stable." It omits the mean on purpose and matches LayerNorm in practice.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Where exactly does the norm sit in a pre-norm block? Expected: inside each residual branch, before attention and before the MLP, plus one final norm before the head.</li>
+<li><em>(level 3)</em> Why does a pre-norm model need a final norm when a post-norm model does not? Expected: the pre-norm skip path is unnormalized, so the head would see an unbounded stream without it.</li>
+<li><em>(level 3)</em> Your six-layer post-norm model trains fine and the twenty-four-layer version diverges. Why? Expected: the skip-path gradient attenuates at every norm, and the effect compounds with depth; add warmup or switch to pre-norm.</li>
+<li><em>(level 4)</em> What would convince you to keep LayerNorm instead of RMSNorm? Expected: a measured quality or stability difference on your own run; the lesson's evidence is that RMSNorm matches it while being cheaper.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a0705">full transformer lesson</a> explains the move to pre-norm and RMSNorm, and the block capstone builds both variants and measures the gradient.</p></div></details>
+<details class="qa" id="a0705-qa7"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">A transformer block has two skip paths, one around attention and one around the feed-forward network. What do they do for training, which of the two sublayers moves information between tokens, and why does a dropout layer placed on the skip path itself break something?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The skip path makes the gradient additive across depth, so its norm stays in scale through a twelve-layer stack instead of shrinking at every layer, and it lets each block learn a small update to a running representation instead of a full replacement. Only attention mixes tokens; the MLP applies the same two layers to every position on its own. Dropout belongs after the attention softmax, on the attention output before the residual add, and after the second linear of the MLP; on the skip path it breaks the identity that carries the gradient, and early stacks that did this trained brittly.</p>
+<p><strong>The block as a function.</strong></p>
+<p>A decoder block takes a tensor of shape <code>(batch, sequence, embedding)</code> and returns the same shape. Inside, two sublayers do the work:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">x = x + attention(norm(x))
+x = x + mlp(norm(x))
+</code></pre></div>
+<p>Each line is an additive update to the stream that flows top to bottom through every block. The lesson calls that tensor the residual stream.</p>
+<p><strong>Why the additive path matters.</strong></p>
+<p>Without the skip path, gradients vanish past about six layers. With it, the gradient of the loss with respect to an early layer has a direct term that does not pass through the sublayers, so depth adds terms instead of multiplying attenuations. The second effect is representational: a block does not have to reproduce its input; it adds what it learned.</p>
+<p><strong>Who talks to whom.</strong></p>
+<p>Attention is the only place tokens exchange information. The MLP is position-wise: the same weights apply to every token independently, with a hidden width of four times the embedding width and a GELU in the classic block. The modern block uses SwiGLU, three matrices at about 2.6 times the width so that the parameter count matches the old four-times MLP, and it drops the bias terms.</p>
+<p><strong>Dropout on the branches, never on the identity.</strong></p>
+<p>Attention dropout after the softmax, residual dropout on the attention output, and residual dropout after the second linear of the MLP. Dropout applied to the identity term randomly removes part of it, and the gradient path that made depth tractable is no longer reliable.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The skip path exists to keep the output shape equal to the input shape." The shape would match anyway; the skip path is about gradient flow and additive updates.</li>
+<li>"Dropout anywhere inside the block is equivalent." Dropout on the identity term damages the gradient path; dropout on the branch outputs does not.</li>
+<li>"The feed-forward network mixes information between tokens." It applies the same MLP to each position alone; mixing happens only in attention.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Which sublayer would you remove if the model only needed per-token transformations? Expected: attention; the MLP never looks across positions.</li>
+<li><em>(level 3)</em> Why does the modern FFN use an expansion of about 2.6 instead of 4? Expected: SwiGLU has three weight matrices, so 2.6 times the width matches the parameter count of the two-matrix MLP at 4 times.</li>
+<li><em>(level 3)</em> Why do modern stacks drop the bias terms in the linear layers? Expected: the lesson reports a slight perplexity improvement and a smaller model.</li>
+<li><em>(level 4)</em> A reviewer wants to regularize a small model by dropping out the identity term. Your answer? Expected: no; keep dropout on the branch outputs, because the additive identity is what lets the gradient reach early layers.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a0705">full transformer lesson</a> names the six pieces of the block, and the block capstone explains the residual stream and the dropout placement.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/1706.03762">Vaswani et al. (2017). Attention Is All You Need</a> — original block spec.</li>
+<li><a href="https://arxiv.org/abs/2002.04745">Xiong et al. (2020). On Layer Normalization in the Transformer Architecture</a> — why pre-norm beats post-norm deeply.</li>
+<li><a href="https://arxiv.org/abs/1910.07467">Zhang, Sennrich (2019). Root Mean Square Layer Normalization</a> — RMSNorm.</li>
+<li><a href="https://arxiv.org/abs/2002.05202">Shazeer (2020). GLU Variants Improve Transformer</a> — the SwiGLU paper.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py">HuggingFace <code>modeling_llama.py</code></a> — canonical 2026 decoder-only block.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/07-transformers-deep-dive/05-full-transformer" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0705" id="done-a0705">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0705" id="undo-a0705" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0704"><span class="pn-dir">Previous</span><span class="pn-t">7.4 · Positional Encoding — Sinusoidal, RoPE, ALiBi</span></a><a class="pn next" href="#a0706"><span class="pn-dir">Next</span><span class="pn-t">7.6 · BERT — Masked Language Modeling</span></a></div></footer>

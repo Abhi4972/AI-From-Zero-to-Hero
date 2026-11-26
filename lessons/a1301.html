@@ -1,0 +1,449 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>The Tool Interface — Why Agents Need Structured I/O</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.1</span><span class="chip">45 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1301" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why an LLM that can only generate text cannot, on its own, take actions against the real world.</li>
+<li>Draw the four-step tool-call loop (describe → decide → execute → observe) and name who owns each step.</li>
+<li>Write a tool definition as four parts: name, description, JSON Schema input, and a deterministic executor function.</li>
+<li>Distinguish pure and side-effecting tools and state why the split matters for safety.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 11 (LLM completion APIs)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 45 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, no LLM). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A language model produces tokens. A program takes actions. The gap between those two is the tool interface: a contract that lets the model request an action and the host execute it. Every 2026 stack — function calling on OpenAI, Anthropic, and Gemini; MCP's <code>tools/call</code>; A2A's task parts — is a different encoding of the same four-step loop. This lesson names the loop and shows the minimum machinery to run it.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tool</td>
+<td>"A thing the model can call"</td>
+<td>A triple of name + JSON-Schema-typed input + executor function</td>
+</tr>
+<tr>
+<td>Function calling</td>
+<td>"Native tool use"</td>
+<td>Provider-level API support for emitting structured tool calls instead of prose</td>
+</tr>
+<tr>
+<td>Tool call</td>
+<td>"The model's request to act"</td>
+<td>A JSON payload with <code>id</code>, <code>name</code>, <code>arguments</code> emitted by the model</td>
+</tr>
+<tr>
+<td>Tool result</td>
+<td>"What the tool returned"</td>
+<td>The executor's output, wrapped in a <code>tool</code> role message with matching id</td>
+</tr>
+<tr>
+<td>Parallel tool calls</td>
+<td>"Many calls at once"</td>
+<td>Multiple call objects in one model turn, independent and orderable by id</td>
+</tr>
+<tr>
+<td>Strict mode</td>
+<td>"Guaranteed JSON"</td>
+<td>Constrained decoding that forces the model's output to validate against the declared schema</td>
+</tr>
+<tr>
+<td>Pure tool</td>
+<td>"Read-only tool"</td>
+<td>No side effects; safe to re-run</td>
+</tr>
+<tr>
+<td>Consequential tool</td>
+<td>"Action tool"</td>
+<td>Mutates external state; requires gate, audit, or user confirmation</td>
+</tr>
+<tr>
+<td>Four-step loop</td>
+<td>"The tool-call cycle"</td>
+<td>describe → decide → execute → observe</td>
+</tr>
+<tr>
+<td>Host</td>
+<td>"Agent runtime"</td>
+<td>The program that holds the tool registry, calls the model, and runs the executor</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A language model can only write text. To check today's weather or send an email, it needs a program to act for it. A tool interface is the agreement between the two. The program tells the model which tools exist: a name, a description and the shape of the arguments. The model answers either in words or with a request such as "call get_weather with city = Tokyo". The program checks the request, runs the tool, and gives the result back to the model, which then answers or asks for another tool. That four-step loop (describe, decide, execute, observe) is the same in OpenAI's, Anthropic's and Google's APIs and in MCP. This lesson runs the loop with a real 0.5B open model on a laptop CPU, including the ways it goes wrong: a call written as prose, an unnecessary call, and an email that waits for the user's permission. No model is trained.</p></div></aside>
+<p>An LLM emits a probability distribution over the next token. That is the entire output surface. If you ask a chat model "what is the weather in Bengaluru right now," it can write a plausible sentence, but it cannot dial into a weather API. The sentence might be right by coincidence or three days stale.</p>
+<p>Closing that gap is the purpose of the tool interface. The host program — your agent runtime, Claude Desktop, ChatGPT, Cursor, or a custom script — advertises a list of callable tools to the model. The model, when it decides an action is needed, emits a structured payload naming a tool and its arguments. The host parses that payload, runs the tool for real, and feeds the result back. The loop continues until the model decides no more calls are needed.</p>
+<p>The first version of this contract shipped in June 2023 as OpenAI's "functions" parameter. Anthropic previewed tool use with Claude 2.1 (November 2023) and shipped <code>tool_use</code> content blocks in 2024. Gemini's API launched with <code>functionDeclarations</code> in December 2023. Every provider now exposes the same shape: a JSON-Schema-typed tool list in, a JSON-payload tool call out. The Model Context Protocol (November 2024) generalized the contract so one tool registry serves every model. A2A (announced April 2025, v1.0 in March 2026) layered the same primitive for agent-to-agent delegation.</p>
+<p>The four-step loop is the invariant underneath all of these. Everything else in Phase 13 is an elaboration.</p>
+<h2>Idea 1 · Step one: describe</h2>
+<p>The host declares each tool to the model with three fields. The fourth part, the executor, stays on the host side and never reaches the model.</p>
+<ul>
+<li><strong>Name.</strong> A stable, machine-readable identifier. <code>get_weather</code>, not "weather thing".</li>
+<li><strong>Description.</strong> A one-paragraph natural-language brief. "Use when the user asks about current conditions for a specific city. Do not use for historical data."</li>
+<li><strong>Input schema.</strong> A JSON Schema object (draft 2020-12) describing the tool's arguments.</li>
+</ul>
+<p>The model receives the list. Modern providers serialize these declarations into the system prompt using a provider-specific template, so you as the caller only deal with the structured form.</p>
+<h2>Idea 2 · Step two: decide</h2>
+<p>Given the user's message and the available tools, the model chooses one of three behaviors.</p>
+<ol>
+<li><strong>Answer directly</strong> in text. No tool call.</li>
+<li><strong>Call one or more tools.</strong> Emit structured call objects. Parallel calls are on by default on OpenAI (<code>parallel_tool_calls</code>), Anthropic (turn off with <code>disable_parallel_tool_use</code>) and Gemini, so the model can emit several calls in one turn.</li>
+<li><strong>Refuse.</strong> Decline in plain text. OpenAI's structured outputs report a refusal in a separate <code>refusal</code> field, so code can tell it apart from a valid result.</li>
+</ol>
+<p>A tool call payload has three stable fields: a call <code>id</code>, a tool <code>name</code>, and a JSON <code>arguments</code> object. The id exists so the host can correlate the later result with the specific call, which matters when parallel calls come back out of order.</p>
+<h2>Idea 3 · Step three: execute</h2>
+<p>The host receives the call, validates arguments against the declared schema, and runs the executor. Invalid arguments mean the model hallucinated a field or used the wrong type — a very common failure mode on weak models. Production hosts do one of three things on invalid arguments: fail fast and surface the error to the model, repair the JSON with a constrained parser, or retry the model with the validation error included in the prompt.</p>
+<p>The executor itself is ordinary code. Python, TypeScript, a shell command, a database query. It produces a result, which is usually a string but can be any JSON value or a structured content block (text, image, or resource reference in MCP). The result must be serializable.</p>
+<h2>Idea 4 · Step four: observe</h2>
+<p>The host appends the tool result to the conversation (as a <code>tool</code> role message with matching <code>id</code>) and re-invokes the model. The model now has the tool output in context and can produce a final answer or request more calls. This continues until the model stops emitting calls or the host hits a safety limit on iteration count.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>The loop.</strong> Let <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> be the conversation at turn <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span> the model. Each turn the model returns either text or a list of calls <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">id</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">name</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">args</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathcal" style="margin-right:0.25417em;">T</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">text</span></span><span class="mclose">}</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{[</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]}</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span><span class="mpunct">,</span></span></span></span></span></div>
+where <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.25417em;">T</span></span></span></span> is the tool list and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">run</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> if <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6747em;vertical-align:-0.2441em;"></span><span class="mord"><span class="mord text"><span class="mord">args</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2175em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span></span></span></span> validates against the tool's schema, or an error message otherwise. The loop stops at the first text answer or at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>Errors compound.</strong> If each call is well-formed with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>, a task that needs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> calls gets through with no bad call with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0435em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span></span></span>. With one retry after a validation error, each call fails only if both attempts fail:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">task</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2491em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">without retries</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.439em;vertical-align:-0.35em;"></span><span class="mord mathnormal">p</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord"><span class="mord"><span class="delimsizing size1">)</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.089em;"><span style="top:-3.3029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">with one retry.</span></span></span></span></span></span></div></p>
+<p><strong>Describe costs tokens on every request</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">extra</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1864em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">tools</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">tokens(name + description + schema)</span></span></span></span></span>, paid once per model call, so once per turn of the loop.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Ten calls, one retry, and the price of describing</div><div class="co-body"><ul>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.95</span></span></span></span>, a task with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> calls: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.9</span><span class="mord"><span class="mord">5</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.60</span></span></span></span>. Four tasks in ten hit at least one bad call.</li>
+<li>With one retry: each call fails with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.0</span><span class="mord"><span class="mord">5</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.0025</span></span></span></span>, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.997</span><span class="mord"><span class="mord">5</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.975</span></span></span></span>.</li>
+<li>In the run below, two short tools add 252 prompt tokens to every request. A 4-turn loop pays that 4 times: 1,008 tokens. Twenty tools of about 120 tokens each would add about 2,400 tokens to every turn.</li>
+<li>A bound of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span> turns caps the cost of a confused model at 5 model calls, however long it keeps calling tools.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The model runs the tool."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The model only writes a request; the host validates it, runs the code and reports back.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The executor's code is sent to the model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only the name, description and schema are; the executor stays on the host.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "If the reply contains JSON, the model made a tool call."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A call counts only in the format the host parses (here <code>&lt;tool_call&gt;</code> tags); JSON in prose is a format error to repair.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A model with tools will use them only when needed."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Small models call tools eagerly; the descriptions and the host's checks have to compensate.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 0.5B open model gets two tools, <code>get_weather</code> and <code>send_email</code>, and four questions: Tokyo's weather, a comparison of two cities, an email to send, and the capital of France. Which ones will it handle correctly? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The four-step loop with a real model</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct (about 1 GB, runs on a laptop CPU) receives the tool list through its chat template. The host parses <code>&lt;tool_call&gt;</code> blocks, validates the arguments with <code>jsonschema</code>, refuses to run the consequential <code>send_email</code> without user confirmation, runs the rest, and returns the results as <code>tool</code> messages. Greedy decoding, at most 5 turns. About 40 seconds on CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, re, torch, jsonschema
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging
+logging.set_verbosity_error(); torch.manual_seed(0)
+
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;                   # a small open model trained for tool calls
+tok = AutoTokenizer.from_pretrained(M); model = AutoModelForCausalLM.from_pretrained(M).eval()
+
+# Step 1, describe: name + description + JSON Schema go to the model; the executor stays on the host.
+WEATHER = {&quot;Bengaluru&quot;: 28, &quot;Tokyo&quot;: 12, &quot;Zurich&quot;: 4}           # degrees Celsius
+def weather(city, units=&quot;celsius&quot;):
+    c = WEATHER.get(city, 20)
+    return {&quot;city&quot;: city, &quot;temp&quot;: c if units == &quot;celsius&quot; else round(c * 9 / 5 + 32, 1), &quot;units&quot;: units}
+TOOLS = {
+    &quot;get_weather&quot;: dict(
+        description=&quot;Get the current temperature for a city. Use for questions about weather now.&quot;,
+        schema={&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;},
+                &quot;units&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;celsius&quot;, &quot;fahrenheit&quot;]}}, &quot;required&quot;: [&quot;city&quot;],
+                &quot;additionalProperties&quot;: False},
+        run=lambda a: weather(**a),
+        consequential=False),
+    &quot;send_email&quot;: dict(
+        description=&quot;Send an email to a person. Use only when the user asks to send a message.&quot;,
+        schema={&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;to&quot;: {&quot;type&quot;: &quot;string&quot;}, &quot;body&quot;: {&quot;type&quot;: &quot;string&quot;}},
+                &quot;required&quot;: [&quot;to&quot;, &quot;body&quot;], &quot;additionalProperties&quot;: False},
+        run=lambda a: {&quot;sent&quot;: True}, consequential=True)}
+specs = [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: n, &quot;description&quot;: t[&quot;description&quot;], &quot;parameters&quot;: t[&quot;schema&quot;]}}
+         for n, t in TOOLS.items()]
+
+def model_turn(messages):                          # Step 2, decide: the model writes text or a tool call
+    ids = tok.apply_chat_template(messages, tools=specs, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=120, do_sample=False)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+def run(user, max_turns=5):
+    messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user}]
+    print(f&quot;USER: {user}&quot;)
+    for turn in range(1, max_turns + 1):        # circuit breaker
+        reply = model_turn(messages)
+        calls = re.findall(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, reply, re.S)
+        if not calls:
+            print(f&quot;  turn {turn} MODEL (final answer): {reply}&quot;); return
+        messages.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: reply})
+        for raw in calls:                        # Step 3, execute: parse, validate, gate, run
+            try:
+                call = json.loads(raw); tool = TOOLS[call[&quot;name&quot;]]
+                jsonschema.validate(call[&quot;arguments&quot;], tool[&quot;schema&quot;])
+            except Exception as e:
+                result = {&quot;error&quot;: f&quot;invalid call: {type(e).__name__}: {str(e).splitlines()[0][:80]}&quot;}
+            else:
+                if tool[&quot;consequential&quot;]:
+                    result = {&quot;error&quot;: &quot;needs user confirmation; not executed&quot;}
+                else:
+                    result = tool[&quot;run&quot;](call[&quot;arguments&quot;])
+            print(f&quot;  turn {turn} MODEL calls: {raw}\n         HOST returns: {json.dumps(result)}&quot;)
+            messages.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: json.dumps(result)})   # Step 4, observe
+    print(&quot;  stopped: turn limit reached&quot;)
+
+for q in (&quot;What's the weather in Tokyo right now?&quot;, &quot;Is it warmer in Bengaluru or in Zurich?&quot;,
+          &quot;Email bob@example.com that the meeting moved to 3pm.&quot;, &quot;What is the capital of France?&quot;):
+    run(q); print()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">USER: What&#x27;s the weather in Tokyo right now?
+  turn 1 MODEL calls: {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Tokyo&quot;, &quot;units&quot;: &quot;fahrenheit&quot;}}
+         HOST returns: {&quot;city&quot;: &quot;Tokyo&quot;, &quot;temp&quot;: 53.6, &quot;units&quot;: &quot;fahrenheit&quot;}
+  turn 2 MODEL (final answer): The current temperature in Tokyo is 53.6 degrees Fahrenheit.
+
+USER: Is it warmer in Bengaluru or in Zurich?
+  turn 1 MODEL (final answer): To determine which city is warmer between Bengaluru and Zurich, I&#x27;ll need to know their respective temperatures at the moment. Ho
+
+Firstly, let&#x27;s use the `get_weather` tool to get the current temperature for both cities:
+
+```json
+{
+    &quot;name&quot;: &quot;get_weather&quot;,
+    &quot;arguments&quot;: {
+        &quot;city&quot;: &quot;Bengaluru&quot;,
+        &quot;units&quot;: &quot;celsius&quot;
+    }
+}
+```
+
+This will give us the
+
+USER: Email bob@example.com that the meeting moved to 3pm.
+  turn 1 MODEL calls: {&quot;name&quot;: &quot;send_email&quot;, &quot;arguments&quot;: {&quot;to&quot;: &quot;bob@example.com&quot;, &quot;body&quot;: &quot;The meeting has been moved to 3 pm.&quot;}}
+         HOST returns: {&quot;error&quot;: &quot;needs user confirmation; not executed&quot;}
+  turn 2 MODEL (final answer): I&#x27;m sorry, but I can&#x27;t execute this task as it requires user confirmation before execution. If you want me to send an email, plea
+
+USER: What is the capital of France?
+  turn 1 MODEL calls: {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Paris&quot;, &quot;units&quot;: &quot;celsius&quot;}}
+         HOST returns: {&quot;city&quot;: &quot;Paris&quot;, &quot;temp&quot;: 20, &quot;units&quot;: &quot;celsius&quot;}
+  turn 2 MODEL (final answer): The capital of France is Paris. The current temperature in Paris is 20 degrees Celsius.</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Tokyo: a correct call with a choice nobody asked for.</strong> The model called <code>get_weather</code> with valid arguments, but picked Fahrenheit on its own; the schema allowed it and the description gave no default. The host converted, and the answer (53.6 °F) is right but not what most users want. Descriptions and schema defaults steer these choices.</p>
+<p><strong>The comparison: a call written as prose.</strong> The model explained that it would call <code>get_weather</code> and printed the call as a JSON code block, outside the <code>&lt;tool_call&gt;</code> tags the host parses. The host saw no call, treated the text as the final answer, and the reply ran out at the 120-token limit. This is the "JSON in prose" failure from Idea 7, on the second question.</p>
+<p><strong>The email: the gate works.</strong> The call was well-formed, but <code>send_email</code> is consequential, so the host refused to run it without confirmation and said so. The model passed that on, though it also asked for the address it already had: small models misread tool results too.</p>
+<p><strong>The capital of France: an unnecessary call.</strong> The answer needs no tool, yet the model called <code>get_weather</code> for Paris and added the temperature to a correct answer. Harmless here; with a paid or slow tool it is wasted time and money.</p>
+<p>One question out of four went exactly right. Frontier models do much better, but every one of these failure kinds occurs in production, which is why the host validates, gates and bounds the loop.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">What &quot;describe&quot; sends, and repairing a format error</div><div class="co-body"><p>This block continues from the one above. It prints the prompt text the chat template builds from the two tools and counts its tokens. Then it reruns the comparison question with one change to the host: a reply that contains a call written as prose is sent back with an instruction to use the proper format. About 15 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above: tok, model, specs, TOOLS, model_turn and run are defined.
+import json, re
+
+# What &quot;describe&quot; really sends: the chat template turns the tool list into prompt text.
+plain = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hi&quot;}], add_generation_prompt=True, tokenize=False)
+with_tools = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hi&quot;}], tools=specs, add_generation_prompt=True, tokenize=False)
+n = lambda s: len(tok(s)[&quot;input_ids&quot;])
+print(f&quot;prompt tokens without tools: {n(plain)}, with 2 tools: {n(with_tools)} &quot;
+      f&quot;(+{n(with_tools) - n(plain)} on every request)&quot;)
+print(&quot;\nwhat the model reads before the user's message:\n&quot;)
+print(with_tools.split(&quot;&lt;|im_start|&gt;user&quot;)[0].strip())
+
+# Repair: a reply that holds JSON outside &lt;tool_call&gt; tags is a format error, not an answer.
+def run_with_repair(user, max_turns=5):
+    messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user}]
+    print(f&quot;\nUSER: {user}&quot;)
+    for turn in range(1, max_turns + 1):
+        reply = model_turn(messages)
+        calls = re.findall(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, reply, re.S)
+        if not calls and '&quot;arguments&quot;' in reply:             # looks like a call, wrong format
+            print(f&quot;  turn {turn} MODEL wrote a call as prose -&gt; HOST asks for the proper format&quot;)
+            messages += [{&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: reply},
+                         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Do not describe tool calls. Emit each call inside &quot;
+                          &quot;&lt;tool_call&gt;&lt;/tool_call&gt; tags, one per tool call.&quot;}]
+            continue
+        if not calls:
+            print(f&quot;  turn {turn} MODEL (final answer): {reply[:300]}&quot;); return
+        messages.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: reply})
+        for raw in calls:
+            call = json.loads(raw); result = TOOLS[call[&quot;name&quot;]][&quot;run&quot;](call[&quot;arguments&quot;])
+            print(f&quot;  turn {turn} MODEL calls: {raw}\n         HOST returns: {json.dumps(result)}&quot;)
+            messages.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: json.dumps(result)})
+    print(&quot;  stopped: turn limit reached&quot;)
+
+run_with_repair(&quot;Is it warmer in Bengaluru or in Zurich?&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">prompt tokens without tools: 30, with 2 tools: 282 (+252 on every request)
+
+what the model reads before the user&#x27;s message:
+
+&lt;|im_start|&gt;system
+You are Qwen, created by Alibaba Cloud. You are a helpful assistant.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within &lt;tools&gt;&lt;/tools&gt; XML tags:
+&lt;tools&gt;
+{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;, &quot;description&quot;: &quot;Get the current temperature for a city. Use for questions about weather now.&quot;, &quot;paramet
+{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;send_email&quot;, &quot;description&quot;: &quot;Send an email to a person. Use only when the user asks to send a message.&quot;, &quot;parameters&quot;
+&lt;/tools&gt;
+
+For each function call, return a json object with function name and arguments within &lt;tool_call&gt;&lt;/tool_call&gt; XML tags:
+&lt;tool_call&gt;
+{&quot;name&quot;: &lt;function-name&gt;, &quot;arguments&quot;: &lt;args-json-object&gt;}
+&lt;/tool_call&gt;&lt;|im_end|&gt;
+
+USER: Is it warmer in Bengaluru or in Zurich?
+  turn 1 MODEL wrote a call as prose -&gt; HOST asks for the proper format
+  turn 2 MODEL calls: {&quot;name&quot;: &quot;get_weather&quot;, &quot;arguments&quot;: {&quot;city&quot;: &quot;Zurich&quot;, &quot;units&quot;: &quot;celsius&quot;}}
+         HOST returns: {&quot;city&quot;: &quot;Zurich&quot;, &quot;temp&quot;: 4, &quot;units&quot;: &quot;celsius&quot;}
+  turn 3 MODEL (final answer): The current temperature in Zurich is 4 degrees Celsius.</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Describing tools costs 252 tokens per request.</strong> The chat template pastes each tool's JSON into a system message inside <code>&lt;tools&gt;</code> tags, followed by an instruction to answer with <code>&lt;tool_call&gt;</code> blocks. The model has no other knowledge of the tools: wording in the description is all it can go on.</p>
+<p><strong>The repair fixes the format.</strong> After the host's correction ("emit each call inside <code>&lt;tool_call&gt;</code> tags"), the model makes a proper call on the next turn.</p>
+<p><strong>It does not fix the reasoning.</strong> The model fetched only Zurich's temperature and then answered about Zurich alone; the comparison with Bengaluru never happened. Format repair is cheap and worth doing, but it cannot make a small model plan a two-call task. Bigger models, clearer descriptions, or a host that checks whether the question was answered are the next steps.</p></div></aside>
+<h2>Idea 5 · The trust split</h2>
+<p>Tools come in two flavors that matter for safety.</p>
+<ul>
+<li><strong>Pure.</strong> Read-only, deterministic, no side effects. <code>get_weather</code>, <code>search_docs</code>, <code>get_current_time</code>. Safe to call speculatively.</li>
+<li><strong>Consequential.</strong> Mutates state, spends money, touches user data. <code>send_email</code>, <code>delete_file</code>, <code>execute_trade</code>. Must be gated.</li>
+</ul>
+<p>Meta's "Agents Rule of Two" (October 2025) says a single agent session should combine at most two of: untrusted input, access to sensitive data or systems, and the ability to change state or communicate externally. The tool interface is where you enforce that rule — by rejecting calls, requiring user confirmation, or escalating scopes. See Phase 13 · 15 for the full security chapter and Phase 14 · 09 for agent-level permission policies.</p>
+<h2>Idea 6 · Where the loop lives</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Context</th>
+<th>Who describes</th>
+<th>Who decides</th>
+<th>Who executes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Single-turn function calling (OpenAI/Anthropic/Gemini)</td>
+<td>App developer</td>
+<td>LLM</td>
+<td>App developer</td>
+</tr>
+<tr>
+<td>MCP</td>
+<td>MCP server</td>
+<td>LLM via MCP client</td>
+<td>MCP server</td>
+</tr>
+<tr>
+<td>A2A</td>
+<td>Agent Card publisher</td>
+<td>Calling agent</td>
+<td>Called agent</td>
+</tr>
+<tr>
+<td>Web browser (function-calling agent)</td>
+<td>Browser extension / WebMCP</td>
+<td>LLM</td>
+<td>Browser runtime</td>
+</tr>
+</tbody>
+</table></div>
+<p>Everywhere, the same four steps. The column names change; the structure does not.</p>
+<h2>Idea 7 · Why not just prompt the model to emit JSON?</h2>
+<p>"Ask the model to reply in JSON" was the pre-function-calling pattern. It fails often enough to matter, rarely on frontier models and far more on small ones (the 0.5B model below does it on its second question). Failure modes include missing braces, trailing commas, hallucinated fields, wrong types, and JSON wrapped in prose. You then need a JSON repair pass, a retry, or a constrained decoder.</p>
+<p>Native function calling is better for three reasons. First, the provider trains the model on the exact call shape, so well-formed calls are the norm. Second, the call payload sits in its own protocol slot, not inside free-text — so a tool call never leaks into the user-visible reply. Third, providers can enforce schema compliance with constrained decoding (OpenAI's <code>strict: true</code>, Anthropic's strict tool use, Gemini's response schemas); in strict mode the arguments are guaranteed to validate.</p>
+<p>Phase 13 · 02 walks the three provider APIs side by side. Phase 13 · 04 goes deep on structured outputs.</p>
+<h2>Idea 8 · Circuit breakers</h2>
+<p>The loop terminates when the model stops emitting calls or the host hits a maximum turn count. Production hosts set such a bound, commonly between 5 and 25 turns; the OpenAI Agents SDK, for example, stops after 10 turns unless you raise <code>max_turns</code>.</p>
+<p>The alternative — unbounded loops — shows up every six months as "agent spent $400 in API calls overnight" post-mortems. Do not ship without a bound.</p>
+<p>Phase 14 · 12 covers error recovery and self-healing in depth; Phase 17 covers production rate limits.</p>
+<h2>Idea 9 · Where Phase 13 goes from here</h2>
+<ul>
+<li>Lessons 02 through 05 polish the provider-level tool-call surface.</li>
+<li>Lessons 06 through 14 generalize the loop into MCP.</li>
+<li>Lessons 15 through 18 defend the loop against hostile servers, adversarial users, and unauthenticated remote auth surfaces.</li>
+<li>Lessons 19 through 22 extend the pattern to agent-to-agent collaboration, observability, routing, and packaging.</li>
+<li><a href="#a1323">Lesson 13.23</a> ships a complete ecosystem using every primitive.</li>
+</ul>
+<p>Every remaining lesson is an elaboration of this four-step loop. Hold it in mind as the invariant.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tp-tool-loop"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> runs the four-step loop without an LLM. A fake "decider" function simulates the model by pattern-matching on the user message; the executor, schema validator, and observe-step harness are real. Run it to see the full request/response choreography with printable intermediate state, then replace the fake decider with any real provider in a later lesson.</p>
+<p>What to look at:</p>
+<ul>
+<li>The tool registry holds four fields per tool: name, description, schema, and an executor reference. Only the first three go to the model.</li>
+<li>The validator is a minimal JSON Schema subset (types, required, enum, min/max) written in stdlib only. Phase 13 · 04 ships a fuller one.</li>
+<li>The loop bounds iteration count at five. Production agents need exactly this kind of circuit breaker.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Remove the turn limit from the loop and give the model a tool whose result always says "partial result, call again for more". What happens to cost and latency, and what should the host do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>The same loop in every major API</strong>: OpenAI (Responses API <code>function</code> tools), Anthropic (<code>tool_use</code> and <code>tool_result</code> blocks) and Google Gemini (<code>functionDeclarations</code>) all take JSON Schema tool lists and return calls with an id, a name and arguments.</li>
+<li><strong>Strict modes guarantee valid arguments</strong>: OpenAI's <code>strict: true</code> and Anthropic's strict tool use constrain decoding so the arguments always match the schema.</li>
+<li><strong>MCP 2026-07-28</strong> is the current revision of the Model Context Protocol: stateless, with tool lists that one server offers to any MCP-capable client (Lessons 13.6–13.14).</li>
+<li><strong>Agent SDKs run the loop for you</strong>: the OpenAI Agents SDK, the Claude Agent SDK and LangGraph handle parsing, tool execution and turn limits (<code>max_turns</code>), and leave confirmation gates to you.</li>
+<li><strong>Laptop-sized tool calling</strong>: Qwen2.5 and Qwen3 models from 0.5B to 4B, and Llama 3.2 1B/3B, support tool calls through their chat templates; expect more format errors than from frontier models, as the run shows.</li>
+</ul>
+<p>Sources: <a href="https://platform.openai.com/docs/guides/function-calling">OpenAI function calling</a>, <a href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview">Anthropic tool use</a>, <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/strict-tool-use">Claude strict tool use</a>, <a href="https://ai.google.dev/gemini-api/docs/function-calling">Gemini function calling</a>, <a href="https://modelcontextprotocol.io/specification/2026-07-28">MCP specification 2026-07-28</a>, <a href="https://ai.meta.com/blog/practical-ai-agent-security/">Meta: Agents Rule of Two</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Describe, decide, execute, observe: the loop behind every tool API and MCP.</li>
+<li>The model sees name, description and schema; the host keeps the executor.</li>
+<li>Validate every call before running it; return errors to the model so it can retry.</li>
+<li>Gate consequential tools behind user confirmation.</li>
+<li>Always bound the loop with a turn limit.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-tool-calling"><span class="t" style="--cs-hue:30">TC</span>Cheat sheet · Tool Calling and Structured Outputs</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-tool-interface-reviewer.md</code>. Given a draft tool definition (name + description + schema + executor outline), the skill audits it for loop fitness: is the name machine-stable, is the description a complete usage brief, does the schema use JSON Schema 2020-12 correctly, and is the pure-vs-consequential classification explicit.</p>
+<p><strong><code>outputs/skill-tool-interface-reviewer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: tool-interface-reviewer
+description: Audit a tool definition (name + description + JSON Schema + executor outline) for loop fitness before it ships to an LLM.
+version: 1.0.0
+phase: 13
+lesson: 01
+tags: [tool-calling, function-calling, json-schema, tool-design]
+---
+
+Given a proposed tool definition, review it against the four-step loop (describe, decide, execute, observe) and flag loop-breaking defects before the tool reaches a model.
+
+Produce:
+
+1. Name audit. Is the name `snake_case`, stable across versions, and unambiguous? Flag names that collide with built-ins, contain tense (&quot;was_&quot;, &quot;will_&quot;), or embed arguments.
+2. Description audit. Does the description read as a complete usage brief? Require the two-sentence shape: &quot;Use when X. Do not use for Y.&quot; Flag descriptions under 40 characters, marketing prose, or anything that does not teach selection.
+3. Schema audit. Is the schema valid JSON Schema 2020-12? Every field typed? `required` list explicit? Enums used for closed value sets? Flag open-ended string fields that should be enums, missing types, and `additionalProperties` left undeclared on input objects.
+4. Executor audit. Is the executor deterministic given arguments? Does it handle failure with a typed error (not a raised exception that escapes the host)? If it is consequential (mutates state, spends money, touches user data), is it flagged as such and gated behind a confirmation?
+5. Classification. State whether the tool is pure or consequential and why. A consequential tool without a gate is an immediate reject.
+
+Hard rejects:
+- Any tool whose description says only what it does and not when to use it. The model needs the &quot;when&quot; for step two.
+- Any schema with an untyped field. The validator cannot do its job.
+- Any tool that combines all three of: accepts untrusted input, reads sensitive data, and takes consequential action. Violates Meta's Rule of Two.
+- Any tool whose executor raises unhandled exceptions on bad input. The host should not need a try/except around every call.
+
+Refusal rules:
+- If the tool definition is missing a schema, refuse. Route to Phase 13 · 04 first.
+- If the tool is pure but the description says &quot;use sparingly,&quot; refuse and ask why. Pure tools should be cheap to re-run.
+- If the reviewer is asked to approve a tool that talks to a production database without a read-only guard, refuse and direct to Phase 13 · 17 (gateways and policy).
+
+Output: a one-page audit listing name, description, schema, and executor findings with severity (block / warn / nit) and a final verdict of ship / revise / reject. End with a one-line rewrite suggestion for any reject, if feasible.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Add a fourth tool to <code>code/main.py</code> called <code>get_stock_price(ticker)</code>. Write its description as "Use when the user asks for a current stock price by ticker. Do not use for historical prices or market summaries." Run the harness and confirm the fake decider routes queries mentioning tickers to the new tool.</p>
+</li>
+<li>
+<p>Break the schema validator. Pass a call whose <code>arguments</code> object is missing a required field, and confirm the host rejects it before execution. Then pass a call with an extra unknown field. Decide: should the host reject or ignore? Justify your choice with a safety argument.</p>
+</li>
+<li>
+<p>Classify each tool in the harness as pure or consequential. Add a <code>consequential: true</code> flag to the registry entries that need it, and change the loop to print a "would confirm with user" line whenever a consequential tool is chosen. This is the shape of the confirmation gate every production host needs.</p>
+</li>
+<li>
+<p>Draw the four-step loop on paper with the provider-column table above filled in for your favorite client (Claude Desktop, Cursor, ChatGPT, or a custom stack). Cross-reference with the MCP-specific variant in Phase 13 · 06.</p>
+</li>
+<li>
+<p>Read OpenAI's function-calling guide top to bottom. Identify the one field that sits in the request but not in the four-step loop as presented here. Explain what it adds and why it is convenient rather than essential.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1301-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · One right, one half-right, one gated, one unnecessary call</span></summary><div class="qa-a"><p>Only Tokyo went right, and even there the model chose Fahrenheit unasked. The comparison failed on format: the call was written as JSON in prose, which the host does not parse. The email was a correct call that the host correctly refused to run without confirmation. The capital of France got a correct answer plus an unnecessary weather call.</p>
+<p>The pattern is typical of small models: they know the call format but apply it unreliably, call tools too eagerly, and lose track of multi-step questions. The host's checks (parsing only the official format, schema validation, confirmation gates, a turn limit) are what keep these errors from turning into wrong actions.</p></div></details>
+<details class="qa" id="a1301-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The loop never ends on its own</span></summary><div class="qa-a"><p>Without a turn limit the loop never ends on its own: every result asks for another call, and the model obliges. Cost grows faster than the number of turns, because each turn resends the whole conversation. If each turn adds <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> tokens, turn <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> sends about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> tokens and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span> turns send about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord">/2</span></span></span></span>: 100 turns cost about 50 times as much as 10, not 10 times. Latency grows the same way, and the user waits for nothing.</p>
+<p>What the host should do:</p>
+<ul>
+<li><strong>A hard turn limit</strong> (5 to 25 is typical), after which it stops and reports what it has.</li>
+<li><strong>A budget</strong> in tokens or money per task, checked every turn.</li>
+<li><strong>Loop detection</strong>: the same tool called with the same arguments twice in a row is almost always a loop; stop or return an error that says so.</li>
+<li><strong>Honest tool results</strong>: a paginated tool should return a cursor and say how much is left, so the model (or the host) can decide when enough is enough.</li>
+</ul></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling">OpenAI — Function calling guide</a> — canonical reference for OpenAI-style tool declarations and call shapes</li>
+<li><a href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview">Anthropic — Tool use overview</a> — Claude's <code>tool_use</code> / <code>tool_result</code> block format</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/function-calling">Google — Gemini function calling</a> — <code>functionDeclarations</code> and parallel-call semantics in Gemini</li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28">Model Context Protocol — Specification 2026-07-28</a> — the current stateless, provider-agnostic generalization of the tool interface</li>
+<li><a href="https://json-schema.org/draft/2020-12/release-notes">JSON Schema — 2020-12 release notes</a> — the schema dialect every modern tool API speaks</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/01-the-tool-interface" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1301" id="done-a1301">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1301" id="undo-a1301" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#cs-vlm-model-families"><span class="pn-dir">Previous</span><span class="pn-t">Cheat sheet · Open VLM Families: LLaVA, Qwen-VL, InternVL</span></a><a class="pn next" href="#a1302"><span class="pn-dir">Next</span><span class="pn-t">13.2 · Function Calling Deep Dive — OpenAI, Anthropic, Gemini</span></a></div></footer>

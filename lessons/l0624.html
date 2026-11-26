@@ -1,0 +1,508 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · Agent Engineering</a></nav><h1>Inside the LangGraph runtime: supersteps, channels, checkpoints and durability</h1><div class="m-meta"><span class="chip chip-zero">From Zero to Agents</span><span class="chip chip-num">Lesson 6.24</span><span class="chip">55 min</span><span class="chip chip-depth">Advanced</span><span class="chip chip-done" data-done-chip="l0624" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain the superstep loop (plan, run, update) and predict the order in which parallel writes land in the state</li>
+<li>Say what each channel type does with zero, one or two writes in a step, and repair a thread that a write collision broke</li>
+<li>Choose a durability mode, knowing what each one saves, and make side effects run once after a crash</li>
+<li>Keep checkpoints small with <code>DeltaChannel</code>, and keep state values that survive a round trip through the checkpointer</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons <a class="xref" href="#l0610">6.10</a>, <a class="xref" href="#l0612">6.12</a> and <a class="xref" href="#l0618">6.18</a>. <a class="xref" href="#l0304">Lesson 3.4</a> built idempotency keys by hand.</li>
+<li><strong>Depth</strong>: Advanced. <strong>Time</strong>: about 55 minutes.</li>
+<li><strong>Status</strong>: New. Checked on 22 November 2026 with <code>langchain</code> 1.5.2 and <code>langgraph</code> 1.2.24.</li>
+</ul></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">1</span><span class="lb-names">Durable execution</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>Durable execution</td><td>Running a long task so that every completed step is saved and a crash resumes from the last one</td><td><a class="xref" href="#l1208">Lesson 12.8</a></td></tr></tbody></table></div></details>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">The model on this page</div><div class="co-body"><p>Idea 2 uses the lab rig from <a class="xref" href="#l0601">Lesson 6.1</a>, so the agent run is the same every time. Everything else is plain <span class="cx" data-c="327" tabindex="0">LangGraph</span> with no model: the nodes are small functions, so you can see the runtime itself.</p></div></aside>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>LangGraph runs a graph the way Google's Pregel system (2010) ran large graph computations: in rounds called supersteps, where every active node runs and all their messages are delivered together at the end of the round. That design makes parallel work predictable and gives a natural place to save a checkpoint. In 2025 and 2026, teams running agents for days and over thousands of steps found the edges of that design: write collisions that break a thread, side effects that repeat after a crash, and checkpoints that grow with the square of the conversation. LangGraph 1.2 (May 2026) added <code>DeltaChannel</code> and durability controls to address the last two.</p></div></aside>
+<h2>The problem: the graph works in tests and fails in production</h2>
+<p>Three surprises reach every team that runs LangGraph for real. Two parallel nodes write the same key, and from then on every read of that thread fails, even the admin page that tries to look at it. A refund tool runs, the process is killed by a deploy a moment later, and the resumed run refunds the customer a second time. A long research thread that holds 100 KB of messages turns out to use 5 MB in the database. None of these are bugs in your nodes. They come from how the runtime plans, merges and saves each step, and each one has a clear fix once you can see the machinery.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">A meeting with minutes</div><div class="co-body"><p>Picture a meeting where everyone works at the same time, then the secretary collects all the notes at once and writes the minutes. That round is a <strong>superstep</strong>. Each topic in the minutes has a rule for combining notes: some topics keep one answer and complain if two people wrote different ones (<strong><code>LastValue</code></strong>), others add every note to a list (<strong>a reducer</strong>). After each round the minutes are filed (<strong>a checkpoint</strong>). If the building is evacuated mid-round, whoever had not handed in their note does that part of the work again, which is fine for thinking and not fine for sending money. And if every set of minutes is a full copy of all earlier minutes, the filing cabinet fills fast (<strong><code>DeltaChannel</code></strong> files only the new notes).</p></div></aside>
+<h2>Idea 1 · One superstep: plan, run, update</h2>
+<p>Every LangGraph run is a loop of supersteps. <strong>Plan</strong>: find the nodes whose input changed since they last ran. <strong>Run</strong>: execute all of them, in parallel. <strong>Update</strong>: apply all their writes at once, then save a checkpoint. A node never sees a write from its own superstep; it reads the state as it was at the end of the previous one.</p>
+<p>The update phase has a rule worth testing. Two nodes run in parallel and each appends to one list. One is slow and one is fast:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import operator, time
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class Lookup(TypedDict, total=False):
+    found: Annotated[list, operator.add]          # a reducer: every write is appended
+
+finished = []
+def make(name, seconds):
+    def node(state):
+        time.sleep(seconds)
+        finished.append(name)                     # the order the nodes really finished in
+        return {&quot;found&quot;: [name]}
+    return node
+
+for slow in (&quot;a&quot;, &quot;b&quot;):
+    finished.clear()
+    g = (StateGraph(Lookup).add_node(&quot;a&quot;, make(&quot;a&quot;, 0.3 if slow == &quot;a&quot; else 0.01))
+         .add_node(&quot;b&quot;, make(&quot;b&quot;, 0.3 if slow == &quot;b&quot; else 0.01))
+         .add_edge(START, &quot;a&quot;).add_edge(START, &quot;b&quot;).compile())
+    out = g.invoke({&quot;found&quot;: []})
+    print(f&quot;slow node {slow}: finished in order {finished} -&gt; state {out['found']}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">slow node a: finished in order ['b', 'a'] -&gt; state ['a', 'b']
+slow node b: finished in order ['a', 'b'] -&gt; state ['a', 'b']
+</code></pre></div></div></aside>
+<p>The nodes finished in different orders, and the state was <code>['a', 'b']</code> both times. Before applying anything, the update phase sorts the tasks by their <strong>task path</strong>, a stable name the planner gave each task, and hands the writes to each reducer in that order. So the result never depends on which node was faster: you can test it, and two replicas of your service compute the same state. The other side of the rule: if your reducer keeps only the last value, the winner is the task whose path sorts last, not the one that finished last.</p>
+<h2>Idea 2 · Watch an agent's supersteps</h2>
+<p><code>create_agent</code> (<a class="xref" href="#l0605">Lesson 6.5</a>) is a graph too, so its run is a series of supersteps. A checkpointer records one checkpoint per superstep, with the nodes planned for the next one:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from mockllm import start                                    # the lab rig (Lesson 6.1)
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langchain.agents import create_agent
+from langgraph.checkpoint.memory import InMemorySaver
+
+chat = init_chat_model(&quot;openai:mock-model&quot;, base_url=start(), api_key=&quot;mock&quot;, temperature=0)
+ORDERS = {&quot;A-1001&quot;: &quot;shipped&quot;, &quot;A-1002&quot;: &quot;processing&quot;}
+
+@tool
+def get_order_status(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Return the shipping status for a ShopKart order ID like 'A-1001'.&quot;&quot;&quot;
+    return f&quot;{order_id} is {ORDERS.get(order_id, 'not found')}&quot;
+
+agent = create_agent(chat, tools=[get_order_status], checkpointer=InMemorySaver())
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;t1&quot;}}
+agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where are A-1001 and A-1002?&quot;}]}, cfg)
+for snap in reversed(list(agent.get_state_history(cfg))):
+    print(f&quot;step {snap.metadata['step']:&gt;2}  next {snap.next}  messages so far {len(snap.values.get('messages', []))}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">step -1  next ('__start__',)  messages so far 0
+step  0  next ('model',)  messages so far 1
+step  1  next ('tools', 'tools')  messages so far 2
+step  2  next ('model',)  messages so far 4
+step  3  next ()  messages so far 5
+</code></pre></div></div></aside>
+<p>Five checkpoints for one question. Step -1 holds the input, step 0 the question in the state, step 1 the model's reply with two <span class="cx" data-c="637" tabindex="0">tool calls</span>. Look at <code>next</code> after step 1: <code>('tools', 'tools')</code>. <code>create_agent</code> turns each tool call into its own task with <code>Send</code> (<a class="xref" href="#l0616">Lesson 6.16</a>), so both lookups run in the same superstep, side by side, and both results land together at step 2. Step 3 has nothing next: the model answered without asking for a tool, so the loop stopped. The animated plate in <a class="xref" href="#l0605">Lesson 6.5</a> draws this same run.</p>
+<h2>Idea 3 · Channels: how each key combines writes</h2>
+<p>Every key of the state is stored in a <strong>channel</strong>, an object with one job: take all the writes for that key in one superstep and produce the new value. A key with no reducer gets a <code>LastValue</code> channel; a key with a reducer gets a <code>BinaryOperatorAggregate</code>. LangGraph also uses channels internally: a <code>Topic</code> collects the <code>Send</code> tasks, and an <code>EphemeralValue</code> carries the input and routing signals, then clears. You can drive them directly:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.channels import LastValue, BinaryOperatorAggregate, Topic, EphemeralValue
+from langgraph.errors import InvalidUpdateError
+
+for name, ch in [(&quot;LastValue&quot;, LastValue(int)), (&quot;BinaryOperatorAggregate(add)&quot;, BinaryOperatorAggregate(int, operator.add)),
+                 (&quot;Topic&quot;, Topic(int)), (&quot;EphemeralValue&quot;, EphemeralValue(int))]:
+    row = []
+    for writes in ([1], [], [2, 3]):                     # one write, no write, two writes in one step
+        try:
+            ch.update(writes)
+            try:
+                value = ch.get()
+            except Exception as e:
+                value = type(e).__name__
+            row.append(f&quot;{writes}-&gt;{value}&quot;)
+        except InvalidUpdateError:
+            row.append(f&quot;{writes}-&gt;InvalidUpdateError&quot;)
+    print(f&quot;{name:30} &quot; + &quot;   &quot;.join(row))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">LastValue                      [1]-&gt;1   []-&gt;1   [2, 3]-&gt;InvalidUpdateError
+BinaryOperatorAggregate(add)   [1]-&gt;1   []-&gt;1   [2, 3]-&gt;6
+Topic                          [1]-&gt;[1]   []-&gt;EmptyChannelError   [2, 3]-&gt;[2, 3]
+EphemeralValue                 [1]-&gt;1   []-&gt;EmptyChannelError   [2, 3]-&gt;InvalidUpdateError
+</code></pre></div></div></aside>
+<p>Read the rows as the rules of the state. A plain key keeps its value when no node writes it, and refuses two writes in one step. A key with a reducer folds every write in (here 1 + 2 + 3 = 6). A <code>Topic</code> holds a step's items and clears when nobody writes. An <code>EphemeralValue</code> lives for one step only. The row to remember is the first one: <strong>two nodes that write a plain key in the same superstep raise <code>InvalidUpdateError</code></strong>.</p>
+<h2>Idea 4 · A collision that breaks a thread, and the repair</h2>
+<p>The error itself is easy to understand. What happens to the thread afterwards is not. Two shipping nodes run in parallel and both set <code>carrier</code>, a key with no reducer, on a graph with a checkpointer:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.checkpoint.memory import InMemorySaver
+
+ran = []
+def bluedart(state): ran.append(&quot;bluedart&quot;); return {&quot;carrier&quot;: &quot;BlueDart&quot;}
+def delhivery(state): ran.append(&quot;delhivery&quot;); return {&quot;carrier&quot;: &quot;Delhivery&quot;}
+
+class Shipment(TypedDict, total=False):
+    carrier: str                                           # no reducer: a LastValue channel
+
+saver = InMemorySaver()
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;ship-1&quot;}}
+def build(schema):
+    return (StateGraph(schema).add_node(&quot;bluedart&quot;, bluedart).add_node(&quot;delhivery&quot;, delhivery)
+            .add_edge(START, &quot;bluedart&quot;).add_edge(START, &quot;delhivery&quot;)
+            .add_edge(&quot;bluedart&quot;, END).add_edge(&quot;delhivery&quot;, END).compile(checkpointer=saver))
+
+broken = build(Shipment)
+try:
+    broken.invoke({&quot;carrier&quot;: &quot;&quot;}, cfg)
+except InvalidUpdateError as e:
+    print(&quot;invoke:&quot;, type(e).__name__, &quot;-&quot;, str(e).split(&quot;.&quot;)[0])
+try:
+    broken.get_state(cfg)
+except InvalidUpdateError as e:
+    print(&quot;get_state:&quot;, type(e).__name__, &quot;(the saved writes still collide)&quot;)
+print(&quot;nodes that ran:&quot;, sorted(ran))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">invoke: InvalidUpdateError - At key 'carrier': Can receive only one value per step
+get_state: InvalidUpdateError (the saved writes still collide)
+nodes that ran: ['bluedart', 'delhivery']
+</code></pre></div></div></aside>
+<p>Both nodes ran before the error, because the collision is found in the update phase. Their outputs were already saved as <strong>pending writes</strong> of the checkpoint the step started from. Now every read of the thread replays those two writes into the same <code>LastValue</code> channel and raises again: <code>get_state</code> fails, a resume fails, a new message to the thread fails. Retrying does not help, and editing the state with <code>update_state</code> does not either, because the pending writes are still there.</p>
+<p>The repair is a schema with a reducer for that key, compiled against the same checkpointer:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def keep_both(old, new):
+    return f&quot;{old} / {new}&quot; if old else new
+
+class FixedShipment(TypedDict, total=False):
+    carrier: Annotated[str, keep_both]                     # a reducer: both writes are allowed
+
+ran.clear()
+fixed = build(FixedShipment)
+print(&quot;get_state with a reducer:&quot;, fixed.get_state(cfg).values)
+print(&quot;resume:&quot;, fixed.invoke(None, cfg), &quot;| nodes run again:&quot;, ran)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">get_state with a reducer: {'carrier': 'BlueDart / Delhivery'}
+resume: {'carrier': 'BlueDart / Delhivery'} | nodes run again: []
+</code></pre></div></div></aside>
+<p>The saved writes now combine, the thread reads again, and the resume finished <strong>without running either node again</strong>: no model call or tool call was paid twice. The lesson for production: give a reducer to every key that two nodes can write in the same superstep, before you deploy, and add a test that runs parallel branches on a checkpointer.</p>
+<h2>Idea 5 · What a checkpoint saves, and when</h2>
+<p>A checkpointer has two write calls. <code>put_writes</code> saves the output of one finished task, as soon as it finishes. <code>put</code> saves the whole checkpoint at the end of the superstep. The <strong>durability mode</strong> of a run (<code>durability=</code> on <code>invoke</code> and <code>stream</code>) decides when they happen:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class Order(TypedDict, total=False):
+    steps: Annotated[list, operator.add]
+
+def check_stock(state): return {&quot;steps&quot;: [&quot;stock ok&quot;]}
+def reserve(state): return {&quot;steps&quot;: [&quot;reserved&quot;]}
+
+class CountingSaver(InMemorySaver):                         # counts the two kinds of write
+    def __init__(self):
+        super().__init__(); self.puts = self.put_writes_calls = 0
+    def put(self, config, checkpoint, metadata, new_versions):
+        self.puts += 1
+        return super().put(config, checkpoint, metadata, new_versions)
+    def put_writes(self, config, writes, task_id, task_path=&quot;&quot;):
+        self.put_writes_calls += 1
+        return super().put_writes(config, writes, task_id, task_path)
+
+for mode in (&quot;sync&quot;, &quot;async&quot;, &quot;exit&quot;):
+    saver = CountingSaver()
+    g = (StateGraph(Order).add_node(&quot;check_stock&quot;, check_stock).add_node(&quot;reserve&quot;, reserve)
+         .add_edge(START, &quot;check_stock&quot;).add_edge(&quot;check_stock&quot;, &quot;reserve&quot;).add_edge(&quot;reserve&quot;, END)
+         .compile(checkpointer=saver))
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;o-1&quot;}}
+    g.invoke({&quot;steps&quot;: []}, cfg, durability=mode)
+    steps = [h.metadata[&quot;step&quot;] for h in g.get_state_history(cfg)]
+    print(f&quot;durability={mode:5}  put calls {saver.puts}  put_writes calls {saver.put_writes_calls}  history steps {steps}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">durability=sync   put calls 4  put_writes calls 3  history steps [2, 1, 0, -1]
+durability=async  put calls 4  put_writes calls 3  history steps [2, 1, 0, -1]
+durability=exit   put calls 1  put_writes calls 0  history steps [2]
+</code></pre></div></div></aside>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Mode</th>
+<th>What is saved during the run</th>
+<th>What the run waits for</th>
+<th>After a crash</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>"exit"</code></td>
+<td>Nothing until the run ends, fails or pauses at an interrupt</td>
+<td>Nothing</td>
+<td>The whole run starts again from the input; there is no history for <span class="cx" data-c="632" tabindex="0">time travel</span></td>
+</tr>
+<tr>
+<td><code>"async"</code> (the default)</td>
+<td>Every checkpoint and every task's writes, in the background</td>
+<td>Nothing</td>
+<td>Repeats a task that had just finished, and any step after the last saved checkpoint</td>
+</tr>
+<tr>
+<td><code>"sync"</code></td>
+<td>The same as async</td>
+<td>Each checkpoint's <code>put</code>, before the next step starts</td>
+<td>Repeats a task that had just finished</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>sync</code> is the safest of the three, and it is still not a guarantee. <code>put_writes</code> for a finished task runs in the background in every mode, and <code>sync</code> only waits for the checkpoint at the end of the step. A task that returned a few milliseconds before the process died can lose its writes and run again on resume. The <em>AI Engineering from Scratch</em> <span class="cx" data-c="326" tabindex="0">LangChain</span> manual measured exactly this: with a crash right after a node returned, the node ran again in 97 of 100 trials in <code>sync</code> mode and 95 of 100 in <code>async</code> mode; with 0.2 seconds between the return and the crash, it never did. One more trap from the same source: <code>durability="sync"</code> on a graph with <strong>no</strong> checkpointer raises an <code>AttributeError</code> instead of warning, so pass it only with a checkpointer.</p>
+<h2>Idea 6 · Side effects: a checkpoint cannot undo them</h2>
+<p>So a node can run twice. That is harmless for thinking and harmful for anything that changes the world: a refund, an email, a stock reservation. The script below pays a refund and is killed right after the payment, before the node returns, the way a deploy or an out-of-memory kill would do it. Save it next to your code:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># save as: refund_job.py
+import os, sys, operator
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.config import get_config
+
+class Refund(TypedDict, total=False):
+    order_id: str
+    log: Annotated[list, operator.add]
+
+def already_paid(key):
+    return os.path.exists(&quot;ledger.txt&quot;) and key in open(&quot;ledger.txt&quot;).read().split()
+
+def pay(state):
+    key = f&quot;{get_config()['configurable']['thread_id']}:pay&quot;       # one key per thread and step
+    if sys.argv[2] == &quot;keyed&quot; and already_paid(key):
+        return {&quot;log&quot;: [&quot;pay skipped, already done&quot;]}
+    with open(&quot;ledger.txt&quot;, &quot;a&quot;) as f:
+        f.write(f&quot;{key} refund {state['order_id']}\n&quot;)            # the side effect: money moves
+    if sys.argv[1] == &quot;crash&quot;:
+        os._exit(1)                                               # the process dies before the node returns
+    return {&quot;log&quot;: [&quot;paid&quot;]}
+
+def notify(state):
+    return {&quot;log&quot;: [&quot;customer told&quot;]}
+
+with SqliteSaver.from_conn_string(&quot;refunds.db&quot;) as saver:
+    graph = (StateGraph(Refund).add_node(&quot;pay&quot;, pay).add_node(&quot;notify&quot;, notify)
+             .add_edge(START, &quot;pay&quot;).add_edge(&quot;pay&quot;, &quot;notify&quot;).add_edge(&quot;notify&quot;, END)
+             .compile(checkpointer=saver))
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;refund-A-1077&quot;}}
+    print(graph.invoke({&quot;order_id&quot;: &quot;A-1077&quot;, &quot;log&quot;: []} if sys.argv[1] == &quot;crash&quot; else None, cfg, durability=&quot;sync&quot;)[&quot;log&quot;])
+</code></pre></div>
+<p>Now crash it, resume it in a new process, and count the payments, first without a key and then with one:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import os, subprocess, sys
+
+def run(*args):
+    p = subprocess.run([sys.executable, &quot;refund_job.py&quot;, *args], capture_output=True, text=True)
+    return p.stdout.strip() or f&quot;(process died, exit code {p.returncode})&quot;
+
+for mode in (&quot;plain&quot;, &quot;keyed&quot;):
+    for f in (&quot;refunds.db&quot;, &quot;ledger.txt&quot;):
+        if os.path.exists(f):
+            os.remove(f)
+    print(mode, &quot;| first run:&quot;, run(&quot;crash&quot;, mode), &quot;| resume:&quot;, run(&quot;resume&quot;, mode))
+    print(&quot;      ledger rows:&quot;, len(open(&quot;ledger.txt&quot;).read().splitlines()))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">plain | first run: (process died, exit code 1) | resume: ['paid', 'customer told']
+      ledger rows: 2
+keyed | first run: (process died, exit code 1) | resume: ['pay skipped, already done', 'customer told']
+      ledger rows: 1
+</code></pre></div></div></aside>
+<p>Without a key, the resume ran <code>pay</code> from its first line, because its writes were never saved, and the customer was refunded twice even in <code>sync</code> mode. With a key, the node first checked its own records, found the payment and skipped it. The rules, the same as <a class="xref" href="#l0304">Lesson 3.4</a>'s:</p>
+<ul>
+<li>Give every side effect an <strong><span class="cx" data-c="293" tabindex="0">idempotency key</span></strong> built from things that are the same on a re-run: the thread ID, the node, the order ID. Never use a timestamp or a random number.</li>
+<li><strong>Check your records</strong> before acting, or let the service do it: most payment APIs accept an idempotency key and refuse a duplicate.</li>
+<li>Keep <strong>approvals and model calls out of the node that acts</strong>. A node that asks for approval with <code>interrupt()</code> and then pays will, after a crash, ask the reviewer again and may pay again (<a class="xref" href="#l0613">Lesson 6.13</a>).</li>
+</ul>
+<h2>Idea 7 · Checkpoints grow with the square of a thread</h2>
+<p>A checkpoint stores the state as it is after the step, so a list key is stored in full in every checkpoint. A thread of 100 steps that adds one item per step stores 1 + 2 + ... + 100 items in total. Measure it with a reader that adds one 1 KB page per step:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.channels import DeltaChannel
+
+PAGE = &quot;x&quot; * 1000                                     # one tool result of about 1 KB
+def append_all(old, batches):                         # a DeltaChannel reducer gets every write of a step at once
+    return (old or []) + [item for batch in batches for item in batch]
+
+def read_page(state):
+    return {&quot;pages&quot;: [f&quot;page {len(state['pages']) + 1}: {PAGE}&quot;]}
+
+def more(state):
+    return &quot;read_page&quot; if len(state[&quot;pages&quot;]) &lt; 100 else END
+
+def run(label, pages_type):
+    class Doc(TypedDict):
+        pages: pages_type
+    path = f&quot;growth_{label}.db&quot;
+    if os.path.exists(path):
+        os.remove(path)
+    with SqliteSaver.from_conn_string(path) as saver:
+        g = (StateGraph(Doc).add_node(&quot;read_page&quot;, read_page).add_edge(START, &quot;read_page&quot;)
+             .add_conditional_edges(&quot;read_page&quot;, more).compile(checkpointer=saver))
+        out = g.invoke({&quot;pages&quot;: []}, {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;long-doc&quot;}, &quot;recursion_limit&quot;: 200})
+        db = sqlite3.connect(path)
+        rows, size = db.execute(&quot;select count(*), sum(length(checkpoint)) from checkpoints&quot;).fetchone()
+        wsize = db.execute(&quot;select sum(length(value)) from writes&quot;).fetchone()[0]
+        print(f&quot;{label:6} pages={len(out['pages'])}  checkpoint rows={rows}  checkpoints about {round(size / 10000) * 10:,} KB  writes about {round(wsize / 10000) * 10:,} KB&quot;)
+
+run(&quot;plain&quot;, Annotated[list, operator.add])
+run(&quot;delta&quot;, Annotated[list, DeltaChannel(append_all)])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">plain  pages=100  checkpoint rows=102  checkpoints about 5,170 KB  writes about 100 KB
+delta  pages=100  checkpoint rows=102  checkpoints about 160 KB  writes about 100 KB
+</code></pre></div></div></aside>
+<p>The content was about 100 KB (the writes table stores each page once). The plain thread's checkpoints held about 5.2 MB, fifty times the content, and the number grows with the square of the thread's length. <strong><code>DeltaChannel</code></strong>, new in LangGraph 1.2 and still marked beta, stores only each step's writes plus a full snapshot every <code>snapshot_frequency</code> steps (100 by default), and rebuilds the value on read: about 160 KB here, a thirtieth of the plain thread. Its reducer receives every write of a step in one call, which is why <code>append_all</code> takes a list of batches. For an agent, swap the message channel by passing <code>create_agent(..., state_schema=...)</code> a subclass of <code>AgentState</code> whose <code>messages</code> key uses a <code>DeltaChannel</code>. Summarising long threads (<a class="xref" href="#l0614">Lesson 6.14</a>) helps too, because it shortens what every checkpoint has to hold.</p>
+<p>In the same manual's measurements, the framework's own work (planning, merging, saving) took under half a percent of a real agent's time; the model took the rest. Spend optimisation effort on bytes and model calls, not on the loop.</p>
+<h2>Idea 8 · What survives a round trip through a checkpoint</h2>
+<p>Everything in the state goes through the checkpointer's serializer (<code>JsonPlusSerializer</code>, which writes msgpack) and comes back on the next step, after a resume, or on another server. Most values come back as they went in. Some do not:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import logging; logging.disable(logging.WARNING)      # hide the loader's warnings for this demo
+from collections import Counter, defaultdict
+from datetime import datetime
+from decimal import Decimal
+from zoneinfo import ZoneInfo
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+serde = JsonPlusSerializer()
+class Plain:
+    def __init__(self, n): self.n = n
+
+values = {&quot;tuple&quot;: (1, 2), &quot;set of ints&quot;: {1, 2}, &quot;set of tuples&quot;: {(1, 2)}, &quot;Counter&quot;: Counter(&quot;abca&quot;),
+          &quot;defaultdict&quot;: defaultdict(list, {&quot;k&quot;: [1]}), &quot;Decimal&quot;: Decimal(&quot;7999.00&quot;),
+          &quot;datetime in Asia/Kolkata&quot;: datetime(2026, 11, 22, 21, 0, tzinfo=ZoneInfo(&quot;Asia/Kolkata&quot;)), &quot;plain class&quot;: Plain(3)}
+for name, v in values.items():
+    try:
+        back = serde.loads_typed(serde.dumps_typed(v))
+        same = type(back) is type(v) and back == v and getattr(back, &quot;tzinfo&quot;, None) == getattr(v, &quot;tzinfo&quot;, None)
+        shown = back.tzinfo if isinstance(back, datetime) else back
+        print(f&quot;{name:26} -&gt; {type(back).__name__:9} {'same' if same else 'CHANGED'}  {shown!r}&quot;)
+    except Exception as e:
+        print(f&quot;{name:26} -&gt; {type(e).__name__}: {e}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">tuple                      -&gt; list      CHANGED  [1, 2]
+set of ints                -&gt; set       same  {1, 2}
+set of tuples              -&gt; list      CHANGED  [[1, 2]]
+Counter                    -&gt; dict      CHANGED  {'a': 2, 'b': 1, 'c': 1}
+defaultdict                -&gt; dict      CHANGED  {'k': [1]}
+Decimal                    -&gt; Decimal   same  Decimal('7999.00')
+datetime in Asia/Kolkata   -&gt; datetime  CHANGED  datetime.timezone(datetime.timedelta(seconds=19800))
+plain class                -&gt; TypeError: Type is not msgpack serializable: Plain
+</code></pre></div></div></aside>
+<p>A node that calls <code>.most_common()</code> on a <code>Counter</code> works on the first step and fails after a resume, because what came back is a plain <code>dict</code>. A time zone comes back as a fixed offset, which is wrong across a daylight-saving change. A plain class cannot be saved at all. Keep state to plain <span class="cx" data-c="311" tabindex="0">JSON</span>-like values, <span class="cx" data-c="477" tabindex="0">Pydantic</span> models, dataclasses, enums and LangChain messages, and convert at the edges.</p>
+<p>Loading also has a security side. A checkpoint row names the type to rebuild, so whoever can write to your checkpoint database can choose what your process constructs. Treat the checkpoint store as trusted infrastructure, never as user input, and in production set <code>LANGGRAPH_STRICT_MSGPACK=true</code>, which makes the loader return raw fields instead of building classes that are not on its allow list.</p>
+<h2>Putting it together</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InvalidUpdateError: At key 'x': Can receive only one value per step</code>, then every read of the thread fails</td>
+<td>Two tasks wrote a key with no reducer in one superstep</td>
+<td>Add a reducer to the key and recompile on the same checkpointer; add a parallel-branch test</td>
+</tr>
+<tr>
+<td>Parallel results in an unexpected order</td>
+<td>The update phase applies writes in task-path order, not finish order</td>
+<td>Do not depend on which task finished first; sort explicitly if order matters</td>
+</tr>
+<tr>
+<td>A refund or email happened twice after a crash or deploy</td>
+<td>A node with a side effect ran again on resume</td>
+<td>An idempotency key and a records check in the node, or at the service</td>
+</tr>
+<tr>
+<td>No history to go back to</td>
+<td>The run used <code>durability="exit"</code></td>
+<td>Use <code>"async"</code> (the default) or <code>"sync"</code></td>
+</tr>
+<tr>
+<td>The checkpoint database grows far faster than the conversation</td>
+<td>Every checkpoint holds the whole message list</td>
+<td><code>DeltaChannel</code> for long lists, summarisation, retention policies</td>
+</tr>
+<tr>
+<td>A value has the wrong type after a resume</td>
+<td>The serializer cannot round-trip that type</td>
+<td>Plain JSON-like types, Pydantic models, dataclasses</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-prod"><div class="co-label">In production</div><div class="co-title">The runtime in production</div><div class="co-body"><ul>
+<li><strong>Test with a checkpointer</strong>: many of these failures appear only when state is saved and reloaded. Run your graph tests on <code>InMemorySaver</code> and at least one test that resumes in a new process on SQLite or Postgres.</li>
+<li><strong>Deploys are crashes</strong>: a rolling deploy kills processes mid-step. Combine <code>RunControl.request_drain()</code> on shutdown (<a class="xref" href="#l0618">Lesson 6.18</a>), which stops at the next superstep boundary with a resumable checkpoint, with idempotent side effects for the steps that were running.</li>
+<li><strong>Retention</strong>: decide how long to keep checkpoint history per thread, and prune old checkpoints, or the database grows without limit even with <code>DeltaChannel</code>.</li>
+<li><strong>Watch the bytes</strong>: alert on checkpoint size per thread, the same way you alert on token usage.</li>
+</ul></div></aside>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Persistence</em>, <em><span class="cx cx-later" data-c="196" tabindex="0">Durable execution</span><a class="cx-pill" href="#l1208" title="Taught later, in Lesson 12.8">later · 12.8</a></em>, <em>Graph API</em> (reducers, <code>Send</code>), <em>Low-level concepts</em> (supersteps); LangGraph changelog, v1.2.0 (May 2026: <code>DeltaChannel</code>, node timeouts, <span class="cx" data-c="215" tabindex="0">error handlers</span>, graceful shutdown); <code>langgraph</code> 1.2.24 source (<code>pregel</code>, <code>channels</code>, <code>checkpoint.serde.jsonplus</code>). The crash measurements and the framework-overhead figure are from <em>AI Engineering from Scratch</em>, LangChain 101 manual (MIT licence, edition 2026.11), Parts 2 and 5; every other number on this page was produced by the code above.</li>
+<li><strong>Versions</strong>: <code>langchain</code> 1.5.2, <code>langgraph</code> 1.2.24, <code>langgraph-checkpoint</code> 4.3.2.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Supersteps, channels, reducers, <code>durability=</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>DeltaChannel</code></td>
+<td>Beta: the on-disk format may change</td>
+</tr>
+<tr>
+<td><code>LANGGRAPH_STRICT_MSGPACK</code></td>
+<td>Supported environment variable</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Parallel writes land in the order the nodes finish."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They are applied in task-path order, the same on every run.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "<code>InvalidUpdateError</code> only fails the run that caused it."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The colliding writes are saved, so every later read of the thread fails until the schema gets a reducer.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "<code>durability=\"sync\"</code> means a node never runs twice."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A task that just finished can still lose its writes in a crash; keys on side effects are still needed.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A checkpoint stores only what changed."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> By default it stores each changed channel in full; <code>DeltaChannel</code> stores only the writes.</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In Idea 1, change the reducer to <code>lambda old, new: new</code> (keep the last write). Which value does <code>found</code> hold in each of the two runs, and does it depend on which node was slow? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In Idea 5, run the <code>"sync"</code> case on a graph compiled <strong>without</strong> a checkpointer. What happens, and what do the <code>"async"</code> and <code>"exit"</code> cases do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: a Counter that stopped counting</div><div class="co-body"><p>This node tallies how often each reason appears in returns. It works in a single run and fails when the thread is resumed from its checkpoint:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tally(state):
+    reasons = state.get(&quot;reasons&quot;, Counter())
+    reasons.update({state[&quot;reason&quot;]: 1})
+    return {&quot;reasons&quot;: reasons, &quot;top&quot;: reasons.most_common(1)[0][0]}
+
+print(&quot;first step:&quot;, tally({&quot;reason&quot;: &quot;damaged&quot;})[&quot;top&quot;])
+saved = serde.loads_typed(serde.dumps_typed(Counter({&quot;damaged&quot;: 1})))   # what the checkpoint gives back
+try:
+    tally({&quot;reasons&quot;: saved, &quot;reason&quot;: &quot;late&quot;})
+except AttributeError as e:
+    print(&quot;AttributeError:&quot;, e)
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">first step: damaged
+AttributeError: 'dict' object has no attribute 'most_common'
+</code></pre></div>
+<p>Explain why, and fix the node so it works before and after a resume. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Change <code>refund_job.py</code> so the idempotency key also includes the order ID, and make <code>pay</code> record the key in a SQLite table with a <code>UNIQUE</code> constraint instead of a text file, so two processes that race cannot both insert it. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0624-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The last task path wins</span></summary><div class="qa-a"><p><code>['b']</code> in both runs. The reducer receives the writes in task-path order, and <code>b</code>'s path sorts after <code>a</code>'s, so <code>b</code>'s write is applied last whichever node was slow. If you need "the latest by time", put a timestamp in the value and choose explicitly in the reducer.</p></div></details>
+<details class="qa" id="l0624-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Sync needs a checkpointer</span></summary><div class="qa-a"><p>With no checkpointer, every mode warns that <code>durability</code> has no effect. <code>"async"</code> and <code>"exit"</code> then run normally, but <code>"sync"</code> raises an <code>AttributeError</code> from inside the loop, because it waits for a checkpoint write that was never started (reported in LangGraph issue #9267). Pass <code>durability="sync"</code> only to a graph compiled with a checkpointer.</p></div></details>
+<details class="qa" id="l0624-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Store plain values, rebuild rich ones</span></summary><div class="qa-a"><p>The checkpointer saved the <code>Counter</code> as a plain <code>dict</code>, so after a resume <code>reasons</code> has no <code>most_common</code>. Store a plain dictionary in the state and build the <code>Counter</code> inside the node:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tally(state):
+    reasons = Counter(state.get(&quot;reasons&quot;, {}))          # rebuild from the plain dict
+    reasons.update({state[&quot;reason&quot;]: 1})
+    return {&quot;reasons&quot;: dict(reasons), &quot;top&quot;: reasons.most_common(1)[0][0]}
+
+print(tally({&quot;reasons&quot;: {&quot;damaged&quot;: 2, &quot;late&quot;: 1}, &quot;reason&quot;: &quot;late&quot;}))
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'reasons': {'damaged': 2, 'late': 2}, 'top': 'damaged'}
+</code></pre></div></div></details>
+<details class="qa" id="l0624-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Let the database refuse the duplicate</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import sqlite3
+
+def pay_once(key, order_id):
+    db = sqlite3.connect(&quot;ledger.db&quot;)
+    db.execute(&quot;create table if not exists refunds (key text unique, order_id text)&quot;)
+    try:
+        with db:
+            db.execute(&quot;insert into refunds values (?, ?)&quot;, (key, order_id))   # fails if the key exists
+        return &quot;paid&quot;
+    except sqlite3.IntegrityError:
+        return &quot;already paid&quot;
+
+if os.path.exists(&quot;ledger.db&quot;):
+    os.remove(&quot;ledger.db&quot;)
+print(pay_once(&quot;refund-A-1077:pay:A-1077&quot;, &quot;A-1077&quot;), &quot;|&quot;, pay_once(&quot;refund-A-1077:pay:A-1077&quot;, &quot;A-1077&quot;))
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">paid | already paid
+</code></pre></div>
+<p>In <code>pay</code>, call <code>pay_once(f"{thread_id}:pay:{state['order_id']}", state['order_id'])</code> before moving money, and move money only when it returns <code>"paid"</code>. A unique constraint holds even when two processes race, which a "check, then write" in Python does not. With a real payment provider, pass the same key as its idempotency key.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0624-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How does LangGraph execute a graph, step by step?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> In supersteps, after Google's Pregel model. Each superstep plans the tasks whose trigger channels changed since they last ran (plus one task per pending <code>Send</code>), runs them in parallel, then applies all their writes at once through each key's channel, sorted by task path, and saves a checkpoint. A node reads the state as of the previous superstep, never a sibling's write from the same one. The run ends when a step plans no task, or at the <span class="cx" data-c="499" tabindex="0">recursion limit</span>, which counts supersteps.</p>
+<p><strong>A plausible wrong answer.</strong> "Nodes run one after another along the edges, and each sees the previous node's output immediately." That misses parallel steps and the all-at-once update.</p>
+<p><strong>Follow-ups.</strong> Why does the update phase sort tasks before applying their writes?</p></div></details>
+<details class="qa" id="l0624-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">After adding a second branch, one customer's thread fails on every request with InvalidUpdateError, even reads. What happened, and how do you fix it without losing the conversation?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Two tasks wrote a key with no reducer in the same superstep. The runtime raised in the update phase after both had run, and their writes were saved as pending writes, so every read replays the collision. Fix the schema with a reducer for that key (or make only one branch write it), recompile against the same checkpointer, and the thread reads and resumes without rerunning the nodes. Add a test that runs the parallel branches on a checkpointer.</p>
+<p><strong>A plausible wrong answer.</strong> "Delete the thread." That loses the customer's history and does not stop the next thread from breaking.</p>
+<p><strong>Follow-ups.</strong> Why does <code>update_state</code> not repair it?</p></div></details>
+<details class="qa" id="l0624-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Is durability="sync" enough to make a refund agent safe to retry after crashes?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> No. <code>sync</code> waits for each checkpoint, but a task that finished just before a crash can still lose its writes and run again, and a model can also simply ask for the same action twice. Safety comes from the side effect: an idempotency key built from stable values, checked against your records or passed to a provider that refuses duplicates, with the approval step in a separate node. Choose <code>sync</code> when losing a completed step is expensive, and keep the key either way.</p>
+<p><strong>A plausible wrong answer.</strong> "Yes, sync writes every checkpoint before continuing." That confuses the checkpoint with the task's own writes.</p>
+<p><strong>Follow-ups.</strong> Where should the idempotency key come from?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Predict the merge order of parallel writes, and explain it.</li>
+<li>Repair a thread broken by a write collision without rerunning its nodes.</li>
+<li>Choose a durability mode and say what a crash repeats in it.</li>
+<li>Make a side effect safe to run twice.</li>
+<li>Cut checkpoint size with <code>DeltaChannel</code>, and keep state values that survive a round trip.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0624-q1"><p class="q-text"><span class="q-num">Q1</span>Two parallel nodes append to a list with a reducer. In what order do their items appear?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0624-q1-o0"><span class="opt-key">A</span><span>The order the nodes finished in</span></button><button type="button" class="opt" data-correct="true" id="l0624-q1-o1"><span class="opt-key">B</span><span>Task-path order, which is the same on every run</span></button><button type="button" class="opt" data-correct="false" id="l0624-q1-o2"><span class="opt-key">C</span><span>Random order</span></button><button type="button" class="opt" data-correct="false" id="l0624-q1-o3"><span class="opt-key">D</span><span>Alphabetical order of the values</span></button></div><p class="q-explain" hidden>The update phase sorts tasks by path before applying writes.</p></div><div class="q" id="l0624-q2"><p class="q-text"><span class="q-num">Q2</span>What happens to a thread after an InvalidUpdateError from two writes to a key with no reducer?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0624-q2-o0"><span class="opt-key">A</span><span>Only that run fails; the next one works</span></button><button type="button" class="opt" data-correct="true" id="l0624-q2-o1"><span class="opt-key">B</span><span>The colliding writes are saved, so reads and resumes keep failing until the key gets a reducer</span></button><button type="button" class="opt" data-correct="false" id="l0624-q2-o2"><span class="opt-key">C</span><span>LangGraph keeps the first write</span></button><button type="button" class="opt" data-correct="false" id="l0624-q2-o3"><span class="opt-key">D</span><span>The checkpointer deletes the thread</span></button></div><p class="q-explain" hidden>Recompile with a reducer on the same checkpointer to repair it.</p></div><div class="q" id="l0624-q3"><p class="q-text"><span class="q-num">Q3</span>Which durability mode keeps no checkpoint history during a run?</p><div class="opts"><button type="button" class="opt" data-correct="true" id="l0624-q3-o0"><span class="opt-key">A</span><span>"exit"</span></button><button type="button" class="opt" data-correct="false" id="l0624-q3-o1"><span class="opt-key">B</span><span>"async"</span></button><button type="button" class="opt" data-correct="false" id="l0624-q3-o2"><span class="opt-key">C</span><span>"sync"</span></button><button type="button" class="opt" data-correct="false" id="l0624-q3-o3"><span class="opt-key">D</span><span>All of them keep history</span></button></div><p class="q-explain" hidden>exit saves once, when the run ends or pauses.</p></div><div class="q" id="l0624-q4"><p class="q-text"><span class="q-num">Q4</span>Why can a refund happen twice after a crash, even with durability="sync"?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0624-q4-o0"><span class="opt-key">A</span><span>sync does not save checkpoints</span></button><button type="button" class="opt" data-correct="true" id="l0624-q4-o1"><span class="opt-key">B</span><span>The node can run again on resume, and a checkpoint cannot undo a side effect</span></button><button type="button" class="opt" data-correct="false" id="l0624-q4-o2"><span class="opt-key">C</span><span>SQLite loses data</span></button><button type="button" class="opt" data-correct="false" id="l0624-q4-o3"><span class="opt-key">D</span><span>The model always asks twice</span></button></div><p class="q-explain" hidden>Use an idempotency key at the side effect.</p></div><div class="q" id="l0624-q5"><p class="q-text"><span class="q-num">Q5</span>What does DeltaChannel change?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0624-q5-o0"><span class="opt-key">A</span><span>It makes nodes run faster</span></button><button type="button" class="opt" data-correct="true" id="l0624-q5-o1"><span class="opt-key">B</span><span>Checkpoints store each step's writes, with periodic snapshots, instead of the full list every time</span></button><button type="button" class="opt" data-correct="false" id="l0624-q5-o2"><span class="opt-key">C</span><span>It compresses messages with gzip</span></button><button type="button" class="opt" data-correct="false" id="l0624-q5-o3"><span class="opt-key">D</span><span>It removes old messages from the conversation</span></button></div><p class="q-explain" hidden>It is beta in LangGraph 1.2.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0624" id="done-l0624">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0624" id="undo-l0624" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0623"><span class="pn-dir">Previous</span><span class="pn-t">6.23 · LangChain and LangGraph reference: cheat sheet, gotchas, error codes and migration notes</span></a><a class="pn next" href="#l0625"><span class="pn-dir">Next</span><span class="pn-t">6.25 · Operating LangGraph services: one run per thread, safe defaults and what it costs</span></a></div></footer>

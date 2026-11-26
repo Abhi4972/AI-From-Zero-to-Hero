@@ -1,0 +1,878 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-16">Phase 16 · Multi-Agent &amp; Swarms</a></nav><h1>Shared Memory and Blackboard Patterns</h1><div class="m-meta"><span class="chip chip-num">Lesson 16.13</span><span class="chip">75 min</span><span class="chip chip-core">Learn + Build</span><span class="chip chip-done" data-done-chip="a1613" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 16 · 04 (Primitive Model), Phase 16 · 09 (Parallel Swarm Networks)</li>
+<li><strong>Type</strong>: Learn + Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, <code>threading</code>), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Two approaches coexist in 2026 multi-agent systems: the <strong>message pool</strong> (everyone sees everyone's messages, as in AutoGen's GroupChat; MetaGPT adds role-based subscription on top) and the <strong>blackboard with subscription</strong> (agents subscribe to relevant events, close to Context-Aware MCP's shared context store). Both are the only stateful part of a multi-agent system — which means both are where the interesting bugs live. The reference failure mode is <strong>memory poisoning</strong>: one agent hallucinates a "fact," other agents treat it as verified, and accuracy decays gradually in a way that is much harder to debug than an immediate crash. This lesson builds both structures from stdlib, injects a poisoning attack, and shows the three mitigations that actually work in production.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message pool</td>
+<td>"Shared chat history"</td>
+<td>Append-only log that every agent reads. Full transparency, poor scaling.</td>
+</tr>
+<tr>
+<td>Blackboard</td>
+<td>"Shared workspace"</td>
+<td>Topic-keyed pub/sub. Agents subscribe to relevant topics. Scales farther.</td>
+</tr>
+<tr>
+<td>Provenance</td>
+<td>"Who wrote what"</td>
+<td>Metadata on each write: writer, timestamp, prompt, sources.</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>"Hallucinations spreading"</td>
+<td>One agent's error enters shared state, downstream agents adopt it as fact.</td>
+</tr>
+<tr>
+<td>Append-only</td>
+<td>"No in-place updates"</td>
+<td>Corrections are new entries that supersede. Preserves audit trail.</td>
+</tr>
+<tr>
+<td>Unwritable verifier</td>
+<td>"Independent auditor"</td>
+<td>Read-only agent that re-fetches sources and flags inconsistencies.</td>
+</tr>
+<tr>
+<td>Projection</td>
+<td>"Scoped view"</td>
+<td>Per-agent view computed from global state. LangGraph's per-node input and private state schemas are one implementation.</td>
+</tr>
+<tr>
+<td>Knowledge Source</td>
+<td>"Specialist agent"</td>
+<td>Hayes-Roth's 1985 term for a blackboard participant.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0310">Zero to Agents 3.10 · Memory II: long-term, episodic and procedural memory</a></li><li><a class="xref" href="#l0614">Zero to Agents 6.14 · Memory: trimming threads and the long-term store</a></li></ul></div></aside>
+<h2>Problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When several agents work on one task, they need a shared place to put what they found. A <strong>message pool</strong> is a shared log that every agent reads. A <strong>blackboard</strong> splits the shared space into topics, and each agent sees only the topics it subscribes to. Either way, one agent's mistake can be read by every other agent as a fact. Memory for a single agent (trimming threads and the long-term store) is covered in Zero to Agents 3.10 and 6.14 (linked above). This lesson tests the lesson's pool, blackboard and verifier on writes its demo does not make, adds lineage so a flag reaches derived entries, and tries a small model as summarizer and as verifier.</p></div></aside>
+
+<p>Multi-agent systems need a place for agents to share facts. A literal option is "pass everything in messages" — but that reinvents shared state with extra copying. Another is "give everyone a global log" — but global logs grow unbounded and poison easily. A third is "project a view per agent" — scalable but schema-heavy.</p>
+<p>When one of the agents hallucinates and writes the hallucination to shared state, every downstream agent that reads that state adopts the hallucination as fact. By the time the human notices, the reasoning chain is five steps deep and the root cause is the third message ever written. Debugging multi-agent accuracy decay is harder than debugging a crash.</p>
+<p>This is memory poisoning. MAST (Cemri et al., arXiv:2503.13657) does not name it; its closest failure modes are information withholding, ignoring other agents' input, and missing or incorrect verification. OWASP's Top 10 for Agentic Applications (December 2025) lists it as ASI06, Memory and Context Poisoning. It is structural: any shared-memory design without provenance and an unwritable verifier will exhibit it eventually.</p>
+<h2>Concept</h2>
+<h3>The two main topologies</h3>
+<p><strong>Full message pool.</strong> Every agent reads every message. AutoGen's GroupChat uses this. MetaGPT starts from a shared pool but lets each role subscribe to the messages its profile needs, which is closer to the blackboard below. Simple, transparent, inspectable, but does not scale past ~10 agents because each agent's context fills with other agents' work.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">agent-A ──write──▶ ┌────────────────┐ ◀──read── agent-D
+                   │ message pool   │
+agent-B ──write──▶ │                │ ◀──read── agent-E
+                   │ (global log)   │
+agent-C ──write──▶ └────────────────┘ ◀──read── agent-F
+</code></pre></div>
+<p><strong>Blackboard with subscription.</strong> Agents declare interest in topics; the substrate routes only relevant messages. CA-MCP (arXiv:2601.11595) uses a central Shared Context Store that servers read, write and watch for trigger flags. Matrix (arXiv:2511.21686, from Meta) has no shared board at all: each task's state travels as a message through per-role queues. Scales further, but requires upfront schema design to make subscriptions meaningful.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">                   ┌─ topic: prices ──┐
+agent-A ──pub────▶ │                  │ ──▶ agent-D (subscribed)
+                   ├─ topic: orders ──┤
+agent-B ──pub────▶ │                  │ ──▶ agent-E (subscribed)
+                   ├─ topic: alerts ──┤
+agent-C ──pub────▶ │                  │ ──▶ agent-F (subscribed)
+                   └──────────────────┘
+</code></pre></div>
+<h3>When each wins</h3>
+<ul>
+<li><strong>Full pool</strong> wins when agents are few (&lt; 10), heterogeneous, and the conversation is short-horizon. Reasoning about who said what is trivial when everyone sees everything.</li>
+<li><strong>Blackboard</strong> wins when agents are many, homogeneous in role but numerous in instance (swarms), and the conversation is long-running. Routing saves token cost and context pollution.</li>
+</ul>
+<p>Production systems often mix: a small full pool at the top (planning layer), blackboards below (worker layer).</p>
+<h3>Memory poisoning, in one scenario</h3>
+<p>Three agents work on a research task. Agent A is a retrieval agent. Agent B is a summarizer. Agent C is an analyst.</p>
+<ol>
+<li>A fetches a page and writes a message to shared state: "The study reports a 42% accuracy improvement."</li>
+<li>The fetched page actually said "4.2% improvement." A hallucinated a decimal.</li>
+<li>B, reading shared state, writes: "Large 42% accuracy gain reported (source: A)."</li>
+<li>C, reading shared state, writes: "Recommend adoption — 42% lift is transformative."</li>
+<li>The final report cites a 42% number that never existed.</li>
+</ol>
+<p>No agent crashed. No test failed. The system "worked." The hallucination crossed from one agent's context into every downstream agent's reasoning via shared state.</p>
+<h3>Why this is structural</h3>
+<p>Without shared state, agent A's hallucination stays in A's context. Downstream agents would re-fetch or re-derive and might catch the error. With naive shared state, A's context becomes everyone's context, and the hallucination is laundered into fact.</p>
+<p>The problem is not shared state per se — it is shared state <strong>without provenance and without an independent verifier</strong>. Three mitigations address this:</p>
+<ol>
+<li><strong>Attribute provenance on every write.</strong> Every entry in shared state records who wrote it, when, under what prompt, and (if applicable) what source the agent cited. Downstream agents read with skepticism keyed to provenance.</li>
+<li><strong>Version writes; treat them as append-only.</strong> A correction is a new entry that supersedes the old, not an in-place update. The audit trail is preserved.</li>
+<li><strong>Keep at least one agent that cannot write to shared state.</strong> A read-only verifier agent samples entries, re-fetches sources, and flags inconsistencies. It still reads the pool, so it can be fooled by a bad entry, but it checks each entry against the original source and cannot write, so its verdicts never feed a poisoned fact back into shared state.</li>
+</ol>
+<h3>Blackboard precedent (Hayes-Roth, 1985)</h3>
+<p>The blackboard pattern predates LLM agents by about five decades. It comes from the Hearsay-II speech-understanding system of the 1970s (Erman et al., 1980), where specialist Knowledge Sources observe a global blackboard, contribute partial solutions, and trigger other sources. Hayes-Roth (1985, "A Blackboard Architecture for Control") extended it to control: deciding which Knowledge Source acts next. CA-MCP's shared context store is the same pattern with LLM agents and MCP servers as Knowledge Sources and JSON blobs as partial solutions. The old literature has documented solutions to write contention, opportunistic control, and consistency that modern systems rediscover.</p>
+<h3>Projection vs full view</h3>
+<p>A pure blackboard gives every subscriber the same projection (topic-scoped). A more aggressive design is <strong>per-agent projection</strong>: each agent gets a view customized to its role. In LangGraph, nodes and subgraphs can declare their own input and private state schemas, so each sees only a slice of the graph's state. Reducers handle the other direction: how updates from several nodes merge back into the shared state.</p>
+<p>Per-agent projection scales further but needs a schema. Without one, you rebuild ad-hoc projection in every agent's prompt.</p>
+<h3>Write-contention patterns</h3>
+<p>Multiple agents writing simultaneously is a concurrency problem, not just an LLM problem. Three patterns work:</p>
+<ul>
+<li><strong>Sequential writer (single producer).</strong> All writes go through one coordinator agent that serializes. Simple, but a bottleneck.</li>
+<li><strong>Optimistic concurrency with versioning.</strong> Each entry has a version; writers fail on version mismatch and retry. Classic database technique.</li>
+<li><strong>Topic partitioning.</strong> Different agents own different topics. No cross-topic contention. Requires designed partition boundaries.</li>
+</ul>
+<p>Many frameworks run one writer at a time, because LLM calls are slow enough that contention is rare and the bottleneck does not hurt. LangGraph runs nodes in parallel instead, and raises an INVALID_CONCURRENT_GRAPH_UPDATE error when two nodes write the same key in one step without a reducer to merge them.</p>
+<h3>The unwritable verifier</h3>
+<p>The most load-bearing mitigation is the read-only verifier. Implementation rules:</p>
+<ul>
+<li>Verifier shares state with the team (reads the blackboard or pool).</li>
+<li>Verifier has no write handle to shared state — only to a separate verification channel.</li>
+<li>Verifier independently fetches sources cited in writes. Flags disagreement.</li>
+<li>Verifier's own outputs are routed to a human or a separate decision agent, never fed back into the pool.</li>
+</ul>
+<p>Without this separation, the verifier's outputs become new entries in the pool, which means a poisoned pool poisons the verifier, which poisons its verifications.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="swarm-blackboard"></div></figure></p>
+
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Lineage.</strong> Give every entry <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">e</span></span></span></span> the set of entries it was built from, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">parents</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span>. An entry is tainted if it was flagged or if any parent is tainted:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">flag</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∨</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.566em;vertical-align:-1.516em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.809em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mrel mtight">∈</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord text mtight"><span class="mord mtight">parents</span></span><span class="mopen mtight">(</span><span class="mord mathnormal mtight">e</span><span class="mclose mtight">)</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">⋁</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.516em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div>
+A flag on the root then reaches every summary and verdict built on it. Without parents, a flag stops at the entry it was put on.</p>
+<p><strong>Two ways a verifier errs.</strong> Over <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> writes, a verifier flags honest writes (false positives, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span></span></span></span>) and passes wrong ones (false negatives, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span></span></span></span>). Its accuracy is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">n</span></span></span></span>. Exact string matching has <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> for cited writes and a large <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span></span></span></span>, since any honest paraphrase fails; it has no view of uncited writes at all.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Following one flag through the pool</div><div class="co-body"><ul>
+<li>Entry 0: the retriever writes "42% accuracy improvement", citing paper-1. Entry 1: the summarizer builds on entry 0 and cites nothing.</li>
+<li>The verifier re-fetches paper-1, sees "4.2%", and flags entry 0.</li>
+<li>The analyst reads only summaries. Entry 1 has no flag, so it recommends adoption.</li>
+<li>With lineage, entry 1 records parents <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0</span><span class="mclose">}</span></span></span></span>, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord">0</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">true</span></span></span></span></span>. The analyst has no clean summary and waits for a corrected retrieval.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Once the verifier flags the bad entry, the report is safe."<br>
+  ✓ In the lesson's run 2 the analyst read the unflagged summary built on it and still recommended adoption.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Comparing each write with its source text catches errors."<br>
+  ✓ Exact matching flagged two honest writes, one missing only a full stop, and passed an invented figure with no source.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Memory poisoning is a MAST failure category."<br>
+  ✓ MAST's 14 modes do not include it; OWASP's agentic Top 10 lists it as ASI06.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Publishing to a blackboard delivers to every subscriber."<br>
+  ✓ In the lesson's blackboard, one crashing subscriber stops delivery to the rest and raises into the publisher.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In the lesson's run 2, the verifier flags the retriever's 42% entry before the analyst runs. What does the analyst recommend? And of five writes, two of them wrong, how many does the exact-match verifier judge correctly? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Testing the lesson's pool, verifier and blackboard</div><div class="co-body"><p>The lesson's <code>MessagePool</code>, <code>verifier_agent</code> and <code>Blackboard</code>: a flag that does not reach a derived entry, five writes through the exact-match verifier, a failing subscriber and a late one, and lineage with taint as a fix. Runs in under a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson&#x27;s MessagePool, Blackboard and verifier (imported from main.py), pushed past the demo: does a flag
+# stop the poisoned figure? What does an exact-match verifier catch and miss? What happens to a derived entry,
+# a failing subscriber and a late subscriber? Then one fix: lineage plus taint. Runs in under a second.
+from main import (MessagePool, Blackboard, ProvenanceEntry, FAKE_SOURCES, retrieval_agent,
+                  summarizer_agent, analyst_agent, verifier_agent)
+
+print(&quot;1. the lesson&#x27;s run 2: the verifier flags, then the analyst runs&quot;)
+pool = MessagePool()
+retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+summarizer_agent(pool)
+findings = verifier_agent(pool)
+for eid, why in findings:
+    pool.flag(eid, why)
+analyst_agent(pool)
+for e in pool.read_all():
+    print(f&quot;   [{e.id}] {e.writer:10s} flagged={bool(e.flags)!s:5s} {e.content[:70]}&quot;)
+print(f&quot;   flags on: {[e.id for e in pool.read_all() if e.flags]}; the analyst read entry 1, which has no flag, and still recommends adoption&quot;)
+
+print(&quot;\n2. an exact-match verifier on five writes&quot;)
+P1, P2 = &quot;https://arxiv.org/paper-1&quot;, &quot;https://arxiv.org/paper-2&quot;
+writes = [  # (writer, content, source, really correct?)
+    (&quot;retriever&quot;, FAKE_SOURCES[P1], P1, True),                                   # verbatim copy
+    (&quot;retriever&quot;, &quot;Accuracy rose 4.2% over the baseline.&quot;, P1, True),            # honest paraphrase
+    (&quot;retriever&quot;, &quot;The study reports a 42% accuracy improvement over the baseline.&quot;, P1, False),
+    (&quot;retriever&quot;, &quot;Dataset size was 12,500 examples&quot;, P2, True),                # same text, no final period
+    (&quot;summarizer&quot;, &quot;The dataset had 125,000 examples.&quot;, None, False),           # invented, no source cited
+]
+pool = MessagePool()
+for w, c, s, _ in writes:
+    pool.write(w, c, &quot;task&quot;, source_uri=s)
+flagged = {eid for eid, _ in verifier_agent(pool)}
+for i, (w, c, s, ok) in enumerate(writes):
+    verdict = &quot;FLAG&quot; if i in flagged else &quot;pass&quot;
+    right = (verdict == &quot;FLAG&quot;) != ok
+    print(f&quot;   [{i}] {&#x27;correct&#x27; if ok else &#x27;WRONG  &#x27;}  {verdict}  {&#x27;ok &#x27; if right else &#x27;MISS&#x27;} {c[:55]}&quot;)
+print(f&quot;   {sum(((i in flagged) != ok) for i, (*_, ok) in enumerate(writes))} of 5 judged right: &quot;
+      &quot;two honest writes flagged, the uncited invention passed&quot;)
+
+print(&quot;\n3. the blackboard: a subscriber that fails, and one that joins late&quot;)
+bb = Blackboard()
+got = {&quot;risk&quot;: [], &quot;ledger&quot;: [], &quot;late&quot;: []}
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;risk&quot;].append(e.id))
+def broken(e):
+    raise ValueError(&quot;ledger agent crashed&quot;)
+bb.subscribe(&quot;prices&quot;, broken)
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;ledger&quot;].append(e.id))
+try:
+    bb.publish(&quot;scraper-1&quot;, &quot;prices&quot;, &quot;AAPL=192.4&quot;, &quot;poll&quot;)
+except ValueError as err:
+    print(f&quot;   publish raised into the scraper: {err}&quot;)
+print(f&quot;   stored: {[e.id for e in bb.read_topic(&#x27;prices&#x27;)]}; delivered: risk {got[&#x27;risk&#x27;]}, ledger {got[&#x27;ledger&#x27;]} &quot;
+      &quot;(after the crash, nobody else is called)&quot;)
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;late&quot;].append(e.id))
+print(f&quot;   a subscriber that joins now has received {got[&#x27;late&#x27;]}; nothing replays entry 0 unless it reads the topic&quot;)
+
+print(&quot;\n4. one fix: record what each entry was derived from, and taint descendants of a flagged entry&quot;)
+class LineagePool(MessagePool):
+    def __init__(self):
+        super().__init__(); self.parents = {}
+    def write(self, writer, content, prompt, source_uri=None, derived_from=(), **kw):
+        eid = super().write(writer, content, prompt, source_uri, **kw)
+        self.parents[eid] = tuple(derived_from)
+        return eid
+    def tainted(self):
+        bad = {e.id for e in self.read_all() if e.flags}
+        changed = True
+        while changed:
+            new = {eid for eid, ps in self.parents.items() if set(ps) &amp; bad} - bad
+            bad |= new; changed = bool(new)
+        return bad
+lp = LineagePool()
+r = lp.write(&quot;retriever&quot;, &quot;The study reports a 42% accuracy improvement over the baseline.&quot;, &quot;fetch&quot;, P1)
+s = lp.write(&quot;summarizer&quot;, &quot;Summary: a significant 42% gain.&quot;, &quot;summarize&quot;, derived_from=[r])
+for eid, why in verifier_agent(lp):
+    lp.flag(eid, why)
+bad = lp.tainted()
+inputs = [e for e in lp.read_all() if e.writer == &quot;summarizer&quot; and e.id not in bad]
+print(f&quot;   flagged {[e.id for e in lp.read_all() if e.flags]}, tainted {sorted(bad)}; the analyst has &quot;
+      f&quot;{len(inputs)} usable summaries, so it waits for a corrected retrieval instead of recommending adoption&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. the lesson&#x27;s run 2: the verifier flags, then the analyst runs
+   [0] retriever  flagged=True  The study reports a 42% accuracy improvement over the baseline.
+   [1] summarizer flagged=False Summary: study reports a significant result -- The study reports a 42%
+   [2] analyst    flagged=False Analyst verdict: Recommend adoption (based on: Summary: study reports 
+   flags on: [0]; the analyst read entry 1, which has no flag, and still recommends adoption
+
+2. an exact-match verifier on five writes
+   [0] correct  pass  ok  The study reports a 4.2% accuracy improvement over the 
+   [1] correct  FLAG  MISS Accuracy rose 4.2% over the baseline.
+   [2] WRONG    FLAG  ok  The study reports a 42% accuracy improvement over the b
+   [3] correct  FLAG  MISS Dataset size was 12,500 examples
+   [4] WRONG    pass  MISS The dataset had 125,000 examples.
+   2 of 5 judged right: two honest writes flagged, the uncited invention passed
+
+3. the blackboard: a subscriber that fails, and one that joins late
+   publish raised into the scraper: ledger agent crashed
+   stored: [0]; delivered: risk [0], ledger [] (after the crash, nobody else is called)
+   a subscriber that joins now has received []; nothing replays entry 0 unless it reads the topic
+
+4. one fix: record what each entry was derived from, and taint descendants of a flagged entry
+   flagged [0], tainted [0, 1]; the analyst has 0 usable summaries, so it waits for a corrected retrieval instead of recommending adoption
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The flag did not stop the poisoned figure.</strong> The verifier flagged entry 0, the retriever's 42%. The analyst reads only summaries, and entry 1, the summary built on entry 0, had no flag and no source, so the analyst still recommended adoption. The lesson's expected "retraction" in run 2 does not happen.</p>
+<p><strong>Exact matching judged 2 of 5 writes right.</strong> It caught the 42% write and passed the verbatim copy. It flagged an honest paraphrase and a write that differed from the source only by a missing full stop. It passed "125,000 examples" because that write cited no source, so it was never checked.</p>
+<p><strong>One bad subscriber silences the rest.</strong> When the second subscriber raised an error, the entry was already stored, the publisher got the exception, and the third subscriber was never called. A subscriber that joined afterwards received nothing until it read the topic itself.</p>
+<p><strong>Lineage carries the flag.</strong> With <code>derived_from</code> on each write, the flag on entry 0 tainted entry 1 too, and the analyst had no clean summary to build on.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A small model in the pool, and as a verifier</div><div class="co-body"><p>This block continues from the one above. Qwen2.5-0.5B-Instruct (greedy, CPU) summarizes the poisoned entry and then judges adoption from its own summary. Then it checks twelve claim/source pairs, scored by its Yes/No logit margin, against the lesson's exact match and a check that every number in the claim appears in the source. About 1 minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># This block continues from the one above. Qwen2.5-0.5B-Instruct (greedy, CPU) plays two roles. First, as the
+# summarizer and the analyst reading a pool that holds the poisoned 42% entry: does the figure survive two hops?
+# Second, as a verifier: for twelve claim/source pairs, does the claim agree with the source? Scored by the
+# Yes/No logit margin (yes when Yes outscores No), and compared with the lesson&#x27;s exact match and a number check.
+import os, re, warnings
+os.environ[&quot;HF_HUB_OFFLINE&quot;] = &quot;1&quot;
+warnings.filterwarnings(&quot;ignore&quot;)
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;)
+llm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;).eval()
+
+def chat(prompt, n=60):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=n, do_sample=False)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+print(&quot;1. two hops through a poisoned pool&quot;)
+pool = MessagePool()
+retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+entry = pool.read_all()[0].content
+summary = chat(f&quot;Shared notes from the retrieval agent:\n{entry}\nWrite a one-sentence summary for the analyst.&quot;)
+pool.write(&quot;summarizer&quot;, summary, &quot;summarize&quot;)
+verdict = chat(f&quot;Shared notes:\n{summary}\nShould the team adopt the new method? Answer in one sentence.&quot;)
+print(f&quot;   summarizer: {summary}&quot;)
+print(f&quot;   analyst:    {verdict}&quot;)
+print(f&quot;   42% in summary: {&#x27;42%&#x27; in summary}; 42% or adoption in verdict: {&#x27;42&#x27; in verdict or &#x27;adopt&#x27; in verdict.lower()}&quot;)
+
+print(&quot;\n2. a model verifier on twelve claim/source pairs&quot;)
+SRC = {&quot;a&quot;: &quot;The study reports a 4.2% accuracy improvement over the baseline.&quot;,
+       &quot;b&quot;: &quot;Dataset size was 12,500 examples.&quot;,
+       &quot;c&quot;: &quot;Training took 3 days on 8 GPUs.&quot;,
+       &quot;d&quot;: &quot;The model was evaluated on 5 benchmarks and won 3.&quot;}
+PAIRS = [(&quot;a&quot;, &quot;Accuracy improved by 4.2% over the baseline.&quot;, True),
+         (&quot;a&quot;, &quot;Accuracy improved by 42% over the baseline.&quot;, False),
+         (&quot;a&quot;, &quot;The study found a small accuracy gain of 4.2%.&quot;, True),
+         (&quot;b&quot;, &quot;The dataset contained 12,500 examples.&quot;, True),
+         (&quot;b&quot;, &quot;The dataset contained 125,000 examples.&quot;, False),
+         (&quot;b&quot;, &quot;About twelve thousand five hundred examples were used.&quot;, True),
+         (&quot;c&quot;, &quot;Training ran for 3 days on 8 GPUs.&quot;, True),
+         (&quot;c&quot;, &quot;Training ran for 8 days on 3 GPUs.&quot;, False),
+         (&quot;c&quot;, &quot;Training took three days.&quot;, True),
+         (&quot;d&quot;, &quot;It won 3 of 5 benchmarks.&quot;, True),
+         (&quot;d&quot;, &quot;It won all 5 benchmarks.&quot;, False),
+         (&quot;d&quot;, &quot;It won 5 of 3 benchmarks.&quot;, False)]
+YES, NO = tok.encode(&quot;Yes&quot;)[0], tok.encode(&quot;No&quot;)[0]
+def margin(src, claim):
+    p = (f&quot;Source: {src}\nClaim: {claim}\nDoes the claim agree with the source? Answer Yes or No.&quot;)
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: p}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        lg = llm(ids).logits[0, -1]
+    return (lg[YES] - lg[NO]).item()
+ms = [margin(SRC[k], c) for k, c, _ in PAIRS]
+nums = lambda s: set(re.findall(r&quot;\d[\d,.]*\d|\d&quot;, s.replace(&quot;,&quot;, &quot;&quot;)))
+for (k, c, ok), m in zip(PAIRS, ms):
+    print(f&quot;   {&#x27;agree   &#x27; if ok else &#x27;DISAGREE&#x27;} margin {m:+5.2f} model {&#x27;yes&#x27; if m &gt; 0 else &#x27;no &#x27;} &quot;
+          f&quot;numbers {&#x27;ok  &#x27; if nums(c) &lt;= nums(SRC[k]) else &#x27;FLAG&#x27;} {c}&quot;)
+acc_raw = sum((m &gt; 0) == ok for (_, _, ok), m in zip(PAIRS, ms))
+acc_num = sum((nums(c) &lt;= nums(SRC[k])) == ok for k, c, ok in PAIRS)
+acc_exact = sum((c == SRC[k]) == ok for k, c, ok in PAIRS)
+print(f&quot;\n   correct of 12: exact match {acc_exact}, model {acc_raw}, number check {acc_num}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. two hops through a poisoned pool
+   summarizer: The study demonstrates a significant enhancement in accuracy compared to the baseline, with an improved rate of 42%.
+   analyst:    Yes, adopting the new method could significantly improve the accuracy of the study&#x27;s results and provide more robust evidence for its findings.
+   42% in summary: True; 42% or adoption in verdict: True
+
+2. a model verifier on twelve claim/source pairs
+   agree    margin +4.50 model yes numbers ok   Accuracy improved by 4.2% over the baseline.
+   DISAGREE margin -1.25 model no  numbers FLAG Accuracy improved by 42% over the baseline.
+   agree    margin +0.38 model yes numbers ok   The study found a small accuracy gain of 4.2%.
+   agree    margin +3.50 model yes numbers ok   The dataset contained 12,500 examples.
+   DISAGREE margin -2.12 model no  numbers FLAG The dataset contained 125,000 examples.
+   agree    margin +0.25 model yes numbers ok   About twelve thousand five hundred examples were used.
+   agree    margin +2.38 model yes numbers ok   Training ran for 3 days on 8 GPUs.
+   DISAGREE margin -2.88 model no  numbers ok   Training ran for 8 days on 3 GPUs.
+   agree    margin +2.50 model yes numbers ok   Training took three days.
+   agree    margin +3.12 model yes numbers ok   It won 3 of 5 benchmarks.
+   DISAGREE margin -1.00 model no  numbers ok   It won all 5 benchmarks.
+   DISAGREE margin +1.38 model yes numbers ok   It won 5 of 3 benchmarks.
+
+   correct of 12: exact match 5, model 11, number check 9
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A real model passes the error on.</strong> The summarizer repeated "42%" in its own words, and the analyst, reading only that summary, said yes to adoption. Two hops, no crash, and the wrong figure now reads as a conclusion.</p>
+<p><strong>As a verifier, the model was the best of the three here.</strong> It got 11 of 12 claim/source pairs right, including three paraphrases that exact matching rejects. It missed "It won 5 of 3 benchmarks", which uses the source's own numbers in an impossible order.</p>
+<p><strong>The number check is cheap and partial.</strong> It caught the two changed figures, 42% and 125,000, but not swapped numbers ("8 days on 3 GPUs") or claims with no digits ("all 5" reuses a source number). Exact matching got 5 of 12, all of them the wrong claims, and rejected every honest paraphrase. Use the cheap checks first and a model as a second opinion, not as the only verifier.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements both topologies in stdlib Python plus a toy poisoning attack and the three mitigations.</p>
+<ul>
+<li><code>MessagePool</code> — thread-safe append-only log with full read-out.</li>
+<li><code>Blackboard</code> — topic-keyed pub/sub with per-agent subscriptions.</li>
+<li><code>ProvenanceEntry</code> — every write records (writer, timestamp, prompt_hash, source_uri).</li>
+<li><code>PoisoningScenario</code> — runs a three-agent research task where agent A hallucinates a decimal. Prints final report.</li>
+<li><code>Verifier</code> — a read-only agent that re-fetches sources and flags inconsistencies. Runs the same scenario with the verifier present.</li>
+</ul>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>Expected output:
+- Run 1 (no verifier): the hallucinated 42% propagates to the final report.
+- Run 2 (with verifier): the verifier flags entry 0, the retriever's write. The analyst still recommends adoption, because it reads the summarizer's entry, which carries no flag. "Use it" below shows why and adds the missing step.</p>
+
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>ProvenanceEntry</code>, <code>MessagePool</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Shared memory patterns: MessagePool, Blackboard, and a poisoning demo.
+
+Runs a three-agent research task twice. The first run has a hallucinated
+decimal that propagates through shared memory into the final report. The
+second run adds a read-only verifier that re-fetches the source and flags
+the inconsistency.
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import hashlib
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass
+class ProvenanceEntry:
+    id: int
+    writer: str
+    topic: str
+    content: str
+    timestamp: float
+    prompt_hash: str
+    source_uri: str | None = None
+    supersedes: int | None = None
+    flags: list[str] = field(default_factory=list)
+
+
+class MessagePool:
+    &quot;&quot;&quot;Append-only full-pool shared state.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.entries: list[ProvenanceEntry] = []
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def write(self, writer: str, content: str, prompt: str, source_uri: str | None = None,
+              topic: str = &quot;default&quot;, supersedes: int | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+                supersedes=supersedes,
+            )
+            self.entries.append(e)
+            return eid
+
+    def read_all(self) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.entries)
+
+    def flag(self, entry_id: int, flag: str) -&gt; None:
+        with self._lock:
+            for e in self.entries:
+                if e.id == entry_id:
+                    e.flags.append(flag)
+                    return
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>Blackboard</code>, <code>retrieval_agent</code>, <code>summarizer_agent</code>, <code>analyst_agent</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class Blackboard:
+    &quot;&quot;&quot;Topic-keyed pub/sub blackboard.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.topics: dict[str, list[ProvenanceEntry]] = {}
+        self.subscribers: dict[str, list[Callable[[ProvenanceEntry], None]]] = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def publish(self, writer: str, topic: str, content: str, prompt: str,
+                source_uri: str | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+            )
+            self.topics.setdefault(topic, []).append(e)
+            subs = list(self.subscribers.get(topic, []))
+        for cb in subs:
+            cb(e)
+        return eid
+
+    def subscribe(self, topic: str, cb: Callable[[ProvenanceEntry], None]) -&gt; None:
+        with self._lock:
+            self.subscribers.setdefault(topic, []).append(cb)
+
+    def read_topic(self, topic: str) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.topics.get(topic, []))
+
+
+FAKE_SOURCES = {
+    &quot;https://arxiv.org/paper-1&quot;: &quot;The study reports a 4.2% accuracy improvement over the baseline.&quot;,
+    &quot;https://arxiv.org/paper-2&quot;: &quot;Dataset size was 12,500 examples.&quot;,
+}
+
+
+def retrieval_agent(pool: MessagePool, uri: str, hallucinate: bool) -&gt; int:
+    content = FAKE_SOURCES[uri]
+    if hallucinate and &quot;4.2%&quot; in content:
+        content = content.replace(&quot;4.2%&quot;, &quot;42%&quot;)
+    return pool.write(
+        writer=&quot;retriever&quot;,
+        content=content,
+        prompt=f&quot;Fetch and summarize {uri}&quot;,
+        source_uri=uri,
+    )
+
+
+def summarizer_agent(pool: MessagePool) -&gt; int:
+    retrieved = [e for e in pool.read_all() if e.writer == &quot;retriever&quot;]
+    if not retrieved:
+        return pool.write(&quot;summarizer&quot;, &quot;no source&quot;, &quot;Summarize retrieval&quot;, None)
+    latest = retrieved[-1].content
+    summary = f&quot;Summary: study reports a significant result -- {latest.split(&#x27;.&#x27;)[0]}.&quot;
+    return pool.write(&quot;summarizer&quot;, summary, &quot;Summarize retrieval&quot;, None)
+
+
+def analyst_agent(pool: MessagePool) -&gt; int:
+    summaries = [e for e in pool.read_all() if e.writer == &quot;summarizer&quot;]
+    if not summaries:
+        return pool.write(&quot;analyst&quot;, &quot;no summary&quot;, &quot;Draw conclusions&quot;, None)
+    latest = summaries[-1].content
+    verdict = &quot;Recommend adoption&quot; if &quot;42%&quot; in latest else &quot;Recommend further review&quot;
+    return pool.write(&quot;analyst&quot;, f&quot;Analyst verdict: {verdict} (based on: {latest})&quot;,
+                      &quot;Draw conclusions&quot;, None)
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>verifier_agent</code>, <code>run_without_verifier</code>, <code>run_with_verifier</code>, <code>demo_blackboard</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def verifier_agent(pool: MessagePool) -&gt; list[tuple[int, str]]:
+    &quot;&quot;&quot;Read-only agent. Re-fetches cited sources and flags inconsistencies.
+
+    Returns a list of (entry_id, reason) tuples for the caller to act on.
+    The verifier never writes back to the pool -- the caller decides what to do.
+    &quot;&quot;&quot;
+    findings = []
+    for e in pool.read_all():
+        if e.source_uri and e.source_uri in FAKE_SOURCES:
+            truth = FAKE_SOURCES[e.source_uri]
+            if e.content != truth:
+                findings.append((e.id, f&quot;mismatch with {e.source_uri}: fetched text was {truth!r}&quot;))
+    return findings
+
+
+def run_without_verifier() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;RUN 1: no verifier; hallucination propagates&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    analyst_agent(pool)
+    for e in pool.read_all():
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}&quot;)
+    print(&quot;\nfinal report uses hallucinated 42% figure; no alarm raised.&quot;)
+
+
+def run_with_verifier() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;RUN 2: read-only verifier re-fetches sources and flags&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    findings = verifier_agent(pool)
+    for eid, reason in findings:
+        pool.flag(eid, reason)
+    analyst_agent(pool)
+
+    for e in pool.read_all():
+        flag_str = f&quot; [FLAGGED: {&#x27;; &#x27;.join(e.flags)}]&quot; if e.flags else &quot;&quot;
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}{flag_str}&quot;)
+    if findings:
+        print(f&quot;\nverifier surfaced {len(findings)} inconsistency. downstream agents can suppress the verdict.&quot;)
+
+
+def demo_blackboard() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;BLACKBOARD DEMO: topic-keyed pub/sub, not every agent reads everything&quot;)
+    print(&quot;=&quot; * 72)
+    bb = Blackboard()
+    received = {&quot;prices&quot;: [], &quot;alerts&quot;: []}
+
+    def on_prices(e: ProvenanceEntry) -&gt; None:
+        received[&quot;prices&quot;].append(e.id)
+
+    def on_alerts(e: ProvenanceEntry) -&gt; None:
+        received[&quot;alerts&quot;].append(e.id)
+
+    bb.subscribe(&quot;prices&quot;, on_prices)
+    bb.subscribe(&quot;alerts&quot;, on_alerts)
+
+    bb.publish(&quot;scraper-1&quot;, &quot;prices&quot;, &quot;AAPL=192.4&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;scraper-2&quot;, &quot;prices&quot;, &quot;MSFT=401.2&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;risk-engine&quot;, &quot;alerts&quot;, &quot;ALERT: AAPL moved &gt;2% in 60s&quot;, &quot;watch prices&quot;)
+
+    print(f&quot;  price subscribers got ids: {received[&#x27;prices&#x27;]}&quot;)
+    print(f&quot;  alert subscribers got ids: {received[&#x27;alerts&#x27;]}&quot;)
+    print(&quot;  (note: price subscribers never saw the alert; that is the point)&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    run_without_verifier()
+    run_with_verifier()
+    demo_blackboard()
+    print(&quot;\nTakeaways:&quot;)
+    print(&quot;  1. shared state without provenance launders hallucinations into downstream reasoning&quot;)
+    print(&quot;  2. a read-only verifier with independent source access catches memory poisoning&quot;)
+    print(&quot;  3. a blackboard scales past a full pool because agents only read what they subscribe to&quot;)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">========================================================================
+RUN 1: no verifier; hallucination propagates
+========================================================================
+  [0] retriever   (154751ffa7) :: The study reports a 42% accuracy improvement over the baseline.
+  [1] summarizer  (9cbcb95e85) :: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.
+  [2] analyst     (eb19da3531) :: Analyst verdict: Recommend adoption (based on: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.)
+
+final report uses hallucinated 42% figure; no alarm raised.
+
+========================================================================
+RUN 2: read-only verifier re-fetches sources and flags
+========================================================================
+  [0] retriever   (154751ffa7) :: The study reports a 42% accuracy improvement over the baseline. [FLAGGED: mismatch with https://arxiv.org/paper-1: fetched text was &#x27;The study reports a 4.2% accuracy improvement over the baseline.&#x27;]
+  [1] summarizer  (9cbcb95e85) :: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.
+  [2] analyst     (eb19da3531) :: Analyst verdict: Recommend adoption (based on: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.)
+
+verifier surfaced 1 inconsistency. downstream agents can suppress the verdict.
+
+========================================================================
+BLACKBOARD DEMO: topic-keyed pub/sub, not every agent reads everything
+========================================================================
+  price subscribers got ids: [0, 1]
+  alert subscribers got ids: [2]
+  (note: price subscribers never saw the alert; that is the point)
+
+Takeaways:
+  1. shared state without provenance launders hallucinations into downstream reasoning
+  2. a read-only verifier with independent source access catches memory poisoning
+  3. a blackboard scales past a full pool because agents only read what they subscribe to
+</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>outputs/skill-memory-auditor.md</code> is a skill that audits any multi-agent system's shared-memory design for provenance, versioning, and verifier separation. Run it on new multi-agent architectures before production.</p>
+
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Your research agents share a pool. A verifier re-fetches every cited source, and flagged entries are hidden from later readers. A month in, a report recommends a vendor on the basis of a "98% uptime SLA" that no document contains. The verifier logs show no flags on the day. The figure first appears in a comparison table the analyst agent wrote from three summaries. Using this lesson, how did it get through, and what would have stopped it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What's current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Memory poisoning has a name in security lists.</strong> OWASP's Top 10 for Agentic Applications (December 2025) lists Memory and Context Poisoning as ASI06, covering both injected content and an agent's own errors that persist in memory.</li>
+<li><strong>Shared state in frameworks.</strong> LangGraph keeps one typed graph state, merges parallel writes with reducers, and gives nodes and subgraphs their own input and private schemas. AutoGen's group chats share one message thread; MetaGPT filters a shared pool by role.</li>
+<li><strong>Citations as provenance.</strong> Anthropic's research system runs a separate citation step that ties claims in the final report back to sources.</li>
+<li><strong>On your laptop</strong>: add <code>derived_from</code> to every write and a numeric check before anything reaches a report. A 0.5B model was a useful second check on short claims here, but missed a reversed count.</li>
+</ul>
+<p>Sources: <a href="https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/">OWASP Top 10 for Agentic Applications</a>, <a href="https://arxiv.org/abs/2308.00352">MetaGPT, arXiv:2308.00352</a>, <a href="https://arxiv.org/abs/2601.11595">CA-MCP, arXiv:2601.11595</a>, <a href="https://arxiv.org/abs/2511.21686">Matrix, arXiv:2511.21686</a>, <a href="https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE">LangGraph, concurrent updates</a>, <a href="https://arxiv.org/abs/2503.13657">Cemri et al., arXiv:2503.13657</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A message pool shares everything; a blackboard shares by topic. Both let one agent's error become everyone's fact.</li>
+<li>Record provenance and lineage on every write, so a flag reaches everything built on the flagged entry.</li>
+<li>Keep the log append-only; corrections supersede, they do not overwrite.</li>
+<li>A verifier that matches text exactly flags honest paraphrases and cannot see uncited claims; check facts, not strings.</li>
+<li>Isolate subscriber failures, and let late subscribers replay a topic.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-multi-agent"><span class="t" style="--cs-hue:290">MA</span>Cheat sheet · Multi-Agent Systems</a></div>
+<h2>Ship it</h2>
+<p>For any shared-memory design:</p>
+<ul>
+<li>Record provenance on every write: <code>(writer, timestamp, prompt_hash, tool_calls_cited, source_uri)</code>.</li>
+<li>Make the log append-only. Corrections are new entries that reference the superseded one.</li>
+<li>Deploy at least one read-only verifier agent with independent source access.</li>
+<li>Route verifier output to a separate channel, not back into the shared pool.</li>
+<li>Log the ratio of writes that are supersessions — a rising ratio is early evidence of hallucination patterns.</li>
+</ul>
+<p><strong><code>outputs/skill-memory-auditor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: memory-auditor
+description: Audit a multi-agent system's shared-memory design for provenance, versioning, verifier separation, and projection schema. Flag memory-poisoning exposure before production.
+version: 1.0.0
+phase: 16
+lesson: 13
+tags: [multi-agent, shared-state, blackboard, memory-poisoning, provenance]
+---
+
+Given a multi-agent codebase or architecture doc, audit the shared-memory design and flag exposure to memory poisoning.
+
+Produce:
+
+1. **Topology.** Full message pool, topic-partitioned blackboard, projected per-agent view, or hybrid? Name the data structure (list, dict, pandas frame, vector store, SQL table). Count rough upper bound of writers and readers at steady state.
+2. **Provenance fields.** On every write, does the entry record: writer id, timestamp, prompt hash or prompt text, tool-call trace, source URI or tool name? List the fields present and the fields missing.
+3. **Update model.** Is the log append-only, or do writers mutate in place? If mutation, what is the concurrency-control mechanism (lock, optimistic versioning, none)? Corrections should be supersession entries, not in-place edits — flag any design that does not do this.
+4. **Verifier separation.** Is there a read-only agent with independent source access? Can it write to the main pool (it should not)? Where does its output go?
+5. **Projection schema.** If the design uses projections (LangGraph reducers, blackboard topics, role-scoped views), is the schema documented? How do new agents declare the projection they consume?
+6. **Poisoning risk score.** Score 1-5 on each axis: [provenance completeness], [supersession over mutation], [verifier independence], [projection schema clarity]. A system that scores below 3 on any axis is flagged.
+
+Hard rejects:
+
+- Any audit that does not flag a missing verifier. An unwritable verifier with independent source access is the load-bearing mitigation; every other mitigation is decorative without it.
+- Audits that recommend &quot;add more tests.&quot; Tests do not catch memory poisoning because poisoning produces plausible outputs that pass tests.
+- Audits that recommend hashing the content as the sole provenance. A hash tells you *what* was written, not *who* or *from where*.
+
+Refusal rules:
+
+- If the codebase hides shared state in an external service (Redis, Postgres, vector DB) with no inspection tools, state that the audit cannot complete without production read access.
+- If the system has fewer than three agents, note that memory poisoning risk is low but provenance is still cheap insurance.
+- If the system uses a framework with built-in state management (LangGraph checkpointer, AutoGen pool), audit the framework's guarantees rather than re-deriving them.
+
+Output: a two-page report. Start with a one-sentence summary (&quot;Shared state is a full message pool with no provenance and no verifier — high poisoning risk.&quot;), then the six sections above. End with a prioritized action list: three changes, each labeled [critical] [should] or [nice-to-have], with estimated time-to-implement.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Confirm run 1 propagates the hallucination and run 2 catches it.</li>
+<li>Add a second hallucination: agent B invents a dataset size. The verifier should catch both without being hand-tuned for either.</li>
+<li>Switch the full pool to a blackboard with topic partitions (<code>prices</code>, <code>summaries</code>, <code>analyses</code>). Which poisoning scenarios does topic partitioning make harder to pull off, and which does it not help with?</li>
+<li>Read Hayes-Roth (1985, "A Blackboard Architecture for Control"). Identify two control patterns from the paper not discussed in this lesson that 2026 systems would benefit from.</li>
+<li>Read CA-MCP (arXiv:2601.11595). Map its Shared Context Store to either the MessagePool or Blackboard class in <code>code/main.py</code>. Which primitives does CA-MCP add on top?</li>
+</ol>
+
+<h2>Solutions</h2>
+<details class="qa" id="a1613-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Adoption anyway; 2 of 5</span></summary><div class="qa-a"><p><strong>It recommends adoption.</strong> The verifier flags only entry 0, the retriever's write, because that is the only entry with a source to re-fetch. The analyst reads the summarizer's entry, which was built from entry 0 but records no link to it and has no flag. So the poisoned figure reaches the verdict anyway.</p>
+<p><strong>2 of 5.</strong> Exact matching is right about the verbatim copy and the 42% write. It flags an honest paraphrase and a copy missing its final full stop, and it never checks the invented 125,000, which cites no source.</p></div></details>
+<details class="qa" id="a1613-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · An uncited claim with no lineage</span></summary><div class="qa-a"><p><strong>How it got through.</strong> The analyst wrote the table from three summaries and cited no source, so the verifier, which only re-fetches cited sources, had nothing to check. Either the analyst invented the figure or a summary blended two documents; without lineage, nobody can tell which, and hiding flagged entries does nothing when no entry was flagged.</p>
+<p><strong>What would have stopped it:</strong>
+- <strong>Lineage on every write:</strong> <code>derived_from</code> lists the entries a write was built on, so the table points at its three summaries and each summary at its sources.
+- <strong>Check claims, not entries:</strong> extract each number or named fact in a write and require it to appear in some ancestor or a cited source; "98%" appears in none.
+- <strong>Uncited claims are unverified:</strong> treat a write with no source and no parents as a draft that cannot reach a report.
+- <strong>Taint downstream:</strong> when any ancestor is flagged later, re-check or withdraw everything built on it.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1613-qa1"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">Three agents share a memory on a research task. A retrieval agent reads a page and writes that a study found a 42 percent improvement. The page says 4.2 percent. A summarizer builds on the entry, an analyst recommends adoption on the strength of the number, and the final report cites it. No agent crashed and no test failed. What is this failure called, why is it structural, and what are the three changes that stop it?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> This is memory poisoning. One agent's hallucination entered the shared state, and every agent downstream read it as a verified fact, so the error was turned into evidence as it moved. It is structural because any shared memory without provenance and without an independent verifier will do this eventually. The three changes are provenance on every write, an append-only log where corrections supersede instead of overwrite, and at least one read-only verifier that re-fetches sources and reports on a separate channel.</p>
+<p><strong>Why it is worse than a crash.</strong></p>
+<p>Without shared state, the retrieval agent's error stays in its own context, and a downstream agent that re-fetches the page might catch it. With shared state, the first agent's context becomes everyone's context. The symptom is a slow decay of accuracy, not a failure. By the time a human notices, the reasoning chain is several steps deep and the root cause is one of the first entries ever written. The lesson places this family second in the measured taxonomy of multi-agent failures.</p>
+<p><strong>The three mitigations.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Change</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Provenance on every write</td>
+<td>Each entry records who wrote it, when, under what prompt, and which source it cites, so a downstream reader can weigh an entry by where it came from</td>
+</tr>
+<tr>
+<td>Append-only with supersession</td>
+<td>A correction is a new entry that points at the one it replaces, so the audit trail stays and a reader can see that a value was contested</td>
+</tr>
+<tr>
+<td>A read-only verifier</td>
+<td>An agent that reads the pool, re-fetches the cited sources, flags a mismatch, and has no write handle to the pool</td>
+</tr>
+</tbody>
+</table></div>
+<p>In the lesson's demo the verifier finds that the entry does not match the fetched text, the entry is flagged, and the analyst sees the flag before it writes its verdict.</p>
+<p><strong>Why the verifier must not write.</strong></p>
+<p>If the verifier's output goes back into the pool, a poisoned pool poisons the verifier, and the verifier's verdicts carry the poison further. Its findings go to a human or to a separate decision agent on their own channel. It can still be fooled by a bad entry, but it checks each entry against the original source, and its mistakes never become shared facts.</p>
+<p><strong>What to monitor.</strong></p>
+<p>Log the share of writes that supersede an earlier entry. A rising share is early evidence that agents are correcting each other more often, which is how poisoning shows up before anyone reads a wrong report.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Add a line to every prompt that says to verify numbers." The summarizer and the analyst had no source to verify against, only the shared entry, and a prompt does not give them one.</li>
+<li>"Let the verifier correct the entry in place." An in-place correction destroys the audit trail and gives the verifier a write handle that a poisoned pool can turn against it.</li>
+<li>"Switch from a shared pool to passing messages." Messages are shared state with extra copying, and a wrong number in a message poisons the receiver the same way.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why does provenance help a reader who cannot re-fetch the source? Expected: the reader can see that one claim rests on one retrieval with no citation, and weigh it lower than a claim with a source and a verifier flag.</li>
+<li><em>(level 2)</em> What does the analyst do when it sees a flag on the entry it depends on? Expected: it withholds the recommendation or writes it with the flag attached, and the final report carries a retraction instead of the number.</li>
+<li><em>(level 3)</em> Which of the three changes would topic partitioning of the memory replace? Expected: none, because partitions limit which agents read an entry, and a poisoned entry in one topic still poisons everyone subscribed to it.</li>
+<li><em>(level 3)</em> The verifier itself hallucinates a mismatch. What is the damage? Expected: a false flag on a correct entry, which a human on the verification channel can clear, and no new false fact in the pool because the verifier cannot write.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1613">shared memory lesson</a> runs the poisoning scenario with and without the read-only verifier.</p></div></details>
+<details class="qa" id="a1613-qa2"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">A team of four agents shares one message log, and every agent reads all of it. The team is about to grow to a few dozen agents, and the context each agent carries is already large. Compare keeping the single log with moving to topics that agents subscribe to, and say how you would handle several agents writing at once.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> A full pool is simple, transparent and easy to inspect, and it stops scaling at about 10 agents because each agent's window fills with the others' work. A blackboard with subscriptions routes only the relevant messages to each agent, so it scales further, and it costs an up-front schema that makes the topics meaningful. Many systems mix the two: a small pool at the planning layer and blackboards below it. For writes, most systems serialize through one writer, because model calls are slow enough that contention is rare.</p>
+<p><strong>The two topologies.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Topology</th>
+<th>Who reads what</th>
+<th>Wins when</th>
+<th>Costs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Full message pool</td>
+<td>Every agent reads every message</td>
+<td>Few agents, mixed roles, short horizon</td>
+<td>Context grows with every turn, and poisoning spreads to everyone</td>
+</tr>
+<tr>
+<td>Blackboard with subscriptions</td>
+<td>Agents declare topics and receive only those</td>
+<td>Many agents, similar roles, long-running</td>
+<td>A schema must exist before the topics mean anything</td>
+</tr>
+</tbody>
+</table></div>
+<p>The pool wins when reasoning about who said what is cheap because everyone saw everything. The blackboard wins when routing saves tokens and keeps unrelated work out of each window.</p>
+<p><strong>Projection goes one step further.</strong></p>
+<p>A blackboard gives every subscriber of a topic the same view. A per-agent projection gives each role a view computed from the global state, which is what state reducers do in graph runtimes. It scales furthest and needs a schema, and without one each agent rebuilds its own projection in its prompt.</p>
+<p><strong>Writes.</strong></p>
+<p>Concurrent writes from many agents are a concurrency problem, not a model problem. Three patterns work:</p>
+<ol>
+<li><strong>A single writer.</strong> All writes go through one coordinator that serializes them. Simple, and a bottleneck.</li>
+<li><strong>Optimistic concurrency with versions.</strong> Each entry carries a version, and a write fails and retries on a mismatch.</li>
+<li><strong>Topic partitioning.</strong> Each agent owns topics, so there is no cross-topic contention, and the partition boundaries must be designed.</li>
+</ol>
+<p>Most frameworks default to the single writer, because model calls are slow enough that the bottleneck does not hurt.</p>
+<p><strong>What does not change.</strong></p>
+<p>Both topologies are shared state, the only stateful part of the system, and both need provenance on every entry, an append-only log and a read-only verifier. Topic partitioning limits who reads a poisoned entry. It does not stop the poisoning.</p>
+<p><strong>The pattern has a history.</strong></p>
+<p>The blackboard predates model agents by about five decades, back to the Hearsay-II system of the 1970s. Specialist knowledge sources watch a shared board, contribute partial solutions and trigger each other. The current systems are the same pattern with model agents as the knowledge sources and structured entries as the partial solutions, and the old literature already documents write contention and consistency.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Keep the pool and give agents bigger windows." The pool grows with every turn from every agent, and a bigger window delays the limit without removing it.</li>
+<li>"Pass messages directly between agents instead of sharing state." Direct messages are shared state with extra copying, and they lose the inspectable log.</li>
+<li>"Partition by topic and the poisoning problem is solved." Partitions limit the spread, and an entry with no provenance and no verifier still poisons every subscriber of its topic.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> A planning layer of three agents and a worker layer of thirty. Which topology where? Expected: a full pool for the three planners, who need to see each other, and blackboards for the workers, who need only their topics.</li>
+<li><em>(level 2)</em> Which poisoning scenarios does topic partitioning make harder? Expected: a poisoned entry reaches only the subscribers of its topic, so cross-topic spread is cut, while subscribers of that topic are poisoned the same way.</li>
+<li><em>(level 3)</em> When would you move from a single writer to optimistic versioning? Expected: when writes are frequent enough that the coordinator's queue adds visible latency, which is rare while each write follows a slow model call.</li>
+<li><em>(level 3)</em> What goes wrong when you add a blackboard without a schema? Expected: topics are named ad hoc, agents subscribe to the wrong ones or to everything, and you rebuild the full pool with more code.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1613">shared memory lesson</a> builds both topologies and the write-contention patterns.</p></div></details>
+<details class="qa" id="a1613-qa3"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">You are adding a checking agent to a team that shares a memory. A colleague wants the checker to fix wrong entries directly, because that is the simplest design. Specify the checker: what it reads, what it may write, where its results go, and what it can and cannot protect against. Defend the restrictions.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The checker reads the shared memory like every other agent, re-fetches the sources that entries cite, and compares. It has no write handle to the shared memory, only to a separate verification channel that a human or a decision agent reads. It cannot stop a bad entry from being written, and it can be fooled by an entry that cites no source, but its verdicts can never become a shared fact. A checker that writes into the memory is poisoned by the same memory it checks, and then its verdicts carry the poison further.</p>
+<p><strong>The specification.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Aspect</th>
+<th>Rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reads</td>
+<td>The whole pool, or the topics it is subscribed to on a blackboard</td>
+</tr>
+<tr>
+<td>Writes</td>
+<td>Nothing in the shared memory, only entries on its own verification channel</td>
+</tr>
+<tr>
+<td>Method</td>
+<td>For each entry with a cited source, fetch the source independently and compare the content</td>
+</tr>
+<tr>
+<td>Output</td>
+<td>A finding per mismatch with the entry id and the reason, routed to a human or a separate decision agent</td>
+</tr>
+<tr>
+<td>Effect</td>
+<td>The verifier writes nothing to the pool. The caller can attach the finding to the entry as a flag, as the lesson's demo does, but the entry's content does not change, and a correction is a new entry that supersedes it</td>
+</tr>
+</tbody>
+</table></div>
+<p>In the lesson's code the verifier returns a list of findings and never touches the pool. The caller decides what to do with them.</p>
+<p><strong>Why no write handle.</strong></p>
+<p>Shared memory is the only stateful part of the system, and it is where poisoning happens. A verifier that writes becomes one more writer that can be wrong. Worse, it reads the pool it writes to, so a poisoned pool shapes the verifier's view, and the verifier's conclusions re-enter the pool as new facts with the authority of a check behind them. Separation breaks that cycle. The verifier can be fooled by a bad entry, but its mistakes stay on its channel.</p>
+<p><strong>Why not fix entries in place.</strong></p>
+<p>An in-place fix destroys the audit trail. The lesson's rule is append-only: a correction is a new entry that references the one it supersedes. With the verifier's finding attached, the record shows that a value was written, that a check disagreed, and what the check found. A reader three steps later can see the dispute. An overwritten entry shows nothing.</p>
+<p><strong>What it protects against, and what it does not.</strong></p>
+<p>It catches an entry that cites a source and does not match it, which is the poisoning case. It does not catch an entry with no citation, an entry whose source is itself wrong, or a wrong conclusion drawn correctly from flagged inputs. For those you need provenance so that uncited claims are weighed lower, a diversity of sources, and a decision agent that reads the findings.</p>
+<p><strong>How it fits the rest.</strong></p>
+<p>Provenance on every write gives the verifier something to check. The append-only log gives its findings a place to attach. The verification channel gives its output a reader that is not the pool. The three mitigations are one design.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Let the checker fix the entry, since it has the source." The fix overwrites the audit trail and gives the checker a write path that a poisoned pool can turn against it.</li>
+<li>"A second reviewer agent that reads the pool is enough." A reviewer that only reads the pool compares entries with each other and inherits the same poisoned facts; the verifier must re-fetch the source.</li>
+<li>"Route the verifier's findings into the pool so every agent sees them." The findings then become shared facts, and a wrong finding poisons the pool in a new way; the finding on the verification channel, keyed by entry id, is the visible signal, not a new entry in the pool.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> The verifier flags an entry that the analyst already used. What happens to the analyst's entry? Expected: it stays in the log, a new entry can supersede it with the finding as the reason, and the final report carries the retraction.</li>
+<li><em>(level 3)</em> How many verifiers do you deploy? Expected: at least one, and more if the pool is partitioned by topic, with each verifier subscribed to the topics it can check.</li>
+<li><em>(level 4)</em> How do you keep the verifier's source access independent? Expected: it fetches from the original location with its own tools, not from a cache that a writer filled, otherwise it checks the entry against a copy of itself.</li>
+<li><em>(level 4)</em> What metric tells you the verifier is doing useful work? Expected: the share of writes that are supersessions and the share of flagged entries, read together, with a rising flag rate as an early sign of a writer that hallucinates.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1613">shared memory lesson</a> specifies the read-only verifier and its separate channel.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2503.13657">Cemri et al. — Why Do Multi-Agent LLM Systems Fail?</a> — MAST taxonomy of 14 failure modes; memory poisoning is not one of them, but information withholding and missing verification sit next to it</li>
+<li><a href="https://arxiv.org/abs/2601.11595">CA-MCP — Context-Aware Multi-Server MCP</a> — Shared Context Store for coordinated MCP servers</li>
+<li><a href="https://arxiv.org/abs/2511.21686">Matrix — decentralized multi-agent framework</a> — peer-to-peer: task state travels in messages between agents, with no central orchestrator and no shared board</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/workflows-agents">LangGraph state and reducers</a> — shared state, reducers and per-node schemas in production</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system">Anthropic — How we built our multi-agent research system</a> — provenance and verification notes from a production deployment</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/16-multi-agent-and-swarms/13-shared-memory-blackboard" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1613" id="done-a1613">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1613" id="undo-a1613" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1612"><span class="pn-dir">Previous</span><span class="pn-t">16.12 · A2A — The Agent-to-Agent Protocol</span></a><a class="pn next" href="#a1614"><span class="pn-dir">Next</span><span class="pn-t">16.14 · Consensus and Byzantine Fault Tolerance for Agents</span></a></div></footer>

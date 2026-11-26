@@ -1,0 +1,458 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-12">Phase 12 · Multimodal AI</a></nav><h1>Document and Diagram Understanding</h1><div class="m-meta"><span class="chip chip-num">Lesson 12.22</span><span class="chip">180 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1222" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain the three eras of document AI: OCR pipeline, OCR-free, VLM-native.</li>
+<li>Describe LayoutLMv3's three input streams: text, layout (bbox), image patches, with unified masking.</li>
+<li>Compare Donut (OCR-free, image → markup), Nougat (scientific paper → LaTeX), DocLLM (layout-aware generative), PaliGemma 2 (VLM-native).</li>
+<li>Pick a document model for a new task (invoices, scientific papers, handwritten forms, Chinese receipts).</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 12 · 05 (LLaVA), Phase 5 (NLP)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 180 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, layout-aware document parser skeleton), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Documents are not photos. A PDF, scientific paper, invoice, or handwritten form has layout, tables, diagrams, footnotes, headers, and semantic structure that plain image understanding cannot capture. The pre-VLM stack was a pipeline: Tesseract OCR + LayoutLMv3 + table-extraction heuristics. The VLM wave replaced that with OCR-free models — Donut (2022) and Nougat (2023) — that emit structured markup directly, while layout-aware models such as LayoutLMv3 and DocLLM kept the OCR step and added the page geometry. By 2026 the common approach is to feed the page image to a VLM at high resolution (Claude 4.7 and later accept up to 2,576 pixels on the long edge) and ask for structured markup, or to run a small dedicated document-parsing VLM</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OCR pipeline</td>
+<td>"Tesseract-style"</td>
+<td>Stage-wise stack: detect -&gt; OCR -&gt; layout -&gt; rules; deterministic, fragile</td>
+</tr>
+<tr>
+<td>OCR-free</td>
+<td>"Donut-style"</td>
+<td>Image-to-output transformer that skips explicit OCR; single model</td>
+</tr>
+<tr>
+<td>Layout-aware</td>
+<td>"LayoutLM"</td>
+<td>Input includes per-token bounding boxes; LayoutLMv3 also reads image patches, masks text and patches, and aligns words with patches</td>
+</tr>
+<tr>
+<td>VLM-native</td>
+<td>"Frontier VLM"</td>
+<td>Feed page image directly to Claude/GPT/Qwen VLM at high resolution; no pipeline</td>
+</tr>
+<tr>
+<td>DocVQA</td>
+<td>"Doc benchmark"</td>
+<td>Questions about scanned document images, scored with ANLS (a string-similarity accuracy); the most-cited document score</td>
+</tr>
+<tr>
+<td>Markup output</td>
+<td>"LaTeX / MD"</td>
+<td>Structured output format instead of free-form text; enables downstream automation</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A document is more than its words. On an invoice, "$1,022.40" means "the total" because of where it sits: on the row that says Total, at the bottom right. Document AI is about reading text together with that layout, plus tables, formulas and handwriting. It went through three eras. First came pipelines: OCR finds the words and their boxes, then rules or layout-aware models such as LayoutLMv3 pick out the fields. Then came OCR-free models such as Donut and Nougat, which turn the page image straight into structured text. Now vision-language models read the page image at high resolution and answer or convert it directly. This lesson runs a real OCR engine on a rendered invoice, builds LayoutLMv3's three inputs with its real processor, and counts what one page costs each kind of model. No model is trained, and no model weights are downloaded.</p></div></aside>
+<p>"Understand this PDF" is deceptively hard. The information sits in:</p>
+<ul>
+<li>Text content (most of the signal).</li>
+<li>Layout (headers, footnotes, sidebars, two-column format).</li>
+<li>Tables (rows, columns, merged cells).</li>
+<li>Figures and diagrams.</li>
+<li>Handwritten annotations.</li>
+<li>Fonts and typography (title vs body).</li>
+</ul>
+<p>Raw OCR dumps the text and loses the rest. A system that cares about invoices needs to know "Total: $1,245" came from the bottom-right, not from a footnote.</p>
+<h2>Idea 1 · Era 1 — OCR pipeline (pre-2021)</h2>
+<p>The classic stack:</p>
+<ol>
+<li>PDF → image per page.</li>
+<li>Tesseract (or commercial OCR) extracts text with per-word bounding boxes.</li>
+<li>Layout analyzer identifies blocks (header, table, paragraph).</li>
+<li>Table structure recognizer parses tables.</li>
+<li>Domain rules + regex extract fields.</li>
+</ol>
+<p>Works for clean printed text. Breaks on handwriting, skewed scans, complex tables, non-English scripts. Every failure mode requires a custom exception path.</p>
+<h2>Idea 2 · TrOCR (2021)</h2>
+<p>TrOCR (Li et al., arXiv:2109.10282) replaced the usual CNN-plus-recurrent text recognizer with a pure transformer: an image encoder initialised from BEiT or DeiT reads a cropped text line, and a text decoder initialised from RoBERTa or MiniLM writes it out. It was pretrained on about 684M text lines cut from digital PDFs, then on synthetic and task data; TrOCR-Large reached a 2.89% character error rate on IAM handwriting and 96.6 F1 on SROIE receipts. Clean win on handwritten and printed text. Still a pipeline (a detector finds the lines, TrOCR reads them, layout comes after), but the OCR step improved dramatically.</p>
+<h2>Idea 3 · Era 2 — OCR-free (2022-2023)</h2>
+<p>The first OCR-free models said: skip detection entirely, map image pixels to structured output directly.</p>
+<p>Donut (Kim et al., arXiv:2111.15664):
+- Encoder-decoder transformer: a Swin-B encoder reading the page at up to 2560×1920 and a 4-layer BART decoder, about 143M parameters.
+- Output is a token sequence that converts to JSON: fields for forms and receipts, a class for document classification, an answer for DocVQA (67.5 ANLS, against 78.1 for LayoutLMv2 with OCR).
+- Pretraining is "pseudo-OCR": read all the text in order, on 11M scanned pages (IIT-CDIP) plus about 2M synthetic pages in four languages (SynthDoG).
+- No OCR, no layout, no detection.</p>
+<p>Nougat (Blecher et al., arXiv:2308.13418):
+- Trained specifically on scientific papers: about 8.2M pages, over 90% of them from arXiv.
+- Output is Markdown with LaTeX math (Mathpix Markdown), about 1,400 tokens per page.
+- Handles equations, multi-column layout, figures.
+- Swin encoder at 896×672 and a 10-layer mBART decoder, 350M parameters. On about 1.5% of test pages it falls into a repetition loop, more often out of domain.</p>
+<p>These are specialists, not generalists. Donut on a scientific paper fails; Nougat on an invoice fails.</p>
+<h2>Idea 4 · LayoutLMv3 (2022)</h2>
+<p>A different track. LayoutLMv3 (Huang et al., arXiv:2204.08387) keeps OCR but adds layout understanding:</p>
+<ul>
+<li>Three input streams: OCR text tokens, per-token 2D bounding boxes, image patches.</li>
+<li>Pretraining: masked language modelling on the text, masked image modelling on the patches (targets from an image tokenizer), and word-patch alignment (is this word's image patch masked?).</li>
+<li>Downstream: classification, entity extraction, table QA.</li>
+</ul>
+<p>LayoutLMv3 is the peak of OCR-based document understanding. Strong on forms and invoices: FUNSD form F1 92.1 (large). Requires OCR upstream: with Microsoft's Read OCR it reached DocVQA ANLS 78.8 (base, 133M) and 83.4 (large, 368M).</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Layout as numbers.</strong> LayoutLM-style models put each word's box on a 0–1000 grid, whatever the page size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6679em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">x</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.2222em;"><span class="mord">~</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.836em;vertical-align:-0.686em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size2">⌊</span></span><span class="mord">1000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">x</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size2">⌋</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">y</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">~</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.836em;vertical-align:-0.686em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size2">⌊</span></span><span class="mord">1000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.08125em;">H</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size2">⌋</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">.</span></span></span></span></span></div>
+Every subword token of a word gets that word's box. LayoutLMv3's image stream is a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">224</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">224</span></span></span></span> page cut into <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">16</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span> patches: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">224/16</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">196</span></span></span></span> patch tokens.</p>
+<p><strong>What a page costs a VLM.</strong> With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> pixels per visual token, a page of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span></span></span></span> pixels costs
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.4em;vertical-align:-0.95em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.08125em;">H</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">⌉</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">28</span><span class="mord text"><span class="mord"> for Qwen2.5-VL and Claude</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">32</span><span class="mord text"><span class="mord"> for a Swin encoder’s last stage.</span></span></span></span></span></span></div></p>
+<p><strong>Can it still read?</strong> For <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span>-point text on a page <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> inches tall, shown to the model at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> pixels tall, the x-height (height of a lowercase "x", about half the point size) is
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">x</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.7936em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">72</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mord text"><span class="mord">pixels.</span></span></span></span></span></span></div></p>
+<p><strong>ANLS</strong>, the DocVQA metric: for each question, compare the output <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> with each accepted answer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> by normalised edit distance <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">NL</span></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm" style="margin-right:0.01389em;">Lev</span></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mord">/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord">∣</span><span class="mord mathnormal">a</span><span class="mord">∣</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∣</span><span class="mord mathnormal">o</span><span class="mord">∣</span><span class="mclose">)</span></span></span></span>, and average the best score
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathrm">NL</span></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">if </span></span><span class="mord"><span class="mord mathrm">NL</span></span><span class="mopen">(</span><span class="mord mathnormal">a</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">o</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">0.5</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">otherwise.</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">An A4 invoice through three kinds of model</div><div class="co-body"><ul>
+<li>At 150 dpi an A4 page is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1240</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1754</span></span></span></span> pixels. Qwen2.5-VL rounds it to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1232</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1764</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">44</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">63</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">772</span></span></span></span> visual tokens.</li>
+<li>10-point text at 150 dpi has an x-height of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">72</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">150</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10.4</span></span></span></span> pixels: easy to read.</li>
+<li>Nougat squeezes the page to 896 pixels tall: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">72</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">11.69</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">896</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5.3</span></span></span></span> pixels. Still readable, just.</li>
+<li>LayoutLMv3's image is 224 pixels tall: about 1.3 pixels. Its image stream sees layout, not letters; the words must come from OCR.</li>
+<li>ANLS for the answer "$1,022.40": the output "$1,022.4" is one edit away, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">NL</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/9</span></span></span></span>, score 0.89. The wrong total "$1,245.00" is 4 edits away, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">NL</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">0.44</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>, so it still scores 0.56. "$189.00" is 5 edits away and scores 0. ANLS forgives typos, and sometimes wrong numbers.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "OCR-free means the model ignores text."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It reads the text itself from pixels; it just has no separate OCR engine.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "LayoutLMv3 reads the words from its image patches."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> At 224 pixels the letters are a pixel tall; it takes words and boxes from OCR, and the image adds layout and style.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Higher resolution is always better for a VLM."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Tokens grow with the square of the resolution; past the point where text is legible, you pay for nothing.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A high DocVQA score means the extracted numbers are right."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> ANLS gives partial credit for near-misses, including wrong numbers that share digits.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A rendered invoice goes through Tesseract, a classic OCR engine. Will a regular expression for the first dollar amount in the OCR text find the invoice total? And how much skew, blur, noise or lost resolution can the OCR take before it stops reading? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">An Era-1 pipeline on a rendered invoice</div><div class="co-body"><p>A two-column invoice is drawn with Pillow at about 150 dpi and read by Tesseract 5, an open-source OCR engine (via <code>pytesseract</code>; install the <code>tesseract</code> program first). The output shows the words with their boxes, then the total found two ways: a regex on the text alone, and a rule that uses the boxes. Last, it measures how many of the words survive skew, blur, noise and lower resolution. About 5 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import re
+import numpy as np
+import pytesseract
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+F = &quot;/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf&quot;
+font = lambda size, bold=False: ImageFont.truetype(F.replace(&quot;.ttf&quot;, &quot;-Bold.ttf&quot;) if bold else F, size)
+
+# A two-column invoice page, rendered at about 150 dpi (A5-sized to keep it fast).
+img = Image.new(&quot;L&quot;, (1240, 870), 255)
+d = ImageDraw.Draw(img)
+d.text((60, 40), &quot;ACME Tools Ltd&quot;, font=font(40, True))
+d.text((60, 95), &quot;12 Harbour Road, Leeds&quot;, font=font(22))
+d.text((760, 40), &quot;INVOICE INV-2026-0042&quot;, font=font(28, True))
+d.text((760, 85), &quot;Date: 14 March 2026&quot;, font=font(22))
+d.text((760, 115), &quot;Due: 13 April 2026&quot;, font=font(22))
+d.text((60, 170), &quot;Bill to: Northwind Garden Supplies&quot;, font=font(22))
+y = 250
+for col, x in ((&quot;Item&quot;, 60), (&quot;Qty&quot;, 640), (&quot;Unit price&quot;, 780), (&quot;Amount&quot;, 1010)):
+    d.text((x, y), col, font=font(22, True))
+d.line((60, y + 34, 1180, y + 34), fill=0, width=2)
+rows = [(&quot;Cordless drill&quot;, 3, 189.00), (&quot;Drill bit set&quot;, 5, 32.00), (&quot;Safety gloves&quot;, 20, 6.25)]
+for i, (item, q, p) in enumerate(rows):
+    yy = y + 50 + 40 * i
+    for txt, x in ((item, 60), (str(q), 640), (f&quot;${p:,.2f}&quot;, 780), (f&quot;${q*p:,.2f}&quot;, 1010)):
+        d.text((x, yy), txt, font=font(22))
+sub = sum(q * p for _, q, p in rows); vat = 0.2 * sub; total = sub + vat
+for i, (k, v) in enumerate(((&quot;Subtotal&quot;, sub), (&quot;VAT 20%&quot;, vat), (&quot;Total&quot;, total))):
+    d.text((780, 470 + 40 * i), k, font=font(22, k == &quot;Total&quot;))
+    d.text((1010, 470 + 40 * i), f&quot;${v:,.2f}&quot;, font=font(22, k == &quot;Total&quot;))
+d.text((60, 780), &quot;Late payment fee: $50.00 per month. Questions: accounts@acme.example&quot;, font=font(16))
+print(f&quot;page {img.size[0]}x{img.size[1]} px; true total ${total:,.2f}&quot;)
+
+def ocr(im):
+    t = pytesseract.image_to_data(im, output_type=pytesseract.Output.DICT)
+    return [(w, (l, tp, l + wd, tp + h), c) for w, l, tp, wd, h, c in
+            zip(t[&quot;text&quot;], t[&quot;left&quot;], t[&quot;top&quot;], t[&quot;width&quot;], t[&quot;height&quot;], t[&quot;conf&quot;]) if w.strip()]
+
+words = ocr(img)
+text = pytesseract.image_to_string(img)
+print(f&quot;\nEra 1, step 2 - OCR: {len(words)} words with boxes; first five:&quot;)
+for w, box, c in words[:5]:
+    print(f&quot;  {w!r:&lt;12} box={box} conf={c:.0f}&quot;)
+
+# Step 5 - field extraction. A regex on the text alone vs a rule that uses the boxes.
+first_money = re.search(r&quot;\$[\d,]+\.\d\d&quot;, text).group()
+key = next(b for w, b, _ in words if w.lower().startswith(&quot;total&quot;))
+same_row = [(b[0], w) for w, b, _ in words
+            if abs((b[1] + b[3]) / 2 - (key[1] + key[3]) / 2) &lt; 15 and b[0] &gt; key[2]]
+print(f&quot;\nregex 'first $ amount' on the text : {first_money}&quot;)
+print(f&quot;layout rule 'right of Total, same row': {min(same_row)[1]}&quot;)
+
+# Robustness: the same page as a skewed, blurred, noisy scan.
+truth = [w for w, _, _ in words]
+def word_recall(im):
+    got = [w for w, _, _ in ocr(im)]
+    return sum(min(got.count(w), truth.count(w)) for w in set(truth)) / len(truth)
+rng = np.random.default_rng(0)
+def scan(angle, blur, noise):
+    im = img.rotate(angle, expand=True, fillcolor=255).filter(ImageFilter.GaussianBlur(blur))
+    a = np.asarray(im, float) + rng.normal(0, noise, (im.size[1], im.size[0]))
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8))
+print(&quot;\nword recall against the clean OCR:&quot;)
+for name, im in ((&quot;clean page&quot;, img), (&quot;rotated 3 degrees&quot;, scan(3, 0, 0)),
+                 (&quot;blur 1.5 px&quot;, scan(0, 1.5, 0)), (&quot;rotated 3, blur 1, noise sd 25&quot;, scan(3, 1, 25)),
+                 (&quot;rotated 3, blur 1, noise sd 40&quot;, scan(3, 1, 40)),
+                 (&quot;half resolution (75 dpi)&quot;, img.resize((620, 435))),
+                 (&quot;third resolution (50 dpi)&quot;, img.resize((413, 290)))):
+    print(f&quot;  {name:&lt;30} {word_recall(im):6.0%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">page 1240x870 px; true total $1,022.40
+
+Era 1, step 2 - OCR: 58 words with boxes; first five:
+  &#x27;ACME&#x27;       box=(60, 48, 184, 78) conf=95
+  &#x27;Tools&#x27;      box=(201, 48, 314, 78) conf=96
+  &#x27;Ltd&#x27;        box=(334, 48, 399, 78) conf=96
+  &#x27;INVOICE&#x27;    box=(763, 46, 887, 66) conf=93
+  &#x27;INV-2026-0042&#x27; box=(902, 46, 1129, 66) conf=91
+
+regex &#x27;first $ amount&#x27; on the text : $189.00
+layout rule &#x27;right of Total, same row&#x27;: $1,022.40
+
+word recall against the clean OCR:
+  clean page                       100%
+  rotated 3 degrees                 95%
+  blur 1.5 px                       98%
+  rotated 3, blur 1, noise sd 25    93%
+  rotated 3, blur 1, noise sd 40     0%
+  half resolution (75 dpi)          93%
+  third resolution (50 dpi)          7%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>On a clean page, OCR is nearly free and exact.</strong> Tesseract finds 58 words, each with a pixel box and a confidence of 90 or more, and its text matches what was drawn. This is step 2 of the Era-1 pipeline, and on clean printed pages it is hard to beat for cost.</p>
+<p><strong>Text alone loses the meaning.</strong> A regex for the first dollar amount returns $189.00, the unit price of the drill. The total is the amount on the same row as "Total", to the right of it: one comparison of box coordinates finds $1,022.40. Real pipelines are many such rules, one per field and layout, which is why they are fragile.</p>
+<p><strong>OCR degrades, then falls off a cliff.</strong> A 3-degree skew costs 5% of the words, a 1.5-pixel blur 2%, and skew, blur and moderate noise together 7%. With stronger noise (standard deviation 40 instead of 25), recall drops to 0%: the page no longer segments into text lines, so nothing is read. Resolution behaves the same way: at 75 dpi (body-text x-height about 5 pixels) 93% survives; at 50 dpi (about 4 pixels) only 7%. Each failure needs its own fix (deskewing, denoising, upscaling), the "custom exception paths" of Era 1.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">LayoutLMv3&#x27;s three streams, and what a page costs</div><div class="co-body"><p>Tesseract reads a small form; LayoutLMv3's real processor (<code>microsoft/layoutlmv3-base</code>, tokenizer and image settings only) turns the words, boxes and image into its three inputs, and the model is built on PyTorch's meta device to count its parameters. Then one A4 page is sized for each kind of model: visual tokens and how tall 10-point text ends up in pixels. Qwen2.5-VL uses its real resizing function; the Claude row approximates its documented limits. A few seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math, torch
+import pytesseract
+from PIL import Image, ImageDraw, ImageFont
+from transformers import AutoConfig, AutoProcessor, LayoutLMv3Model
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
+# A small form: OCR words and boxes, as an Era-1 pipeline would hand them over.
+img = Image.new(&quot;RGB&quot;, (900, 260), &quot;white&quot;)
+d = ImageDraw.Draw(img)
+f = ImageFont.truetype(&quot;/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf&quot;, 24)
+d.text((40, 40), &quot;Invoice number: INV-2026-0042&quot;, font=f, fill=&quot;black&quot;)
+d.text((40, 100), &quot;Customer: Northwind Garden Supplies&quot;, font=f, fill=&quot;black&quot;)
+d.text((560, 180), &quot;Total: $1,022.40&quot;, font=f, fill=&quot;black&quot;)
+t = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+W, H = img.size
+words, boxes = [], []
+for w, l, tp, wd, h in zip(t[&quot;text&quot;], t[&quot;left&quot;], t[&quot;top&quot;], t[&quot;width&quot;], t[&quot;height&quot;]):
+    if w.strip():
+        words.append(w)                                  # LayoutLMv3 wants boxes on a 0-1000 grid
+        boxes.append([int(1000 * l / W), int(1000 * tp / H), int(1000 * (l + wd) / W), int(1000 * (tp + h) / H)])
+
+proc = AutoProcessor.from_pretrained(&quot;microsoft/layoutlmv3-base&quot;, apply_ocr=False)
+enc = proc(img, words, boxes=boxes, return_tensors=&quot;pt&quot;)
+ids, bb, px = enc[&quot;input_ids&quot;][0], enc[&quot;bbox&quot;][0], enc[&quot;pixel_values&quot;]
+print(f&quot;stream 1, text : {len(ids)} tokens for {len(words)} OCR words&quot;)
+print(f&quot;stream 2, boxes: {tuple(bb.shape)}, one 0-1000 box per token&quot;)
+print(f&quot;stream 3, image: {tuple(px.shape)} -&gt; (224/16)^2 = {(224 // 16) ** 2} patches&quot;)
+print(&quot;\n  token        box (x0, y0, x1, y1)&quot;)
+for tok, b in list(zip(proc.tokenizer.convert_ids_to_tokens(ids), bb.tolist()))[:14]:
+    print(f&quot;  {tok:&lt;12} {b}&quot;)
+
+cfg = AutoConfig.from_pretrained(&quot;microsoft/layoutlmv3-base&quot;)
+with torch.device(&quot;meta&quot;):
+    n = sum(p.numel() for p in LayoutLMv3Model(cfg).parameters())
+print(f&quot;\nLayoutLMv3-base: {n/1e6:.0f}M parameters (built on the meta device, no weights)&quot;)
+
+# What one A4 page costs each family, and how big 10-pt text ends up in pixels.
+PAGE_IN = (8.27, 11.69)                                  # A4, inches (width, height)
+def xheight(px_tall):                                    # 10-pt text, x-height about half the em
+    return 0.5 * (10 / 72) * px_tall / PAGE_IN[1]
+def claude(w, h):   # approximates the documented limits: 28-px patches, 2,576 px and 4,784 tokens max
+    s = min(1, 2576 / max(w, h))
+    while math.ceil(w * s / 28) * math.ceil(h * s / 28) &gt; 4784:
+        s *= 0.99
+    return math.ceil(w * s / 28) * math.ceil(h * s / 28), h * s
+print(f&quot;\n{'model input for one A4 page':&lt;44}{'visual tokens':&gt;14}{'10-pt x-height':&gt;16}&quot;)
+rows = [(&quot;LayoutLMv3: 224x224 (+ up to 512 OCR tokens)&quot;, 196, 224),
+        (&quot;Nougat: 896x672, Swin /32&quot;, (896 // 32) * (672 // 32), 896),
+        (&quot;Donut: 2560x1920, Swin /32&quot;, (2560 // 32) * (1920 // 32), 2560),
+        (&quot;DeepSeek-OCR Small: 640x640&quot;, 100, 640),
+        (&quot;DeepSeek-OCR Base: 1024x1024&quot;, 256, 1024)]
+for dpi in (100, 150, 300):
+    w, h = round(PAGE_IN[0] * dpi), round(PAGE_IN[1] * dpi)
+    rh, rw = smart_resize(h, w, factor=28, min_pixels=56 * 56, max_pixels=12845056)
+    rows.append((f&quot;Qwen2.5-VL, page at {dpi} dpi ({w}x{h})&quot;, (rh // 28) * (rw // 28), rh))
+    n_c, ch = claude(w, h)
+    rows.append((f&quot;Claude 4.7+, page at {dpi} dpi&quot;, n_c, ch))
+for name, n, tall in rows:
+    print(f&quot;{name:&lt;44}{n:&gt;14,}{xheight(tall):&gt;14.1f}px&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">stream 1, text : 28 tokens for 9 OCR words
+stream 2, boxes: (28, 4), one 0-1000 box per token
+stream 3, image: (1, 3, 224, 224) -&gt; (224/16)^2 = 196 patches
+
+  token        box (x0, y0, x1, y1)
+  &lt;s&gt;          [0, 0, 0, 0]
+  ĠInv         [46, 173, 138, 242]
+  oice         [46, 173, 138, 242]
+  Ġnumber      [150, 173, 257, 242]
+  :            [150, 173, 257, 242]
+  ĠINV         [271, 173, 466, 242]
+  -            [271, 173, 466, 242]
+  20           [271, 173, 466, 242]
+  26           [271, 173, 466, 242]
+  -            [271, 173, 466, 242]
+  00           [271, 173, 466, 242]
+  42           [271, 173, 466, 242]
+  ĠCustomer    [45, 403, 178, 473]
+  :            [45, 403, 178, 473]
+
+LayoutLMv3-base: 125M parameters (built on the meta device, no weights)
+
+model input for one A4 page                  visual tokens  10-pt x-height
+LayoutLMv3: 224x224 (+ up to 512 OCR tokens)           196           1.3px
+Nougat: 896x672, Swin /32                              588           5.3px
+Donut: 2560x1920, Swin /32                           4,800          15.2px
+DeepSeek-OCR Small: 640x640                            100           3.8px
+DeepSeek-OCR Base: 1024x1024                           256           6.1px
+Qwen2.5-VL, page at 100 dpi (827x1169)               1,260           7.0px
+Claude 4.7+, page at 100 dpi                         1,260           6.9px
+Qwen2.5-VL, page at 150 dpi (1240x1754)              2,772          10.5px
+Claude 4.7+, page at 150 dpi                         2,835          10.4px
+Qwen2.5-VL, page at 300 dpi (2481x3507)             11,125          20.8px
+Claude 4.7+, page at 300 dpi                         4,756          13.6px</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Three streams, aligned by position.</strong> 9 OCR words become 28 text tokens, because the RoBERTa-style tokenizer splits "Invoice" into "ĠInv" + "oice" and the invoice number into 7 pieces. Every piece carries its word's box on the 0–1000 grid, so the model knows that all of "INV-2026-0042" sits at the same place. The image adds 196 patches from a 224×224 copy of the page. The base model has 125M parameters as built here (the paper's 133M counts slightly differently).</p>
+<p><strong>LayoutLMv3's own image cannot read.</strong> Shrunk to 224 pixels, 10-point text is 1.3 pixels tall. The patches tell the model where blocks, lines and tables are; the words themselves must come from OCR. That is why it is an Era-1 model with a better back end, not an OCR-free one.</p>
+<p><strong>OCR-free models pay for legibility in tokens.</strong> Nougat's 896-pixel page leaves an x-height of 5.3 pixels for 588 tokens, enough for clean printed papers. Donut's 2560-pixel page gives 15.2 pixels but 4,800 tokens. DeepSeek-OCR's Small mode (100 tokens) leaves 3.8 pixels: below what Tesseract could read in the last run, so its compact modes rely on a decoder trained to read very small text.</p>
+<p><strong>A VLM's cost follows the resolution you send.</strong> Qwen2.5-VL takes the page as given: 1,260 tokens at 100 dpi, 2,772 at 150 and 11,125 at 300, four times the tokens for twice the resolution. Claude's limits cap the cost at about 4,800 tokens; a 300-dpi page is scaled down to an x-height of about 14 pixels. Around 150 dpi (10 pixels) is usually plenty for body text; small print and dense tables are the reason to go higher.</p></div></aside>
+<h2>Idea 5 · DocLLM (2023)</h2>
+<p>DocLLM (Wang et al., JPMorgan AI Research, arXiv:2401.00908, submitted 31 December 2023, so the ID carries a January 2024 prefix) is LayoutLM's generative sibling. It has no image encoder at all: it reads OCR text plus bounding boxes. The boxes get their own embeddings, and attention gets four terms (text-text, text-box, box-text, box-box). It is pretrained by filling in masked text blocks and built on Falcon-1B and Llama 2 7B. Better for QA on documents; still depends on OCR input.</p>
+<h2>Idea 6 · Era 3 — VLM-native (2024+)</h2>
+<p>2024 VLMs became good enough to replace the pipeline entirely. Feed the full page image at high resolution to a VLM, ask the question, get an answer.</p>
+<ul>
+<li>LLaVA-NeXT 336-tile AnyRes works for small documents.</li>
+<li>Qwen2.5-VL reads the page at native resolution, one token per 28×28 pixels (Lesson 12.9).</li>
+<li>Claude 4.7 and later accept images up to 2,576 pixels on the long edge (at most about 4,784 visual tokens).</li>
+<li>PaliGemma 2 (December 2024) added transfer results on text detection and recognition, table structure, molecular structures and music scores, at up to 896 pixels.</li>
+</ul>
+<p>The gap between VLM-native and OCR-pipeline closed rapidly. By 2026, VLM-native wins on:</p>
+<ul>
+<li>Scene text (hand-written + printed, mixed scripts).</li>
+<li>Complex tables with merged cells.</li>
+<li>Math equations embedded in text.</li>
+<li>Figures with text annotations.</li>
+</ul>
+<p>OCR pipelines still win on:</p>
+<ul>
+<li>Pure-scan workloads at massive scale where per-page latency matters.</li>
+<li>Pipeline reliability (deterministic failures vs VLM hallucinations).</li>
+<li>Regulated environments requiring auditable OCR output.</li>
+</ul>
+<h2>Idea 7 · The Claude 4.7 / GPT-5 frontier</h2>
+<p>At high resolution, frontier VLMs read documents very well, near the top of the standard benchmarks. Vendors publish their current scores on their model pages. Open reference points:</p>
+<ul>
+<li>DocVQA (ANLS): Qwen2.5-VL-72B 96.4 (validation set), LayoutLMv3-Large with OCR 83.4, Donut 67.5.</li>
+<li>ChartQA: Qwen2.5-VL-72B 89.5.</li>
+<li>OmniDocBench v1.5 (whole-page parsing into text, tables and formulas), as reported by PaddleOCR-VL's authors: PaddleOCR-VL (0.9B) 92.6, MinerU2.5 (1.2B) 90.7, Gemini 2.5 Pro 88.0, GPT-4o 75.0.</li>
+</ul>
+<p>DocVQA is close to saturated. For whole-page conversion, small specialised open models now match or beat general frontier models, because they are trained on exactly that output format.</p>
+<h2>Idea 8 · Math equations and LaTeX output</h2>
+<p>Scientific papers need exact LaTeX output for equations. Nougat was trained on this, and its successors among document parsers (MinerU, PaddleOCR-VL, olmOCR and others) produce usable LaTeX for formulas. Without explicit LaTeX training, VLMs produce readable but imprecise transcriptions.</p>
+<p>A common scientific-paper pipeline in 2026: a document parser for the whole PDF, then a larger VLM on the pages it flags as hard (dense formulas, complex figures).</p>
+<h2>Idea 9 · Handwriting</h2>
+<p>Still the hardest sub-task. Mixed printed + handwritten (doctors' notes, filled forms) is where OCR pipelines with a handwriting recognizer can still win on cost. General VLMs have improved fast on handwriting; test on your own documents, since public benchmarks rarely match a specific hand or form.</p>
+<h2>Idea 10 · 2026 recipe</h2>
+<p>For a new document-AI project:</p>
+<ul>
+<li>Pure-printed invoices at scale: LayoutLMv3 + rules, cost-efficient.</li>
+<li>Mixed documents (scientific + handwritten + forms): VLM-native, either a document parser (PaddleOCR-VL, MinerU, Docling) or a general VLM (Qwen2.5-VL, Qwen3-VL).</li>
+<li>Full arXiv ingestion: a parser with LaTeX output for text and math, a VLM for figures.</li>
+<li>Regulatory: OCR pipeline + VLM validator for cross-check.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="mm-doc-layout"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>A toy layout-aware tokenizer: given (text, bbox) pairs, produces the LayoutLMv3-style input.</li>
+<li>A Donut-style task schema generator: JSON template for forms.</li>
+<li>A comparison of token budgets per page across OCR-pipeline, Donut, Nougat, and VLM-native.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>To save tokens, a team sends every scanned A4 page to a VLM at 640 pixels on the long side (a few hundred tokens) and asks for the invoice total. On a test set of clean, large-print invoices it scores well. What happens on real invoices, and how would you find out before production does? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Small open document parsers</strong> convert pages to Markdown, JSON or HTML with tables and formulas: PaddleOCR-VL (0.9B, October 2025, 109 languages; a layout model then a VLM per element), MinerU2.5 (1.2B), IBM's Granite-Docling (258M, September 2025, used inside the Docling toolkit, Apache 2.0) and olmOCR 2 (a Qwen2.5-VL-7B fine-tune from AI2, trained with unit-test rewards). The sub-1B ones run on a laptop GPU or a CPU; a 7B model needs 4-bit on an 8 GB card.</li>
+<li><strong>Fewer tokens per page</strong>: DeepSeek-OCR (October 2025) encodes a page in 64 to 400 visual tokens and reports about 97% decoding precision at up to 10× compression, about 60% at 20×.</li>
+<li><strong>General VLMs on page images</strong>: Qwen2.5-VL and Qwen3-VL (2B to 8B sizes fit a laptop in 4-bit) and hosted models from Anthropic, OpenAI and Google, which accept PDFs or page images directly. Check each vendor's page for its current document scores.</li>
+<li><strong>Classic OCR still runs at scale</strong>: Tesseract, PaddleOCR and the cloud OCR services (Azure Document Intelligence, Google Document AI, Amazon Textract) remain the cheap, auditable first stage for high-volume printed documents.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2510.14528">PaddleOCR-VL (arXiv 2510.14528)</a>, <a href="https://arxiv.org/abs/2510.18234">DeepSeek-OCR (arXiv 2510.18234)</a>, <a href="https://www.ibm.com/new/announcements/granite-docling-end-to-end-document-conversion">Granite-Docling announcement</a>, <a href="https://allenai.org/blog/olmocr-2">olmOCR 2</a>, <a href="https://arxiv.org/abs/2204.08387">LayoutLMv3 (arXiv 2204.08387)</a>, <a href="https://arxiv.org/abs/2111.15664">Donut (arXiv 2111.15664)</a>, <a href="https://arxiv.org/abs/2308.13418">Nougat (arXiv 2308.13418)</a>, <a href="https://arxiv.org/abs/2502.13923">Qwen2.5-VL technical report (arXiv 2502.13923)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Documents carry meaning in layout, tables and formulas, not just words.</li>
+<li>Era 1: OCR gives words and boxes; rules or LayoutLMv3 use the boxes to find fields.</li>
+<li>Era 2: Donut and Nougat map pixels straight to structured text, as specialists.</li>
+<li>Era 3: VLMs read the page image at high resolution; small parsers convert whole pages.</li>
+<li>Resolution decides legibility, and tokens grow with its square: size pages on purpose.</li>
+<li>ANLS rewards near-misses; check extracted numbers exactly.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-ocr-documents-v4"><span class="t" style="--cs-hue:165">OD</span>Cheat sheet · OCR and Document Understanding</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-document-ai-stack-picker.md</code>. Given a document-AI project (domain, scale, quality, regulatory), picks between OCR pipeline, OCR-free specialist, and VLM-native.</p>
+<p><strong><code>outputs/skill-document-ai-stack-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: document-ai-stack-picker
+description: Pick between OCR pipeline, OCR-free specialist, and VLM-native for a document-AI project based on domain, scale, and regulatory needs.
+version: 1.0.0
+phase: 12
+lesson: 22
+tags: [document-ai, ocr, donut, nougat, paligemma, vlm-native]
+---
+
+Given a document-AI project (domain: invoices / scientific papers / forms / mixed; scale: pages per day; quality bar; regulatory needs), pick a stack and produce a reference config.
+
+Produce:
+
+1. Stack pick. Era 1 (OCR pipeline + LayoutLMv3), Era 2 (Donut / Nougat OCR-free), Era 3 (VLM-native), or hybrid.
+2. Per-page cost estimate. Token count and latency at the chosen stack.
+3. Accuracy expectation. DocVQA + ChartQA + domain-specific benchmarks.
+4. Handwriting strategy. VLM-native for cost-insensitive; dedicated TrOCR + routing for scale.
+5. Math / LaTeX output. Nougat for scientific papers; VLM for other.
+6. Regulatory fallback. Hybrid with cross-check audit log.
+
+Hard rejects:
+- Proposing VLM-native for &gt;1M pages/day without cost analysis. Token cost at 2576px per page is significant.
+- Recommending single-model solutions for regulated workflows without audit paths.
+- Claiming Nougat handles scanned invoices. It does not — it is scientific-paper specialist.
+
+Refusal rules:
+- If scale is &gt;10M pages/day, refuse Era 3 and recommend Era 1 with Era 3 as sampling validator.
+- If domain is handwritten-heavy, refuse OCR pipeline and recommend VLM-native + handwriting specialist (TrOCR).
+- If LaTeX fidelity is required for equations, require Nougat in the loop.
+
+Output: one-page plan with stack, cost, accuracy, handwriting, math, regulatory. End with arXiv 2308.13418 (Nougat), 2204.08387 (LayoutLMv3), 2111.15664 (Donut).
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Your project is 10M invoices per day. Which stack minimizes cost-per-page without losing accuracy?</p>
+</li>
+<li>
+<p>Why does LayoutLMv3 outperform pure-CLIP-VLMs on form QA but underperform at scene-text? What does the bbox stream give up?</p>
+</li>
+<li>
+<p>Nougat generates LaTeX. Propose a test case where VLM-native output beats Nougat on LaTeX fidelity, and a case where Nougat wins.</p>
+</li>
+<li>
+<p>Read the PaliGemma 2 report (Google, 2024). Which document-related tasks did it add over PaliGemma, and what did resolution (224, 448 or 896 pixels) do for text-heavy tasks?</p>
+</li>
+<li>
+<p>Design a regulatory-safe hybrid: OCR pipeline as primary, VLM as secondary cross-check. How do you resolve disagreement?</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1222-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The regex finds the wrong amount; OCR fails at cliffs</span></summary><div class="qa-a"><p>No. The first dollar amount in the text is $189.00, the drill's unit price. Plain OCR text has no notion of "the number next to Total"; you need the boxes (or a model that sees the layout). A one-line rule on the coordinates finds $1,022.40.</p>
+<p>OCR held up well to each problem on its own: 95% of words after a 3-degree skew, 98% after a 1.5-pixel blur, 93% at 75 dpi. But it failed abruptly: skew, blur and heavier noise together dropped recall to 0%, and 50 dpi dropped it to 7%. The lesson for production is to measure on degraded samples of your real documents, because the failure is a cliff, not a slope.</p></div></details>
+<details class="qa" id="a1222-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The small print disappears first</span></summary><div class="qa-a"><p>At 640 pixels on the long side, an A4 page is about 55 pixels per inch. Body text at 10 points then has an x-height of about 4 pixels, and 7-point footnotes and small table figures under 3: about where OCR stopped reading at 50 dpi in the first run. Large-print headings survive, so a clean test set with big totals looks fine. On real invoices the model cannot read small figures, and a VLM, unlike OCR, does not return nothing: it produces a plausible-looking number. Wrong totals with high confidence are worse than a visible failure.</p>
+<p>How to catch it before production:</p>
+<ul>
+<li><strong>Compute the legibility first</strong>: smallest font on your documents, page size, and the resolution you send give the x-height in pixels (the formula above). Under about 5 pixels, expect errors.</li>
+<li><strong>Test on real, varied pages</strong>, including small print, scans and photos, and score extracted fields exactly (or with arithmetic checks such as subtotal + tax = total), not with ANLS.</li>
+<li><strong>Spend tokens where they matter</strong>: send the page at a readable resolution, or crop the region with the totals at full resolution, or use a parser that keeps resolution per element.</li>
+</ul></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2109.10282">Li et al. — TrOCR (arXiv:2109.10282)</a></li>
+<li><a href="https://arxiv.org/abs/2308.13418">Blecher et al. — Nougat (arXiv:2308.13418)</a></li>
+<li><a href="https://arxiv.org/abs/2204.08387">Huang et al. — LayoutLMv3 (arXiv:2204.08387)</a></li>
+<li><a href="https://arxiv.org/abs/2111.15664">Kim et al. — Donut (arXiv:2111.15664)</a></li>
+<li><a href="https://arxiv.org/abs/2401.00908">Wang et al. — DocLLM (arXiv:2401.00908)</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/12-multimodal-ai/22-document-diagram-understanding" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1222" id="done-a1222">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1222" id="undo-a1222" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1221"><span class="pn-dir">Previous</span><span class="pn-t">12.21 · Embodied VLAs: RT-2, OpenVLA, π0, GR00T</span></a><a class="pn next" href="#a1223"><span class="pn-dir">Next</span><span class="pn-t">12.23 · ColPali and Vision-Native Document RAG</span></a></div></footer>

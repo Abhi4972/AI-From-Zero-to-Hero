@@ -1,0 +1,463 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-07">Phase 7 · Transformers Deep Dive</a></nav><h1>Audio Transformers — Whisper Architecture</h1><div class="m-meta"><span class="chip chip-num">Lesson 7.10</span><span class="chip">45 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a0710" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 7 · 05 (Full Transformer), Phase 7 · 08 (Encoder-Decoder), Phase 7 · 09 (ViT)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 45 minutes.</li>
+<li><strong>Code in</strong>: Python, Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Audio is an image of frequency over time. Whisper is a ViT that eats mel spectrograms and speaks back.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mel spectrogram</td>
+<td>"Audio image"</td>
+<td>2D representation: frequency bins on one axis, time frames on the other; log-scaled energy per cell.</td>
+</tr>
+<tr>
+<td>Log-mel</td>
+<td>"What Whisper sees"</td>
+<td>Mel spectrogram passed through log; approximates human perception of loudness.</td>
+</tr>
+<tr>
+<td>Frame</td>
+<td>"One time slice"</td>
+<td>A 25 ms window of samples; overlapping at 10 ms stride.</td>
+</tr>
+<tr>
+<td>Task token</td>
+<td>"Prompt prefix for speech"</td>
+<td>Special tokens like <code>&lt;\|transcribe\|&gt;</code> / <code>&lt;\|translate\|&gt;</code> in the decoder prompt.</td>
+</tr>
+<tr>
+<td>Voice activity detection (VAD)</td>
+<td>"Find the speech"</td>
+<td>Gate that removes silence before ASR; cuts cost massively.</td>
+</tr>
+<tr>
+<td>CTC</td>
+<td>"Connectionist Temporal Classification"</td>
+<td>Classic ASR loss for alignment-free training; Whisper does NOT use it.</td>
+</tr>
+<tr>
+<td>Whisper-turbo</td>
+<td>"Small decoder, full encoder"</td>
+<td>large-v3 encoder + 4-layer decoder; 8× faster decoding.</td>
+</tr>
+<tr>
+<td>Faster-whisper</td>
+<td>"The production wrapper"</td>
+<td>CTranslate2 reimplementation; int8 quantization; 4× faster than OpenAI's reference.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Whisper turns speech into text with the same encoder–decoder transformer as a translation model. The audio is first turned into a picture: a log-mel spectrogram, which shows how much energy each band of pitches has in each 10-millisecond slice, much as the ear hears it. The encoder reads that picture (always a 30-second window), and the decoder writes text token by token, reading the audio through cross-attention. What it should do is chosen by a few special tokens at the start of the decoder's input: which language, and whether to transcribe or translate into English. This lesson runs the lesson's framing code, rebuilds Whisper's log-mel spectrogram in a dozen lines of NumPy and matches the official one, and has Whisper identify, transcribe and translate German speech, switching task by changing one token. Nothing is trained.</p></div></aside>
+<p>Before Whisper (OpenAI, Radford et al. 2022), state-of-the-art automatic speech recognition (ASR) meant wav2vec 2.0 and HuBERT — self-supervised feature extractors plus a fine-tuned head. High quality, expensive data pipelines, domain-brittle. Multilingual speech recognition needed separate models per language family.</p>
+<p>Whisper made three bets:</p>
+<ol>
+<li><strong>Train on everything.</strong> 680,000 hours of weakly-labeled audio scraped from the internet across 97 languages. No clean academic corpus. No phoneme labels.</li>
+<li><strong>Multi-task single model.</strong> One decoder trained jointly on transcription, translation, voice activity detection, language ID, and timestamping via task tokens.</li>
+<li><strong>Standard encoder-decoder transformer.</strong> Encoder consumes log-mel spectrograms. Decoder produces text tokens autoregressively. No vocoder, no CTC, no HMM.</li>
+</ol>
+<p>The result: Whisper large-v3 is robust across accents, noise, and languages that have zero clean labeled data. It is the default speech front-end for every open-source voice assistant and most commercial ones in 2026.</p>
+<h2>The idea</h2>
+<p><img alt="Whisper pipeline: audio → mel → encoder → decoder → text" src="repo-assets/phases/07-transformers-deep-dive/10-audio-transformers-whisper/assets/whisper.svg" /></p>
+<h2>Idea 1 · Step 1 — resample + window</h2>
+<p>Audio at 16 kHz. Clip/pad to 30 seconds. Compute log-mel spectrogram: 80 mel bins (128 in large-v3), 10 ms stride → 3,000 frames × 80 features. This is the "input image" that Whisper sees.</p>
+<h2>Idea 2 · Step 2 — convolutional stem</h2>
+<p>Two Conv1D layers with kernel 3 and stride 2 reduce the 3,000 frames to 1,500. Halves sequence length without adding a lot of parameters.</p>
+<h2>Idea 3 · Step 3 — encoder</h2>
+<p>A 32-layer (for large) transformer encoder over 1,500 timesteps. Sinusoidal positional encoding, self-attention, GELU FFN. Produces 1,500 × 1,280 hidden states.</p>
+<h2>Idea 4 · Step 4 — decoder</h2>
+<p>A 32-layer (for large) transformer decoder. It autoregressively produces tokens from a BPE vocabulary that is a superset of GPT-2's with a few audio-specific special tokens.</p>
+<h2>Idea 5 · Step 5 — task tokens</h2>
+<p>The decoder prompt starts with control tokens that tell the model what to do:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">&lt;|startoftranscript|&gt;  &lt;|en|&gt;  &lt;|transcribe|&gt;  &lt;|0.00|&gt;
+</code></pre></div>
+<p>or</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">&lt;|startoftranscript|&gt;  &lt;|fr|&gt;  &lt;|translate|&gt;   &lt;|0.00|&gt;
+</code></pre></div>
+<p>The model was trained on this convention. You control task by prefix. The 2026 equivalent of instruction-tuning, but applied to speech.</p>
+<h2>Idea 6 · Step 6 — output</h2>
+<p>Beam search (width 5) with a log-prob threshold. Timestamps are predicted every 0.02 seconds of audio when the <code>&lt;|notimestamps|&gt;</code> token is absent.</p>
+<h2>Idea 7 · Whisper sizes</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Params</th>
+<th>Layers</th>
+<th>d_model</th>
+<th>Heads</th>
+<th>VRAM (fp16)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tiny</td>
+<td>39M</td>
+<td>4</td>
+<td>384</td>
+<td>6</td>
+<td>~1 GB</td>
+</tr>
+<tr>
+<td>Base</td>
+<td>74M</td>
+<td>6</td>
+<td>512</td>
+<td>8</td>
+<td>~1 GB</td>
+</tr>
+<tr>
+<td>Small</td>
+<td>244M</td>
+<td>12</td>
+<td>768</td>
+<td>12</td>
+<td>~2 GB</td>
+</tr>
+<tr>
+<td>Medium</td>
+<td>769M</td>
+<td>24</td>
+<td>1024</td>
+<td>16</td>
+<td>~5 GB</td>
+</tr>
+<tr>
+<td>Large</td>
+<td>1550M</td>
+<td>32</td>
+<td>1280</td>
+<td>20</td>
+<td>~10 GB</td>
+</tr>
+<tr>
+<td>Large-v3</td>
+<td>1550M</td>
+<td>32</td>
+<td>1280</td>
+<td>20</td>
+<td>~10 GB</td>
+</tr>
+<tr>
+<td>Large-v3-turbo</td>
+<td>809M</td>
+<td>32</td>
+<td>1280</td>
+<td>20</td>
+<td>~6 GB (4-layer decoder)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Large-v3-turbo (2024) cut the decoder from 32 layers to 4: much faster decoding for a small loss in accuracy, mostly on translation, which turbo was not trained for. That decode speed unlock is why Whisper-turbo is the default for real-time voice agents in 2026.</p>
+<h2>Idea 8 · What Whisper does not do</h2>
+<ul>
+<li>No diarization (who is speaking). Pair with pyannote for that.</li>
+<li>No real-time streaming natively — the 30-second window is fixed. Modern wrappers (<code>faster-whisper</code>, <code>WhisperX</code>) bolt on streaming via VAD + overlap.</li>
+<li>No long-form context beyond 30 s without external chunking. Works well in practice because human speech rarely needs long-range context for transcription.</li>
+</ul>
+<h2>Idea 9 · 2026 landscape</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Model</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>English ASR</td>
+<td>Whisper-turbo, Moonshine, NVIDIA Parakeet</td>
+<td>Moonshine needs far less compute on short clips; Parakeet tops several English benchmarks</td>
+</tr>
+<tr>
+<td>Multilingual ASR</td>
+<td>Whisper-large-v3</td>
+<td>97 languages</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>faster-whisper + VAD, dedicated streaming models</td>
+<td>Whisper itself works on 30 s windows; wrappers chunk the stream with VAD</td>
+</tr>
+<tr>
+<td>TTS</td>
+<td>Piper, XTTS-v2, Kokoro</td>
+<td>Different designs (VITS, codec language models, StyleTTS-style), not Whisper-shaped</td>
+</tr>
+<tr>
+<td>Audio + language</td>
+<td>Qwen2-Audio, Voxtral</td>
+<td>A Whisper-style audio encoder feeding a language model</td>
+</tr>
+</tbody>
+</table></div>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="n5-mel-decode"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>From waveform to log-mel.</strong> With samples <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mopen">[</span><span class="mord mathnormal">n</span><span class="mclose">]</span></span></span></span> at 16 kHz, a Hann window <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">400</span></span></span></span> samples (25 ms) and hop <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">160</span></span></span></span> (10 ms), the short-time Fourier transform of frame <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> is</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mopen">[</span><span class="mord mathnormal">m</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.0954em;vertical-align:-1.2671em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8829em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2671em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">x</span><span class="mopen">[</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.188em;vertical-align:-0.25em;"></span><span class="mord mathnormal">m</span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mopen">[</span><span class="mord mathnormal">n</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.938em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">2</span><span class="mord mathnormal mtight">πikn</span><span class="mord mtight">/</span><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mord">/2</span></span></span></span></span></div></p>
+<p>The power <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mopen">[</span><span class="mord mathnormal">m</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mord"><span class="mord">∣</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> is pooled by 80 triangular mel filters <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span></span></span></span> (spaced evenly on the mel scale <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">mel</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2595</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mord">/700</span><span class="mclose">)</span></span></span></span>, which is roughly linear below 1 kHz and logarithmic above, like hearing), then</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2491em;vertical-align:-0.35em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">max</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span><span class="mord">∣</span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mord"><span class="mord">∣</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">10</span></span></span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">←</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">max</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">←</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">4</span><span class="mclose">)</span><span class="mord">/4</span></span></span></span></span></div></p>
+<p>(an 80 dB range, scaled to roughly <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">−</span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">]</span></span></span></span>). Thirty seconds give <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">30</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">100</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">3</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span></span></span></span> frames.</p>
+<p><strong>Encoder.</strong> Two 1-D convolutions (kernel 3; stride 1, then 2) turn <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">80</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span> into <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1500</span></span></span></span>: one position per 20 ms. Sinusoidal positions are added and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> encoder blocks attend over all 1,500 positions, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">150</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.25</span></span></span></span> million scores per head per layer, padding included.</p>
+<p><strong>Decoder.</strong> A standard causal decoder with cross-attention to the encoder:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">audio</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3em;vertical-align:-1.25em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5147em;vertical-align:-1.6647em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span style="top:-1.4714em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prompt</span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord munder"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.75em;"><span class="svg-align" style="top:-2.102em;"><span class="pstrut" style="height:3em;"></span><span class="stretchy" style="height:0.548em;min-width:1.6em;"><span class="brace-left" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMinYMin slice"><path d="M0 6l6-6h17c12.688 0 19.313.3 20 1 4 4 7.313 8.3 10 13
+ 35.313 51.3 80.813 93.8 136.5 127.5 55.688 33.7 117.188 55.8 184.5 66.5.688
+ 0 2 .3 4 1 18.688 2.7 76 4.3 172 5h399450v120H429l-6-1c-124.688-8-235-61.7
+-331-161C60.687 138.7 32.312 99.3 7 54L0 41V6z"/></svg></span><span class="brace-center" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMidYMin slice"><path d="M199572 214
+c100.7 8.3 195.3 44 280 108 55.3 42 101.7 93 139 153l9 14c2.7-4 5.7-8.7 9-14
+ 53.3-86.7 123.7-153 211-199 66.7-36 137.3-56.3 212-62h199568v120H200432c-178.3
+ 11.7-311.7 78.3-403 201-6 8-9.7 12-11 12-.7.7-6.7 1-18 1s-17.3-.3-18-1c-1.3 0
+-5-4-11-12-44.7-59.3-101.3-106.3-170-141s-145.3-54.3-229-60H0V214z"/></svg></span><span class="brace-right" style="height:0.548em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="0.548em" viewBox="0 0 400000 548" preserveAspectRatio="xMaxYMin slice"><path d="M399994 0l6 6v35l-6 11c-56 104-135.3 181.3-238 232-57.3
+ 28.7-117 45-179 50H-300V214h399897c43.3-7 81-15 113-26 100.7-33 179.7-91 237
+-174 2.7-5 6-9 10-13 .7-1 7.3-1 20-1h17z"/></svg></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord texttt">&lt;|sot|&gt;</span></span><span class="mspace"> </span><span class="mord text"><span class="mord texttt">&lt;|lang|&gt;</span></span><span class="mspace"> </span><span class="mord text"><span class="mord texttt">&lt;|task|&gt;</span></span><span class="mspace"> </span><span class="mopen">[</span><span class="mord text"><span class="mord texttt">&lt;|notimestamps|&gt;</span></span><span class="mclose">]</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.898em;"><span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.6647em;"><span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></div></p>
+<p>The task is chosen by which tokens are placed in the prompt; language identification is just the decoder's prediction for the position after <code>&lt;|startoftranscript|&gt;</code>. Timestamp tokens come in steps of 0.02 s, the encoder's resolution: 1,501 of them cover 0.00 to 30.00 s.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">One clip by hand</div><div class="co-body"><p>A 5.9-second English sentence at 16 kHz:</p>
+<ul>
+<li>Samples: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5.86</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">93</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">800</span></span></span></span>, padded with zeros to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">480</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span></span></span></span> (30 s).</li>
+<li>Frames: 3,000 of 10 ms, of which about 586 contain speech; after the stride-2 convolution, 1,500 encoder positions, about 293 of them speech.</li>
+<li>The encoder still computes all 1,500 positions: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">150</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord">/29</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">26</span></span></span></span> times the attention scores the speech alone would need. That fixed 30-second window is the cost that Moonshine (variable-length input) and VAD-based chunking cut.</li>
+<li>The decoder then runs once per output token, about 20 times for this sentence, each step attending over the 1,500 encoder vectors.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Whisper processes the waveform directly."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It sees a log-mel spectrogram: 80 (or 128) mel bins every 10 ms, a time–frequency image.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Short clips are cheaper for the encoder."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Every input is padded to 30 seconds, so the encoder always processes 1,500 positions; only the decoder's work shrinks with less speech.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Translation needs a separate model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The same weights translate into English when the prompt says <code>&lt;|translate|&gt;</code> instead of <code>&lt;|transcribe|&gt;</code> (the last run).</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Under "Use it", Whisper-small hears a German sentence. It is asked twice, with decoder prompts that differ in one token: <code>&lt;|de|&gt; &lt;|transcribe|&gt;</code> and <code>&lt;|de|&gt; &lt;|translate|&gt;</code>. What will each output be, and how sure will it be that the language is German before it writes anything? (Solution P1.)</p></div></aside>
+<h2>Step 1 · synthesize audio</h2>
+<p>See <code>code/main.py</code>. We don't train Whisper — we build the log-mel spectrogram pipeline + task-token prompt formatter. Those are the parts you actually touch in production.</p>
+<p>Generate a 1-second sine wave at 440 Hz sampled at 16 kHz. 16,000 samples.</p>
+<h2>Step 2 · log-mel spectrogram (simplified)</h2>
+<p>Full mel spectrogram needs FFT. We do a simplified framing + per-frame energy version that shows the pipeline without requiring <code>librosa</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def frame_signal(x, frame_size=400, hop=160):
+    frames = []
+    for start in range(0, len(x) - frame_size + 1, hop):
+        frames.append(x[start:start + frame_size])
+    return frames
+</code></pre></div>
+
+<p>Frame = 25 ms, hop = 10 ms. Matches Whisper's windowing. Per-frame energy stands in for mel bins for pedagogy.</p>
+<h2>Step 3 · pad to 30 s</h2>
+<p>Whisper always processes 30-second chunks. Pad (or clip) the spectrogram to 3,000 frames.</p>
+<h2>Step 4 · build the prompt tokens</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def whisper_prompt(lang=&quot;en&quot;, task=&quot;transcribe&quot;, timestamps=True):
+    tokens = [&quot;&lt;|startoftranscript|&gt;&quot;, f&quot;&lt;|{lang}|&gt;&quot;, f&quot;&lt;|{task}|&gt;&quot;]
+    if not timestamps:
+        tokens.append(&quot;&lt;|notimestamps|&gt;&quot;)
+    return tokens
+</code></pre></div>
+
+<p>That is the whole task-control surface. A 4-token prefix.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s preprocessing</div><div class="co-body"><p><code>main.py</code>'s <code>main()</code>: framing a sine wave into 25 ms frames every 10 ms, padding to 30 s, three task prompts and the size table.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== Whisper preprocessing pipeline ===
+target: 30s audio at 16000 Hz
+frame:  400 samples (25 ms)
+hop:    160 samples (10 ms)
+
+1s signal → 16000 samples → 98 frames
+5s signal → 80000 samples → 498 frames
+after pad to 30s: 3000 frames  (target 3000)
+first 5 frame log-energies: +5.298, +5.298, +5.298, +5.298, +5.298
+
+=== task prompts: what flips Whisper&#x27;s behavior ===
+  English transcription with timestamps:
+    &lt;|startoftranscript|&gt;  &lt;|en|&gt;  &lt;|transcribe|&gt;
+  French translation to English, no timestamps:
+    &lt;|startoftranscript|&gt;  &lt;|fr|&gt;  &lt;|translate|&gt;  &lt;|notimestamps|&gt;
+  Japanese transcription with timestamps:
+    &lt;|startoftranscript|&gt;  &lt;|ja|&gt;  &lt;|transcribe|&gt;
+
+=== Whisper size table (large-v3 geometry) ===
+  name         params(M)   layers   d_model   heads
+  tiny                39        4       384       6
+  base                74        6       512       8
+  small              244       12       768      12
+  medium             769       24      1024      16
+  large-v3          1550       32      1280      20
+  turbo              809       32      1280      20
+
+turbo = large-v3 encoder + 4-layer decoder. 8x faster decoding.</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>One second gives 98 frames, not 100, because a full 400-sample frame must fit: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌊(</span><span class="mord">16000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">400</span><span class="mclose">)</span><span class="mord">/160</span><span class="mclose">⌋</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">98</span></span></span></span>. Whisper's own extractor pads the signal by half a window on both sides ("centring"), so it gets exactly 100 per second and 3,000 for 30 s. The energies are identical because a steady sine wave has the same energy in every frame. The prompts show the whole control surface: a language token, a task token and optionally <code>&lt;|notimestamps|&gt;</code>.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import io
+import numpy as np, soundfile as sf, torch
+from datasets import load_dataset, Audio
+from transformers import pipeline
+
+# The &quot;meeting.wav&quot; of the original: here a real LibriSpeech clip (openai/whisper is not installed on this page).
+libri = load_dataset(&quot;hf-internal-testing/librispeech_asr_dummy&quot;, &quot;clean&quot;, split=&quot;validation&quot;).cast_column(&quot;audio&quot;, Audio(decode=False))
+speech, sr = sf.read(io.BytesIO(libri[0][&quot;audio&quot;][&quot;bytes&quot;]), dtype=&quot;float32&quot;)
+sf.write(&quot;meeting.wav&quot;, speech, sr)
+
+asr = pipeline(&quot;automatic-speech-recognition&quot;, model=&quot;openai/whisper-base&quot;)
+result = asr(&quot;meeting.wav&quot;, return_timestamps=True, generate_kwargs={&quot;language&quot;: &quot;en&quot;, &quot;task&quot;: &quot;transcribe&quot;})
+print(result[&quot;text&quot;])
+print(result[&quot;chunks&quot;][0][&quot;timestamp&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel.
+(0.0, 5.44)</code></pre></div></div></aside>
+<p>Faster, OpenAI-compatible:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from faster_whisper import WhisperModel
+model = WhisperModel(&quot;large-v3-turbo&quot;, compute_type=&quot;int8_float16&quot;)
+segments, info = model.transcribe(&quot;meeting.wav&quot;, vad_filter=True)
+for s in segments:
+    print(f&quot;{s.start:.2f} - {s.end:.2f}: {s.text}&quot;)
+</code></pre></div>
+
+<p><strong>When to pick Whisper in 2026:</strong></p>
+<ul>
+<li>Multilingual ASR with one model.</li>
+<li>Robust transcription of noisy, diverse audio.</li>
+<li>Research / prototype ASR — fastest starting point.</li>
+</ul>
+<p><strong>When to pick something else:</strong></p>
+<ul>
+<li>Ultra-low latency streaming on edge — Moonshine beats Whisper at matched quality.</li>
+<li>Real-time conversational AI needing &lt;200 ms — dedicated streaming ASR.</li>
+<li>Speaker diarization — Whisper does not do this; bolt on pyannote.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Whisper&#x27;s log-mel spectrogram, rebuilt</div><div class="co-body"><p>The LibriSpeech clip transcribed above, turned into Whisper's input by <code>WhisperFeatureExtractor</code> and by the formula box in NumPy.</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import matplotlib.pyplot as plt
+from transformers import WhisperFeatureExtractor
+
+fe = WhisperFeatureExtractor.from_pretrained(&quot;openai/whisper-base&quot;)
+ref = fe(speech, sampling_rate=16000, return_tensors=&quot;np&quot;).input_features[0]      # (80, 3000)
+
+# The same log-mel spectrogram in a few lines of NumPy (mel filter bank taken from the extractor).
+x = np.pad(speech, (0, 30 * 16000 - len(speech)))                 # pad to 30 s = 480,000 samples
+x = np.pad(x, 200, mode=&quot;reflect&quot;)                                # centre the 400-sample windows
+win = np.hanning(401)[:-1]                                        # periodic Hann window, 25 ms
+frames = np.lib.stride_tricks.sliding_window_view(x, 400)[::160]  # hop 160 samples = 10 ms
+power = np.abs(np.fft.rfft(frames * win, axis=-1)) ** 2           # (3001, 201) frequency bins
+mel = fe.mel_filters.T @ power[:-1].T                              # (80, 3000)
+logmel = np.log10(np.maximum(mel, 1e-10))
+logmel = np.maximum(logmel, logmel.max() - 8.0)                   # keep an 80 dB range
+logmel = (logmel + 4.0) / 4.0                                     # Whisper's fixed scaling
+print(f&quot;audio: {len(speech) / 16000:.2f} s -&gt; padded to 30 s -&gt; log-mel {logmel.shape} (mel bins x 10 ms frames)&quot;)
+print(f&quot;ours vs WhisperFeatureExtractor: max difference {np.abs(logmel - ref).max():.1e}&quot;)
+print(f&quot;frames that contain speech: about {int(len(speech) / 160)} of 3000; the rest is padding&quot;)
+
+fig, ax = plt.subplots(figsize=(9, 2.6))
+ax.imshow(ref[:, :700], origin=&quot;lower&quot;, aspect=&quot;auto&quot;, cmap=&quot;magma&quot;)
+ax.set_xlabel(&quot;frame (10 ms each); the first 7 s of the 30 s window&quot;); ax.set_ylabel(&quot;mel bin&quot;)
+ax.set_title(f&quot;What Whisper's encoder sees: \&quot;{libri[0]['text'][:60].capitalize()}...\&quot;&quot;, fontsize=9)
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">audio: 5.86 s -&gt; padded to 30 s -&gt; log-mel (80, 3000) (mel bins x 10 ms frames)
+ours vs WhisperFeatureExtractor: max difference 1.1e-05
+frames that contain speech: about 585 of 3000; the rest is padding</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/f22fa5e18153cfad.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The dozen lines of NumPy reproduce the official features to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>: Whisper's input really is the formula box, a framed, windowed power spectrum pooled into 80 mel bins, logged, clipped to an 80 dB range and scaled. The 5.9-second sentence fills about 585 of the 3,000 frames; everything after it is padding that the encoder still processes. In the picture, voiced sounds show as stacks of horizontal harmonics in the low bins, fricatives such as "s" and "sh" as broad energy high up, and the pauses between words as dark columns. large-v3 uses the same pipeline with 128 mel bins, which is why its feature extractor cannot be swapped with the smaller models'.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">One model, three jobs, chosen by tokens</div><div class="co-body"><p>A German sentence synthesised with Meta's MMS text-to-speech, then Whisper-small: the encoder's output shape, the language-token probabilities at the first decoding step, and two generations with prompts that differ only in the task token.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from transformers import VitsModel, AutoTokenizer, WhisperForConditionalGeneration, WhisperProcessor
+
+# German speech for the test, synthesised with Meta's MMS text-to-speech model.
+ttok = AutoTokenizer.from_pretrained(&quot;facebook/mms-tts-deu&quot;)
+tts = VitsModel.from_pretrained(&quot;facebook/mms-tts-deu&quot;).eval()
+torch.manual_seed(0)
+with torch.no_grad():
+    de = tts(**ttok(&quot;Das Wetter ist heute schön, deshalb gehen wir am Nachmittag in den Park.&quot;, return_tensors=&quot;pt&quot;)).waveform[0].numpy()
+de16 = np.interp(np.arange(0, len(de), tts.config.sampling_rate / 16000), np.arange(len(de)), de).astype(&quot;float32&quot;)
+
+repo = &quot;openai/whisper-small&quot;
+proc = WhisperProcessor.from_pretrained(repo)
+wm = WhisperForConditionalGeneration.from_pretrained(repo).eval()
+feats = proc(de16, sampling_rate=16000, return_tensors=&quot;pt&quot;).input_features
+with torch.no_grad():
+    enc_out = wm.model.encoder(feats).last_hidden_state
+print(f&quot;log-mel {tuple(feats.shape)} -&gt; two convolutions (stride 1, then 2) + {wm.config.encoder_layers} encoder layers -&gt; {tuple(enc_out.shape)}&quot;)
+
+# Language identification: the decoder's first prediction after &lt;|startoftranscript|&gt;.
+lang_ids = {l: proc.tokenizer.convert_tokens_to_ids(f&quot;&lt;|{l}|&gt;&quot;) for l in [&quot;de&quot;, &quot;en&quot;, &quot;nl&quot;, &quot;fr&quot;, &quot;sv&quot;]}
+with torch.no_grad():
+    first = wm(input_features=feats, decoder_input_ids=torch.tensor([[wm.config.decoder_start_token_id]])).logits[0, -1]
+p = first[list(lang_ids.values())].softmax(-1)
+print(&quot;language token probabilities (among five):&quot;, &quot;, &quot;.join(f&quot;{l} {v:.2f}&quot; for l, v in zip(lang_ids, p)))
+
+for task in [&quot;transcribe&quot;, &quot;translate&quot;]:
+    with torch.no_grad():
+        out = wm.generate(input_features=feats, language=&quot;de&quot;, task=task, max_new_tokens=60, max_length=None)
+    prompt = proc.tokenizer.convert_ids_to_tokens([wm.config.decoder_start_token_id] +
+                                                  [i for _, i in proc.get_decoder_prompt_ids(language=&quot;de&quot;, task=task)])
+    print(f&quot;\ndecoder prompt {' '.join(prompt)}\n  -&gt; {proc.tokenizer.decode(out[0], skip_special_tokens=True).strip()}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">log-mel (1, 80, 3000) -&gt; two convolutions (stride 1, then 2) + 12 encoder layers -&gt; (1, 1500, 768)
+language token probabilities (among five): de 1.00, en 0.00, nl 0.00, fr 0.00, sv 0.00
+
+decoder prompt &lt;|startoftranscript|&gt; &lt;|de|&gt; &lt;|transcribe|&gt; &lt;|notimestamps|&gt;
+  -&gt; Das Wetter ist, heute schön, deshalb gehen wir am Nachmittag in den Park.
+
+decoder prompt &lt;|startoftranscript|&gt; &lt;|de|&gt; &lt;|translate|&gt; &lt;|notimestamps|&gt;
+  -&gt; The weather is beautiful today, so we go to the park in the afternoon.</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The two convolutions turn the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">80</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3000</span></span></span></span> log-mel into 1,500 positions of width 768 (Whisper-small), one per 20 ms. Before writing a word, the decoder's first prediction already identifies the language: among the five language tokens, German gets essentially all the probability, which is exactly how <code>detect_language</code> works. The two generations then share everything, the audio, the encoder output and the weights, except one prompt token. With <code>&lt;|transcribe|&gt;</code> the output is German ("Das Wetter ist, heute schön…", with one stray comma); with <code>&lt;|translate|&gt;</code> it is a fluent English translation, "The weather is beautiful today, so we go to the park in the afternoon." Task selection by prompt tokens is the speech version of what instruction-tuned language models do with text prompts.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Load a 44.1 kHz recording and pass its samples to Whisper's feature extractor without resampling and without saying <code>sampling_rate=44100</code> (older code often omits it). No error is raised in that case. What does Whisper hear, and what happens to the transcript? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Whisper is the open baseline.</strong> large-v3 and large-v3-turbo run in production through <code>faster-whisper</code> (CTranslate2), <code>whisper.cpp</code> and <code>transformers</code>; NVIDIA's Parakeet and Canary models lead several English and multilingual benchmarks on the Hugging Face Open ASR Leaderboard.</li>
+<li><strong>Hosted speech-to-text moved to LLM-based models</strong>, for example OpenAI's <code>gpt-4o-transcribe</code> (2025), while open audio–language models such as Qwen2-Audio and Mistral's Voxtral reuse a Whisper-style encoder in front of a language model.</li>
+<li><strong>Pipelines around the model.</strong> Production systems add VAD (Silero), diarisation (pyannote) and word timestamps (WhisperX) around the recogniser (Phase 6).</li>
+</ul>
+<p>Sources: <a href="https://github.com/openai/whisper">Whisper</a>, <a href="https://github.com/SYSTRAN/faster-whisper">faster-whisper</a>, <a href="https://github.com/ggml-org/whisper.cpp">whisper.cpp</a>, <a href="https://huggingface.co/spaces/hf-audio/open_asr_leaderboard">Open ASR Leaderboard</a>, <a href="https://openai.com/index/introducing-our-next-generation-audio-models/">OpenAI audio models</a>, <a href="https://mistral.ai/news/voxtral">Voxtral</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Input: a log-mel spectrogram, 80 or 128 bins every 10 ms, always 30 s (3,000 frames).</li>
+<li>A convolutional stem halves it to 1,500 positions; an encoder–decoder transformer does the rest.</li>
+<li>Task, language and timestamps are chosen by tokens in the decoder's prompt; language ID is the first prediction.</li>
+<li>The fixed 30 s window wastes encoder work on short clips; wrappers and newer models chunk or cut it.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-asr-whisper-v3"><span class="t" style="--cs-hue:265">SR</span>Cheat sheet · Speech Recognition and Whisper</a></div>
+<h2>Ship it</h2>
+<p>See <code>outputs/skill-asr-configurator.md</code>. The skill picks an ASR model, decoding parameters, and preprocessing pipeline for a new speech application.</p>
+<p><strong><code>outputs/skill-asr-configurator.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: asr-configurator
+description: Pick an ASR model (Whisper variant / Moonshine / faster-whisper) and decoding parameters for a new speech pipeline.
+version: 1.0.0
+phase: 7
+lesson: 10
+tags: [transformers, whisper, asr, speech]
+---
+
+Given a speech task (transcription / translation / streaming / on-device), language(s), audio characteristics (noise, accent, duration), and latency/quality targets, output:
+
+1. Model choice. One of: faster-whisper large-v3-turbo (default production), whisper large-v3 (highest quality, multilingual), whisper medium (mid-tier), Moonshine base (edge), distil-whisper (2× faster English). One-sentence reason.
+2. Quantization. int8_float16 (CPU default), float16 (GPU default), fp32 (research). Flag VRAM impact.
+3. Decoding. Beam width (5 typical, 1 for streaming), temperature fallback schedule, log-prob threshold, no-speech threshold, VAD gate on/off.
+4. Chunking. 30 s fixed window vs streaming chunks (typically 10 s with 2 s overlap) + VAD-based segmentation. Document post-merge strategy for overlaps.
+5. Post-processing. Timestamp alignment (WhisperX forced alignment), punctuation restoration, diarization (pyannote). Flag which are required by the task.
+
+Refuse to recommend plain OpenAI Whisper (reference implementation) for production — `faster-whisper` is 4× faster with identical outputs. Refuse to ship streaming ASR without VAD unless documented reason. Flag any single-speaker assumption when the input is likely multi-speaker.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. Confirm the frame count for a 1-second signal at 16 kHz with 10 ms hop is ~100 frames. For 30 seconds: ~3,000 frames.</li>
+<li><strong>Medium.</strong> Build the full log-mel spectrogram using <code>numpy.fft</code>. Verify 80 mel bins match <code>librosa.feature.melspectrogram(n_mels=80)</code> within numerical error.</li>
+<li><strong>Hard.</strong> Implement streaming inference: chunk audio into 10 s windows with 2 s overlap, run Whisper on each chunk, merge transcripts. Measure word-error rate vs single-pass on a 5-minute podcast sample.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a0710-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · German text, then English text</span></summary><div class="qa-a"><p>Before generating, Whisper is essentially certain the audio is German: the language token <code>&lt;|de|&gt;</code> takes practically all the probability among the five checked. With <code>&lt;|transcribe|&gt;</code> it writes German, "Das Wetter ist, heute schön, deshalb gehen wir am Nachmittag in den Park." (one spurious comma); with <code>&lt;|translate|&gt;</code> it writes English, "The weather is beautiful today, so we go to the park in the afternoon." One token in the prompt switches the task; the audio, the encoder output and the weights are the same.</p></div></details>
+<details class="qa" id="a0710-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Slowed-down audio</span></summary><div class="qa-a"><p>Whisper assumes every sample array is at 16 kHz. Samples recorded at 44.1 kHz, read as 16 kHz, last <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">44.1/16</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.76</span></span></span></span> times longer and every frequency drops by the same factor: a voice at 200 Hz becomes 73 Hz, slow and deep. The spectrogram is stretched in time and squashed towards the low mel bins, nothing like the training data, so the transcript degrades into errors or hallucinated text; a long recording also spills over the 30 s window. Always resample to 16 kHz (<code>librosa.resample</code>, <code>torchaudio.functional.resample</code>) and pass <code>sampling_rate=16000</code>, which makes <code>transformers</code> check it.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2212.04356">Radford et al. (2022). Robust Speech Recognition via Large-Scale Weak Supervision</a> — Whisper paper.</li>
+<li><a href="https://github.com/openai/whisper">OpenAI Whisper repo</a> — reference code + model weights. Read <code>whisper/model.py</code> to see the Conv1D stem + encoder + decoder top-to-bottom in ~400 lines.</li>
+<li><a href="https://github.com/openai/whisper/blob/main/whisper/decoding.py">OpenAI Whisper — <code>whisper/decoding.py</code></a> — the beam-search + task-token logic described in Steps 5–6 is here; 500 lines, fully readable.</li>
+<li><a href="https://arxiv.org/abs/2006.11477">Baevski et al. (2020). wav2vec 2.0: A Framework for Self-Supervised Learning of Speech Representations</a> — precursor; still SOTA features in some settings.</li>
+<li><a href="https://github.com/SYSTRAN/faster-whisper">SYSTRAN/faster-whisper</a> — production wrapper, 4× faster than reference.</li>
+<li><a href="https://arxiv.org/abs/2410.15608">Jia et al. (2024). Moonshine: Speech Recognition for Live Transcription and Voice Commands</a> — 2024 edge-friendly ASR, Whisper-shaped but smaller.</li>
+<li><a href="https://huggingface.co/blog/fine-tune-whisper">HuggingFace blog — "Fine-Tune Whisper For Multilingual ASR with 🤗 Transformers"</a> — canonical fine-tuning recipe including mel spectrogram preprocessor and token-timestamp handling.</li>
+<li><a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/whisper/modeling_whisper.py">HuggingFace <code>modeling_whisper.py</code></a> — full implementation (encoder, decoder, cross-attention, generation) that mirrors the lesson's architecture diagram.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/07-transformers-deep-dive/10-audio-transformers-whisper" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0710" id="done-a0710">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0710" id="undo-a0710" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0709"><span class="pn-dir">Previous</span><span class="pn-t">7.9 · Vision Transformers (ViT)</span></a><a class="pn next" href="#a0711"><span class="pn-dir">Next</span><span class="pn-t">7.11 · Mixture of Experts (MoE)</span></a></div></footer>

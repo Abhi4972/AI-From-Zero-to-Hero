@@ -1,0 +1,502 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>DeepSeek-V3 Architecture Walkthrough</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.20</span><span class="chip">75 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1020" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Read the DeepSeek-V3 config top to bottom and explain each field in terms of the six GPT-2 knobs plus four DeepSeek-specific additions.</li>
+<li>Derive the total parameter count (671B), active parameter count (37B), and the components that contribute to each.</li>
+<li>Compute the KV cache footprint of MLA at 128k context and compare to what a same-active-param dense model with GQA would pay.</li>
+<li>State the four DeepSeek-specific innovations (MLA, MTP, auxiliary-loss-free routing, DualPipe) and name which part of the architecture/training stack each one targets.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10 · 14 (open-model walkthroughs), Phase 10 · 17 (NSA), Phase 10 · 18 (MTP), Phase 10 · 19 (DualPipe)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, parameter calculator), Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p><a href="#a1014">Lesson 10.14</a> named the six architectural knobs every open model turns. DeepSeek-V3 (December 2024, 671B parameters total, 37B active) turns all six and adds four more: Multi-Head Latent Attention, auxiliary-loss-free load balancing, Multi-Token Prediction, and DualPipe training. This lesson reads DeepSeek-V3's architecture top to bottom and derives every parameter count from the published config. By the end you can explain why the 671B/37B ratio is the right bet and why MLA + MoE together beat either alone at the frontier.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MLA</td>
+<td>"Multi-Head Latent Attention"</td>
+<td>Compress K and V into a shared low-rank latent (kv_lora_rank, typically 512), decompress per head on-the-fly; KV cache stores only the latent</td>
+</tr>
+<tr>
+<td>kv_lora_rank</td>
+<td>"MLA compression dim"</td>
+<td>The size of the shared latent for K and V; DeepSeek-V3 uses 512</td>
+</tr>
+<tr>
+<td>First k dense layers</td>
+<td>"Early layers stay dense"</td>
+<td>The first few MoE-model layers skip the MoE router and run a dense MLP for stability</td>
+</tr>
+<tr>
+<td>num_experts_per_tok</td>
+<td>"Top-k routing"</td>
+<td>How many routed experts fire per token; DeepSeek-V3 uses 8</td>
+</tr>
+<tr>
+<td>Shared experts</td>
+<td>"Always-on experts"</td>
+<td>Experts that process every token regardless of routing; DeepSeek-V3 uses 1</td>
+</tr>
+<tr>
+<td>Auxiliary-loss-free routing</td>
+<td>"Bias-adjusted load balance"</td>
+<td>Per-expert bias terms adjusted during training to keep expert load balanced without adding a loss term</td>
+</tr>
+<tr>
+<td>MTP module</td>
+<td>"Extra prediction head"</td>
+<td>Transformer block predicting $t+2$ from $h^{(1)}$ and $E(t+1)$; denser training, free speculative-decoding draft</td>
+</tr>
+<tr>
+<td>DualPipe</td>
+<td>"Bidirectional pipeline"</td>
+<td>Training schedule that overlaps forward/backward compute with cross-node all-to-all</td>
+</tr>
+<tr>
+<td>Active parameter ratio</td>
+<td>"Sparsity"</td>
+<td>active_params / total_params; DeepSeek-V3 hits 5.5%</td>
+</tr>
+<tr>
+<td>FP8 training</td>
+<td>"8-bit training"</td>
+<td>Training storage and many compute ops in FP8; roughly halves memory vs BF16 at a small quality cost</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>DeepSeek-V3 (December 2024) is a 671-billion-parameter model of which only 37 billion work on any one token: each layer holds 256 small expert networks and a router sends every token to 8 of them. Its attention is also different: instead of caching keys and values for every head, it caches one small compressed vector per token (Multi-Head Latent Attention, MLA) and rebuilds what each head needs from it. Add a load-balancing trick without an extra loss, multi-token prediction (<a href="#a1018">Lesson 10.18</a>) and the DualPipe schedule (<a href="#a1019">Lesson 10.19</a>), and you have the blueprint many later open models copy. This lesson runs the lesson's calculator, counts every tensor of the real model from its config, simulates the load balancing, and checks MLA's cache and its "absorbed" attention with Hugging Face's own DeepSeek-V3 code. No model is trained.</p></div></aside>
+<p>DeepSeek-V3 is the first frontier open model whose architecture is meaningfully different from the Llama family. Llama 3 405B is "GPT-2 with six knobs turned." DeepSeek-V3 is GPT-2 with all six knobs plus four more. Reading the Llama 3 config is a warmup for reading the DeepSeek config, but the deep structure — the shape of the attention block, the routing logic, the training-time objective — is different enough that you need a separate walkthrough.</p>
+<p>The payoff of learning it: DeepSeek-V3's open-weights release shifted what "frontier capability" means in open models. The architecture is the blueprint many 2026 training runs are copying. Understanding it is table stakes for any role that touches frontier LLM training or inference.</p>
+<h2>Idea 1 · The invariant core, again</h2>
+<p>DeepSeek-V3 is still autoregressive. It still stacks decoder blocks. Each block still has attention plus MLP plus two RMSNorms. It still uses SwiGLU in the MLP. It still uses RoPE. Pre-norm. A separate input embedding and output head (not tied, as in Llama 3). Same baseline as every Llama or Mistral.</p>
+<h2>Idea 2 · The twist: MLA instead of GQA</h2>
+<p>From Phase 10 · 14 you know GQA shrinks the KV cache by sharing K and V across groups of Q heads. Multi-Head Latent Attention (MLA) goes further: K and V are compressed into a shared low-rank latent representation (the <code>kv_lora_rank</code>), then decompressed per head on the fly. The KV cache stores only the latent: 512 numbers per token per layer, plus one 64-number key that carries the RoPE position and is shared by all heads, against 2 × 8 × 128 = 2,048 numbers for a GQA layer with 8 KV heads.</p>
+<p>At 128k context, DeepSeek-V3 with MLA (one shared latent <code>c^{KV}</code> per token per layer; K and V are both derived from this latent via up-projections that can be absorbed into the subsequent matmul):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">kv_cache = num_layers * kv_lora_rank * max_seq_len * bytes_per_element
+         = 61 * 512 * 131072 * 2
+         = 7.6 GB
+</code></pre></div>
+<p>A hypothetical GQA baseline (Llama 3 70B shape, 8 KV heads, head dim 128) would pay:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">kv_cache = 2 * 61 * 8 * 128 * 131072 * 2
+         = 30.5 GB
+</code></pre></div>
+<p>Both results are in GiB (2³⁰ bytes). Counting the 64-number RoPE key that MLA also caches, the MLA cache is 61 × 576 × 131,072 × 2 bytes = 8.6 GiB, 3.6× smaller than the Llama-3-70B-style GQA cache at 128k context.</p>
+<p>The tradeoff: MLA adds a decompression step per attention computation (per head). The extra compute is small compared to the bandwidth saved. Net win for long-context inference.</p>
+<h2>Idea 3 · The routing: auxiliary-loss-free load balancing</h2>
+<p>MoE routers decide which top-k experts process each token. A naive router concentrates too much work on a few experts, leaving others idle. Standard fix: add an auxiliary loss term that penalizes load imbalance. This works but slightly degrades main-task performance.</p>
+<p>DeepSeek-V3 introduces an auxiliary-loss-free scheme. Per-expert bias terms are added to the router logits, adjusted during training by a simple rule: if expert <code>e</code> is overloaded, decrease <code>bias_e</code>; if underloaded, increase it. No extra loss term. Training stays clean. Expert load stays balanced.</p>
+<p>Two details matter. The bias only decides <em>which</em> experts are chosen; the gate weights that mix the chosen experts' outputs come from the unbiased affinities. And the bias step is small (γ = 0.001 for the first 14.3T tokens, then 0). DeepSeek-V3 also keeps a tiny sequence-wise balance loss (α = 0.0001) against extreme imbalance within single sequences. In the report's ablations, models balanced this way score better than the same models balanced with an auxiliary loss.</p>
+<h2>Idea 4 · The MTP: denser training + free draft</h2>
+<p>From Phase 10 · 18 you know DeepSeek-V3 adds D=1 MTP module that predicts the token two positions ahead. At inference, the trained module is repurposed as a speculative-decoding draft with 85–90% acceptance. At training, each hidden state is supervised on D+1 = 2 targets, providing a denser signal.</p>
+<p>Parameters: 14B on top of the 671B main. Overhead: 2.1%.</p>
+<h2>Idea 5 · The training: DualPipe</h2>
+<p>From Phase 10 · 19 you know DualPipe is a bidirectional pipeline that overlaps forward and backward chunks with cross-node all-to-all comms. At DeepSeek-V3's 2,048-H800 scale, its main job is hiding the expert-parallel all-to-all traffic, which would otherwise take about as long as the computation.</p>
+<h2>Idea 6 · The config, field by field</h2>
+<p>Here is the DeepSeek-V3 config (simplified):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">hidden_size: 7168
+intermediate_size: 18432   (dense MLP hidden size, used on first few layers)
+moe_intermediate_size: 2048 (expert MLP hidden size)
+num_hidden_layers: 61
+first_k_dense_layers: 3    (first 3 layers use dense MLP)
+num_attention_heads: 128
+num_key_value_heads: 128   (formally equal to num_heads under MLA, but
+                           the real compression is in kv_lora_rank)
+kv_lora_rank: 512          (MLA latent dimension)
+num_experts: 256            (MoE expert count per block)
+num_experts_per_tok: 8      (top-8 routing)
+shared_experts: 1           (always-on shared expert per block)
+max_position_embeddings: 163840
+rope_theta: 10000.0
+vocab_size: 129280
+mtp_module: 1               (1 MTP module at depth 1)
+</code></pre></div>
+<p>Parse it (the real file names some fields differently: <code>first_k_dense_replace</code>, <code>n_routed_experts</code>, <code>n_shared_experts</code>, <code>num_nextn_predict_layers</code>; it also sets <code>q_lora_rank: 1536</code> for compressed queries, <code>qk_rope_head_dim: 64</code> and YaRN scaling with factor 40, all used after Use it):</p>
+<ul>
+<li><code>hidden_size=7168</code>: embedding dimension.</li>
+<li><code>num_hidden_layers=61</code>: total block depth.</li>
+<li><code>first_k_dense_layers=3</code>: the first 3 blocks use a dense MLP of size 18432. The remaining 58 use MoE.</li>
+<li><code>num_attention_heads=128</code>: 128 query heads.</li>
+<li><code>kv_lora_rank=512</code>: K and V are compressed to this latent dimension and decompressed per head.</li>
+<li><code>num_experts=256, num_experts_per_tok=8</code>: each MoE block has 256 experts, routes top-8.</li>
+<li><code>shared_experts=1</code>: on top of the 256 routed experts, 1 always-on expert contributes to every token. Think of it as a "dense floor" that ensures every token gets something reliable.</li>
+<li><code>moe_intermediate_size=2048</code>: each expert's MLP hidden size. Smaller than the dense MLP because there are 256 of them.</li>
+</ul>
+<h2>Idea 7 · Parameter accounting</h2>
+<p>The full calculation lives in <code>code/main.py</code>. The headline:</p>
+<ul>
+<li>Embedding: <code>vocab * hidden = 129280 * 7168 = ~0.93B</code>.</li>
+<li>First 3 dense blocks: attention with MLA (~84M per block in the calculator's simplified count) + dense SwiGLU MLP (<code>3 * 7168 * 18432 = ~396M</code> per block) + norms. About 1.4B total.</li>
+<li>58 MoE blocks: attention with MLA (~84M) + 256 routed experts (<code>3 * 7168 * 2048 = ~44M</code> apiece) + 1 shared expert (~44M) + router + norms. About 11.4B per block, including all experts. About 661B for the 58 MoE blocks.</li>
+<li>MTP module: the published module is 14B. The calculator uses a dense stand-in of ~0.8B.</li>
+</ul>
+<p>Grand total: the calculator lands at ~664B against the published 671B for the main model. The Hugging Face checkpoint is 685B because it adds the 14B MTP module on top of the 671B. The remaining ~1% gap comes from simplifications: the calculator skips the decoupled RoPE dimensions in MLA, the untied output head, and a few small tensors. Counting every tensor of the real model (after Use it) gives 671.03B, with 187M of attention per layer rather than 84M.</p>
+<p>Active parameters per forward:</p>
+<ul>
+<li>Attention: 84M per layer * 61 = ~5.1B (all layers fire).</li>
+<li>MLP active: first 3 layers dense (<code>3 * 396M = ~1.2B</code>), 58 MoE layers each active with 8 routed + 1 shared expert (<code>9 * 44M = ~396M</code> per layer, ~23B total). About 24B in all.</li>
+<li>Embedding + norms: ~0.9B.</li>
+<li>Total active: ~30B from the calculator against the published 37B. Most of the gap is attention: full MLA, with its RoPE dimensions and wider query and key heads, is larger than the simplified count. The MTP module does not count toward the 37B.</li>
+</ul>
+<figure class="xv" data-xv="moe-token" aria-label="Animated plate: one token passes through attention, the router picks 4 of 8 nodes and 8 of 256 experts, and their weighted outputs are summed with the shared expert."></figure>
+<h2>Idea 8 · The 671B / 37B ratio</h2>
+<p>18x sparsity ratio (active params are 5.5% of total). At its release it was among the sparsest open MoE models; later ones go further (Llama 4 Maverick runs 17B of 400B, Kimi K2 32B of 1T). Mixtral 8x7B at ratio 13/47 (28%) is much denser. Llama 4 Maverick at ratio 17B/400B (4.25%) is comparable. The DeepSeek bet: at frontier scale, more experts with lower activation ratio produces better quality per active-FLOP.</p>
+<h2>Idea 9 · Where DeepSeek-V3 sits</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Total</th>
+<th>Active</th>
+<th>Ratio</th>
+<th>Attention</th>
+<th>Novel ideas</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Llama 3 70B</td>
+<td>70B</td>
+<td>70B</td>
+<td>100%</td>
+<td>GQA 64/8</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Llama 4 Maverick</td>
+<td>400B</td>
+<td>17B</td>
+<td>4.25%</td>
+<td>GQA</td>
+<td>—</td>
+</tr>
+<tr>
+<td>Mixtral 8x22B</td>
+<td>141B</td>
+<td>39B</td>
+<td>27%</td>
+<td>GQA</td>
+<td>—</td>
+</tr>
+<tr>
+<td>DeepSeek V3</td>
+<td>671B</td>
+<td>37B</td>
+<td>5.5%</td>
+<td>MLA 512</td>
+<td>MLA + MTP + aux-free + DualPipe</td>
+</tr>
+<tr>
+<td>Qwen 2.5 72B</td>
+<td>72B</td>
+<td>72B</td>
+<td>100%</td>
+<td>GQA 64/8</td>
+<td>YaRN extension</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Idea 10 · The follow-on: R1, V4</h2>
+<p>DeepSeek-R1 (2025) is a reasoning-training run on the V3 backbone. R1 uses the same architecture. What changed is the post-training recipe (large-scale RL on verifiable tasks), not the pretraining architecture.</p>
+<p>DeepSeek-V3.2 (2025) keeps V3's architecture and adds DSA (DeepSeek Sparse Attention), the successor to NSA from Phase 10 · 17. DeepSeek-V4 (April 2026: V4-Pro with 1.6T parameters, 49B active, and V4-Flash with 284B, 13B active, both with a 1M-token context) goes further, with a new hybrid of compressed and sparse attention and a new residual scheme (hyper-connections), beyond the scope of this lesson.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="moe-routing"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>MLA.</strong> For token <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> with hidden state <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, cache only
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1383em;vertical-align:-0.247em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0413em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">DK</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1383em;vertical-align:-0.247em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">512</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-2.453em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.00773em;">R</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1413em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">RoPE</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.00773em;">R</span></span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8641em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8641em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">64</span></span></span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div>
+Head <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span>'s key and value are rebuilt as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9805em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1em;vertical-align:-0.2587em;"></span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.453em;margin-left:-0.0315em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.00773em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1em;vertical-align:-0.2587em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>Absorption.</strong> The content part of a score is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2439em;vertical-align:-0.3948em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.4413em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">i</span></span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">⊤</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3948em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.439em;vertical-align:-0.35em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mtight">⊤</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">s</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord"><span class="delimsizing size1">)</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:1.089em;"><span style="top:-3.3029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span></span></span></span>: multiply the query by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1078em;vertical-align:-0.2587em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mtight">⊤</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span></span></span></span> once and attend directly over the cached latents. Likewise <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1em;vertical-align:-0.2587em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-2.4413em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">U</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span></span></span></span> folds into the output projection.</p>
+<p><strong>Cache per token:</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.00773em;">R</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> numbers for MLA, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> for GQA.</p>
+<p><strong>Routing.</strong> Affinity <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">e</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">u</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.453em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">⊤</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>; choose the top 8 of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">e</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>; gate weights <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7167em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">e</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1858em;vertical-align:-0.4358em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mathnormal mtight">e</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1783em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mrel mtight">∈</span><span class="mord text mtight"><span class="mord mtight">top</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4358em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.328em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mpunct mtight">,</span><span class="mord mtight"><span class="mord mathnormal mtight">e</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6828em;"><span style="top:-2.786em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> use <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>, not <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>. After each step, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">←</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathrm">sign</span></span><span class="mopen">(</span><span class="mord"><span class="mord text"><span class="mord">load</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">e</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1444em;vertical-align:-0.25em;"></span><span class="mord overline"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">load</span></span></span></span><span style="top:-3.8144em;"><span class="pstrut" style="height:3em;"></span><span class="overline-line" style="border-bottom-width:0.04em;"></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>.</p>
+<p><strong>Active parameters</strong> $= $ attention <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">+</span></span></span></span> dense MLPs $+ \tfrac{8}{256}\,$routed experts <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">+</span></span></span></span> shared experts <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">+</span></span></span></span> output head.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">DeepSeek-V3&#x27;s attention and cache</div><div class="co-body"><ul>
+<li>Per layer: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">a</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7168</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1536</span></span></span></span> (11.0M), <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1536</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">192</span></span></span></span> (37.7M), <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">a</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7168</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">576</span></span></span></span> (4.1M), <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">256</span></span></span></span> (16.8M), <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">o</span></span></span></span> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">7168</span></span></span></span> (117.4M): 187M.</li>
+<li>Cache per token and layer: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">576</span></span></span></span> numbers, 1,152 bytes in BF16; over 61 layers 68.6 KB.</li>
+<li>A GQA layer with 8 heads of 128 caches <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">048</span></span></span></span> numbers, 3.6× more; caching V3's own 128 heads decompressed would be <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">192</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">128</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">40</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">960</span></span></span></span> numbers, 71× more.</li>
+<li>Experts: $256 \times 3 \times 7168 \times 2048 = 11.27$B per MoE layer, 58 layers: 654B, the bulk of the 671B. Per token only 8 run: 20.4B.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "MLA caches 512 numbers per token per layer."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> 576: the 512-number latent plus a 64-number RoPE key, because positions cannot be absorbed into the latent.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Auxiliary-loss-free balancing changes the expert weights."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The bias only changes which experts are picked; the mixing weights come from the unbiased scores.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "671B parameters means 671B of compute per token."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> About 37B are active per token; the routed experts hold 654B and only 8 of 256 run.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Hugging Face's DeepSeek-V3 code is run with the real attention sizes. Will its cache store the per-head keys and values (128 heads), or the compressed latent? And how many bytes per token per layer would that be in BF16? (Solution P1.)</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> is the parameter calculator specialized to DeepSeek-V3's shape. Run it, compare its output to the paper's numbers, and use it on hypothetical variants (256 experts vs 512, top-8 vs top-16, MLA rank 512 vs 1024).</p>
+<p>What to look at:</p>
+<ul>
+<li>Total parameter count vs published 671B.</li>
+<li>Active parameter count vs published 37B.</li>
+<li>KV cache at 128k context — the MLA vs GQA comparison.</li>
+<li>Per-layer breakdown to see where the parameter budget actually goes.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s calculator</div><div class="co-body"><p><code>main.py</code>: total and active parameters, per-layer breakdown and KV cache for DeepSeek-V3's config and three what-ifs (latent 256, 512 experts, top-16), instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # the lesson's parameter calculator with three what-ifs; instant
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+DEEPSEEK-V3 ARCHITECTURE WALKTHROUGH (Phase 10, Lesson 20)
+======================================================================
+
+DeepSeek-V3 (published config)
+----------------------------------------------------------------------
+  total params       : 664.5B
+  active params      : 30.4B
+  active ratio       : 4.6%
+  embedding          : 926.7M
+  attention / layer  : 84.4M  (MLA)
+  moe block / layer  : 11.4B  (total)
+  active moe / layer : 482.6M  (per forward)
+  KV cache BF16, 131,072 ctx : 7.6GB
+  GQA(8/128) reference       : 30.5GB
+  MLA savings              : 75%
+
+DeepSeek-V3 (MLA rank 256 what-if)
+----------------------------------------------------------------------
+  total params       : 664.2B
+  active params      : 30.0B
+  active ratio       : 4.5%
+  embedding          : 926.7M
+  attention / layer  : 78.9M  (MLA)
+  moe block / layer  : 11.4B  (total)
+  active moe / layer : 477.1M  (per forward)
+  KV cache BF16, 131,072 ctx : 3.8GB
+  GQA(8/128) reference       : 30.5GB
+  MLA savings              : 88%
+
+DeepSeek-V3 (512 experts, top-8 what-if)
+----------------------------------------------------------------------
+  total params       : 1318.6B
+  active params      : 30.5B
+  active ratio       : 2.3%
+  embedding          : 926.7M
+…
+(28 more lines)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The calculator gets the shape right and the details wrong. It lands at 664.5B total and 30.4B active against the published 671B and 37B because its attention count is 84M per layer, less than half of MLA's real 187M (the next run counts every tensor): it misses the compressed-query matrices, the 64 RoPE dimensions of every query head and the 128 × 128 → 7,168 output projection. Over 61 layers that is about 6.3B, most of the gap in both totals; the missing output head (0.93B) explains most of the rest.</p>
+<p>Its cache figure leaves out MLA's 64-number RoPE key: 7.6 GiB at 128K instead of 8.6 GiB, so "75% savings" against GQA is really 72%. The what-ifs show the trade-offs correctly in direction: halving the latent halves the cache; 512 experts double the total parameters but leave the active ones unchanged; top-16 routing keeps the total but adds about 20B active parameters per token, which is compute on every token.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Every tensor counted, caches compared, routing balanced</div><div class="co-body"><p>A: the published config built on PyTorch's meta device (shapes only, no weights) and every parameter summed by component. B: cache per token for MLA, the lesson's MLA count, GQA and decompressed MHA. C: a simulation of auxiliary-loss-free balancing with 64 experts and top-8 routing, where some experts are systematically preferred.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np, torch, transformers
+from transformers import AutoConfig, AutoModelForCausalLM
+transformers.logging.set_verbosity_error()
+
+print(&quot;A. DeepSeek-V3 built from its published config on the meta device (shapes only)&quot;)
+cfg = AutoConfig.from_pretrained(&quot;deepseek-ai/DeepSeek-V3&quot;)
+with torch.device(&quot;meta&quot;):
+    model = AutoModelForCausalLM.from_config(cfg)
+groups = {&quot;embedding&quot;: 0, &quot;output head&quot;: 0, &quot;attention (MLA)&quot;: 0, &quot;dense MLPs (layers 0-2)&quot;: 0,
+          &quot;routed experts&quot;: 0, &quot;shared experts&quot;: 0, &quot;routers&quot;: 0, &quot;norms&quot;: 0}
+for n, p in model.named_parameters():
+    k = (&quot;embedding&quot; if &quot;embed_tokens&quot; in n else &quot;output head&quot; if n.startswith(&quot;lm_head&quot;) else
+         &quot;attention (MLA)&quot; if &quot;.self_attn.&quot; in n else &quot;routed experts&quot; if &quot;.experts.&quot; in n else
+         &quot;shared experts&quot; if &quot;shared_experts&quot; in n else &quot;routers&quot; if &quot;.gate.&quot; in n or n.endswith(&quot;gate.weight&quot;) or &quot;e_score&quot; in n else
+         &quot;dense MLPs (layers 0-2)&quot; if &quot;.mlp.&quot; in n else &quot;norms&quot;)
+    groups[k] += p.numel()
+total = sum(groups.values())
+for k, v in groups.items():
+    print(f&quot;  {k:&lt;26} {v / 1e9:8.2f}B&quot;)
+print(f&quot;  {'total':&lt;26} {total / 1e9:8.2f}B   (published: 671B, without the 14B MTP module)&quot;)
+L, moe = cfg.num_hidden_layers, cfg.num_hidden_layers - cfg.first_k_dense_replace
+active = (groups[&quot;embedding&quot;] / cfg.vocab_size + groups[&quot;output head&quot;] + groups[&quot;attention (MLA)&quot;] + groups[&quot;dense MLPs (layers 0-2)&quot;]
+          + groups[&quot;routed experts&quot;] * cfg.num_experts_per_tok / cfg.n_routed_experts + groups[&quot;shared experts&quot;] + groups[&quot;routers&quot;] + groups[&quot;norms&quot;])
+print(f&quot;  active per token: {active / 1e9:.2f}B  (one embedding row, 8 of 256 experts; published: 37B)&quot;)
+print(f&quot;  attention per layer: {groups['attention (MLA)'] / L / 1e6:.0f}M   (the lesson's calculator: 84M)&quot;)
+print()
+
+print(&quot;B. KV cache per token and at 128K tokens (BF16)&quot;)
+c = cfg.kv_lora_rank + cfg.qk_rope_head_dim
+rows = [(&quot;MLA latent (512 + 64 RoPE key)&quot;, L * c * 2),
+        (&quot;MLA without the RoPE key (lesson)&quot;, L * cfg.kv_lora_rank * 2),
+        (&quot;GQA, 8 KV heads of 128, 61 layers&quot;, L * 2 * 8 * 128 * 2),
+        (&quot;MHA with V3's 128 heads, decompressed&quot;, L * cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim) * 2)]
+for name, b in rows:
+    print(f&quot;  {name:&lt;40} {b / 1024:8.1f} KB/token   {b * 131072 / 2**30:7.1f} GiB at 128K&quot;)
+print()
+
+print(&quot;C. Auxiliary-loss-free balancing: a bias per expert, nudged by the sign of its load (gamma = 0.001)&quot;)
+rng = np.random.default_rng(0)
+E, k, T = 64, 8, 4096
+pref = rng.normal(0, 1, E) * 0.5                     # some experts are systematically preferred
+bias = np.zeros(E)
+for step in range(301):
+    x = rng.normal(0, 1, (T, E))
+    s = 1 / (1 + np.exp(-(x + pref)))                # sigmoid affinities, as in DeepSeek-V3
+    chosen = np.argsort(-(s + bias), 1)[:, :k]       # the bias only changes WHICH experts are chosen
+    load = np.bincount(chosen.ravel(), minlength=E) / (T * k / E)
+    if step in (0, 30, 100, 300):
+        g = np.take_along_axis(s, chosen, 1); g /= g.sum(1, keepdims=True)    # gate weights from s, without the bias
+        print(f&quot;  step {step:&gt;3}: busiest expert {load.max():.2f}x its fair share, idlest {load.min():.2f}x, &quot;
+              f&quot;mean gate weight of the top choice {g.max(1).mean():.3f}&quot;)
+    bias -= 0.001 * np.sign(load - 1)                # overloaded: lower the bias; underloaded: raise it
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. DeepSeek-V3 built from its published config on the meta device (shapes only)
+  embedding                      0.93B
+  output head                    0.93B
+  attention (MLA)               11.41B
+  dense MLPs (layers 0-2)        1.19B
+  routed experts               653.91B
+  shared experts                 2.55B
+  routers                        0.11B
+  norms                          0.00B
+  total                        671.03B   (published: 671B, without the 14B MTP module)
+  active per token: 36.63B  (one embedding row, 8 of 256 experts; published: 37B)
+  attention per layer: 187M   (the lesson&#x27;s calculator: 84M)
+
+B. KV cache per token and at 128K tokens (BF16)
+  MLA latent (512 + 64 RoPE key)               68.6 KB/token       8.6 GiB at 128K
+  MLA without the RoPE key (lesson)            61.0 KB/token       7.6 GiB at 128K
+  GQA, 8 KV heads of 128, 61 layers           244.0 KB/token      30.5 GiB at 128K
+  MHA with V3&#x27;s 128 heads, decompressed      4880.0 KB/token     610.0 GiB at 128K
+
+C. Auxiliary-loss-free balancing: a bias per expert, nudged by the sign of its load (gamma = 0.001)
+  step   0: busiest expert 3.01x its fair share, idlest 0.07x, mean gate weight of the top choice 0.136
+  step  30: busiest expert 2.66x its fair share, idlest 0.11x, mean gate weight of the top choice 0.137
+  step 100: busiest expert 1.65x its fair share, idlest 0.24x, mean gate weight of the top choice 0.140
+  step 300: busiest expert 1.10x its fair share, idlest 0.89x, mean gate weight of the top choice 0.141</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> Built from the published config and summed tensor by tensor, DeepSeek-V3 has 671.03B parameters, exactly the published 671B. The routed experts are 653.9B of them, 97%; attention (MLA) is 11.4B, 187M per layer. Counting what one token uses (one embedding row, all attention, the dense MLPs of layers 0–2, 8 of 256 routed experts, the shared experts, routers and output head) gives 36.6B, the published 37B.</p>
+<p><strong>B.</strong> Per token, MLA caches 68.6 KB over 61 layers, 8.6 GiB at 128K tokens. The lesson's count without the RoPE key gives 7.6 GiB. A GQA model with 8 KV heads and the same depth would need 30.5 GiB; caching DeepSeek-V3's own 128 heads decompressed would need 610 GiB, which is why MLA's latent cache is essential at 128 heads.</p>
+<p><strong>C.</strong> With some experts systematically preferred, plain top-8 routing sends the busiest expert 3× its fair share of tokens and the idlest almost none (0.07×). Nudging each expert's routing bias by 0.001 per step against the sign of its load brings both to 1.10× and 0.89× within 300 steps, with no loss term at all. The gate weights that mix the chosen experts are computed without the bias, so the mean weight of the top choice barely changes (0.136 to 0.141): the bias changes who gets the token, not how much each chosen expert counts.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Hugging Face&#x27;s MLA, run</div><div class="co-body"><p>A 2-layer model with DeepSeek-V3's full-size attention (and random weights; no checkpoint is loaded) runs 256 tokens. Shown: what the cache actually stores, and attention scores computed two ways with that layer's own weights: by decompressing per-head keys, and by absorbing the key matrix into the query. About 10 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, transformers
+from transformers import AutoConfig, AutoModelForCausalLM
+transformers.logging.set_verbosity_error()
+torch.manual_seed(0)
+
+# DeepSeek-V3's real attention shapes in a 2-layer model with random weights (no checkpoint is loaded):
+# full-size MLA (hidden 7168, 128 heads, latent 512 + 64), small dense MLPs and a 1,000-token vocabulary to fit in memory.
+cfg = AutoConfig.from_pretrained(&quot;deepseek-ai/DeepSeek-V3&quot;)
+cfg.num_hidden_layers, cfg.first_k_dense_replace, cfg.intermediate_size, cfg.vocab_size = 2, 2, 512, 1000
+cfg.quantization_config = None
+model = AutoModelForCausalLM.from_config(cfg, dtype=torch.bfloat16).eval()
+attn = model.model.layers[0].self_attn
+print(f&quot;attention parameters per layer: {sum(p.numel() for p in attn.parameters()) / 1e6:.1f}M&quot;)
+
+T = 256
+with torch.no_grad():
+    out = model(torch.randint(0, 1000, (1, T)), use_cache=True)
+cache = out.past_key_values
+lay = cache.layers[0]
+kb = lay.keys.numel() * lay.keys.element_size(); vb = lay.values.numel() * lay.values.element_size()
+print(f&quot;\nwhat Hugging Face's DeepSeek-V3 code caches per layer for {T} tokens:&quot;)
+print(f&quot;  'keys'   {tuple(lay.keys.shape)}  (the 512-number latent c_KV, one 'head')&quot;)
+print(f&quot;  'values' {tuple(lay.values.shape)}  (the shared 64-number RoPE key)&quot;)
+print(f&quot;  bytes per token per layer: {(kb + vb) // T} (BF16)&quot;)
+full = cfg.num_attention_heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim + cfg.v_head_dim) * 2
+print(f&quot;  decompressed keys and values for 128 heads would be {full:,} bytes: {full / ((kb + vb) / T):.0f}x more&quot;)
+
+print(&quot;\nweight absorption: scores from decompressed keys versus from the latent, with this layer's own weights&quot;)
+x = torch.randn(1, 16, cfg.hidden_size, dtype=torch.float32)
+a = attn.float()
+with torch.no_grad():
+    q = a.q_b_proj(a.q_a_layernorm(a.q_a_proj(x))).view(1, 16, 128, 192)
+    q_nope = q[..., :128]                                               # the part of q without RoPE
+    c = a.kv_a_layernorm(a.kv_a_proj_with_mqa(x)[..., :512])            # latent c_KV, 512 per token
+    W = a.kv_b_proj.weight.view(128, 256, 512)                          # per head: 128 key rows + 128 value rows
+    W_uk = W[:, :128, :]
+    k_nope = torch.einsum(&quot;hdc,tc-&gt;thd&quot;, W_uk, c[0])                    # decompress: 128 heads x 128 dims per token
+    s_dec = torch.einsum(&quot;qhd,thd-&gt;hqt&quot;, q_nope[0], k_nope)
+    q_abs = torch.einsum(&quot;qhd,hdc-&gt;qhc&quot;, q_nope[0], W_uk)               # absorb W_uk into the query once
+    s_abs = torch.einsum(&quot;qhc,tc-&gt;hqt&quot;, q_abs, c[0])                    # then dot with the 512-number latent directly
+print(f&quot;  largest difference between the two score tables: {(s_dec - s_abs).abs().max():.1e} &quot;
+      f&quot;(scores are about {s_dec.abs().mean():.1f} in size)&quot;)
+print(f&quot;  per cached token, decompressing reads 512 numbers and writes {128 * 128:,}; the absorbed form reads only the 512&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">attention parameters per layer: 187.1M
+
+what Hugging Face&#x27;s DeepSeek-V3 code caches per layer for 256 tokens:
+  &#x27;keys&#x27;   (1, 1, 256, 512)  (the 512-number latent c_KV, one &#x27;head&#x27;)
+  &#x27;values&#x27; (1, 1, 256, 64)  (the shared 64-number RoPE key)
+  bytes per token per layer: 1152 (BF16)
+  decompressed keys and values for 128 heads would be 81,920 bytes: 71x more
+
+weight absorption: scores from decompressed keys versus from the latent, with this layer&#x27;s own weights
+  largest difference between the two score tables: 9.5e-06 (scores are about 3.2 in size)
+  per cached token, decompressing reads 512 numbers and writes 16,384; the absorbed form reads only the 512</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Hugging Face's current DeepSeek-V3 code caches exactly what MLA promises: per layer, a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">256</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">512</span></span></span></span> tensor (the latent <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8413em;"></span><span class="mord"><span class="mord mathnormal">c</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mord mathnormal mtight" style="margin-right:0.22222em;">V</span></span></span></span></span></span></span></span></span></span></span></span>, stored in the cache's "keys" slot as a single head) and a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">256</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> tensor (the shared RoPE key, in the "values" slot). That is 1,152 bytes per token per layer in BF16; decompressed keys and values for all 128 heads would be 81,920 bytes, 71 times more. The per-head keys and values are rebuilt from the latent for each attention call.</p>
+<p>The second part checks the absorption trick with this layer's own weights. Scoring the queries against keys decompressed per head, and instead multiplying each query by the head's key matrix once and scoring it directly against the 512-number latents, give the same table up to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span>, float rounding on scores of size about 3. With absorption, decoding never materialises per-head keys: the 128 heads attend over the same 576-number cache, which is what FlashMLA does in vLLM and SGLang. The weights here are random; the check is about shapes and algebra, which do not depend on training.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In auxiliary-loss-free balancing, use the biased scores <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> also for the gate weights that mix the chosen experts' outputs. What goes wrong? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>DeepSeek-V3, R1 and V3.2</strong> are widely served open models: vLLM and SGLang use FlashMLA kernels that attend directly over the cached latents, and expert parallelism with DeepEP.</li>
+<li><strong>The architecture is copied</strong>: Kimi K2 (1T total, 32B active) uses MLA, 384 experts and DeepSeek-style routing.</li>
+<li><strong>DeepSeek-V4</strong> (April 2026) moves on to a new hybrid compressed and sparse attention at 1M-token context.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 report</a>, <a href="https://arxiv.org/abs/2405.04434">DeepSeek-V2 (MLA)</a>, <a href="https://github.com/deepseek-ai/FlashMLA">FlashMLA</a>, <a href="https://arxiv.org/abs/2507.20534">Kimi K2 report</a>, <a href="https://vllm.ai/blog/2025-09-29-deepseek-v3-2">vLLM: DeepSeek-V3.2</a>, <a href="https://rits.shanghai.nyu.edu/ai/deepseek-releases-v4-open-source-1-6t-moe-with-1m-context">DeepSeek-V4 release coverage</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>671B total, about 37B active: 256 routed experts per layer, 8 chosen, plus 1 shared.</li>
+<li>MLA caches 576 numbers per token per layer: a 512 latent and a 64 RoPE key.</li>
+<li>Absorbing W^UK into the query lets attention run on the latent directly.</li>
+<li>Load balance comes from a per-expert bias on routing only, nudged by load.</li>
+<li>Count parameters from the config; simplified formulas drift.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-moe-hybrid-architectures"><span class="t" style="--cs-hue:168">MH</span>Cheat sheet · Mixture of Experts and Hybrid Architectures</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-deepseek-v3-reader.md</code>. Given a DeepSeek-family model (V3, R1, or any future variant), it produces a component-by-component architecture reading that names each field of the config, derives parameter counts by component, and identifies which of the four DeepSeek-specific innovations the model uses.</p>
+<p><strong><code>outputs/skill-deepseek-v3-reader.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: deepseek-v3-reader
+description: Read a DeepSeek-family config and produce a component-by-component architecture analysis.
+version: 1.0.0
+phase: 10
+lesson: 20
+tags: [deepseek-v3, deepseek-r1, mla, moe, mtp, dualpipe, architecture]
+---
+
+Given a DeepSeek-family model (V3, R1, or any derivative) and its config (hidden_size, layers, num_experts, kv_lora_rank, etc.), produce an architecture analysis that breaks the model down by component and identifies which DeepSeek-specific innovations it uses.
+
+Produce:
+
+1. Field-by-field config read. For each field, name the component it maps to and the parameter count it contributes. Format: `field_name: value → interpretation → parameter contribution`.
+2. Parameter breakdown. Total parameters, active parameters, active ratio. Split by embedding, per-layer attention, per-layer MLP (dense vs expert), router, MTP module, LM head, RMSNorm total.
+3. KV cache at target context. Report BF16 and FP8 values. Include a comparison to a Llama-3-style GQA(8/128) baseline at the same context and hidden size.
+4. Innovation checklist. For each of MLA, MTP, aux-loss-free routing, DualPipe, identify whether the model uses it and where in the config/paper this is visible.
+5. Sanity check. Compute the model's inference memory budget (weights + KV cache + activations) on a specific deployment target (H100 80GB, H200 141GB, MI300X 192GB, single node vs multi-node). Report whether it fits and what quantization would be needed.
+
+Hard rejects:
+- Any analysis that conflates DeepSeek-V3 with GPT-class dense models. The architecture is materially different.
+- Claiming MLA is faster than GQA without specifying context length. At short context (under 4k) they are comparable; MLA wins at long context.
+- Interpreting MTP as a replacement for speculative decoding. It is a pre-training objective that also doubles as a draft.
+
+Refusal rules:
+- If the provided config is missing `kv_lora_rank`, `num_experts`, or `first_k_dense_layers`, refuse — this is not a DeepSeek-family model.
+- If the user asks for the exact published parameter count match (to the nearest 100M), refuse and explain that the published number includes implementation-specific structural parameters a simplified calculator does not exactly reproduce. Direct them to the paper's Section 2 appendix.
+- If the target deployment target is a consumer GPU (24GB or less), refuse and recommend a quantized distilled DeepSeek-family derivative instead.
+
+Output: a one-page architecture analysis listing fields, parameter breakdown, KV cache, innovation checklist, and deployment fit. End with a &quot;what to read next&quot; paragraph naming one of NSA (Phase 10 · 17), MLA ablations from the V2 paper, or the V3 technical report's Section 2 appendix, depending on what question the analysis surfaced.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Compare the calculator's total-parameter estimate to the published 671B and identify where the delta comes from. The paper's Section 2 has the full itemization.</p>
+</li>
+<li>
+<p>Modify the config to use MLA rank 256 instead of 512. Compute the resulting KV cache size at 128k context. What percentage reduction does it buy, and at what cost to the per-head expressiveness?</p>
+</li>
+<li>
+<p>Compare DeepSeek-V3's (256 experts, top-8) routing to a hypothetical (512 experts, top-8) variant. Total parameters grow; active parameters stay the same. What does the extra expert capacity buy in theory, and what does it cost at inference?</p>
+</li>
+<li>
+<p>Read Section 2.1 of the DeepSeek-V3 technical report (arXiv:2412.19437) on MLA. Explain in three sentences why the K and V decompression matrices can be "absorbed" into the subsequent matmul for inference-time efficiency.</p>
+</li>
+<li>
+<p>DeepSeek-V3 uses FP8 training for most operations. Compute the memory savings of FP8 vs BF16 for storing the 671B weights. How does this intersect with the 14.8T-token training budget?</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1020-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The latent: 1,152 bytes</span></summary><div class="qa-a"><p>The compressed latent: per layer the cache holds a 512-number latent and a 64-number RoPE key for each token, 576 numbers or 1,152 bytes in BF16, the same for all 128 heads. The per-head keys and values (192 + 128 numbers for each of 128 heads, 81,920 bytes) are rebuilt from the latent at every attention call and never stored. Over 61 layers that is 68.6 KB per token, 8.6 GiB for a 128K-token conversation.</p></div></details>
+<details class="qa" id="a1020-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The bias leaks into the output</span></summary><div class="qa-a"><p>The bias leaks into the model's output. The bias exists only to shift <em>which</em> experts are chosen, and it keeps changing during training in response to load, not to what helps the loss. If it also scaled the gate weights, an expert whose bias was raised to attract tokens would also get a larger say in every token's output, and an expert lowered to shed load would be muted even when it is the right one; the output would change every step for reasons unrelated to the data, and the router could no longer express "this expert matters a lot for this token". In the simulation the top choice's gate weight stays about 0.14 because the mixing uses the unbiased scores. DeepSeek-V3 uses the biased scores for top-k selection only.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI — DeepSeek-V3 Technical Report (arXiv:2412.19437)</a> — the full architecture, training, and results document</li>
+<li><a href="https://huggingface.co/deepseek-ai/DeepSeek-V3">DeepSeek-V3 model card on Hugging Face</a> — config files and deployment notes</li>
+<li><a href="https://arxiv.org/abs/2405.04434">DeepSeek-V2 paper (arXiv:2405.04434)</a> — the predecessor that introduced MLA</li>
+<li><a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1 paper (arXiv:2501.12948)</a> — the reasoning-training successor on V3's architecture</li>
+<li><a href="https://arxiv.org/abs/2502.11089">Native Sparse Attention (arXiv:2502.11089)</a> — the future direction for DeepSeek-family attention</li>
+<li><a href="https://github.com/deepseek-ai/DualPipe">DualPipe repository</a> — the training-schedule reference</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/20-deepseek-v3-walkthrough" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1020" id="done-a1020">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1020" id="undo-a1020" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1019"><span class="pn-dir">Previous</span><span class="pn-t">10.19 · DualPipe Parallelism</span></a><a class="pn next" href="#a1021"><span class="pn-dir">Next</span><span class="pn-t">10.21 · Jamba — Hybrid SSM-Transformer</span></a></div></footer>

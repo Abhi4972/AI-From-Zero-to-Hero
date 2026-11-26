@@ -1,0 +1,530 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>DualPipe Parallelism</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.19</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1019" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Name the four components of a DualPipe forward-backward chunk and why each one gets its own overlap window.</li>
+<li>Explain the pipeline bubble problem at scale, and what "bubble-free" means in practice versus in marketing.</li>
+<li>Trace a DualPipe schedule by hand for 8 PP ranks and 16 micro-batches and confirm the forward and reverse streams fill each other's idle slots.</li>
+<li>State the tradeoff DualPipeV (Sea AI Lab, 2025) makes: drops the 2x parameter replication at the cost of a slightly larger bubble when Expert Parallelism is inactive.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10 · 05 (distributed training, FSDP, DeepSpeed), Phase 10 · 14 (open-model architectures and MoE)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, schedule simulator), Rust. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>DeepSeek-V3 was trained on 2,048 H800 GPUs with MoE experts scattered across nodes. Cross-node expert all-to-all communication cost 1 GPU-hour of comm for every 1 GPU-hour of compute. GPUs were idle half the time. DualPipe (DeepSeek, Dec 2024) is a bidirectional pipeline that overlaps forward and backward computation with the all-to-all comms they trigger. Bubbles drop, throughput climbs, and the keeping of two model-parameter copies (the "dual" that gives the name) is cheap once Expert Parallelism is already spreading experts across ranks anyway. This lesson is a Lea</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pipeline bubble</td>
+<td>"Idle time per rank"</td>
+<td>GPU cycles wasted because a pipeline stage is waiting for its input or gradient</td>
+</tr>
+<tr>
+<td>1F1B</td>
+<td>"Default pipeline schedule"</td>
+<td>One forward / one backward interleaved scheduling; the baseline DualPipe beats</td>
+</tr>
+<tr>
+<td>Zero Bubble</td>
+<td>"Sea AI Lab 2023"</td>
+<td>Splits backward into B (input gradient) and W (weight gradient); almost fully tightens the pipeline</td>
+</tr>
+<tr>
+<td>DualPipe</td>
+<td>"DeepSeek-V3 schedule"</td>
+<td>Bidirectional pipeline + compute-comm overlap; bubbles do not grow with micro-batch count</td>
+</tr>
+<tr>
+<td>DualPipeV</td>
+<td>"Cut-in-half"</td>
+<td>V-shape refinement that drops the 2x parameter replication at the cost of slightly larger bubbles</td>
+</tr>
+<tr>
+<td>Chunk</td>
+<td>"Unit of pipeline work"</td>
+<td>A forward or backward pass of one micro-batch through one pipeline stage</td>
+</tr>
+<tr>
+<td>All-to-all dispatch</td>
+<td>"Send tokens to experts"</td>
+<td>Cross-node comm that routes tokens to their assigned MoE experts</td>
+</tr>
+<tr>
+<td>All-to-all combine</td>
+<td>"Bring expert outputs back"</td>
+<td>Cross-node comm that gathers expert outputs after the MLP</td>
+</tr>
+<tr>
+<td>Expert Parallelism (EP)</td>
+<td>"Experts across GPUs"</td>
+<td>Shards MoE experts across ranks so different GPUs hold different experts</td>
+</tr>
+<tr>
+<td>Pipeline Parallelism (PP)</td>
+<td>"Layers across GPUs"</td>
+<td>Shards model layers across ranks; the dimension DualPipe schedules</td>
+</tr>
+<tr>
+<td>Bubble fraction</td>
+<td>"Wasted GPU time"</td>
+<td>(bubble_time / total_time); the fraction DualPipe drives toward zero</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A model too big for one GPU can be cut into consecutive slices (pipeline <em>stages</em>), one per GPU, with the batch split into small micro-batches that flow through the GPUs like cars on an assembly line. At the start and end of every step some GPUs sit idle waiting for work: the pipeline <em>bubble</em>. DeepSeek-V3 had a second problem: its mixture-of-experts layers send every token across the network to the GPUs holding its experts, and that communication took about as long as the computation itself. DualPipe feeds micro-batches in from both ends of the pipeline and pairs each forward pass with another micro-batch's backward pass, so that one's computation hides the other's communication. This lesson computes the published bubble formulas, checks the 1:1 communication claim, and runs PyTorch's real DualPipeV schedule on four CPU processes. No model is trained.</p></div></aside>
+<p>Training a 671B MoE model on 2k H800 GPUs runs into three compounding bottlenecks:</p>
+<ol>
+<li><strong>Memory pressure.</strong> Each GPU holds a slice of the model. Activation memory for 4K-token sequences across 61 layers with 128 attention heads is enormous.</li>
+<li><strong>Pipeline bubbles.</strong> Traditional pipeline parallelism (GPipe, 1F1B) leaves GPUs idle while they wait for their stage's input or gradient. At 8 stages, roughly 12% of GPU time can be bubble even with 1F1B scheduling.</li>
+<li><strong>Cross-node all-to-all.</strong> MoE with expert parallelism scatters experts across nodes. Every forward pass triggers an all-to-all to dispatch tokens to their experts, and another to combine. At 2k GPUs this easily becomes a 1:1 compute-to-comm ratio.</li>
+</ol>
+<p>Each of these has separate solutions: gradient checkpointing for memory, Zero Bubble (Sea AI Lab, 2023) for pipeline bubbles, expert-parallel comm kernels for all-to-all. What DualPipe does is make them play together. The schedule overlaps compute and comm within a single forward-backward chunk, injects micro-batches from both ends of the pipeline simultaneously, and uses the resulting schedule to hide all-to-all inside the compute windows.</p>
+<p>Reported result: fewer pipeline bubbles than 1F1B and Zero Bubble, and the all-to-all communication almost fully hidden behind computation. DeepSeek-V3's training took 2.788M H800 GPU-hours in total; the report gives no overall utilisation figure.</p>
+<h2>Idea 1 · Pipeline parallelism refresher</h2>
+<p>Split an N-layer model across P devices. Device <code>i</code> holds layers <code>i * N/P .. (i+1) * N/P - 1</code>. A micro-batch flows forward through devices 0 to P-1, then backward from P-1 to 0. Each device can only start its forward stage when the prior device sends its output and can only start backward when the downstream device sends the upstream gradient.</p>
+<p>GPipe (Huang et al., 2019) schedules one micro-batch at a time, which wastes most GPU time. 1F1B (Narayanan et al., 2021) interleaves forward and backward passes for multiple micro-batches. Zero Bubble (Qi et al., 2023) splits the backward pass into two parts — backward-for-input (B) and backward-for-weights (W) — and schedules them to fill the bubble. After Zero Bubble, the pipeline is almost tight.</p>
+<p>DualPipe is the next step. It adds two ideas on top:</p>
+<h2>Idea 2 · Idea 1: chunk decomposition</h2>
+<p>Each forward chunk is split into four components:</p>
+<ul>
+<li><strong>Attention.</strong> Q/K/V projections, attention, output projection.</li>
+<li><strong>All-to-all dispatch.</strong> Cross-node communication that sends tokens to their experts.</li>
+<li><strong>MLP.</strong> The MoE expert computation.</li>
+<li><strong>All-to-all combine.</strong> Cross-node communication that brings expert outputs back.</li>
+</ul>
+<p>A backward chunk adds gradient versions of each of these. DualPipe schedules them so that all-to-all dispatch happens in parallel with the attention compute of the next chunk, and all-to-all combine happens in parallel with the MLP compute of the following chunk.</p>
+<h2>Idea 3 · Idea 2: bidirectional scheduling</h2>
+<p>Most pipeline schedules inject micro-batches from stage 0 and flow toward stage P-1. DualPipe injects micro-batches from BOTH ends. Stage 0 sees forward micro-batches originating there; stage P-1 sees forward micro-batches originating there too. The two streams meet in the middle.</p>
+<p>For this to work, device <code>i</code> must hold BOTH the early-pipeline layer <code>i</code> AND the late-pipeline layer <code>P - 1 - i</code>. That is the "dual" part of DualPipe: each device keeps two copies of the model layers it needs to serve (one for each direction). At DeepSeek-V3's scale, this is a 2x parameter replication cost. It is affordable because Expert Parallelism already spreads the MoE experts so thin that replicating the non-expert layers twice is small potatoes.</p>
+<p>Crucially, the forward stream in one direction and the backward stream in the other direction overlap exactly where the bubbles would be in a single-direction schedule. The bubbles vanish.</p>
+<h2>Idea 4 · A hand-traced schedule</h2>
+<p>Consider P = 4 ranks, 8 micro-batches, divided 4 forward / 4 reverse. Time moves left to right; rows are device ranks.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">           Time →
+rank 0:  F1 F2 F3 F4  F5R F6R F7R F8R  B1 B2 B3 B4  ...
+rank 1:     F1 F2 F3  F4/F5R F6R F7R   B1 B2 ...
+rank 2:        F1 F2  F3/F5R F4/F6R    B1 ...
+rank 3:           F1  F2/F5R F3/F6R    ...
+</code></pre></div>
+<p>Reading the "F4/F5R" notation: rank 1 is running forward of micro-batch 4 (going left-to-right in the pipeline) AND forward of micro-batch 5 (going right-to-left) in the same time slot. That is what "bidirectional" means operationally.</p>
+<p>At rank 2 the cross streams overlap sooner, at rank 0 and P-1 they overlap latest. In the stable middle phase of the schedule, every rank runs forward-of-X-direction overlapped with backward-of-Y-direction. Compute is busy. All-to-all dispatches for the forward pass hide inside backward compute. All-to-all combines hide inside forward compute. The bubbles are squeezed out.</p>
+<h2>Idea 5 · Bubble accounting</h2>
+<p>Standard 1F1B pipeline bubble (time wasted per rank):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">bubble_1F1B = (P - 1) * forward_chunk_time
+</code></pre></div>
+<p>Zero Bubble refinement brings it down but not to zero. DualPipe needs the number of stages and the number of micro-batches to be even (but, unlike the earlier bidirectional schedule Chimera, not the micro-batches to be divisible by the stages). Its bubble is (PP/2 − 1)(F&amp;B + B − 3W), against (PP − 1)(F + B) for 1F1B and (PP − 1)(F + B − 2W) for Zero Bubble, where F&amp;B is a forward and a backward chunk executed together. Outside the stable phase (warmup and cooldown), there is some bubble but it does not grow with the number of micro-batches — a key property the paper highlights.</p>
+<p>In marketing terms: "bubble-free". In technical terms: a smaller fixed bubble that, like 1F1B's and Zero Bubble's, does not grow with the micro-batch count, plus all-to-all communication hidden inside computation. Sea AI Lab's follow-up (Cut-in-half) notes that part of DualPipe's bubble comes from its specialisation for Expert Parallelism: without the EP overlap, the same V-shape becomes the zero-bubble ZB-V schedule.</p>
+<h2>Idea 6 · DualPipeV — the refinement</h2>
+<p>Sea AI Lab (2025) observed that the second parameter copy is not needed at all. Cutting DualPipe's schedule in half gives a V-shape schedule on half as many devices: each device holds two <em>different</em> stages (one on the way down the pipeline, one on the way back), so no parameter is duplicated, at the cost of twice the pipeline communication, which is small next to EP communication. The bubble is about the same, ((PP − 1)/2)(F&amp;B + B − 3W) with PP now counting the devices after cutting. DeepSeek added it to the open-source DualPipe repository as DualPipeV, and PyTorch ships it as <code>ScheduleDualPipeV</code> (run after Use it).</p>
+<p>The tradeoff:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>DualPipe</th>
+<th>DualPipeV</th>
+<th>1F1B</th>
+<th>Zero Bubble</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Param copies per device</td>
+<td>2</td>
+<td>1</td>
+<td>1</td>
+<td>1</td>
+</tr>
+<tr>
+<td>Bubble (fixed, independent of micro-batch count)</td>
+<td>(PP/2−1)(F&amp;B+B−3W)</td>
+<td>((PP−1)/2)(F&amp;B+B−3W), PP = devices</td>
+<td>(PP−1)(F+B)</td>
+<td>(PP−1)(F+B−2W)</td>
+</tr>
+<tr>
+<td>Compute-comm overlap</td>
+<td>full</td>
+<td>partial</td>
+<td>minimal</td>
+<td>partial</td>
+</tr>
+<tr>
+<td>Use when</td>
+<td>EP-heavy MoE</td>
+<td>dense or EP-light</td>
+<td>baseline</td>
+<td>any pipeline</td>
+</tr>
+</tbody>
+</table></div>
+<figure class="xv" data-xv="dualpipev-grid" aria-label="Step-through: the DualPipeV schedule PyTorch computed for 4 ranks and 8 micro-batches."></figure>
+<h2>Idea 7 · What it means for a 14.8T-token run</h2>
+<p>DeepSeek-V3's pre-training consumed 14.8T tokens on 2,048 H800 GPUs in 2.664M GPU-hours (2.788M including context extension and post-training). With 1F1B at 16 stages, the bubble would take 10% of each step with 128 micro-batches and more with fewer: hundreds of thousands of GPU-hours, the compute of several 7B models trained on 2T tokens (computed after Use it). The report does not quantify DualPipe's saving; its main gain is hiding the all-to-all communication, which otherwise would have cost about as much time as the computation.</p>
+<p>For smaller runs (under 1k GPUs), DualPipe is overkill — pipeline bubbles are smaller relative to total cost, and dense-model training rarely hits the all-to-all bottleneck. For frontier MoE training at multi-thousand GPU scale, it is effectively required.</p>
+<h2>Idea 8 · Where it sits in the stack</h2>
+<ul>
+<li>Complementary to <strong>FSDP</strong> (Phase 10 · 05). FSDP shards the model parameters across ranks; DualPipe schedules the compute across ranks. They combine.</li>
+<li>Compatible with <strong>ZeRO-3</strong> gradient sharding. The bookkeeping for the two-copy replication needs to cooperate with ZeRO's sharded gradients.</li>
+<li>Requires <strong>custom all-to-all kernels</strong> tuned for the specific cluster topology. DeepSeek's open-source kernels are the reference implementation.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="expert-capacity"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>Let <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span></span></span></span> be the time of one forward chunk on one stage, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> of one full backward chunk, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span></span> of its weight-gradient part (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> minus the input-gradient part), and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> of a forward and a backward chunk of two micro-batches executed together. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span></span></span></span> pipeline stages:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Schedule</th>
+<th>Bubble per step</th>
+<th>Parameters per device</th>
+<th>Activations (micro-batches)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1F1B</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mclose">)</span></span></span></span></td>
+<td>1×</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span></span></span></span></td>
+</tr>
+<tr>
+<td>ZB1P</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mclose">)</span></span></span></span></td>
+<td>1×</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span></span></span></span></td>
+</tr>
+<tr>
+<td>DualPipe</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mord">/2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mclose">)</span></span></span></span></td>
+<td>2×</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span></td>
+</tr>
+<tr>
+<td>DualPipeV (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> devices)</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2251em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8801em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mclose">)</span></span></span></span></td>
+<td>1×</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Share of a step</strong> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span></span></span></span> micro-batches: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.3074em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">bubble</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">bubble</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>. The bubble is fixed, so the share falls as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span></span></span></span> grows.</p>
+<p><strong>Communication to hide</strong>, per token and MoE layer: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">nodes</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mclose">)</span></span></span></span> for an FP8 dispatch and BF16 combine; it is hidden when <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> leaves room for it.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">16 stages, F = 1, B = 2, W = 1</div><div class="co-body"><ul>
+<li>1F1B: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">15</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">45</span></span></span></span> units of idle time per step.</li>
+<li>ZB1P: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">15</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span>: weight gradients fill most of the bubble.</li>
+<li>DualPipe with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> (no gain from overlapping): <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">3</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">14</span></span></span></span>.</li>
+<li>With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span> micro-batches a step has <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">192</span></span></span></span> units of work, so the shares are <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">45/237</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">19%</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">15/207</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">7.2%</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">14/206</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">6.8%</span></span></span></span>.</li>
+<li>With the same assumption DualPipe barely beats Zero Bubble: its real gain is that <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mord">&amp;</span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> also hides the all-to-all communication, which would otherwise add about as much time as the computation.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "1F1B's bubble grows with the number of micro-batches; DualPipe's does not."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Every schedule here has a fixed bubble; adding micro-batches shrinks its share for all of them.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "DualPipe's 'dual' is a second copy of the whole model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Each device keeps two copies of <em>its own stage's</em> parameters; with large expert parallelism that is affordable, and DualPipeV removes even that.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Pipeline schedules change the result."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They only reorder work: the run after Use it gets the single-process loss and gradients from all three schedules.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>PyTorch's <code>ScheduleDualPipeV</code> runs an 8-stage model on 4 processes. On rank 0, which holds the first and the last stage, will its very first actions be forward passes of stage 0, of stage 7, or a mix? And will the three schedules produce exactly the same gradients? (Solution P1.)</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> is a pipeline schedule simulator. It takes <code>(P, n_micro_batches, schedule)</code> and prints the stable-phase utilization for each of 1F1B, Zero Bubble, DualPipe, and DualPipeV. It is a teaching tool — the numbers match the qualitative claims in the papers, they are not a claim about production measured speedup.</p>
+<p>The simulator's value: run it with different P and micro-batch counts and watch the bubble fraction shrink for every schedule as micro-batches are added, with DualPipe starting lower.</p>
+<p>Integration considerations for a real training run:</p>
+<ul>
+<li>Pick a pipeline-parallel depth that divides cleanly into your micro-batch count.</li>
+<li>Ensure your expert-parallel mesh supports bidirectional all-to-all. DeepSeek's kernels are the reference.</li>
+<li>Expect to burn a week of debugging time on the schedule itself the first time. The bookkeeping is fiddly.</li>
+<li>Monitor GPU utilization per rank, not just aggregate. DualPipe's benefit comes from tightening the stragglers.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s simulator</div><div class="co-body"><p><code>main.py</code>: bubble fractions from simple formulas for 1F1B, Zero Bubble, DualPipe and DualPipeV at 8 stages and 16 micro-batches, their scaling with micro-batches and depth, and a GPU-hour estimate (instant).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # bubble formulas for four schedules; instant
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+DUALPIPE PARALLELISM SIMULATOR (Phase 10, Lesson 19)
+======================================================================
+
+----------------------------------------------------------------------
+Step 1: bubble fraction at P=8, micro_batches=16
+----------------------------------------------------------------------
+  schedule           bubble   param copies   comm overlap
+  1F1B               30.4%               1         minimal
+  Zero Bubble        11.3%               1         partial
+  DualPipe            5.5%               2            full
+  DualPipeV           6.5%               1         partial
+
+----------------------------------------------------------------------
+Step 2: bubble fraction scaling vs micro_batches (P=8)
+----------------------------------------------------------------------
+       M        1F1B  ZeroBubble    DualPipe   DualPipeV
+       4       63.6%       26.9%       15.8%       18.9%
+       8       46.7%       18.4%        9.7%       11.6%
+      16       30.4%       11.3%        5.5%        6.5%
+      32       17.9%        6.4%        2.9%        3.5%
+      64        9.9%        3.4%        1.5%        1.8%
+     128        5.2%        1.8%        0.8%        0.9%
+
+----------------------------------------------------------------------
+Step 3: bubble fraction scaling vs pipeline depth (M=64 fixed)
+----------------------------------------------------------------------
+       P        1F1B  ZeroBubble    DualPipe   DualPipeV
+       4        4.5%        1.5%        0.5%        0.6%
+       8        9.9%        3.4%        1.5%        1.8%
+      16       19.0%        6.8%        3.4%        4.1%
+      32       32.6%       12.2%        6.7%        8.1%
+      64       49.6%       19.8%       12.2%       14.6%
+
+----------------------------------------------------------------------
+Step 4: recovered GPU-hours (DeepSeek-V3-shape run)
+…
+(12 more lines)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The simulator does not schedule anything; each schedule is a one-line formula with made-up costs. The 1F1B line is the standard result, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>: 30.4% at 8 stages and 16 micro-batches. The others are guesses: Zero Bubble's and DualPipe's formulas are rough, and DualPipeV is simply DualPipe times 1.2, a number not taken from any source (Sea AI Lab's analysis gives it about the same bubble on half the devices, with no duplicated parameters; the next run uses the published formulas).</p>
+<p>Step 2 also contradicts the lesson's earlier claim: the bubble <em>fraction</em> shrinks with more micro-batches for <strong>every</strong> schedule, 1F1B included (30% at 16, 5% at 128), because every bubble here is a fixed cost per step. What grows with pipeline depth (Step 3) is the bubble, for all of them.</p>
+<p>Step 4's "roughly the cost of a full 70B dense pre-training run" is wrong by a factor of about two: 245K H800 GPU-hours is closer to four 7B models on 2T tokens (next run, part C).</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The published formulas, the 1:1 claim, and the GPU-hours</div><div class="co-body"><p>A: bubbles, parameter and activation memory from DeepSeek-V3's Table 2 and Sea AI Lab's Cut-in-half table at 16 stages. B: computation against network traffic for one token through one DeepSeek-V3 MoE layer on an H800. C: what bubbles cost at DeepSeek-V3's scale, next to the compute of whole training runs.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">print(&quot;A. Bubble per step from the published formulas (DeepSeek-V3 report Table 2; Sea AI Lab for DualPipeV)&quot;)
+F, B, W = 1.0, 2.0, 1.0          # forward chunk, full backward chunk, its weight-gradient part (times in units of F)
+FB = F + B                       # a forward and a backward chunk run together, assuming no speed-up from overlapping them
+PP = 16
+sched = {
+    &quot;1F1B&quot;:        ((PP - 1) * (F + B),              1, f&quot;{PP}&quot;),
+    &quot;ZB1P&quot;:        ((PP - 1) * (F + B - 2 * W),      1, f&quot;{PP}&quot;),
+    &quot;DualPipe&quot;:    ((PP / 2 - 1) * (FB + B - 3 * W), 2, f&quot;{PP + 1}&quot;),
+    &quot;DualPipeV&quot;:   (((PP // 2) - 1) / 2 * (FB + B - 3 * W), 1, f&quot;{PP // 2} + 1/2&quot;),   # same model on PP/2 = 8 devices
+}
+print(f&quot;  PP = {PP} stages, F = {F:g}, B = {B:g}, W = {W:g}, F&amp;B = {FB:g}&quot;)
+print(f&quot;  {'schedule':&lt;10} {'bubble (F units)':&gt;16} {'parameters':&gt;11} {'activations':&gt;12}   bubble share of a step with M micro-batches&quot;)
+print(f&quot;  {'':&lt;10} {'':&gt;16} {'per device':&gt;11} {'(micro-b.)':&gt;12}   &quot; + &quot;&quot;.join(f&quot;{f'M={M}':&gt;8}&quot; for M in [16, 32, 64, 128]))
+for name, (bub, par, act) in sched.items():
+    work = 2 if name == &quot;DualPipeV&quot; else 1      # on 8 devices every micro-batch passes each device twice (down and back)
+    shares = &quot;&quot;.join(f&quot;{bub / (bub + work * M * (F + B)):&gt;8.1%}&quot; for M in [16, 32, 64, 128])
+    print(f&quot;  {name:&lt;10} {bub:&gt;16.1f} {str(par) + 'x':&gt;11} {act:&gt;12}   {shares}&quot;)
+print(&quot;  every bubble is a fixed cost: it does not grow with M, so its share falls as M grows (for all four)&quot;)
+print(&quot;  DualPipeV runs the same 16 stages on 8 devices, two different stages each: half the GPUs, each doing twice the work&quot;)
+print()
+
+print(&quot;B. Why DeepSeek needed the overlap: one token through one MoE layer of DeepSeek-V3 on an H800&quot;)
+h, ff, experts = 7168, 2048, 8 + 1                       # 8 routed experts + 1 shared expert per token
+flops = 2 * (experts * 3 * h * ff + 187e6)               # expert MLPs + about 187M attention parameters, forward
+gpu = 1979e12 * 0.4                                      # FP8 dense peak at an assumed 40% utilisation
+nodes = 4                                                # each token goes to at most 4 nodes
+comm = nodes * h * 1 + nodes * h * 2                     # dispatch in FP8, combine in BF16, bytes over InfiniBand
+ib = 50e9                                                # 400 Gb/s per GPU
+print(f&quot;  compute : {flops / 1e9:.2f} GFLOP -&gt; {flops / gpu * 1e6:.2f} microseconds&quot;)
+print(f&quot;  traffic : {comm / 1e3:.0f} KB over InfiniBand -&gt; {comm / ib * 1e6:.2f} microseconds&quot;)
+print(f&quot;  communication / computation = {comm / ib / (flops / gpu):.1f} : 1   (the report: about 1 : 1)&quot;)
+print()
+
+print(&quot;C. What a bubble costs in GPU-hours, for scale&quot;)
+total = 2.664e6                                          # DeepSeek-V3 pre-training, H800 GPU-hours
+for name, M in [(&quot;1F1B, M=32&quot;, 32), (&quot;1F1B, M=128&quot;, 128)]:
+    share = sched[&quot;1F1B&quot;][0] / (sched[&quot;1F1B&quot;][0] + M * (F + B))
+    print(f&quot;  {name:&lt;12}: bubble {share:.1%} of {total / 1e6:.3f}M GPU-hours = {share * total / 1e3:,.0f}K GPU-hours&quot;)
+eff = 989e12 * 0.4                                       # BF16 training at 40% utilisation
+for n, d in [(7e9, 2e12), (70e9, 2e12)]:
+    print(f&quot;  training a {n / 1e9:.0f}B model on {d / 1e12:.0f}T tokens: 6ND = {6 * n * d:.1e} FLOP = {6 * n * d / eff / 3600 / 1e3:,.0f}K H800 GPU-hours&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. Bubble per step from the published formulas (DeepSeek-V3 report Table 2; Sea AI Lab for DualPipeV)
+  PP = 16 stages, F = 1, B = 2, W = 1, F&amp;B = 3
+  schedule   bubble (F units)  parameters  activations   bubble share of a step with M micro-batches
+                               per device   (micro-b.)       M=16    M=32    M=64   M=128
+  1F1B                   45.0          1x           16      48.4%   31.9%   19.0%   10.5%
+  ZB1P                   15.0          1x           16      23.8%   13.5%    7.2%    3.8%
+  DualPipe               14.0          2x           17      22.6%   12.7%    6.8%    3.5%
+  DualPipeV               7.0          1x      8 + 1/2       6.8%    3.5%    1.8%    0.9%
+  every bubble is a fixed cost: it does not grow with M, so its share falls as M grows (for all four)
+  DualPipeV runs the same 16 stages on 8 devices, two different stages each: half the GPUs, each doing twice the work
+
+B. Why DeepSeek needed the overlap: one token through one MoE layer of DeepSeek-V3 on an H800
+  compute : 1.17 GFLOP -&gt; 1.47 microseconds
+  traffic : 86 KB over InfiniBand -&gt; 1.72 microseconds
+  communication / computation = 1.2 : 1   (the report: about 1 : 1)
+
+C. What a bubble costs in GPU-hours, for scale
+  1F1B, M=32  : bubble 31.9% of 2.664M GPU-hours = 850K GPU-hours
+  1F1B, M=128 : bubble 10.5% of 2.664M GPU-hours = 279K GPU-hours
+  training a 7B model on 2T tokens: 6ND = 8.4e+22 FLOP = 59K H800 GPU-hours
+  training a 70B model on 2T tokens: 6ND = 8.4e+23 FLOP = 590K H800 GPU-hours</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> With the published formulas at 16 stages, 1F1B idles for 45 units per step, Zero Bubble for 15 and DualPipe for 14 (with the cautious assumption that running a forward and a backward together is no faster than running them in turn). At 64 micro-batches that is 19%, 7.2% and 6.8% of the step. DualPipe's bubble is barely smaller than Zero Bubble's, and it pays with twice the stage parameters and one more micro-batch of activations. DualPipeV runs the same 16 stages on 8 devices, two different stages per device: no duplicated parameters, a bubble of 7 units against twice the work per device, so 3.5% at 64 micro-batches. All four bubbles are fixed costs, which is why every share falls as micro-batches are added.</p>
+<p><strong>B.</strong> One token through one DeepSeek-V3 MoE layer needs about 1.2 GFLOP of computation (9 experts plus attention), 1.5 microseconds on an H800 in FP8 at an assumed 40% utilisation, and about 86 KB of network traffic to up to 4 nodes, 1.7 microseconds at 50 GB/s. Communication takes as long as computation, the report's 1:1. Without overlap, a step would take about twice as long; this, not the bubble, is what DualPipe's paired forward and backward chunks are for: one micro-batch computes while another's tokens travel.</p>
+<p><strong>C.</strong> At DeepSeek-V3's scale, a 1F1B bubble of 10% to 32% (128 down to 32 micro-batches per step) would cost 280K to 850K GPU-hours. For scale, training a 7B model on 2T tokens costs about 59K H800 GPU-hours at 40% utilisation, and a 70B model about 590K.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">PyTorch&#x27;s real schedules on four processes</div><div class="co-body"><p><code>torch.distributed.pipelining</code> with four CPU processes (gloo backend): one training step of an 8-block MLP with 8 micro-batches under <code>ScheduleGPipe</code>, <code>Schedule1F1B</code> (4 stages, one per process) and <code>ScheduleDualPipeV</code> (8 stages, two per process in a V). Loss and gradients are compared with the same model in one process, and DualPipeV's computed schedule is printed. About 10 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import subprocess, sys, textwrap
+from pathlib import Path
+
+# A real pipeline run: 4 processes on this CPU (gloo), PyTorch's own schedules (torch.distributed.pipelining).
+# One step of an 8-block MLP; gradients checked against the same model in one process. No training.
+Path(&quot;pp_demo.py&quot;).write_text(textwrap.dedent('''
+    import torch, torch.distributed as dist, torch.nn as nn
+    from torch.distributed.pipelining import PipelineStage, ScheduleGPipe, Schedule1F1B, ScheduleDualPipeV
+    from torch.distributed.pipelining.schedules import _format_pipeline_order
+    dist.init_process_group(&quot;gloo&quot;); rank, P = dist.get_rank(), dist.get_world_size()
+    torch.manual_seed(0)
+    blocks = [nn.Sequential(nn.Linear(64, 64), nn.GELU()) for _ in range(8)]           # the whole model, on every rank
+    X, Y, M = torch.randn(32, 64), torch.randn(32, 64), 8                             # one batch in 8 micro-batches
+    loss_fn = nn.MSELoss()
+    ref = nn.Sequential(*[nn.Sequential(nn.Linear(64, 64), nn.GELU()) for _ in range(8)])
+    ref.load_state_dict(nn.Sequential(*blocks).state_dict())
+    loss_ref = sum(loss_fn(ref(X[i * 4:(i + 1) * 4]), Y[i * 4:(i + 1) * 4]) for i in range(M)) / M
+    loss_ref.backward()
+    ref_grads = {id(b): [p.grad for p in r.parameters()] for b, r in zip(blocks, ref)}
+    def piece(ids):                                                                    # a stage = some of the blocks
+        m = nn.Sequential(*[blocks[i] for i in ids]); return m
+    for name in [&quot;GPipe&quot;, &quot;1F1B&quot;, &quot;DualPipeV&quot;]:
+        for b in blocks: b.zero_grad()
+        if name == &quot;DualPipeV&quot;:                       # 8 stages of 1 block; rank r holds stages r and 7-r (a V)
+            own = [rank, 2 * P - 1 - rank]
+            stages = [PipelineStage(piece([s]), s, 2 * P, torch.device(&quot;cpu&quot;)) for s in own]
+            sched = ScheduleDualPipeV(stages, n_microbatches=M, loss_fn=loss_fn)
+        else:                                         # 4 stages of 2 blocks; rank r holds stage r
+            own = [rank]
+            stage = PipelineStage(piece([2 * rank, 2 * rank + 1]), rank, P, torch.device(&quot;cpu&quot;))
+            sched = (ScheduleGPipe if name == &quot;GPipe&quot; else Schedule1F1B)(stage, n_microbatches=M, loss_fn=loss_fn)
+        losses = []
+        first, last = (0 in own), ((2 * P - 1 if name == &quot;DualPipeV&quot; else P - 1) in own)
+        args = (X,) if first else ()
+        kw = dict(target=Y, losses=losses) if last else {}
+        sched.step(*args, **kw)
+        mine = [blocks[i] for i in (own if name == &quot;DualPipeV&quot; else [2 * rank, 2 * rank + 1])]
+        err = max((p.grad - g).abs().max().item() for b in mine for p, g in zip(b.parameters(), ref_grads[id(b)]))
+        errs = [None] * P; dist.all_gather_object(errs, err)
+        if last:
+            print(f&quot;{name:&lt;10} loss {sum(l.item() for l in losses) / M:.6f} (one process: {loss_ref.item():.6f}); &quot;
+                  f&quot;largest gradient difference on any rank {max(errs):.1e}&quot;, flush=True)
+        if rank == 0 and name == &quot;DualPipeV&quot;:
+            order = getattr(sched, &quot;pipeline_order&quot;, None)
+            if order:
+                print(f&quot;\\n{name} schedule as PyTorch computes it (stage, then F = forward, B = backward, I/W = input/weight gradient, then micro-batch;&quot;
+                      f&quot; (a;b)OVERLAP_F_B = forward and backward of two micro-batches at once):&quot;, flush=True)
+                print(_format_pipeline_order(order), flush=True)
+    dist.destroy_process_group()
+'''))
+out = subprocess.run([sys.executable, &quot;-m&quot;, &quot;torch.distributed.run&quot;, &quot;--nproc_per_node=4&quot;, &quot;--master_port=29533&quot;,
+                      &quot;pp_demo.py&quot;], capture_output=True, text=True, timeout=300)
+print(out.stdout.strip() or out.stderr[-3000:])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">GPipe      loss 1.034468 (one process: 1.034468); largest gradient difference on any rank 4.7e-10
+1F1B       loss 1.034468 (one process: 1.034468); largest gradient difference on any rank 4.7e-10
+DualPipeV  loss 1.034468 (one process: 1.034468); largest gradient difference on any rank 4.7e-10
+
+DualPipeV schedule as PyTorch computes it (stage, then F = forward, B = backward, I/W = input/weight gradient, then micro-batch; (a;b)OVERLAP_F_B = forward and 
+         Rank 0               Rank 1               Rank 2               Rank 3              
+Step 00: 0F0                  1F0                  2F0                  3F0                 
+Step 01: 0F1                  1F1                  2F1                  4F0                 
+Step 02: 0F2                  1F2                  2F2                  3F1                 
+Step 03: 0F3                  1F3                  5F0                  4F1                 
+Step 04: 0F4                  1F4                  2F3                  3F2                 
+Step 05: 0F5                  6F0                  5F1                  4F2                 
+Step 06: 0F6                  1F5                  2F4                  3F3                 
+Step 07: 7F0                  6F1                  5F2                  4F3                 
+Step 08: 7I0                  6I0                  5I0                  3F4                 
+Step 09: 7W0                  6W0                  5W0                  4B0                 
+Step 10: 7F1                  6F2                  5F3                  (4F4;3B0)OVERLAP_F_B
+Step 11: 7I1                  6I1                  (2F5;5B1)OVERLAP_F_B (3F5;4B1)OVERLAP_F_B
+Step 12: 7W1                  6W1                  (5F4;2B0)OVERLAP_F_B (4F5;3B1)OVERLAP_F_B
+Step 13: 7F2                  6F3                  (2F6;5B2)OVERLAP_F_B (3F6;4B2)OVERLAP_F_B
+Step 14: 7I2                  (1F6;6B2)OVERLAP_F_B (5F5;2B1)OVERLAP_F_B (4F6;3B2)OVERLAP_F_B
+Step 15: 7W2                  (6F4;1B0)OVERLAP_F_B (2F7;5B3)OVERLAP_F_B (3F7;4B3)OVERLAP_F_B
+Step 16: 7F3                  (1F7;6B3)OVERLAP_F_B (5F6;2B2)OVERLAP_F_B (4F7;3B3)OVERLAP_F_B
+Step 17: (0F7;7B3)OVERLAP_F_B (6F5;1B1)OVERLAP_F_B 5B4                  4B4                 
+Step 18: (7F4;0B0)OVERLAP_F_B 6B4                  (5F7;2B3)OVERLAP_F_B 3B4                 
+Step 19: 7B4                  (6F6;1B2)OVERLAP_F_B 5B5                  4B5                 
+Step 20: (7F5;0B1)OVERLAP_F_B 6B5                  2B4                  3B5                 
+Step 21: 7B5                  (6F7;1B3)OVERLAP_F_B 5B6                  4I6                 
+Step 22: (7F6;0B2)OVERLAP_F_B 6B6                  2I5                  3I6                 
+Step 23: 7B6                  1B4                  5I7                  4I7                 
+Step 24: (7F7;0B3)OVERLAP_F_B 6I7                  2I6                  3I7                 
+Step 25: 7B7                  1I5                  2W5                  4W6                 
+Step 26: 0I4                  6W7                  2I7                  3W6                 
+Step 27: 0W4                  1I6                  5W7                  4W7                 
+Step 28: 0I5                  1W5                  2W6                  3W7                 
+Step 29: 0W5                  1I7                  2W7                                      
+Step 30: 0I6                  1W6                                                           
+Step 31: 0W6                  1W7                                                           
+Step 32: 0I7                                                                                
+Step 33: 0W7</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>All three schedules compute exactly the same thing: the loss over 8 micro-batches equals the single-process loss (1.034468), and every gradient on every rank matches to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">10</span></span></span></span></span></span></span></span></span></span></span></span>, rounding error. Pipeline schedules only reorder work.</p>
+<p>The printed grid is DualPipeV's plan as PyTorch computes it, one column per process. Each entry names the stage, the action and the micro-batch: <code>3F1</code> is stage 3 running the forward pass of micro-batch 1. Rank 0 holds stages 0 and 7, rank 3 holds stages 3 and 4: the V. During warm-up, rank 0 runs forwards of stage 0 for micro-batches 0 to 6 while their activations travel down to rank 3 and back up through stages 4 to 7. Backward passes are split into input gradients (<code>I</code>) and weight gradients (<code>W</code>), and from step 10 the entries <code>(4F4;3B0)OVERLAP_F_B</code> are DualPipe's key move: the forward of one micro-batch and the backward of another executed together, which on GPUs lets the computation of one hide the all-to-all communication of the other. At the end, the leftover weight gradients fill what would otherwise be the cool-down bubble. The grid lists actions in order, not wall-clock time, so idle time is not shown.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Run DualPipe with a pipeline of 16 stages but only 8 micro-batches per step. What goes wrong? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>DualPipe and DualPipeV</strong>: open source from DeepSeek; DualPipeV is also in PyTorch (<code>torch.distributed.pipelining.ScheduleDualPipeV</code>).</li>
+<li><strong>Zero-bubble schedules</strong> (ZB-V, interleaved zero bubble) are in PyTorch's pipelining library next to GPipe and 1F1B.</li>
+<li><strong>MoE communication kernels</strong>: DeepEP, DeepSeek's open all-to-all library, is used for expert parallelism by Megatron-Core, SGLang and vLLM.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3 report</a>, <a href="https://github.com/deepseek-ai/DualPipe">DualPipe repository</a>, <a href="https://sail.sea.com/blog/articles/63">Sea AI Lab: Cut-in-half</a>, <a href="https://arxiv.org/abs/2401.10241">Zero Bubble</a>, <a href="https://docs.pytorch.org/docs/stable/distributed.pipelining.html">PyTorch pipelining docs</a>, <a href="https://github.com/deepseek-ai/DeepEP">DeepEP</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Pipeline bubbles are a fixed cost per step; more micro-batches shrink their share.</li>
+<li>Zero Bubble fills bubbles with weight gradients; DualPipe feeds both ends and overlaps forward with backward.</li>
+<li>DualPipe's main win at DeepSeek scale is hiding all-to-all communication that cost as much as computation.</li>
+<li>DualPipe keeps 2× stage parameters; DualPipeV gets the same schedule with 1× on half the devices.</li>
+<li>Schedules reorder work; the gradients are identical.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-distributed-training"><span class="t" style="--cs-hue:280">DF</span>Cheat sheet · DDP, FSDP, ZeRO and Pipeline Parallel</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-dualpipe-planner.md</code>. Given a training cluster specification (GPU count, topology, interconnect, model shape), it recommends a pipeline parallelism strategy, the scheduling algorithm to use, and the expected bubble fraction at the target scale.</p>
+<p><strong><code>outputs/skill-dualpipe-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: dualpipe-planner
+description: Plan a pipeline parallelism strategy (1F1B, Zero Bubble, DualPipe, DualPipeV) for a training cluster.
+version: 1.0.0
+phase: 10
+lesson: 19
+tags: [pipeline-parallelism, dualpipe, dualpipev, zero-bubble, expert-parallelism, distributed-training]
+---
+
+Given a training cluster specification (total GPU count, interconnect topology, accelerator model, memory per GPU), a model shape (total params, active params, MoE or dense, expected layer count), and a target training-data volume, recommend a pipeline parallelism strategy and confirm the expected bubble fraction.
+
+Produce:
+
+1. Pipeline depth P. Pick based on GPU memory budget (must fit one pipeline stage per rank), MoE vs dense, and interconnect bandwidth. Range: 4 for small clusters, 16-32 for frontier MoE training.
+2. Micro-batch count M. Must be divisible by 2 for DualPipe and DualPipeV. Typical ratio M/P between 8 and 16. Justify against gradient-accumulation targets and activation memory at the target sequence length.
+3. Schedule choice. Pick from 1F1B, Zero Bubble, DualPipe, DualPipeV. Decision table: dense training under 500 GPUs -&gt; Zero Bubble. MoE with expert parallelism -&gt; DualPipe. Dense training above 500 GPUs without heavy all-to-all -&gt; DualPipeV. Small runs under 100 GPUs -&gt; 1F1B is fine.
+4. Expected bubble fraction. Compute for the chosen schedule at the target P and M. Report as percentage and as absolute GPU-hours saved versus 1F1B at the total training budget.
+5. Parameter replication plan (DualPipe only). Confirm the 2x parameter replication fits in available VRAM. Report the effective parameter density per GPU given the chosen P.
+
+Hard rejects:
+- DualPipe without Expert Parallelism. The 2x replication is not justified without EP-heavy comms to hide.
+- P &gt; 64 on any training run. Bubble fraction grows linearly with P regardless of schedule.
+- Micro-batch count not divisible by 2 for DualPipe/DualPipeV. The schedule will not close.
+- Pipeline parallelism at all when the model fits in one GPU's memory. Use data parallelism only.
+
+Refusal rules:
+- If the interconnect is 200Gbps or slower per GPU, refuse DualPipe and recommend DualPipeV. The all-to-all overlap window is too narrow to justify the replication.
+- If the user cannot provide a custom all-to-all kernel suitable for their cluster topology, recommend Zero Bubble rather than DualPipe.
+- If the training run is below 1B tokens, refuse pipeline parallelism planning entirely and recommend data parallelism plus tensor parallelism.
+
+Output: a one-page plan listing P, M, schedule, expected bubble fraction, parameter replication cost (if DualPipe), and an all-to-all kernel recommendation. End with a &quot;rollback trigger&quot; paragraph naming the specific utilization metric (aggregate GPU utilization percentage, measured over the first 1000 steps) that would justify switching to a simpler schedule if the target number is not hit.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code> on <code>(P=8, micro_batches=16, schedule=dualpipe)</code> and <code>(P=8, micro_batches=16, schedule=1f1b)</code>. Compute the GPU utilization difference and express it as recovered GPU-hours per million tokens of training.</p>
+</li>
+<li>
+<p>Sketch the schedule table for <code>(P=4, micro_batches=8, schedule=dualpipe)</code> by hand. Mark each time slot with the micro-batch ID and direction. Identify the first time slot where bubbles are absent.</p>
+</li>
+<li>
+<p>Read Figure 5 of the DeepSeek-V3 technical report (arXiv:2412.19437). Identify the overlap window for all-to-all dispatch inside a DualPipe forward chunk. Explain how the compute schedule hides it.</p>
+</li>
+<li>
+<p>Compute the 2x parameter overhead of DualPipe for a 70B dense model with P=8 pipeline stages and a 671B MoE model with P=16 pipeline stages. Show why the MoE case's overhead is proportionally smaller (most parameters are experts, sharded across a large EP group).</p>
+</li>
+<li>
+<p>Compare DualPipe to Chimera (a competing bidirectional scheduler from 2021). Identify the two specific properties DualPipe added that Chimera did not have, using the paper's Section 3.4 as the reference.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1019-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Stage 0 first, and identical gradients</span></summary><div class="qa-a"><p>Stage 0 first: rank 0 starts with forward passes of stage 0 for micro-batches 0 to 6 (<code>0F0</code> to <code>0F6</code>), because stage 7, also on rank 0, has nothing to do until a micro-batch has travelled through stages 1 to 6 on the other ranks; its first forward (<code>7F0</code>) comes at step 7. And yes, identical gradients: all three schedules match the single-process gradients to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">10</span></span></span></span></span></span></span></span></span></span></span></span>, since a schedule changes the order of the forward and backward chunks, never what they compute.</p></div></details>
+<details class="qa" id="a1019-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Too few micro-batches to fill the pipeline</span></summary><div class="qa-a"><p>The pipeline never fills. With fewer micro-batches than stages, the last stage receives its first micro-batch only after the first stage has run out of new ones, so warm-up and cool-down overlap and most devices are idle most of the time: for 1F1B the bubble share would be <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">15/</span><span class="mopen">(</span><span class="mord">15</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">65%</span></span></span></span>. PyTorch's <code>ScheduleDualPipeV</code> refuses outright: it raises an error when there are fewer micro-batches than stages. The fix is more micro-batches per step (smaller micro-batches or gradient accumulation) or fewer pipeline stages, trading for more data or expert parallelism instead.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2412.19437">DeepSeek-AI — DeepSeek-V3 Technical Report (arXiv:2412.19437), Section 3.3.2 and Figure 5</a> — the primary DualPipe reference</li>
+<li><a href="https://github.com/deepseek-ai/DualPipe">DeepSeek — DualPipe GitHub repository</a> — the open-source reference implementation, including DualPipeV (Cut-in-half) mode</li>
+<li><a href="https://arxiv.org/abs/2401.10241">Qi et al. — Zero Bubble Pipeline Parallelism (arXiv:2401.10241, Sea AI Lab 2023)</a> — the Zero Bubble predecessor</li>
+<li><a href="https://sail.sea.com/blog/articles/63">Sea AI Lab — DualPipe could be better without the Dual</a> — the DualPipeV analysis that informed DeepSeek's EP-off mode</li>
+<li><a href="https://arxiv.org/abs/1806.03377">Narayanan et al. — PipeDream / 1F1B (arXiv:1806.03377, 2018-2021)</a> — the 1F1B schedule DualPipe compares against</li>
+<li><a href="https://arxiv.org/abs/1811.06965">Huang et al. — GPipe (arXiv:1811.06965, 2018)</a> — the original pipeline parallelism paper and bubble problem</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/19-dualpipe-parallelism" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1019" id="done-a1019">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1019" id="undo-a1019" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1018"><span class="pn-dir">Previous</span><span class="pn-t">10.18 · Multi-Token Prediction (MTP)</span></a><a class="pn next" href="#a1020"><span class="pn-dir">Next</span><span class="pn-t">10.20 · DeepSeek-V3 Architecture Walkthrough</span></a></div></footer>

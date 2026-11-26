@@ -1,0 +1,612 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-04">Phase 4 · Computer Vision</a></nav><h1>Stable Diffusion — Architecture &amp; Fine-Tuning</h1><div class="m-meta"><span class="chip chip-num">Lesson 4.11</span><span class="chip">75 min</span><span class="chip chip-core">Learn + Use</span><span class="chip chip-done" data-done-chip="a0411" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Trace the five pieces of a Stable Diffusion pipeline: VAE, text encoder, U-Net, scheduler, safety checker — and what each of them actually does</li>
+<li>Explain latent diffusion and why training in a 4x64x64 latent space (instead of a 3x512x512 image) cuts the values the denoiser handles by 48x at little visible quality cost</li>
+<li>Use <code>diffusers</code> to generate images, run image-to-image, inpainting, and ControlNet-guided generation</li>
+<li>Fine-tune Stable Diffusion with LoRA on a small custom dataset and load the LoRA adapter at inference</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 4 Lesson 10 (Diffusion), Phase 7 Lesson 02 (Self-Attention)</li>
+<li><strong>Type</strong>: Learn + Use. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Stable Diffusion is a DDPM that runs in the latent space of a pretrained VAE, conditioned on text via cross-attention, sampled with a fast deterministic ODE solver, and steered by classifier-free guidance.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Latent diffusion</td>
+<td>"Diffuse in latents"</td>
+<td>Run the entire DDPM in the VAE latent space (4x64x64) instead of pixel space (3x512x512); 48x fewer values to denoise</td>
+</tr>
+<tr>
+<td>VAE scale factor</td>
+<td>"0.18215"</td>
+<td>Constant that rescales the VAE's raw latent to roughly unit variance; 0.18215 for SD 1.x and 2.x, 0.13025 for SDXL; <code>diffusers</code> reads it from <code>vae.config.scaling_factor</code></td>
+</tr>
+<tr>
+<td>Classifier-free guidance</td>
+<td>"CFG"</td>
+<td>Mix conditional and unconditional noise predictions; the single most impactful inference knob</td>
+</tr>
+<tr>
+<td>Scheduler</td>
+<td>"Sampler"</td>
+<td>The algorithm that turns noise + model predictions into a denoised latent trajectory</td>
+</tr>
+<tr>
+<td>LoRA</td>
+<td>"Low-rank adapter"</td>
+<td>Small rank-decomposition matrices that fine-tune attention layers without touching base weights</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>"Text-image attention"</td>
+<td>Attention from latent tokens to text tokens; injects prompt information at every U-Net level</td>
+</tr>
+<tr>
+<td>ControlNet</td>
+<td>"Structure conditioning"</td>
+<td>A separately-trained adapter that steers SD with an extra input (canny, depth, pose, segmentation)</td>
+</tr>
+<tr>
+<td>DPM-Solver++</td>
+<td>"The default scheduler"</td>
+<td>Second-order deterministic ODE solver; a common default at 20-30 steps</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Stable Diffusion is the previous lesson's denoiser with three practical upgrades. First, it does not denoise the full photo: a separate network (the <strong>VAE</strong>) squeezes a 512 × 512 image into a small 64 × 64 grid of numbers, the diffusion happens there, and the VAE turns the result back into pixels. Second, the denoiser reads your prompt through a text encoder and <strong>cross-attention</strong>, so "a dog on a skateboard" shapes every step. Third, <strong>classifier-free guidance</strong> turns up how strongly the prompt is obeyed. Everything else, from image-to-image to LoRA fine-tuning, is a small variation on that pipeline.</p></div></aside>
+<p>Training a DDPM directly on 512x512 RGB images is expensive. Every training step backprops through a U-Net that sees 3x512x512 = 786,432 input values, and sampling takes 50+ forward passes through that same U-Net. Even in latent space, Stable Diffusion v1 took about 150,000 A100 GPU-hours to train, according to its model card; in pixel space every one of those training steps, and every sampling step afterwards, would be far more expensive.</p>
+<p>The trick that made open-weight text-to-image practical was <strong>latent diffusion</strong> (Rombach et al., CVPR 2022). Train a VAE that maps a 3x512x512 image to a 4x64x64 latent tensor and back, then do the diffusion in that latent space. The number of values the denoiser handles drops by <code>(3*512*512)/(4*64*64) = 48x</code>, and since a U-Net's cost grows with spatial size, every training and sampling step gets cheaper by a similar order of magnitude.</p>
+<p>Almost every modern image-generation model — SDXL, SD3, FLUX, HunyuanDiT, Wan-Video — is a latent diffusion (or latent flow-matching) model with variations on the autoencoder, the denoiser (U-Net or DiT), and the text conditioning. Learn Stable Diffusion and you have learnt the template.</p>
+<h2>Idea 1 · The pipeline</h2>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mme4d6707f7b" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1538.86px; background-color: transparent;" viewBox="0 0 1538.859375 210" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mme4d6707f7b{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mme4d6707f7b .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mme4d6707f7b .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mme4d6707f7b .error-icon{fill:#f4efe7;}#mme4d6707f7b .error-text{fill:#0b1018;stroke:#0b1018;}#mme4d6707f7b .edge-thickness-normal{stroke-width:1px;}#mme4d6707f7b .edge-thickness-thick{stroke-width:3.5px;}#mme4d6707f7b .edge-pattern-solid{stroke-dasharray:0;}#mme4d6707f7b .edge-thickness-invisible{stroke-width:0;fill:none;}#mme4d6707f7b .edge-pattern-dashed{stroke-dasharray:3;}#mme4d6707f7b .edge-pattern-dotted{stroke-dasharray:2;}#mme4d6707f7b .marker{fill:#6c6357;stroke:#6c6357;}#mme4d6707f7b .marker.cross{stroke:#6c6357;}#mme4d6707f7b svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mme4d6707f7b p{margin:0;}#mme4d6707f7b .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mme4d6707f7b .cluster-label text{fill:#0b1018;}#mme4d6707f7b .cluster-label span{color:#0b1018;}#mme4d6707f7b .cluster-label span p{background-color:transparent;}#mme4d6707f7b .label text,#mme4d6707f7b span{fill:#211c16;color:#211c16;}#mme4d6707f7b .node rect,#mme4d6707f7b .node circle,#mme4d6707f7b .node ellipse,#mme4d6707f7b .node polygon,#mme4d6707f7b .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mme4d6707f7b .rough-node .label text,#mme4d6707f7b .node .label text,#mme4d6707f7b .image-shape .label,#mme4d6707f7b .icon-shape .label{text-anchor:middle;}#mme4d6707f7b .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mme4d6707f7b .rough-node .label,#mme4d6707f7b .node .label,#mme4d6707f7b .image-shape .label,#mme4d6707f7b .icon-shape .label{text-align:center;}#mme4d6707f7b .node.clickable{cursor:pointer;}#mme4d6707f7b .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mme4d6707f7b .arrowheadPath{fill:#0b0b0b;}#mme4d6707f7b .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mme4d6707f7b .flowchart-link{stroke:#6c6357;fill:none;}#mme4d6707f7b .edgeLabel{background-color:#ffffff;text-align:center;}#mme4d6707f7b .edgeLabel p{background-color:#ffffff;}#mme4d6707f7b .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mme4d6707f7b .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mme4d6707f7b .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mme4d6707f7b .cluster text{fill:#0b1018;}#mme4d6707f7b .cluster span{color:#0b1018;}#mme4d6707f7b div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mme4d6707f7b .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mme4d6707f7b rect.text{fill:none;stroke-width:0;}#mme4d6707f7b .icon-shape,#mme4d6707f7b .image-shape{background-color:#ffffff;text-align:center;}#mme4d6707f7b .icon-shape p,#mme4d6707f7b .image-shape p{background-color:#ffffff;padding:2px;}#mme4d6707f7b .icon-shape .label rect,#mme4d6707f7b .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mme4d6707f7b .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mme4d6707f7b .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mme4d6707f7b .node .neo-node{stroke:#b5521b;}#mme4d6707f7b [data-look="neo"].node rect,#mme4d6707f7b [data-look="neo"].cluster rect,#mme4d6707f7b [data-look="neo"].node polygon{stroke:url(#mme4d6707f7b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mme4d6707f7b [data-look="neo"].swimlane.cluster rect{filter:none;}#mme4d6707f7b [data-look="neo"].node path{stroke:url(#mme4d6707f7b-gradient);stroke-width:1px;}#mme4d6707f7b [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mme4d6707f7b [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mme4d6707f7b [data-look="neo"].node circle{stroke:url(#mme4d6707f7b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mme4d6707f7b [data-look="neo"].node circle .state-start{fill:#000000;}#mme4d6707f7b [data-look="neo"].icon-shape .icon{fill:url(#mme4d6707f7b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mme4d6707f7b [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mme4d6707f7b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mme4d6707f7b :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mme4d6707f7b_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mme4d6707f7b_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mme4d6707f7b_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M147.656,166L151.823,166C155.99,166,164.323,166,171.99,166C179.656,166,186.656,166,190.156,166L193.656,166" id="mme4d6707f7b-L_TXT_TE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TXT_TE_0" data-points="W3sieCI6MTQ3LjY1NjI1LCJ5IjoxNjZ9LHsieCI6MTcyLjY1NjI1LCJ5IjoxNjZ9LHsieCI6MTk3LjY1NjI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M351.531,166L355.698,166C359.865,166,368.198,166,375.865,166C383.531,166,390.531,166,394.031,166L397.531,166" id="mme4d6707f7b-L_TE_CT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TE_CT_0" data-points="W3sieCI6MzUxLjUzMTI1LCJ5IjoxNjZ9LHsieCI6Mzc2LjUzMTI1LCJ5IjoxNjZ9LHsieCI6NDAxLjUzMTI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M530.328,44L535.456,44C540.583,44,550.839,44,559.556,46.083C568.274,48.166,575.454,52.332,579.044,54.415L582.634,56.498" id="mme4d6707f7b-L_NOISE_UNET_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_NOISE_UNET_0" data-points="W3sieCI6NTMwLjMyODEyNSwieSI6NDR9LHsieCI6NTYxLjA5Mzc1LCJ5Ijo0NH0seyJ4Ijo1ODYuMDkzNzUsInkiOjU4LjUwNTQ2MTg0MTQyMDgyNX1d" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M536.094,166L540.26,166C544.427,166,552.76,166,560.517,163.917C568.274,161.834,575.454,157.668,579.044,155.585L582.634,153.502" id="mme4d6707f7b-L_CT_UNET_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CT_UNET_0" data-points="W3sieCI6NTM2LjA5Mzc1LCJ5IjoxNjZ9LHsieCI6NTYxLjA5Mzc1LCJ5IjoxNjZ9LHsieCI6NTg2LjA5Mzc1LCJ5IjoxNTEuNDk0NTM4MTU4NTc5Mn1d" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M746.359,105L750.526,105C754.693,105,763.026,105,770.693,105C778.359,105,785.359,105,788.859,105L792.359,105" id="mme4d6707f7b-L_UNET_SCHED_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_UNET_SCHED_0" data-points="W3sieCI6NzQ2LjM1OTM3NSwieSI6MTA1fSx7IngiOjc3MS4zNTkzNzUsInkiOjEwNX0seyJ4Ijo3OTYuMzU5Mzc1LCJ5IjoxMDV9XQ==" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M963.469,105L967.635,105C971.802,105,980.135,105,987.802,105C995.469,105,1002.469,105,1005.969,105L1009.469,105" id="mme4d6707f7b-L_SCHED_LATENT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SCHED_LATENT_0" data-points="W3sieCI6OTYzLjQ2ODc1LCJ5IjoxMDV9LHsieCI6OTg4LjQ2ODc1LCJ5IjoxMDV9LHsieCI6MTAxMy40Njg3NSwieSI6MTA1fV0=" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M1152.172,105L1156.339,105C1160.505,105,1168.839,105,1176.505,105C1184.172,105,1191.172,105,1194.672,105L1198.172,105" id="mme4d6707f7b-L_LATENT_VAE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LATENT_VAE_0" data-points="W3sieCI6MTE1Mi4xNzE4NzUsInkiOjEwNX0seyJ4IjoxMTc3LjE3MTg3NSwieSI6MTA1fSx7IngiOjEyMDIuMTcxODc1LCJ5IjoxMDV9XQ==" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/><path d="M1348.031,105L1352.198,105C1356.365,105,1364.698,105,1372.365,105C1380.031,105,1387.031,105,1390.531,105L1394.031,105" id="mme4d6707f7b-L_VAE_IMG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_VAE_IMG_0" data-points="W3sieCI6MTM0OC4wMzEyNSwieSI6MTA1fSx7IngiOjEzNzMuMDMxMjUsInkiOjEwNX0seyJ4IjoxMzk4LjAzMTI1LCJ5IjoxMDV9XQ==" data-look="classic" marker-end="url(#mme4d6707f7b_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_TXT_TE_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_TE_CT_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_NOISE_UNET_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_CT_UNET_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_UNET_SCHED_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_SCHED_LATENT_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_LATENT_VAE_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_VAE_IMG_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mme4d6707f7b-flowchart-TXT-0" data-look="classic" transform="translate(77.828125, 166)"><rect class="basic label-container" style="" x="-69.828125" y="-25.5" width="139.65625" height="51"/><g class="label" style="" transform="translate(-39.828125, -10.5)"><rect/><foreignObject width="79.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Text prompt</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-TE-1" data-look="classic" transform="translate(274.59375, 166)"><rect class="basic label-container" style="fill:#dbeafe !important;stroke:#2563eb !important" x="-76.9375" y="-36" width="153.875" height="72"/><g class="label" style="" transform="translate(-46.9375, -21)"><rect/><foreignObject width="93.875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Text encoder<br />(CLIP-L or T5)</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-CT-3" data-look="classic" transform="translate(468.8125, 166)"><rect class="basic label-container" style="" x="-67.28125" y="-36" width="134.5625" height="72"/><g class="label" style="" transform="translate(-37.28125, -21)"><rect/><foreignObject width="74.5625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Text<br />embedding</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-NOISE-4" data-look="classic" transform="translate(468.8125, 44)"><rect class="basic label-container" style="" x="-61.515625" y="-36" width="123.03125" height="72"/><g class="label" style="" transform="translate(-31.515625, -21)"><rect/><foreignObject width="63.03125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Noise<br />4x64x64</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-UNET-5" data-look="classic" transform="translate(666.2265625, 105)"><rect class="basic label-container" style="fill:#fef3c7 !important;stroke:#d97706 !important" x="-80.1328125" y="-57" width="160.265625" height="114"/><g class="label" style="" transform="translate(-50.1328125, -42)"><rect/><foreignObject width="100.265625" height="84"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>UNet<br />(denoiser with<br />cross-attention<br />to text)</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-SCHED-9" data-look="classic" transform="translate(879.9140625, 105)"><rect class="basic label-container" style="fill:#fecaca !important;stroke:#dc2626 !important" x="-83.5546875" y="-46.5" width="167.109375" height="93"/><g class="label" style="" transform="translate(-53.5546875, -31.5)"><rect/><foreignObject width="107.109375" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Scheduler<br />(DPM-Solver++,<br />Euler)</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-LATENT-11" data-look="classic" transform="translate(1082.8203125, 105)"><rect class="basic label-container" style="" x="-69.3515625" y="-36" width="138.703125" height="72"/><g class="label" style="" transform="translate(-39.3515625, -21)"><rect/><foreignObject width="78.703125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Clean latent<br />4x64x64</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-VAE-13" data-look="classic" transform="translate(1275.1015625, 105)"><rect class="basic label-container" style="" x="-72.9296875" y="-25.5" width="145.859375" height="51"/><g class="label" style="" transform="translate(-42.9296875, -10.5)"><rect/><foreignObject width="85.859375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>VAE decoder</p></span></div></foreignObject></g></g><g class="node default" id="mme4d6707f7b-flowchart-IMG-15" data-look="classic" transform="translate(1464.4453125, 105)"><rect class="basic label-container" style="fill:#dcfce7 !important;stroke:#16a34a !important" x="-66.4140625" y="-36" width="132.828125" height="72"/><g class="label" style="" transform="translate(-36.4140625, -21)"><rect/><foreignObject width="72.828125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>512x512<br />RGB image</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mme4d6707f7b-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mme4d6707f7b-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mme4d6707f7b-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<ul>
+<li><strong>VAE</strong> — frozen autoencoder. Encoder turns image into latents (used for img2img and training). Decoder turns latents back into an image.</li>
+<li><strong>Text encoder</strong> — CLIP text encoder (SD 1.x/2.x), CLIP-L + CLIP-G (SDXL), or T5-XXL (SD3/FLUX). Produces a sequence of token embeddings.</li>
+<li><strong>U-Net</strong> — the denoiser. Has cross-attention layers that attend from latents to the text embedding at every resolution level.</li>
+<li><strong>Scheduler</strong> — the sampling algorithm (DDIM, Euler, DPM-Solver++). Picks sigmas, blends predicted noise back into the latent.</li>
+<li><strong>Safety checker</strong> — optional NSFW / illegal-content filter on the output image.</li>
+</ul>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The 48x, by hand</div><div class="co-body"><ul>
+<li>A 512 × 512 RGB image holds <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">786</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">432</span></span></span></span> numbers.</li>
+<li>Its SD latent is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">384</span></span></span></span> numbers: each side shrinks 8 times (because <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">512/8</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>) and the channels go from 3 to 4.</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">786</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">432/16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">384</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">48</span></span></span></span>.</li>
+</ul>
+<p>The U-Net never sees a pixel. It denoises those 16,384 numbers 25 to 50 times, and the VAE decoder runs <strong>once</strong> at the end to turn the result into an image.</p></div></aside>
+<figure class="xv" data-xv="latent-diffusion" aria-label="Plate: one Stable Diffusion 1.5 image, from prompt through 50 U-Net steps in a 4 × 64 × 64 latent to the VAE decoder."></figure>
+<h2>Idea 2 · Classifier-free guidance (CFG)</h2>
+<p>Plain text conditioning learns <code>epsilon_theta(x_t, t, c)</code> for every prompt <code>c</code>. CFG trains the same network with <code>c</code> dropped 10% of the time (replaced by an empty embedding), giving a single model that predicts both the conditional and the unconditional noise. At inference:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">ϵ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">ϵ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">uncond</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">ϵ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">cond</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">ϵ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">uncond</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span></span></div></p>
+<p><code>w</code> is the guidance scale. <code>w=0</code> is unconditional, <code>w=1</code> is plain conditional, <code>w&gt;1</code> pushes the output toward being "more conditioned on the prompt" at the cost of diversity. SD default is <code>w=7.5</code>.</p>
+<p>CFG is the reason text-to-image works at production quality. Without it, prompts bias the output weakly; with it, prompts dominate.</p>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Higher guidance is always better: the image matches the prompt more."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It matches more <em>narrowly</em>. Past a point, samples lose variety, then leave the data distribution: over-saturated, over-sharpened images. The picture under "Use it" shows both effects.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "CFG needs a separate unconditional model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> One network, trained with the prompt dropped about 10% of the time, gives both predictions. It costs two forward passes per step at inference (usually batched together).</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The 4 × 64 × 64 latent is an abstract code with no picture in it."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is still a small spatial map. The latent channels under "Use it" show the puppies' outline clearly.</li>
+</ul></div></aside>
+<h2>Idea 3 · Latent space geometry</h2>
+<p>The VAE's 4-channel latent is not just a compressed image. It is still spatial (roughly a picture 8 times smaller, with 4 channels instead of 3), but only a thin set of latents decodes to natural images, and that set is what the diffusion U-Net spends its entire modelling budget on. Decoding a random 4x64x64 latent does not produce a random-looking image — it produces garbage, because only a specific submanifold of latents decodes to valid images.</p>
+<p>Two consequences:</p>
+<ol>
+<li><strong>Img2img</strong> = encode image to latent, add partial noise, run the denoiser, decode. Image structure survives because only part of the noise schedule is applied, so the coarse layout is still in the latent; the prompt steers the details that the noise erased.</li>
+<li><strong>Inpainting</strong> = same as img2img but the denoiser only updates masked regions; unmasked regions are kept at the encoded latent. Dedicated inpainting models such as <code>stable-diffusion-inpainting</code> go further: their U-Net takes 9 input channels (the noisy latent, the mask, and the latent of the masked image) so it sees the surroundings it must match.</li>
+</ol>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">How much does img2img actually denoise?</div><div class="co-body"><p>With <code>strength=0.6</code> and <code>num_inference_steps=50</code>, the pipeline noises the encoded photo to the point 60% of the way into the schedule, then runs only the last <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">50</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">30</span></span></span></span> denoising steps. <code>strength=1.0</code> starts from pure noise, which is why it ignores the input (Exercise 2), and <code>strength=0.2</code> runs 10 steps on a barely noised latent, which can only change fine detail.</p></div></aside>
+<h2>Idea 4 · The U-Net architecture</h2>
+<p>The SD U-Net is a big version of the TinyUNet from <a href="#a0410">Lesson 4.10</a> scaled up, with three ingredients used far more heavily:</p>
+<ul>
+<li><strong>Transformer blocks</strong> at every spatial resolution, containing self-attention + cross-attention to the text embedding.</li>
+<li><strong>Time embedding</strong> via MLP on sinusoidal encoding.</li>
+<li><strong>Skip connections</strong> between encoder and decoder at matching resolutions.</li>
+</ul>
+<p>Total parameters in SD 1.5: ~860M. SDXL: ~2.6B. FLUX: ~12B. (FLUX replaces the U-Net with a transformer.)</p>
+<h2>Idea 5 · LoRA fine-tuning</h2>
+<p>Full fine-tuning of Stable Diffusion needs 20+ GB of VRAM and updates 860M parameters. LoRA (Low-Rank Adaptation) keeps the base model frozen and injects small rank-decomposition matrices into the attention layers. A LoRA adapter for SD is typically 10-50 MB, trains in 10-60 minutes on a single consumer GPU, and loads at inference time as a drop-in modification.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Original: W_q : (d_in, d_out)   frozen
+LoRA:     W_q + alpha * (A @ B)   where A : (d_in, r), B : (r, d_out)
+
+r is typically 4-32.
+</code></pre></div>
+<p>LoRA is how almost every community fine-tune is distributed. CivitAI and Hugging Face host huge libraries of them.</p>
+<h2>Idea 6 · Schedulers you will see</h2>
+<ul>
+<li><strong>DDIM</strong> — deterministic, ~50 steps, simple.</li>
+<li><strong>Euler ancestral</strong> — stochastic, 30-50 steps, slightly more creative samples.</li>
+<li><strong>DPM-Solver++ 2M Karras</strong> — deterministic, 20-30 steps, production default.</li>
+<li><strong>LCM / TCD / Turbo</strong> — consistency models and distilled variants; 1-4 steps at the cost of some quality.</li>
+</ul>
+<p>Swapping schedulers is a one-line change in <code>diffusers</code> and sometimes fixes sample issues without any retraining.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cv3-latent-compression"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Work in a latent space.</strong> A VAE encoder compresses a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">512</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3</span></span></span></span> image to a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> latent (8× smaller per side): <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">786</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">432</span></span></span></span> numbers become <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">384</span></span></span></span>, 48 times fewer, and diffusion runs there. The decoder turns the final latent back into pixels.</p>
+<p><strong>Classifier-free guidance.</strong> The network is trained both with the text condition <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> and, a fraction of the time, with an empty prompt. At sampling, the two noise predictions are extrapolated:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">ε</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">^</span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord amsrm">∅</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mord mathnormal">ε</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">θ</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord amsrm">∅</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span></span></div></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> is the plain conditional model; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span><span class="mord text"><span class="mord">–</span></span><span class="mord">8</span></span></span></span> follows the prompt more closely at some cost in diversity; each step now needs two network evaluations (batched together).</p>
+<p><strong>Text conditioning.</strong> The prompt's token embeddings (from a CLIP or T5 text encoder) enter the U-Net through cross-attention: queries from image positions, keys and values from text tokens.</p>
+<p><strong>LoRA.</strong> Freeze a weight matrix <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span></span></span></span> and learn a low-rank update:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8019em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.7936em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.1076em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mord mathnormal">A</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0935em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">A</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8991em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">)</span></span></span></span> trainable numbers instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>: for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">768</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">6</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">144</span></span></span></span> instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">589</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">824</span></span></span></span>, about 1%. <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> starts at zero, so training starts from the original model.</p></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Under "Use it", a small model learns two interleaved half-moons, class 0 and class 1, with the class label dropped 10% of the time. Sampling class 0 with guidance <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">3</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">7.5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">15</span></span></span></span>: what happens to the samples as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> grows? (Solution P1.)</p></div></aside>
+<h2>Step 1 · Text-to-image</h2>
+<aside class="co co-warn"><div class="co-label">Watch out</div><div class="co-title">These steps need a GPU</div><div class="co-body"><p>Steps 1 to 6 load 2 to 4 GB of weights and run in <code>float16</code> on CUDA, so they are not run on this page. Their API calls were checked against <code>diffusers</code> 0.43 with a tiny test pipeline. The experiments under "Use it" run the same ideas on CPU: the real Stable Diffusion VAE, and classifier-free guidance on a model small enough to train here.</p></div></aside>
+<p>This lesson uses <code>diffusers</code> end-to-end rather than rebuilding Stable Diffusion from scratch. The pieces you would need to rebuild (VAE, text encoder, U-Net, scheduler) are topics of their own lessons; here the goal is fluency with the production API.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+from diffusers import StableDiffusionPipeline
+
+pipe = StableDiffusionPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = pipe(
+    prompt=&quot;a dog riding a skateboard in tokyo, studio ghibli style&quot;,
+    guidance_scale=7.5,
+    num_inference_steps=25,
+    generator=torch.Generator(&quot;cuda&quot;).manual_seed(42),
+).images[0]
+image.save(&quot;dog.png&quot;)
+</code></pre></div>
+
+<p><code>float16</code> halves VRAM with no visible quality loss. SD 1.5's default scheduler in <code>diffusers</code> is PNDM; with DPM-Solver++ (Step 2), 20-25 steps usually look as good as 50 DDIM steps.</p>
+<h2>Step 2 · Swap the scheduler</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from diffusers import DPMSolverMultistepScheduler, EulerAncestralDiscreteScheduler
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(pipe.scheduler.config)
+</code></pre></div>
+
+<p>Scheduler state is decoupled from U-Net weights. You can train on DDPM and sample with any scheduler.</p>
+<h2>Step 3 · Image-to-image</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from diffusers import StableDiffusionImg2ImgPipeline
+from PIL import Image
+
+img2img = StableDiffusionImg2ImgPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-v1-5&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+init_image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+out = img2img(
+    prompt=&quot;a dog riding a skateboard, oil painting&quot;,
+    image=init_image,
+    strength=0.6,
+    guidance_scale=7.5,
+).images[0]
+</code></pre></div>
+
+<p><code>strength</code> is how much noise to add before denoising (0.0 = unchanged, 1.0 = full regeneration). 0.5-0.7 is the standard range for style transfer.</p>
+<h2>Step 4 · Inpainting</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from diffusers import StableDiffusionInpaintPipeline
+
+inpaint = StableDiffusionInpaintPipeline.from_pretrained(
+    &quot;runwayml/stable-diffusion-inpainting&quot;,
+    torch_dtype=torch.float16,
+).to(&quot;cuda&quot;)
+
+image = Image.open(&quot;dog.png&quot;).convert(&quot;RGB&quot;).resize((512, 512))
+mask = Image.open(&quot;dog_mask.png&quot;).convert(&quot;L&quot;).resize((512, 512))
+
+out = inpaint(
+    prompt=&quot;a cat&quot;,
+    image=image,
+    mask_image=mask,
+    guidance_scale=7.5,
+).images[0]
+</code></pre></div>
+
+<p>White pixels in the mask are the area to regenerate. Black pixels are preserved.</p>
+<h2>Step 5 · LoRA loading</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">pipe.load_lora_weights(
+    &quot;artificialguybr/studioghibli-redmond-1-5v-studio-ghibli-lora-for-liberteredmond-sd-1-5&quot;,
+    weight_name=&quot;StudioGhibliRedmond-15V-LiberteRedmond-StdGBRedmAF-StudioGhibli.safetensors&quot;,
+)
+pipe.fuse_lora(lora_scale=0.8)
+
+image = pipe(prompt=&quot;a village square, StdGBRedmAF, Studio Ghibli&quot;).images[0]
+</code></pre></div>
+
+<p>The trigger phrase from the model card (<code>StdGBRedmAF, Studio Ghibli</code>) switches the style on. <code>lora_scale</code> controls strength; 0.0 = no effect, 1.0 = full effect. <code>fuse_lora</code> bakes the adapter into the weights in place for speed, but prevents swapping. Call <code>pipe.unfuse_lora()</code> before loading a different adapter.</p>
+<h2>Step 6 · LoRA training (sketch)</h2>
+<p>Real LoRA training lives in <code>peft</code> or <code>diffusers.training</code>. The outline:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Pseudocode
+for step, batch in enumerate(dataloader):
+    images, prompts = batch
+    latents = vae.encode(images).latent_dist.sample() * 0.18215
+
+    t = torch.randint(0, num_train_timesteps, (batch_size,))
+    noise = torch.randn_like(latents)
+    noisy_latents = scheduler.add_noise(latents, noise, t)
+
+    text_emb = text_encoder(tokenizer(prompts))
+
+    pred_noise = unet(noisy_latents, t, text_emb)  # LoRA weights injected here
+
+    loss = F.mse_loss(pred_noise, noise)
+    loss.backward()
+    optimizer.step()
+</code></pre></div>
+
+<p>Only the LoRA matrices receive gradient; the base U-Net, VAE, and text encoder are frozen. With a batch size of 1 and gradient checkpointing this fits in 8 GB of VRAM.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the training sketch, drop the <code>* 0.18215</code>. Training still runs and the loss still falls. What goes wrong? Use the latent standard deviation printed under "Use it". (Solution B1.)</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>In production, the decisions you actually make:</p>
+<ul>
+<li><strong>Model family</strong>: SD 1.5 for open-source community fine-tunes, SDXL for higher fidelity, SD3 / FLUX for the best quality of these, after checking their licences (FLUX.1 [dev], for example, is non-commercial).</li>
+<li><strong>Scheduler</strong>: DPM-Solver++ 2M Karras for 20-30 steps, LCM-LoRA when latency is under 1s.</li>
+<li><strong>Precision</strong>: <code>float16</code> on 4080/4090, <code>bfloat16</code> on A100 and newer, <code>int8</code> (via <code>bitsandbytes</code>) when VRAM is tight.</li>
+<li><strong>Conditioning</strong>: plain text works; for stronger control, add ControlNet (canny, depth, pose) on top of the base pipeline.</li>
+</ul>
+<p>For batch generation, <code>AUTO1111</code> / <code>ComfyUI</code> are the community tools; for production APIs, <code>diffusers</code> + <code>accelerate</code> or <code>optimum-nvidia</code> with TensorRT compilation.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">See the VAE</div><div class="co-body"><p>The actual VAE from Stable Diffusion 1.5 (84M parameters) on a 512 × 512 photo: encode, look at the 4 latent channels, decode. Last panel: decoding random numbers of the right size and scale.</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import io
+import numpy as np
+import matplotlib.pyplot as plt
+import pyarrow.parquet as pq
+from PIL import Image
+from huggingface_hub import hf_hub_download
+from diffusers import AutoencoderKL
+
+vae = AutoencoderKL.from_pretrained(&quot;runwayml/stable-diffusion-v1-5&quot;, subfolder=&quot;vae&quot;).eval()
+parquet = hf_hub_download(&quot;Multimodal-Fatima/Imagenette_validation&quot;,
+                          &quot;data/validation-00000-of-00001-b518380f1876c09a.parquet&quot;, repo_type=&quot;dataset&quot;)
+photo = Image.open(io.BytesIO(pq.read_table(parquet, columns=[&quot;image&quot;]).column(&quot;image&quot;)[2700].as_py()[&quot;bytes&quot;])).convert(&quot;RGB&quot;).resize((512, 512))
+pixels = torch.from_numpy(np.array(photo)).permute(2, 0, 1).float()[None] / 127.5 - 1
+
+with torch.no_grad():
+    latent = vae.encode(pixels).latent_dist.mean
+    rebuilt = vae.decode(latent).sample.clamp(-1, 1)
+    torch.manual_seed(0)
+    random_latent = torch.randn_like(latent) / vae.config.scaling_factor
+    from_random = vae.decode(random_latent).sample.clamp(-1, 1)
+mse = ((rebuilt - pixels) ** 2).mean().item()
+print(f&quot;image {tuple(pixels.shape)} = {pixels.numel():,} numbers -&gt; latent {tuple(latent.shape)} = {latent.numel():,} numbers ({pixels.numel() // latent.numel()}x smaller)&quot;)
+print(f&quot;latent std {latent.std():.2f}; after x {vae.config.scaling_factor}: {(latent * vae.config.scaling_factor).std():.2f}&quot;)
+print(f&quot;reconstruction PSNR {10 * np.log10(4 / mse):.1f} dB&quot;)
+
+show = lambda t: ((t[0] + 1) / 2).permute(1, 2, 0).numpy()
+fig = plt.figure(figsize=(11, 4.6))
+grid = fig.add_gridspec(2, 5)
+for k, (img, title) in enumerate(((show(pixels), &quot;photo, 512 x 512 x 3&quot;), (show(rebuilt), &quot;decoded from latent&quot;), (show(from_random), &quot;decoded random latent&quot;))):
+    ax = fig.add_subplot(grid[:, [0, 3, 4][k]]); ax.imshow(img); ax.axis(&quot;off&quot;); ax.set_title(title, fontsize=9)
+for c in range(4):
+    ax = fig.add_subplot(grid[c // 2, 1 + c % 2])
+    ax.imshow(latent[0, c], cmap=&quot;gray&quot;); ax.axis(&quot;off&quot;); ax.set_title(f&quot;latent channel {c} (64 x 64)&quot;, fontsize=8)
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">image (1, 3, 512, 512) = 786,432 numbers -&gt; latent (1, 4, 64, 64) = 16,384 numbers (48x smaller)
+latent std 4.58; after x 0.18215: 0.83
+reconstruction PSNR 31.3 dB</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/1cb483908f6994ef.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The four latent channels are recognisably the puppies at 64 × 64: the VAE keeps the layout and packs texture and colour into the channel values. Decoding brings back a photo that is hard to tell from the original (the PSNR above 30 dB is high fidelity), so 48 times fewer numbers lose surprisingly little. Random numbers of the same size and scale decode to texture soup, not a picture: only latents near what the encoder produces mean anything, and generating such latents is exactly the diffusion model's job. The printed standard deviation shows why the 0.18215 is there: it brings the latent to roughly unit scale, which is what the noise schedule assumes.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">See classifier-free guidance</div><div class="co-body"><p>A small denoiser trained on two interleaved half-moons. It gets the class (0 or 1) as an input, replaced by a "no class" token 10% of the time, exactly the CFG training recipe. Sampling uses DDIM with 50 steps and the CFG formula from Idea 2.</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math, time
+import torch.nn as nn
+
+T = 1000
+alpha_bar = torch.cumprod(1 - torch.linspace(1e-4, 2e-2, T), dim=0)
+
+def two_moons(n):
+    cls = torch.randint(0, 2, (n,))
+    theta = torch.rand(n) * math.pi
+    x = torch.where(cls == 0, torch.cos(theta), 1 - torch.cos(theta))
+    y = torch.where(cls == 0, torch.sin(theta), 0.5 - torch.sin(theta))
+    return torch.stack([x - 0.5, y - 0.25], 1) * 1.2 + 0.05 * torch.randn(n, 2), cls
+
+def time_embedding(t, dim=64):
+    freqs = torch.exp(-math.log(10000) * torch.arange(dim // 2) / (dim // 2))
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([args.sin(), args.cos()], dim=-1)
+
+class ConditionalDenoiser(nn.Module):
+    def __init__(self, hidden=256):
+        super().__init__()
+        self.time = nn.Sequential(nn.Linear(64, hidden), nn.SiLU())
+        self.label = nn.Embedding(3, hidden)                     # 0, 1, and 2 = &quot;no class&quot;
+        self.inp = nn.Linear(2, hidden)
+        self.net = nn.Sequential(nn.SiLU(), nn.Linear(hidden, hidden), nn.SiLU(),
+                                 nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, 2))
+    def forward(self, x, t, c):
+        return self.net(self.inp(x) + self.time(time_embedding(t)) + self.label(c))
+
+torch.manual_seed(0)
+cond_model = ConditionalDenoiser()
+opt = torch.optim.Adam(cond_model.parameters(), lr=1e-3)
+decay = torch.optim.lr_scheduler.CosineAnnealingLR(opt, 12000)
+start = time.time()
+for step in range(12000):
+    x0, c = two_moons(512)
+    c = torch.where(torch.rand(512) &lt; 0.1, torch.full_like(c, 2), c)   # drop the label 10% of the time
+    t = torch.randint(0, T, (512,))
+    noise = torch.randn_like(x0)
+    a = alpha_bar[t][:, None]
+    loss = ((cond_model(a.sqrt() * x0 + (1 - a).sqrt() * noise, t, c) - noise) ** 2).mean()
+    opt.zero_grad(); loss.backward(); opt.step(); decay.step()
+print(f&quot;trained in {time.time() - start:.0f} s&quot;)
+
+@torch.no_grad()
+def sample_cfg(n, cls, w, steps=50):
+    x = torch.randn(n, 2)
+    ts = torch.linspace(T - 1, -1, steps + 1).round().long()
+    for i in range(steps):
+        t, t_prev = ts[i], ts[i + 1]
+        tb = torch.full((n,), int(t))
+        eps_cond = cond_model(x, tb, torch.full((n,), cls))
+        eps_uncond = cond_model(x, tb, torch.full((n,), 2))
+        eps = eps_uncond + w * (eps_cond - eps_uncond)             # the CFG formula
+        a, a_prev = alpha_bar[t], (alpha_bar[t_prev] if t_prev &gt;= 0 else torch.tensor(1.0))
+        x0_pred = (x - (1 - a).sqrt() * eps) / a.sqrt()
+        x = a_prev.sqrt() * x0_pred + (1 - a_prev).sqrt() * eps
+    return x
+
+reference, ref_cls = two_moons(5000)
+fig, axes = plt.subplots(1, 5, figsize=(13, 2.9), sharey=True)
+for ax, w in zip(axes, (0, 1, 3, 7.5, 15)):
+    torch.manual_seed(1)
+    pts = sample_cfg(1500, cls=0, w=w)
+    nearest = torch.cdist(pts, reference).min(1)
+    print(f&quot;w = {w:4}: on class-0 moon {100 * (ref_cls[nearest.indices] == 0).float().mean():5.1f}%   &quot;
+          f&quot;distance to data {nearest.values.mean():.3f}   spread {pts.std(0).mean():.2f}&quot;)
+    ax.scatter(reference[:, 0], reference[:, 1], s=1, color=&quot;#d9dde3&quot;)
+    ax.scatter(pts[:, 0], pts[:, 1], s=1, color=&quot;#b24a1d&quot; if w &gt; 7.5 else &quot;#24753a&quot;)
+    ax.set_title(f&quot;w = {w}&quot;, fontsize=10); ax.set_xlim(-2, 2); ax.set_ylim(-1.5, 1.5); ax.set_xticks([]); ax.set_yticks([])
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">trained in 58 s
+w =    0: on class-0 moon  49.3%   distance to data 0.038   spread 0.80
+w =    1: on class-0 moon  99.9%   distance to data 0.008   spread 0.60
+w =    3: on class-0 moon 100.0%   distance to data 0.007   spread 0.44
+w =  7.5: on class-0 moon 100.0%   distance to data 0.018   spread 0.34
+w =   15: on class-0 moon 100.0%   distance to data 0.334   spread 0.29</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/178e36bfde75e5fd.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>At <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> the class is ignored and samples cover both moons. At <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> (plain conditioning) nearly all samples land on the class-0 moon. Raising <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> further keeps them on the right moon but squeezes them into a narrower part of it: the spread number falls steadily. At <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> the samples are pushed so hard away from "what the unconditional model expects" that they leave the data altogether (the distance to data jumps). In images that shows up as over-saturated colours and harsh contrast, which is why Stable Diffusion defaults to 7.5, not 30.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Stable Diffusion = VAE + text encoder + U-Net denoiser + scheduler (+ optional safety checker).</li>
+<li>Diffusion runs on a 4 × 64 × 64 latent, 48 times fewer numbers than the 512 × 512 image; the VAE decodes once at the end.</li>
+<li>Classifier-free guidance mixes conditional and unconditional predictions; higher <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> obeys the prompt more narrowly and, too high, breaks images.</li>
+<li>Img2img and inpainting reuse the same denoiser on a partly noised encoded image.</li>
+<li>LoRA trains small low-rank matrices in the attention layers and leaves the base model frozen.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a0411-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Narrower, then wrong</span></summary><div class="qa-a"><p>At <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> samples fall on both moons (the label is ignored). From <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> almost all land on the class-0 moon. As <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> grows they crowd into a shrinking part of that moon, and at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">15</span></span></span></span> they drift off the data entirely. Guidance trades diversity for adherence, and too much of it leaves the distribution: the 2-D version of an over-cooked Stable Diffusion image.</p></div></details>
+<details class="qa" id="a0411-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Latents at the wrong scale</span></summary><div class="qa-a"><p>The printed raw latent standard deviation is about 4.6, not 1. The noise schedule assumes data of roughly unit scale, so at every timestep the "clean" part of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> is about 4.6 times too large relative to the noise. The model learns a different problem from the one the pretrained U-Net and the scheduler expect, and at inference its outputs decode to washed-out or blown-out images. Nothing errors; the constant is a contract between the VAE, the schedule and the U-Net.</p></div></details>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Which Stable Diffusion people run.</strong> SDXL remains the most widely fine-tuned open image model thanks to its ecosystem of LoRAs; Stable Diffusion 3.5 (October 2024) moved to a transformer (MMDiT) with rectified flow, and FLUX models compete for the same users.</li>
+<li><strong>Fine-tuning is LoRA.</strong> DreamBooth-style LoRA training with <code>diffusers</code> or kohya scripts adapts a model to a subject or style on one GPU; ComfyUI is the usual production workflow tool.</li>
+</ul>
+<p>Sources: <a href="https://stability.ai/news/introducing-stable-diffusion-3-5">Stable Diffusion 3.5</a>, <a href="https://huggingface.co/docs/diffusers/training/lora">diffusers LoRA training</a>, <a href="https://github.com/comfyanonymous/ComfyUI">ComfyUI</a>.</p></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-image-editing-control"><span class="t" style="--cs-hue:265">CI</span>Cheat sheet · ControlNet, Inpainting and Image Editing</a><a href="#cs-image-generation-compared"><span class="t" style="--cs-hue:315">GD</span>Cheat sheet · GANs, Diffusion and Flow Compared</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-sd-pipeline-planner.md</code> — a prompt that picks SD 1.5 / SDXL / SD3 / FLUX plus scheduler and precision given a latency budget, fidelity target, and licensing constraint.</li>
+<li><code>outputs/skill-lora-training-setup.md</code> — a skill that writes a full LoRA training config for a custom dataset including captions, rank, batch size, and learning rate.</li>
+</ul>
+<p><strong><code>outputs/prompt-sd-pipeline-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-sd-pipeline-planner
+description: Pick SD 1.5 / SDXL / SD3 / FLUX plus scheduler and precision given a latency budget, fidelity target, and licensing constraint
+phase: 4
+lesson: 11
+---
+
+You are a Stable Diffusion pipeline planner. Given the constraints below, return one model, one scheduler, one precision, and one step count.
+
+## Inputs
+
+- `latency_target_s`: seconds per image at the target GPU
+- `fidelity`: prototype | production | premium
+- `licensing`: permissive (any use) | research | commercial_ok
+- `gpu`: rtx3060 | rtx4090 | a100 | h100 | cpu_only
+- `resolution`: 512 | 768 | 1024 | custom
+
+## Model picker
+
+Rules fire in order; the first match wins.
+
+- `fidelity == prototype` -&gt; **SD 1.5** (fastest, smallest, widest community).
+- `fidelity == production` and `resolution &gt;= 1024` -&gt; **SDXL**.
+- `fidelity == production` and `768 &lt; resolution &lt; 1024` -&gt; **SDXL** at a lower target resolution with a refiner pass, or **SD 1.5** upscaled; pick the former when detail matters, the latter when latency matters.
+- `fidelity == production` and `resolution &lt;= 768` -&gt; **SDXL Turbo** (better quality-per-step than SD 1.5 turbo when commercial licensing is acceptable); if the project requires a fully permissive base, fall back to **SD 1.5 turbo**.
+- `fidelity == production` and `resolution == custom` -&gt; treat as the nearest supported bucket: `&lt;= 768` for any side under 768, otherwise SDXL at 1024.
+- `fidelity == premium` and `licensing == commercial_ok` -&gt; **SD3 Medium**.
+- `fidelity == premium` and `licensing == permissive` -&gt; **FLUX.1-schnell** (Apache 2.0).
+- `fidelity == premium` and `licensing == research` -&gt; **FLUX.1-dev**.
+
+## Scheduler picker
+
+Pick the column by latency budget:
+
+- `latency_target_s &lt; 0.5s` -&gt; Fast column (≤10 steps).
+- `0.5s &lt;= latency_target_s &lt; 3s` -&gt; Quality column (20-30 steps).
+- `latency_target_s &gt;= 3s` -&gt; Reference column (50 steps). If the model's Reference cell is `N/A`, use the Quality column instead.
+
+| Model | Fast (≤10 steps) | Quality (20-30 steps) | Reference (50 steps) |
+|-------|------------------|-----------------------|----------------------|
+| SD 1.5 | LCM-LoRA | DPM-Solver++ 2M Karras | DDIM |
+| SDXL | Lightning | DPM-Solver++ 2M SDE Karras | Euler ancestral |
+| SD3 | Flow-match Euler | Flow-match Euler | Flow-match Euler |
+| FLUX | Flow-match Euler 4 steps | Flow-match Euler 20 steps | N/A |
+
+## Precision picker
+
+- `gpu == rtx3060 | rtx4090` -&gt; `torch.float16`
+- `gpu == a100 | h100` -&gt; `torch.bfloat16`
+- `gpu == cpu_only` -&gt; `torch.float32`, warn user that inference will be slow
+
+## Output
+
+```
+[pipeline]
+  model:         &lt;full HF id&gt;
+  scheduler:     &lt;name&gt;
+  steps:         &lt;int&gt;
+  guidance:      &lt;float&gt;
+  precision:     float16 | bfloat16 | float32
+  resolution:    &lt;HxW&gt;
+
+[reason]
+  one sentence grounded in fidelity + latency_target + licensing
+
+[expected latency]
+  &lt;float&gt; seconds (approx based on gpu + steps + resolution)
+
+[warnings]
+  - &lt;any licensing caveat&gt;
+  - &lt;any resolution-vs-model mismatch&gt;
+```
+
+## Rules
+
+- Never recommend a model whose license contradicts the user's constraint. `SD 1.5` ships under CreativeML Open RAIL-M, which forbids specific use categories (listed in the license); when `licensing == commercial_ok`, warn but allow if the user confirms the project is not in a restricted category. When `licensing == permissive`, reject SD 1.5 outright and switch to an Apache 2.0 or similarly permissive base.
+- Flag if requested `resolution` is outside a model's native size (e.g. SD 1.5 at 1024x1024 produces broken samples without custom training).
+- If `latency_target_s &lt; 0.5s` on consumer GPU, recommend LCM-LoRA or a turbo/schnell variant with 1-4 steps.
+- Do not recommend CPU-only for `fidelity == production`; propose reducing resolution or switching to a smaller model.
+</code></pre></div>
+<p><strong><code>outputs/skill-lora-training-setup.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-lora-training-setup
+description: Write a full LoRA training config for a custom dataset, including captions, rank, batch size, and learning rate
+version: 1.0.0
+phase: 4
+lesson: 11
+tags: [computer-vision, stable-diffusion, lora, fine-tuning]
+---
+
+# LoRA Training Setup
+
+Turn a description of the fine-tune intent into a concrete training config that is ready to pass to `diffusers` or `kohya_ss`.
+
+## When to use
+
+- Training a LoRA for a subject (person, object, character), a style (artist, brand), or a concept (pose, lighting).
+- Extending an existing LoRA with more data.
+- Debugging a LoRA run whose output underfits or overfits the training images.
+
+## Inputs
+
+- `purpose`: subject | style | concept
+- `num_images`: how many training images are available
+- `base_model`: SD 1.5 | SDXL | SD3 | FLUX
+- `gpu_vram_gb`: 8 | 12 | 16 | 24 | 48+
+- `caption_source`: manual | BLIP2-generated | dataset-native
+
+## Rank picker
+
+| Purpose | Rank | Alpha |
+|---------|------|-------|
+| Subject | 8-16 | rank |
+| Style | 16-32 | rank * 2 |
+| Concept | 32-64 | rank |
+
+Higher rank = more capacity, more overfitting risk on small datasets. Alpha scales the LoRA's effect strength; `alpha == rank` is the safe default. Styles are the documented exception: `alpha == rank * 2` gives a stronger style push at the cost of more risk of baking the style too hard — use only when subject fidelity is not the goal.
+
+## Training step target
+
+- `subject` with 5-20 images: 500-1500 steps.
+- `style` with 30-100 images: 1500-4000 steps.
+- `concept` with 100+ images: 4000-10000 steps.
+
+Overshoot at your peril — a LoRA that has memorised its training images cannot generalise.
+
+## Learning rate
+
+- Text encoder LoRA: `1e-4` for SD 1.5, `5e-5` for SDXL.
+- U-Net LoRA: `1e-4` for SD 1.5, `1e-4` for SDXL.
+- FLUX / SD3: `5e-5` for the transformer, text encoders usually frozen.
+- Halve the LR when `num_images &lt; 15` (subject) or when training for more than 3000 steps; tiny datasets and long runs both benefit from a gentler update.
+
+## Scheduler
+
+- `cosine_with_warmup` (default): warmup over the first 5-10% of steps, then cosine decay. Use when `steps &gt;= 1000`; the decay tail gives sharper final samples.
+- `constant`: use only for very short runs (`steps &lt; 500`) or when resuming a previous LoRA where you want to preserve the current learned features without re-annealing.
+
+## Caption format
+
+- Subject: prepend a unique trigger token (&quot;myperson&quot;) to every caption. Keep trigger token rare so it does not overwrite existing concepts. Avoid real words and common names.
+- Style: append a unique style tag at the end of every caption (&quot;...in mystyle style&quot;). Treat the tag itself as a rare trigger token — `mystyle`, not `impressionism`, which already maps to a real concept.
+- Concept: describe the concept in every caption; no trigger token. The concept itself (e.g. &quot;low-angle shot&quot;) is the anchor.
+
+## Output config
+
+```yaml
+model:
+  base: &lt;base_model HF id&gt;
+  precision: fp16 | bf16
+
+lora:
+  rank: &lt;int&gt;
+  alpha: &lt;int&gt;
+  targets: unet.cross_attention  # and/or unet.to_q, to_k, to_v, to_out
+
+training:
+  steps:          &lt;int&gt;
+  batch_size:     &lt;int, tuned to gpu_vram_gb&gt;
+  grad_accum:     &lt;int, usually 1 on &gt;=16 GB, 4 on &lt;=12 GB&gt;
+  learning_rate:  &lt;float&gt;
+  optimizer:      AdamW8bit | AdamW
+  scheduler:      cosine_with_warmup | constant
+  warmup_steps:   &lt;int&gt;
+  save_every:     &lt;int&gt;
+
+data:
+  images_dir:     &lt;path&gt;
+  caption_source: &lt;manual | BLIP2 | native&gt;
+  trigger_token:   &lt;string if purpose==subject&gt;
+  resolution:      &lt;512 for SD 1.5, 1024 for SDXL&gt;
+  aspect_ratio_bucketing: true
+  augmentation:
+    flip:          true
+    color_jitter:  false
+
+validation:
+  prompts:
+    - &quot;&lt;trigger&gt; ...test prompt...&quot;
+    - &quot;&lt;trigger&gt; in a different scene&quot;
+  every_steps: 250
+```
+
+## Report
+
+```
+[lora setup]
+  purpose:   &lt;subject|style|concept&gt;
+  base:      &lt;model&gt;
+  rank:      &lt;int&gt;
+  steps:     &lt;int&gt;
+  batch:     &lt;int&gt;   grad_accum: &lt;int&gt;
+  lr:        &lt;float&gt;
+  vram est.: &lt;float&gt; GB
+```
+
+## Rules
+
+- Never recommend `rank &gt; 64`; above that the LoRA becomes a mini fine-tune and loses its &quot;adapter&quot; nature.
+- For `num_images &lt; 5`, warn strongly — identity LoRAs on 1-3 images overfit every time.
+- For `gpu_vram_gb &lt; 12`, require AdamW8bit and gradient checkpointing.
+- If `base_model == FLUX` and `gpu_vram_gb &lt; 24`, route to the `schnell` variant and note that training is slower.
+- Never skip validation prompts; a LoRA without sample grids is impossible to evaluate.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Generate the same prompt with <code>guidance_scale</code> in <code>[1, 3, 5, 7.5, 10, 15]</code>. Describe how the image changes. At what guidance value do artefacts appear?</li>
+<li><strong>(Medium)</strong> Take any real photograph, run it through <code>StableDiffusionImg2ImgPipeline</code> at <code>strength</code> in <code>[0.2, 0.4, 0.6, 0.8, 1.0]</code>. Which strength preserves composition while changing style? Why does 1.0 ignore the input entirely?</li>
+<li><strong>(Hard)</strong> Train a LoRA on 10-20 images of a single subject (a pet, a logo, a character) and generate novel scenes with that subject in them. Report the LoRA rank and training steps that produced the best identity preservation without overfitting to the input images.</li>
+</ol>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2112.10752">High-Resolution Image Synthesis with Latent Diffusion (Rombach et al., 2022)</a> — the Stable Diffusion paper; includes every ablation that justifies the design</li>
+<li><a href="https://arxiv.org/abs/2207.12598">Classifier-Free Diffusion Guidance (Ho &amp; Salimans, 2022)</a> — the CFG paper</li>
+<li><a href="https://arxiv.org/abs/2106.09685">LoRA: Low-Rank Adaptation of Large Language Models (Hu et al., 2021)</a> — LoRA was NLP-first; it transferred to SD with almost no changes</li>
+<li><a href="https://huggingface.co/docs/diffusers">diffusers documentation</a> — the reference for every SD / SDXL / SD3 / FLUX pipeline</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/04-computer-vision/11-stable-diffusion" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0411" id="done-a0411">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0411" id="undo-a0411" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0410"><span class="pn-dir">Previous</span><span class="pn-t">4.10 · Image Generation — Diffusion Models</span></a><a class="pn next" href="#a0412"><span class="pn-dir">Next</span><span class="pn-t">4.12 · Video Understanding — Temporal Modeling</span></a></div></footer>

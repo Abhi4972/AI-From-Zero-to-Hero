@@ -1,0 +1,604 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>OpenTelemetry GenAI — Tracing Tool Calls End-to-End</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.20</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1320" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Name the required OTel GenAI attributes for an LLM span and a tool-execution span.</li>
+<li>Build a trace hierarchy that covers agent loop, LLM call, tool call, and MCP client dispatch.</li>
+<li>Decide what content to capture (opt-in) vs redact (defaults).</li>
+<li>Emit spans to a local collector (Jaeger, Langfuse) without rewriting tool code.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 07 (MCP server), Phase 13 · 08 (MCP client)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, OTel span emitter), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>An agent calls five tools, three MCP servers, and two sub-agents. You need one trace across all of it. The OpenTelemetry GenAI semantic conventions (still at Development status; since v1.42 in June 2026 they live in their own <code>semantic-conventions-genai</code> repository) are the 2026 standard, natively supported by Datadog, Langfuse, Arize Phoenix, OpenLLMetry, and AgentOps. This lesson names the required attributes, walks the span hierarchy (agent → LLM → tool), and ships a stdlib span emitter you can plug into any OTel exporter.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OTel</td>
+<td>"OpenTelemetry"</td>
+<td>Open standard for traces, metrics, logs</td>
+</tr>
+<tr>
+<td>GenAI semconv</td>
+<td>"GenAI semantic conventions"</td>
+<td>Stable attribute names for LLM / tool / agent spans</td>
+</tr>
+<tr>
+<td><code>gen_ai.*</code></td>
+<td>"The attribute namespace"</td>
+<td>All GenAI attributes share this prefix</td>
+</tr>
+<tr>
+<td>Span</td>
+<td>"Timed operation"</td>
+<td>A unit of work with a start, end, and attributes</td>
+</tr>
+<tr>
+<td>Trace</td>
+<td>"Cross-span ancestry"</td>
+<td>Tree of spans sharing a trace id</td>
+</tr>
+<tr>
+<td>SpanKind</td>
+<td>"CLIENT / SERVER / INTERNAL"</td>
+<td>Hints about span direction</td>
+</tr>
+<tr>
+<td>OTLP</td>
+<td>"OpenTelemetry Protocol"</td>
+<td>Wire format for exporters</td>
+</tr>
+<tr>
+<td>Opt-in content</td>
+<td>"Prompt / completion capture"</td>
+<td>Off by default; env var to enable</td>
+</tr>
+<tr>
+<td>traceparent</td>
+<td>"W3C header"</td>
+<td>Propagates trace context across services</td>
+</tr>
+<tr>
+<td>Exporter</td>
+<td>"Backend-specific shipper"</td>
+<td>Component that sends spans to Jaeger / Datadog / etc.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When an agent is slow or wrong, you need to see what happened inside one run: which model calls it made, how many tokens each used, which tools it called, and how long each MCP server took. Tracing gives you that. A trace is a tree of timed steps called spans, all sharing one trace id. OpenTelemetry (OTel) is the open standard for traces and metrics, and its GenAI conventions fix the names: a model call is a <code>chat</code> span with attributes such as <code>gen_ai.usage.input_tokens</code>, a tool call is an <code>execute_tool</code> span, an agent run is an <code>invoke_agent</code> span. When the agent calls an MCP server in another process, the trace id travels inside the request so the server's span joins the same tree. Prompts and answers are not recorded unless you switch that on, because they may hold private data. This lesson traces a real Qwen tool call across two processes with the OTel SDK.</p></div></aside>
+<p>A debug from February 2026: user reports "my agent sometimes takes 30 seconds to respond; other times 3 seconds." No traces. Logs show the LLM call, but not the tool dispatch, not the MCP server round-trip, not the sub-agent. You guess. Eventually you find: one MCP server occasionally hangs on a cold-start.</p>
+<p>Without end-to-end tracing, you cannot find this. OTel GenAI fixes it.</p>
+<p>The conventions settled in 2025-2026 under the OpenTelemetry semantic-conventions group. They define shared attribute names so Datadog, Langfuse, Phoenix, OpenLLMetry, and AgentOps all parse the same spans. Instrument once; ship to any backend.</p>
+<h2>Idea 1 · Span hierarchy</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">invoke_agent {agent}          (INTERNAL, or CLIENT for a remote agent)
+ ├── chat {model}             (CLIENT; INTERNAL for an in-process model)
+ ├── execute_tool {tool}      (INTERNAL)
+ │    └── tools/call {tool}   (MCP: CLIENT span here, SERVER span in the server)
+ ├── chat {model}             (CLIENT)
+ └── invoke_agent {subagent}  (INTERNAL or CLIENT)
+</code></pre></div>
+<p>The whole thing nests under one trace id. Span ids link the parent-child relationships.</p>
+<h2>Idea 2 · Required attributes</h2>
+<p>Per the 2025-2026 semconv:</p>
+<ul>
+<li><code>gen_ai.operation.name</code> — <code>"chat"</code>, <code>"text_completion"</code>, <code>"embeddings"</code>, <code>"execute_tool"</code>, <code>"invoke_agent"</code>.</li>
+<li><code>gen_ai.provider.name</code> — <code>"openai"</code>, <code>"anthropic"</code>, <code>"google"</code>, <code>"azure_openai"</code>.</li>
+<li><code>gen_ai.request.model</code> — requested model string (e.g. <code>"gpt-4o-2024-08-06"</code>).</li>
+<li><code>gen_ai.response.model</code> — the model actually served.</li>
+<li><code>gen_ai.usage.input_tokens</code> / <code>gen_ai.usage.output_tokens</code>.</li>
+<li><code>gen_ai.response.id</code> — provider response id for correlation.</li>
+</ul>
+<p>For tool spans:</p>
+<ul>
+<li><code>gen_ai.tool.name</code> — tool identifier.</li>
+<li><code>gen_ai.tool.call.id</code> — the specific call id.</li>
+<li><code>gen_ai.tool.description</code> — tool description (optional).</li>
+</ul>
+<p>For agent spans:</p>
+<ul>
+<li><code>gen_ai.agent.name</code> / <code>gen_ai.agent.id</code> / <code>gen_ai.agent.description</code>.</li>
+</ul>
+<h2>Idea 3 · Span kinds</h2>
+<ul>
+<li><code>SpanKind.CLIENT</code> for calls crossing a process boundary (LLM provider, MCP server).</li>
+<li><code>SpanKind.INTERNAL</code> for the agent's own loop steps and tool execution.</li>
+</ul>
+<h2>Idea 4 · Opt-in content capture</h2>
+<p>By default, spans carry metrics and timing — not prompts or completions. Large payloads and PII are off by default. Instrumentations turn content on with a switch such as <code>OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true</code> (the exact name and values vary by library), and many use <code>OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental</code> to emit the newest attribute shapes. Review carefully before enabling in prod.</p>
+<h2>Idea 5 · Events on spans</h2>
+<p>When content capture is on, it is recorded on the <code>gen_ai.client.inference.operation.details</code> event (older drafts used <code>gen_ai.content.prompt</code> and <code>gen_ai.content.completion</code> events, now replaced):</p>
+<ul>
+<li><code>gen_ai.input.messages</code>: the messages sent, as structured role/parts JSON.</li>
+<li><code>gen_ai.output.messages</code>: the messages the model returned, including tool calls.</li>
+<li><code>gen_ai.system_instructions</code>: the system prompt, kept separate.</li>
+</ul>
+<p>A separate <code>gen_ai.evaluation.result</code> event records evaluation scores. Events are time-ordered within a span for detailed replay.</p>
+<h2>Idea 6 · Exporters</h2>
+<p>OTel spans export to:</p>
+<ul>
+<li><strong>Jaeger / Tempo.</strong> OSS, on-prem.</li>
+<li><strong>Langfuse.</strong> LLM-observability-specific; visualizes token usage.</li>
+<li><strong>Arize Phoenix.</strong> Evals + tracing combined.</li>
+<li><strong>Datadog.</strong> Commercial; natively parses <code>gen_ai.*</code> attributes.</li>
+<li><strong>Honeycomb.</strong> Column-oriented; query-friendly.</li>
+</ul>
+<p>All speak OTLP, the wire format. Your code does not care.</p>
+<h2>Idea 7 · Propagation across MCP</h2>
+<p>When an MCP client calls a server, it puts the W3C trace context in the request's <code>params._meta</code> under the unprefixed keys <code>traceparent</code>, <code>tracestate</code> and <code>baggage</code>. This works the same on stdio and Streamable HTTP. The convention comes from the OTel MCP semantic conventions and is documented in the MCP specification by SEP-414 (Final). The official Python SDK 2.x injects it on the client and extracts it on the server automatically; the server span becomes a child of the client span.</p>
+<h2>Idea 8 · Metrics</h2>
+<p>Alongside spans, the GenAI semconv defines metrics:</p>
+<ul>
+<li><code>gen_ai.client.token.usage</code> — histogram.</li>
+<li><code>gen_ai.client.operation.duration</code> — histogram.</li>
+<li><code>gen_ai.execute_tool.duration</code> — histogram.</li>
+<li><code>gen_ai.client.operation.time_to_first_chunk</code>, <code>gen_ai.invoke_agent.duration</code> and, for self-hosted inference, <code>gen_ai.server.time_to_first_token</code> and <code>gen_ai.server.time_per_output_token</code>.</li>
+<li>MCP adds <code>mcp.client.operation.duration</code> and <code>mcp.server.operation.duration</code>.</li>
+</ul>
+<p>Use these for dashboards that do not need per-call detail.</p>
+<h2>Idea 9 · AgentOps layer</h2>
+<p>AgentOps (founded 2024) specializes in GenAI observability. It wraps popular frameworks (LangGraph, Pydantic AI, CrewAI) to emit OTel spans automatically. Useful if your stack uses a supported framework; use manual instrumentation otherwise.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="t3-span-waterfall"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>A trace is a tree.</strong> Every span <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span> has a trace id <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>, its own id and a parent id <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span>. For one agent run,
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mopen">(</span><span class="mord text"><span class="mord">root</span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">∀</span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">duration</span></span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.566em;vertical-align:-1.516em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.809em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mrel mtight">:</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight">p</span><span class="mopen mtight">(</span><span class="mord mathnormal mtight">c</span><span class="mclose mtight">)</span><span class="mrel mtight">=</span><span class="mord mathnormal mtight">s</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.516em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">duration</span></span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord text"><span class="mord">(for children that run one after another)</span></span><span class="mord">.</span></span></span></span></span></div>
+The gap between a span and its children is time spent in the span's own code: in an <code>execute_tool</code> span, it is the host's work around the MCP call.</p>
+<p><strong>Token usage adds up across spans.</strong> For the chat spans <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span></span></span></span> of one run,
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">input tokens</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3717em;vertical-align:-1.3217em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8557em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">c</span><span class="mrel mtight">∈</span><span class="mord mathnormal mtight" style="margin-right:0.07153em;">C</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3217em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">gen_ai.usage.input_tokens</span></span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mclose">)</span><span class="mpunct">,</span></span></span></span></span></div>
+and each later call usually re-sends the whole conversation, so input tokens grow with each turn even when the new text is short.</p>
+<p><strong>Propagation.</strong> A <code>traceparent</code> value has four fields: <code>version-traceid-parentid-flags</code>, for example <code>00-</code> then 32 hex digits of trace id, <code>-</code>, 16 hex digits of the caller's span id, <code>-01</code> (sampled). The receiver starts its span with that parent.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Reading one trace</div><div class="co-body"><ul>
+<li>The run is <code>invoke_agent notes-assistant</code>, 7.5 s.</li>
+<li>First <code>chat</code> span: 185 input tokens (the question plus the tool schema in the template), 21 output tokens, finish reason <code>tool_call</code>, 2.6 s.</li>
+<li><code>execute_tool search_notes</code>, 36 ms, contains the SDK's client span <code>MCP send tools/call search_notes</code> (4 ms), which contains the server process's span <code>tools/call search_notes</code> (1 ms). The server span has the same trace id because the client sent <code>traceparent</code> in <code>_meta</code>.</li>
+<li>Second <code>chat</code> span: 249 input tokens (the conversation now includes the tool call and its result), 36 output tokens, 4.2 s.</li>
+<li>So almost all the time is model generation (6.8 of 7.5 s); the tool path is about 0.5% of the run. Total tokens: 434 in, 57 out.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The GenAI semantic conventions are stable, so names will not change."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> In 2026 they are at Development status; pin your instrumentation version.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Traces include the prompts by default."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Content is off by default; turn it on deliberately and redact.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Stdio MCP servers cannot join a trace because there are no HTTP headers."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Trace context travels in <code>params._meta</code> (<code>traceparent</code>), on any transport.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A span per tool call is enough; metrics are redundant."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Metrics such as <code>gen_ai.client.token.usage</code> aggregate cheaply for dashboards and alerts; spans are for single-run detail.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The agent's first model call decides to call <code>search_notes</code>, and the tool runs in a separate MCP server process over stdio. Will the server's span appear in the same trace, and where in the tree? Which span will take most of the time? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">One agent run traced across two processes</div><div class="co-body"><p>The OTel SDK records spans in memory (a real service would use an OTLP exporter). Qwen2.5-0.5B-Instruct decides to call <code>search_notes</code>; the tool runs in an MCP server started as a subprocess over stdio, which exports its own spans to a file. The block merges both sets and prints the tree. About 15 seconds on a laptop CPU (model load plus two generations).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># One agent run traced with the OpenTelemetry SDK: invoke_agent -&gt; chat -&gt; execute_tool -&gt; MCP client -&gt; MCP server.
+import asyncio, json, re, torch, uuid
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+exporter = InMemorySpanExporter()                       # in production: an OTLP exporter to a collector
+provider = TracerProvider(); provider.add_span_processor(SimpleSpanProcessor(exporter)); trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(&quot;notes-agent&quot;)
+from opentelemetry.trace import SpanKind
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as tlog
+from mcp import Client
+from mcp.client.stdio import stdio_client, StdioServerParameters
+import sys
+tlog.set_verbosity_error(); torch.manual_seed(0)
+
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); model = AutoModelForCausalLM.from_pretrained(M).eval()
+SERVER = r'''
+import json
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
+class FileExporter(SpanExporter):              # a stand-in for the OTLP exporter the server would really use
+    def export(self, spans):
+        with open(&quot;server_spans.jsonl&quot;, &quot;a&quot;) as f:
+            for s in spans: f.write(json.dumps({&quot;name&quot;: s.name, &quot;kind&quot;: s.kind.name, &quot;trace&quot;: s.context.trace_id,
+                &quot;id&quot;: s.context.span_id, &quot;parent&quot;: s.parent.span_id if s.parent else None,
+                &quot;start&quot;: s.start_time, &quot;end&quot;: s.end_time, &quot;attrs&quot;: dict(s.attributes)}) + &quot;\n&quot;)
+        return SpanExportResult.SUCCESS
+p = TracerProvider(); p.add_span_processor(SimpleSpanProcessor(FileExporter())); trace.set_tracer_provider(p)
+from mcp.server import MCPServer
+notes = MCPServer(&quot;notes&quot;, log_level=&quot;WARNING&quot;)
+@notes.tool()
+def search_notes(query: str) -&gt; str:
+    &quot;&quot;&quot;Search the user's saved notes by keyword and return matching notes.&quot;&quot;&quot;
+    return json.dumps([{&quot;title&quot;: &quot;Q3 offsite&quot;, &quot;text&quot;: &quot;Offsite moved to 14 October, Goa.&quot;}])
+notes.run()
+'''
+open(&quot;notes_server.py&quot;, &quot;w&quot;).write(SERVER); open(&quot;server_spans.jsonl&quot;, &quot;w&quot;).close()
+SPECS = [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;search_notes&quot;, &quot;description&quot;: &quot;Search the user's saved notes by keyword and return matching notes.&quot;,
+          &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;query&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;keyword to search for&quot;}}, &quot;required&quot;: [&quot;query&quot;]}}}]
+
+def chat(messages):                                     # one model call = one `chat {model}` span
+    with tracer.start_as_current_span(f&quot;chat {M}&quot;, kind=SpanKind.INTERNAL) as s:   # in-process model: INTERNAL, remote API: CLIENT
+        ids = tok.apply_chat_template(messages, tools=SPECS, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+        with torch.no_grad(): out = model.generate(ids, max_new_tokens=60, do_sample=False)
+        text = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+        s.set_attributes({&quot;gen_ai.operation.name&quot;: &quot;chat&quot;, &quot;gen_ai.provider.name&quot;: &quot;local.transformers&quot;,
+                          &quot;gen_ai.request.model&quot;: M, &quot;gen_ai.response.model&quot;: M,
+                          &quot;gen_ai.usage.input_tokens&quot;: ids.shape[1], &quot;gen_ai.usage.output_tokens&quot;: out.shape[1] - ids.shape[1],
+                          &quot;gen_ai.response.finish_reasons&quot;: [&quot;tool_call&quot; if &quot;&lt;tool_call&gt;&quot; in text else &quot;stop&quot;]})
+        return text
+
+async def run(question):
+    with tracer.start_as_current_span(&quot;invoke_agent notes-assistant&quot;, kind=SpanKind.INTERNAL,
+                                      attributes={&quot;gen_ai.operation.name&quot;: &quot;invoke_agent&quot;, &quot;gen_ai.agent.name&quot;: &quot;notes-assistant&quot;}):
+        messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: question}]
+        async with Client(stdio_client(StdioServerParameters(command=sys.executable, args=[&quot;notes_server.py&quot;]), errlog=sys.__stderr__)) as mcp:
+            for _ in range(3):
+                reply = chat(messages)
+                calls = re.findall(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, reply, re.S)
+                if not calls: return reply
+                messages.append({&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: reply})
+                for raw in calls:
+                    call, call_id = json.loads(raw), &quot;call_&quot; + uuid.uuid4().hex[:8]
+                    with tracer.start_as_current_span(f&quot;execute_tool {call['name']}&quot;, kind=SpanKind.INTERNAL,
+                            attributes={&quot;gen_ai.operation.name&quot;: &quot;execute_tool&quot;, &quot;gen_ai.tool.name&quot;: call[&quot;name&quot;],
+                                        &quot;gen_ai.tool.call.id&quot;: call_id, &quot;gen_ai.tool.type&quot;: &quot;extension&quot;}):
+                        r = await mcp.call_tool(call[&quot;name&quot;], call[&quot;arguments&quot;])   # the SDK adds a CLIENT span and _meta.traceparent
+                    messages.append({&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: r.content[0].text})
+        return &quot;(turn limit)&quot;
+
+answer = asyncio.run(run(&quot;Search my notes for offsite.&quot;))
+print(&quot;answer:&quot;, answer, &quot;\n&quot;)
+# Merge the agent's spans with the spans the server process exported, then print the tree.
+class S:  # a tiny common shape for both sources
+    def __init__(self, name, kind, trace_id, sid, parent, start, end, attrs, proc):
+        self.name, self.kind, self.trace, self.id, self.parent, self.start, self.end, self.attrs, self.proc = name, kind, trace_id, sid, parent, start, end, attrs, proc
+spans = [S(s.name, s.kind.name, s.context.trace_id, s.context.span_id, s.parent.span_id if s.parent else None,
+           s.start_time, s.end_time, dict(s.attributes), &quot;agent&quot;) for s in exporter.get_finished_spans()]
+spans += [S(d[&quot;name&quot;], d[&quot;kind&quot;], d[&quot;trace&quot;], d[&quot;id&quot;], d[&quot;parent&quot;], d[&quot;start&quot;], d[&quot;end&quot;], d[&quot;attrs&quot;], &quot;server&quot;)
+          for d in map(json.loads, open(&quot;server_spans.jsonl&quot;))]
+spans.sort(key=lambda s: s.start); by_id = {s.id: s for s in spans}
+def depth(s): return 0 if s.parent not in by_id else 1 + depth(by_id[s.parent])
+print(&quot;trace ids across both processes:&quot;, {format(s.trace, &quot;032x&quot;)[:16] + &quot;...&quot; for s in spans})
+SHOW = (&quot;gen_ai.usage.input_tokens&quot;, &quot;gen_ai.usage.output_tokens&quot;, &quot;gen_ai.tool.call.id&quot;, &quot;gen_ai.response.finish_reasons&quot;, &quot;mcp.method.name&quot;)
+for s in spans:
+    if s.attrs.get(&quot;mcp.method.name&quot;) in (&quot;server/discover&quot;, &quot;tools/list&quot;) : continue      # connection housekeeping
+    d = depth(s); keep = {k.split(&quot;.&quot;, 1)[1]: v for k, v in s.attrs.items() if k in SHOW}
+    print(f&quot;{'  ' * d}{s.name:&lt;{50 - 2 * d}} {s.proc:&lt;6} {s.kind:&lt;8} {(s.end - s.start) / 1e6:7.0f} ms  {keep}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">answer: I found some notes related to your question. The title is &quot;Q3 offsite&quot; and it states that the project was moved to October 14th, Goa. 
+
+trace ids across both processes: {&#x27;99a3deaff7957efb...&#x27;}
+invoke_agent notes-assistant                       agent  INTERNAL    7339 ms  {}
+  chat Qwen/Qwen2.5-0.5B-Instruct                  agent  INTERNAL    2391 ms  {&#x27;usage.input_tokens&#x27;: 185, &#x27;usage.output_tokens&#x27;: 21, &#x27;response.finish_reasons&#x27;:
+  execute_tool search_notes                        agent  INTERNAL      44 ms  {&#x27;tool.call.id&#x27;: &#x27;call_1cd3c2af&#x27;}
+    MCP send tools/call search_notes               agent  CLIENT         4 ms  {&#x27;method.name&#x27;: &#x27;tools/call&#x27;}
+      tools/call search_notes                      server SERVER         2 ms  {&#x27;method.name&#x27;: &#x27;tools/call&#x27;}
+  chat Qwen/Qwen2.5-0.5B-Instruct                  agent  INTERNAL    3925 ms  {&#x27;usage.input_tokens&#x27;: 249, &#x27;usage.output_tokens&#x27;: 36, &#x27;response.finish_reasons&#x27;:</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The model called the tool.</strong> Qwen answered the request with a <code>search_notes</code> call, the server returned the note, and the second model call wrote the answer from it.</p>
+<p><strong>One trace id across two processes.</strong> The set of trace ids has a single entry, although the server ran in a separate Python process and exported its spans separately. The SDK client wrote <code>traceparent</code> into the request's <code>_meta</code>, and the SDK server read it and used it as the parent.</p>
+<p><strong>The tree shows who waited for whom.</strong> Under <code>execute_tool search_notes</code> is the SDK's CLIENT span <code>MCP send tools/call search_notes</code>, and under that the server's SERVER span. The two connection-setup requests (<code>server/discover</code>, <code>tools/list</code>) are hidden to keep the tree short.</p>
+<p><strong>The chat spans carry the numbers that matter.</strong> The first used 185 input tokens and stopped with <code>tool_call</code>; the second used 249 input tokens because the conversation now includes the call and its result. Almost all the wall time is in the two <code>chat</code> spans; the MCP round trip takes milliseconds. If this agent were slow, the trace says where to look.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Metrics and opt-in content capture</div><div class="co-body"><p>This block continues from the one above (it uses <code>spans</code>, <code>tracer</code> and <code>exporter</code>). It records the GenAI histograms from the run, then shows content capture off and on, with emails and API keys redacted before they reach the event. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above. Metrics from the same run, and opt-in content capture with redaction.
+import os, re
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+reader = InMemoryMetricReader(); meter = MeterProvider(metric_readers=[reader]).get_meter(&quot;notes-agent&quot;)
+tokens = meter.create_histogram(&quot;gen_ai.client.token.usage&quot;, unit=&quot;{token}&quot;)
+op_dur = meter.create_histogram(&quot;gen_ai.client.operation.duration&quot;, unit=&quot;s&quot;)
+tool_dur = meter.create_histogram(&quot;gen_ai.execute_tool.duration&quot;, unit=&quot;s&quot;)
+for s in spans:                                   # in a real service you record these where the span ends
+    if s.attrs.get(&quot;gen_ai.operation.name&quot;) == &quot;chat&quot;:
+        base = {&quot;gen_ai.operation.name&quot;: &quot;chat&quot;, &quot;gen_ai.request.model&quot;: s.attrs[&quot;gen_ai.request.model&quot;]}
+        tokens.record(s.attrs[&quot;gen_ai.usage.input_tokens&quot;], {**base, &quot;gen_ai.token.type&quot;: &quot;input&quot;})
+        tokens.record(s.attrs[&quot;gen_ai.usage.output_tokens&quot;], {**base, &quot;gen_ai.token.type&quot;: &quot;output&quot;})
+        op_dur.record((s.end - s.start) / 1e9, base)
+    if s.proc == &quot;agent&quot; and s.attrs.get(&quot;gen_ai.operation.name&quot;) == &quot;execute_tool&quot;:
+        tool_dur.record((s.end - s.start) / 1e9, {&quot;gen_ai.tool.name&quot;: s.attrs[&quot;gen_ai.tool.name&quot;]})
+for m in reader.get_metrics_data().resource_metrics[0].scope_metrics[0].metrics:
+    for p in m.data.data_points:
+        labels = {k.replace(&quot;gen_ai.&quot;, &quot;&quot;): v for k, v in p.attributes.items() if k != &quot;gen_ai.request.model&quot;}
+        print(f&quot;{m.name:&lt;34} {str(labels):&lt;52} count={p.count} sum={p.sum:.3f} {m.unit}&quot;)
+
+# Content is off by default. When an operator opts in, record it as an event and redact first.
+SECRET = [(re.compile(r&quot;[\w.+-]+@[\w-]+(?:\.[\w-]+)+&quot;), &quot;&lt;email&gt;&quot;), (re.compile(r&quot;\bsk-[A-Za-z0-9]{8,}&quot;), &quot;&lt;api-key&gt;&quot;)]
+def redact(t):
+    for rx, sub in SECRET: t = rx.sub(sub, t)
+    return t
+def record_content(span, messages, output):
+    if os.environ.get(&quot;OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT&quot;, &quot;false&quot;).lower() != &quot;true&quot;: return
+    span.add_event(&quot;gen_ai.client.inference.operation.details&quot;, {
+        &quot;gen_ai.input.messages&quot;: json.dumps([{&quot;role&quot;: m[&quot;role&quot;], &quot;parts&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;content&quot;: redact(m[&quot;content&quot;])}]} for m in messages]),
+        &quot;gen_ai.output.messages&quot;: json.dumps([{&quot;role&quot;: &quot;assistant&quot;, &quot;parts&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;content&quot;: redact(output)}]}])})
+msgs = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Email the offsite date to priya@example.com, my key is sk-live12345678.&quot;}]
+print()
+for flag in (&quot;false&quot;, &quot;true&quot;):
+    os.environ[&quot;OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT&quot;] = flag; exporter.clear()
+    with tracer.start_as_current_span(f&quot;chat {M}&quot;) as sp: record_content(sp, msgs, &quot;Sent the date to priya@example.com.&quot;)
+    ev = exporter.get_finished_spans()[0].events
+    print(f&quot;capture={flag:&lt;5} events={len(ev)}&quot;, *(f&quot;\n   {k}: {v}&quot; for e in ev for k, v in e.attributes.items()))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">gen_ai.client.token.usage          {&#x27;operation.name&#x27;: &#x27;chat&#x27;, &#x27;token.type&#x27;: &#x27;input&#x27;}    count=2 sum=434.000 {token}
+gen_ai.client.token.usage          {&#x27;operation.name&#x27;: &#x27;chat&#x27;, &#x27;token.type&#x27;: &#x27;output&#x27;}   count=2 sum=57.000 {token}
+gen_ai.client.operation.duration   {&#x27;operation.name&#x27;: &#x27;chat&#x27;}                           count=2 sum=6.316 s
+gen_ai.execute_tool.duration       {&#x27;tool.name&#x27;: &#x27;search_notes&#x27;}                        count=1 sum=0.044 s
+
+capture=false events=0
+capture=true  events=1 
+   gen_ai.input.messages: [{&quot;role&quot;: &quot;user&quot;, &quot;parts&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;content&quot;: &quot;Email the offsite date to &lt;email&gt;, my key is &lt;api-key&gt;.&quot;}]}] 
+   gen_ai.output.messages: [{&quot;role&quot;: &quot;assistant&quot;, &quot;parts&quot;: [{&quot;type&quot;: &quot;text&quot;, &quot;content&quot;: &quot;Sent the date to &lt;email&gt;.&quot;}]}]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Metrics aggregate the run.</strong> <code>gen_ai.client.token.usage</code> has one series per token type: 2 input samples summing to 434 tokens and 2 output samples summing to 57. <code>gen_ai.client.operation.duration</code> sums the two model calls in seconds, and <code>gen_ai.execute_tool.duration</code> has the one tool call. These are what a dashboard or an alert uses, across thousands of runs.</p>
+<p><strong>Content is absent unless switched on.</strong> With the switch off, the span has no events. With it on, one <code>gen_ai.client.inference.operation.details</code> event appears, holding <code>gen_ai.input.messages</code> and <code>gen_ai.output.messages</code> as structured JSON.</p>
+<p><strong>Redaction happens before recording.</strong> The email address and the API key are replaced with <code>&lt;email&gt;</code> and <code>&lt;api-key&gt;</code> in both input and output. Once a secret reaches a tracing backend, it is copied, indexed and retained; scrubbing it at the source is the only reliable place.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> emits OTel-shaped spans to stdout (in OTLP-JSON-like format) for an agent that calls an LLM, dispatches two tools, and makes one MCP round-trip. No real exporter — the lesson focuses on the span shape and attribute set. Paste the output into an OTLP-compatible viewer or just read it.</p>
+<p>What to look at:</p>
+<ul>
+<li>Trace id is shared across all spans.</li>
+<li>Parent-child links are encoded via <code>parentSpanId</code>.</li>
+<li>Required <code>gen_ai.*</code> attributes are populated.</li>
+<li>Content capture is off by default; one scenario turns it on via env var.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team turns on content capture in production to debug a bad answer and leaves it on. Their tracing backend keeps data for 90 days and is readable by every engineer. What is wrong, and what should they do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>OTel GenAI semantic conventions</strong>: Development status; at v1.42 (June 2026) they moved to the <code>semantic-conventions-genai</code> repository, which also holds the MCP conventions. <code>gen_ai.provider.name</code> replaced the older <code>gen_ai.system</code>.</li>
+<li><strong>Instrumentation used in production</strong>: OpenTelemetry's own <code>opentelemetry-instrumentation-openai-v2</code> and related packages, OpenLLMetry (Traceloop), OpenInference (Arize), Pydantic Logfire, and framework hooks in LangChain/LangGraph, the OpenAI Agents SDK and Google ADK.</li>
+<li><strong>MCP</strong>: SEP-414 documents <code>traceparent</code> in <code>_meta</code>; the official Python SDK 2.x creates client and server spans and propagates context automatically, as the run above shows.</li>
+<li><strong>Backends</strong> that read <code>gen_ai.*</code>: Datadog, Grafana Tempo, Honeycomb, Langfuse, Arize Phoenix, New Relic and others, all through OTLP.</li>
+<li><strong>On your laptop</strong>: the OTel SDK costs almost nothing; local backends such as Jaeger or Phoenix run in Docker. The model here is 0.5B in float32 on the CPU; on the RTX 4060 it would run in bf16 in well under a second per turn.</li>
+</ul>
+<p>Sources: <a href="https://github.com/open-telemetry/semantic-conventions-genai">OTel GenAI semconv repository</a>, <a href="https://www.dash0.com/knowledge/opentelemetry-genai-semantic-conventions-explained">OTel GenAI conventions explained (Dash0, Sep 2026)</a>, <a href="https://modelcontextprotocol.io/seps/414-request-meta">SEP-414</a>, <a href="https://www.w3.org/TR/trace-context/">W3C Trace Context</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>One trace per run: <code>invoke_agent</code> → <code>chat</code> → <code>execute_tool</code> → MCP client → MCP server.</li>
+<li>Required on model spans: <code>gen_ai.operation.name</code> and <code>gen_ai.provider.name</code>; record model, token usage and finish reasons.</li>
+<li>MCP carries <code>traceparent</code> in <code>params._meta</code>, so even stdio servers join the trace.</li>
+<li>Metrics for dashboards, spans for single runs.</li>
+<li>Content capture is opt-in; redact before recording and limit retention.</li>
+<li>The conventions are still Development status: pin versions.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-genai-observability"><span class="t" style="--cs-hue:25">OG</span>Cheat sheet · OpenTelemetry GenAI and Agent Observability</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-otel-genai-instrumentation.md</code>. Given an agent codebase, the skill produces an instrumentation plan: where to add spans, which attributes to populate, and which exporters to target.</p>
+<p><strong><code>outputs/skill-otel-genai-instrumentation.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: otel-genai-instrumentation
+description: Produce an instrumentation plan for an agent codebase to emit OTel GenAI spans end-to-end.
+version: 1.0.0
+phase: 13
+lesson: 19
+tags: [otel, observability, gen-ai, tracing]
+---
+
+Given an agent codebase (LLM calls, tool dispatch, MCP client, sub-agents), produce an OTel GenAI instrumentation plan.
+
+Produce:
+
+1. Span hierarchy. Root `agent.invoke_agent` (INTERNAL) and children: `llm.chat` (CLIENT), `tool.execute` (INTERNAL), `mcp.call` (CLIENT), `subagent.invoke` (INTERNAL).
+2. Attribute checklist per span. `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.*`, `gen_ai.tool.name`, `gen_ai.agent.name`.
+3. Propagation rule. Inject W3C traceparent on every remote call; for MCP stdio use `_meta.traceparent` as an interim field.
+4. Content capture policy. Off by default; document which env var enables; name PII risks.
+5. Exporter choice. Jaeger / Tempo / Langfuse / Phoenix / Datadog / Honeycomb; OTLP as the wire.
+
+Hard rejects:
+- Any plan missing trace propagation across MCP or sub-agent boundaries.
+- Any plan with content capture on by default. Leaks prompts and PII.
+- Any plan that emits arbitrary custom attributes without the `gen_ai.` or explicit vendor prefix.
+
+Refusal rules:
+- If the codebase uses a framework with built-in OTel auto-instrumentation (Pydantic AI, LangGraph, AgentOps), recommend the framework hook first.
+- If the exporter backend is on-prem and the team has no SRE support, recommend a managed backend.
+- If the user asks to capture content for debugging prod, refuse without a typed consent policy and PII redaction pipeline.
+
+Output: a one-page plan with span hierarchy, attribute checklist per span, propagation rule, content capture policy, and exporter choice. End with the top metric to alert on (typically p95 `gen_ai.client.operation.duration`).
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Count the spans and identify which is CLIENT vs INTERNAL.</p>
+</li>
+<li>
+<p>Turn on content capture (env var) and confirm a <code>gen_ai.client.inference.operation.details</code> event with <code>gen_ai.input.messages</code> and <code>gen_ai.output.messages</code> appears. Note the implications for PII.</p>
+</li>
+<li>
+<p>Add the tool-execution metric <code>gen_ai.execute_tool.duration</code> and emit it as a histogram sample per call.</p>
+</li>
+<li>
+<p>Propagate a traceparent from a parent agent span into an MCP request's <code>_meta.traceparent</code> field. Verify the MCP server would see the same trace id.</p>
+</li>
+<li>
+<p>Read the OTel GenAI semconv spec. Identify one attribute listed in the semconv that this lesson's code does NOT emit. Add it.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1320-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Same trace, under the tool span</span></summary><div class="qa-a"><p>Yes. The SDK client puts the current trace context into the request's <code>params._meta</code> as <code>traceparent</code>, and the server, in its own process, starts its <code>tools/call search_notes</code> SERVER span with that context as its parent. So the server span appears in the same trace, under the client span <code>MCP send tools/call search_notes</code>, which is itself under <code>execute_tool search_notes</code>.</p>
+<p>Most of the time goes to the two <code>chat</code> spans: generating tokens with a 0.5B model on a CPU takes seconds, while the MCP round trip takes a few milliseconds.</p></div></details>
+<details class="qa" id="a1320-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Debug switches become data leaks</span></summary><div class="qa-a"><p>Prompts and answers now flow into a system built for operational data, not for personal or secret data. Every user's messages, including emails, account numbers or pasted API keys, are stored for 90 days and visible to every engineer, which may break privacy law, contracts and the company's own data rules. Traces are also exported and copied (to vendors, to test environments), so the data spreads.</p>
+<p>Instead:</p>
+<ul>
+<li>Turn content capture on only for a short window, a small sample, or specific test accounts, and turn it off again.</li>
+<li>Redact at the source (emails, keys, numbers) before the event is recorded, as in the block above.</li>
+<li>Send content to a separate, access-controlled store with short retention, and keep only ids and metrics in the general backend.</li>
+<li>Prefer reproducing the problem with an evaluation set over capturing real user content.</li>
+</ul></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1320-qa3"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">Your trace backend can store the full prompt and completion on every model span. The support team wants it on, because they debug tickets from traces. The security team wants it off. What do you decide, and how do you still give support what they need?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Keep content capture off, which is the default the conventions recommend. Store prompts and completions in your own store, with access control and a retention period, and record a reference id on the span. Support follows the id from the trace to the content, and the trace backend never holds customer data.</p>
+<p><strong>What the default is.</strong></p>
+<p>By default a span carries timing and metrics, not prompts or completions. Content capture is opt-in through the stability opt-in variable and separate content variables. When it is on, the content lands in <code>gen_ai.input.messages</code>, <code>gen_ai.output.messages</code> and <code>gen_ai.system_instructions</code>, or in the content events on the span.</p>
+<p><strong>What goes wrong when it is on.</strong></p>
+<p>Prompts carry personal data, secrets and customer documents. Operators read traces, and the trace backend sets its own retention. The conventions lesson lists "capturing full prompts in spans" as the first way the pattern fails. A trace backend is also an attractive target, because it holds everything in one place.</p>
+<p><strong>The pattern that works.</strong></p>
+<p>Store the content outside the trace: in your log store or object store, under your own access control, audit log and retention. Put a reference id on the span. The lesson calls this the external-reference pattern, and it is also the defense against content poisoning, because the poisoned text never enters the telemetry store.</p>
+<p><strong>What support gets.</strong></p>
+<p>The same debugging path with one extra step: trace, span, reference id, content store. The store can redact known patterns on write and log every read. Most tickets do not need the content at all, because the span already shows the model, the tokens, the latency, the tool calls and the status.</p>
+<p><strong>What you give up.</strong></p>
+<p>A one-click view of the prompt inside the trace UI. That is the price, and it is small next to a trace backend full of customer data.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Turn it on, the trace backend is internal." Internal operators read traces, and the backend's retention is not your policy.</li>
+<li>"Store a hash of the prompt on the span." A hash shows a repeat but gives support nothing to read. A reference id into a controlled store does both.</li>
+<li>"Keep the content on the span and strip personal data with a regex." Patterns miss, and the span is still the wrong store with the wrong retention.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Which spans may carry raw content when capture is on? Expected: none in production. Keep one rule, references only, so nobody has to decide per span.</li>
+<li><em>(level 3)</em> A developer turns capture on in staging for a day. What is the risk? Expected: staging often replays production prompts, and the backend keeps them for its retention period. Use synthetic prompts or scrub before export.</li>
+<li><em>(level 3)</em> How do you keep the content store from becoming the same leak? Expected: access by role, an audit log of reads, a retention period, and redaction of known patterns before the write.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The conventions lesson sets the opt-in rule and the pattern of storing content outside the span, and the <a href="#a1320">OpenTelemetry GenAI lesson</a> names the content events.</p></div></details>
+<details class="qa" id="a1320-qa4"><summary><span class="qa-lvl qa-coderead">Read the code</span><span class="qa-q">A colleague opens a review that adds tracing to the agent. The branch emits this span for every model call. List every problem you find before you approve it. <code>json { "traceId": "abcdefabcdefabcdefabcdefabcdefab", "spanId": "abcdefabcdefabcd", "parentSpanId": "", "name": "chat", "kind": "INTERNAL", "attributes": { "gen_ai.operation.name": "chat", "gen_ai.request.model": "our_smart_model", "gen_ai.usage.prompt_tokens": 500, "gen_ai.content.prompt": "You are a support agent. The customer's card number is ..." } }</code></span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The span marks a model call as INTERNAL, has no parent, and uses an old attribute name for the input tokens. It omits the provider, the output tokens, the response model and the response id, and it writes the prompt text, with a card number in it, into the trace. Fix the kind and the parent link, use the current attribute names, add the missing attributes, and move the content out of the span.</p>
+<p><strong>The problems, in order of damage.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Line</th>
+<th>Problem</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>parentSpanId: ""</code></td>
+<td>an orphan span; no backend can show which agent step made the call</td>
+<td>pass the parent context from the <code>invoke_agent</code> span</td>
+</tr>
+<tr>
+<td><code>kind: INTERNAL</code></td>
+<td>a model call crosses a process boundary</td>
+<td><code>CLIENT</code></td>
+</tr>
+<tr>
+<td><code>gen_ai.content.prompt</code></td>
+<td>prompt text with customer data in a store that operators read</td>
+<td>capture off by default; store content outside and put a reference id on the span</td>
+</tr>
+<tr>
+<td><code>gen_ai.usage.prompt_tokens</code></td>
+<td>the attribute was renamed; backends read <code>gen_ai.usage.input_tokens</code></td>
+<td>use the current name and add <code>gen_ai.usage.output_tokens</code></td>
+</tr>
+<tr>
+<td>no <code>gen_ai.provider.name</code></td>
+<td>cost and error dashboards cannot split by provider</td>
+<td>set it on every model span</td>
+</tr>
+<tr>
+<td>no <code>gen_ai.response.model</code></td>
+<td>with routing, the served model can differ from the requested alias</td>
+<td>record what the provider returned</td>
+</tr>
+<tr>
+<td>no <code>gen_ai.response.id</code></td>
+<td>no way to match the span to the provider's own log</td>
+<td>record the response id</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Why the content line is the one to fight over.</strong></p>
+<p>The conventions say instrumentations should not capture inputs and outputs by default. Capture is opt-in through an environment variable, and the production pattern stores content in your own log store and records a pointer on the span. A prompt with a card number in a trace backend is a data leak with a retention policy you did not choose.</p>
+<p><strong>Why the renamed attribute will come back.</strong></p>
+<p>The GenAI conventions are still marked as in development, and they have renamed attributes before. Pin the conventions version you emit, set the stability opt-in, and test the attribute names of emitted spans, or the next SDK upgrade reopens this review.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"It has a trace id and a model name, so it is fine." A trace id alone does not link the span to its parent, and a model name without a provider cannot be attributed.</li>
+<li>"Keep the prompt in the span, it is useful." Prompts carry personal data and secrets into a store that operators read. The default is off, and production stores content outside the span.</li>
+<li>"The two token names are synonyms." Backends read the current name. The old one lands in an unknown attribute, and the token dashboard shows nothing.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why does the empty parent matter more than the wrong kind? Expected: with no parent the span is an orphan, the trace is no longer a tree, and you cannot see which step made the call.</li>
+<li><em>(level 3)</em> The team needs the prompt text to debug failures. What do you offer? Expected: store prompts in a separate store with access control and put a reference id on the span, which is the pattern the conventions recommend for production.</li>
+<li><em>(level 4)</em> How do you keep the old attribute name from returning after an upgrade? Expected: pin the conventions version, set the stability opt-in variable, and add a test that asserts the attribute names on emitted spans.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1320">OpenTelemetry GenAI lesson</a> lists the required attributes, the conventions lesson gives the content-capture rule, and the capstone traces lesson notes the renamed token attribute.</p></div></details>
+<details class="qa" id="a1320-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">You add tracing to an agent. In one run it calls a model API twice, runs two tools inside its own process and sends one request to a tool server on another machine. Which of these operations get a CLIENT span, which get an INTERNAL span, and why does anyone care?</span></summary><div class="qa-a"><p><em>Level 1 of 4 · about 5 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> A call that leaves the process gets a CLIENT span: the two model API calls and the request to the remote tool server. The agent loop step and a tool that runs in your own process get INTERNAL spans. The kind tells a backend the direction of each call, so it can show which operations left the process and which did not.</p>
+<p><strong>The tree for this run.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">invoke_agent            INTERNAL
+ ├── chat               CLIENT
+ ├── execute_tool       INTERNAL
+ │    └── remote call   CLIENT
+ ├── execute_tool       INTERNAL
+ └── chat               CLIENT
+</code></pre></div>
+<p>Every span shares one trace id. Each child carries the id of its parent. That is what makes the run one tree instead of six loose records.</p>
+<p><strong>The rule.</strong></p>
+<p>CLIENT marks a call across a process boundary: a model provider, a tool server, a hosted agent service. INTERNAL marks the agent's own loop steps and any tool that runs in the same process. The conventions apply the same rule to the agent span itself: an agent that runs as a remote service is CLIENT from the caller, and an in-process agent framework is INTERNAL.</p>
+<p><strong>The attributes that go with each kind.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Span</th>
+<th>Attributes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>model call</td>
+<td><code>gen_ai.operation.name</code>, <code>gen_ai.provider.name</code>, <code>gen_ai.request.model</code>, <code>gen_ai.response.model</code>, <code>gen_ai.usage.input_tokens</code>, <code>gen_ai.usage.output_tokens</code>, <code>gen_ai.response.id</code></td>
+</tr>
+<tr>
+<td>tool call</td>
+<td><code>gen_ai.tool.name</code>, <code>gen_ai.tool.call.id</code></td>
+</tr>
+<tr>
+<td>agent run</td>
+<td><code>gen_ai.agent.name</code>, <code>gen_ai.agent.id</code></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>Why it matters.</strong></p>
+<p>Backends draw a waterfall from the kinds and the parent links. A CLIENT span with no response id cannot be matched to the provider log. A tool span with no parent is an orphan, and you can no longer see which agent step caused the call.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Every tool call is a CLIENT span." A tool that runs in your process is INTERNAL. Only the call that leaves the process is CLIENT.</li>
+<li>"The kind is decoration." Backends read the kind to show direction, and the conventions set it per span category.</li>
+<li>"Start a new trace for each tool call, for isolation." Separate traces lose the parent link, so you cannot see which step caused the call.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 1)</em> What joins the spans into one tree? Expected: one shared trace id, and a parent span id on every child.</li>
+<li><em>(level 2)</em> The agent calls a hosted agent service instead of a local one. What kind is that span? Expected: CLIENT, because the agent runs in another process.</li>
+<li><em>(level 2)</em> Which attribute lets a dashboard split cost by provider? Expected: <code>gen_ai.provider.name</code>, and multi-provider dashboards break when it is missing.</li>
+<li><em>(level 3)</em> A sub-agent runs inside the same process. Does it start a new trace? Expected: no. It is a child span under the parent agent span, so the whole run stays in one trace.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1320">OpenTelemetry GenAI lesson</a> draws the span hierarchy, and the conventions lesson names the span categories and their kinds.</p></div></details>
+<details class="qa" id="a1320-qa6"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Your agent uses three tool servers over the MCP protocol. Two of them speak streamable HTTP, and one runs as a local subprocess over stdio. Design how a single trace id reaches all three, and say what each server has to do when it arrives.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> For the HTTP servers, inject the W3C <code>traceparent</code> header into every request, as any traced HTTP client does. The stdio transport has no headers, so put the same value into the <code>_meta</code> field of each JSON-RPC request until the protocol adds a standard field for it. Each server reads the value, opens its own span as a child of that context, writes the trace id into its logs, and passes the context on if it calls anything else.</p>
+<p><strong>Why this is worth the work.</strong></p>
+<p>The lesson opens with a report from production: the agent sometimes answers in 3 seconds and sometimes in 30. The logs show the model calls and nothing else. The cause was one tool server that hung during its cold start, and nothing short of an end-to-end trace could show it.</p>
+<p><strong>The HTTP servers.</strong></p>
+<p>Streamable HTTP carries standard headers. The client injects <code>traceparent</code>, and the server starts a span under that parent. On the client side the call is a CLIENT span under the <code>execute_tool</code> span. On the server side the work is a child of the same trace. The gap between the two is the transport time.</p>
+<p><strong>The stdio server.</strong></p>
+<p>Stdio carries no HTTP headers. The protocol roadmap discusses a <code>_meta.traceparent</code> field on JSON-RPC calls. Until it ships, include the <code>traceparent</code> value in <code>_meta</code> on every request yourself, and have the server read it from there. The server logs the trace id so that a log line and a span can be joined later.</p>
+<p><strong>What every server does with the context.</strong></p>
+<ol>
+<li>Parse the context from the header or from <code>_meta</code>.</li>
+<li>Start a span as a child of that context, not a new trace.</li>
+<li>Write the trace id into every log line of the request.</li>
+<li>Propagate the context to anything it calls in turn.</li>
+</ol>
+<p><strong>What you can see afterwards.</strong></p>
+<p>One waterfall: the agent step, the tool call, the server's work. A hang appears as one long server span under a long client span. Beside the spans, emit the tool execution duration histogram per tool, which answers the dashboard questions without a trace.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Log a request id and join the logs later." A request id has no parent-child structure and no timing. A trace has both.</li>
+<li>"The stdio server is local, so it does not need tracing." The hang in the lesson was in a local server's cold start. Local does not mean fast.</li>
+<li>"Put the trace id into the prompt so the model carries it." The model is not a transport, and a changing value in the prompt also breaks the prefix cache.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> A server ignores the <code>_meta</code> field. What do you see in the trace? Expected: the server's work shows up as a separate trace or not at all, and the client span shows the duration but not where the time went.</li>
+<li><em>(level 3)</em> Which span records the hang, the client span or the server span? Expected: both. The client span shows the wait from the agent's side, the server span shows what the server did, and the gap between them is the transport.</li>
+<li><em>(level 4)</em> Another team operates one tool server. What do you ask them to commit to? Expected: accept the context from headers or <code>_meta</code>, continue the trace instead of starting one, log the trace id, and export spans to a backend that both teams can read.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1320">OpenTelemetry GenAI lesson</a> covers propagation across the MCP transports and the tool duration metric.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/">OpenTelemetry — GenAI semconv</a> — canonical conventions for GenAI spans, metrics, and events</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/">OpenTelemetry — GenAI spans</a> — LLM and tool-execution span attribute list</li>
+<li><a href="https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-agent-spans/">OpenTelemetry — GenAI agent spans</a> — agent-level <code>invoke_agent</code> span</li>
+<li><a href="https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md">open-telemetry/semantic-conventions — GenAI spans</a> — GitHub-hosted source of truth</li>
+<li><a href="https://www.datadoghq.com/blog/llm-otel-semantic-convention/">Datadog — LLM OTel semantic convention</a> — production integration walkthrough</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/20-opentelemetry-genai" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1320" id="done-a1320">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1320" id="undo-a1320" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1319"><span class="pn-dir">Previous</span><span class="pn-t">13.19 · A2A — Agent-to-Agent Protocol</span></a><a class="pn next" href="#a1321"><span class="pn-dir">Next</span><span class="pn-t">13.21 · LLM Routing Layer — LiteLLM, OpenRouter, Portkey</span></a></div></footer>

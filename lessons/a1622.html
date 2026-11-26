@@ -1,0 +1,800 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-16">Phase 16 · Multi-Agent &amp; Swarms</a></nav><h1>Production Scaling — Queues, Checkpoints, Durability</h1><div class="m-meta"><span class="chip chip-num">Lesson 16.22</span><span class="chip">75 min</span><span class="chip chip-core">Learn + Build</span><span class="chip chip-done" data-done-chip="a1622" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 16 · 09 (Parallel Swarm Networks), Phase 16 · 13 (Shared Memory)</li>
+<li><strong>Type</strong>: Learn + Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, <code>asyncio</code>, <code>sqlite3</code>), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Scaling multi-agent systems to thousands of concurrent runs requires <strong>durable execution</strong> — work queues plus checkpoints, so any worker can resume any run after any crash, provided lease handling, idempotent side effects, and deterministic replay are in place. LangGraph's runtime is the reference example: it writes a checkpoint after each super-step keyed by <code>thread_id</code> (Postgres by default); worker crashes release a lease and another worker resumes. Agents can sleep indefinitely waiting for human input. <strong>MegaAgent</strong> (arXiv:2408.09955) ran a per-agent producer-consumer queue with three states (Idle / Processing / Response) and two-layer coordination (intra-group chat + inter-group admin chat). <strong>Fiber/async</strong> beats thread-per-job for LLM streaming: threads sit idle 99% of the time waiting for tokens, fibers cooperatively yield on I/O. Counterpoint: Ashpreet Bedi's "Scaling Agentic Software" argues for <strong>FastAPI + Postgres + nothing else</strong> until load proves otherwise — simple architectures go further than expected. This lesson builds a durable checkpoint log, a per-agent work queue with state transitions, an async-vs-thread demo, and lands the pragmatic "start simple" rule.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Durable execution</td>
+<td>"Persist the program state"</td>
+<td>Engine writes state after each super-step; crash recovery is deterministic.</td>
+</tr>
+<tr>
+<td>Super-step</td>
+<td>"Transactional boundary"</td>
+<td>Unit of work between checkpoints. LangGraph term.</td>
+</tr>
+<tr>
+<td>thread_id</td>
+<td>"Agent run identifier"</td>
+<td>Key that binds checkpoints and resume logic.</td>
+</tr>
+<tr>
+<td>Idempotency</td>
+<td>"Safe to retry"</td>
+<td>Repeating a side effect produces the same result as one attempt.</td>
+</tr>
+<tr>
+<td>Outbox pattern</td>
+<td>"Decouple side effects"</td>
+<td>Write intent to a table; a separate executor performs and marks done.</td>
+</tr>
+<tr>
+<td>At-least-once delivery</td>
+<td>"Possible duplicates"</td>
+<td>Message queue semantics; dedup key makes consumer effective-once.</td>
+</tr>
+<tr>
+<td>Rainbow deploy</td>
+<td>"Overlapping versions"</td>
+<td>Multiple runtime versions concurrent during long-running workloads.</td>
+</tr>
+<tr>
+<td>Async fiber</td>
+<td>"Cooperative yielding"</td>
+<td>User-mode concurrency; cheap compared to threads for I/O-bound loads.</td>
+</tr>
+<tr>
+<td>Checkpoint</td>
+<td>"State snapshot"</td>
+<td>Serialized state at a super-step boundary; key for resume.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l1208">Zero to Agents 12.8 · Durable execution and deployment</a></li><li><a class="xref" href="#l1209">Zero to Agents 12.9 · Scaling agents: capacity, quotas and tenants</a></li><li><a class="xref" href="#l1217">Zero to Agents 12.17 · Platforms and multi-agent systems at scale</a></li></ul></div></aside>
+<h2>Problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>In production, agent runs last minutes or hours, workers crash, and load spikes. <strong>Durable execution</strong> saves each run's state after every step (a <strong>checkpoint</strong>), so any worker can pick the run up where it stopped. Two more things make that safe: side effects that can be repeated without harm (<strong>idempotency</strong>), and only one worker owning a run at a time (a <strong>lease</strong>). Durable execution, scaling and multi-agent platforms are covered in Zero to Agents 12.8, 12.9 and 12.17 (linked above). This lesson breaks the lesson's checkpoint store in the two ways production does, measures what threads cost, and checkpoints a small real agent.</p></div></aside>
+
+<p>A prototype multi-agent system works on one laptop with three agents in an in-memory event loop. You move to production:</p>
+<ul>
+<li>Agents sometimes run for hours (long research, human-in-the-loop waits).</li>
+<li>Worker processes crash. Restarting loses state.</li>
+<li>Peak load is 10x average; you need horizontal scaling.</li>
+<li>Users pay per agent-run; you need exactly-once semantics for charging.</li>
+</ul>
+<p>The in-memory event loop does none of these. You need a durable execution layer underneath. The 2026 canonical options are:</p>
+<ol>
+<li>A workflow engine with checkpoints (Temporal, LangGraph runtime).</li>
+<li>A message queue with a state store (Postgres + SQS/RabbitMQ).</li>
+<li>Actor-model frameworks (MegaAgent's producer-consumer per agent).</li>
+<li>Hand-rolled FastAPI + Postgres (Bedi's argument).</li>
+</ol>
+<p>This lesson builds a miniature of each.</p>
+<h2>Concept</h2>
+<h3>Durable execution, the pattern</h3>
+<p>A durable-execution engine persists the full program state after each "step" (super-step, in LangGraph's language). On crash:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">worker crashes mid-step
+  -&gt; lease timeout
+  -&gt; another worker picks up the thread_id
+  -&gt; resumes from last checkpoint
+  -&gt; no duplicate side effects
+</code></pre></div>
+<p>Requirements for this to work:</p>
+<ul>
+<li><strong>Serializable state.</strong> All agent state has to be persistable. Function closures with live database connections do not survive.</li>
+<li><strong>Deterministic resume.</strong> Given the same state and same inputs, the agent produces the same actions (or defers to an external deterministic oracle for LLM calls).</li>
+<li><strong>Idempotent side effects.</strong> External calls (tool calls, payments) must be idempotent or use a deduplication key.</li>
+</ul>
+<p>LangGraph writes a checkpoint after each super-step; Temporal writes after each activity; Restate uses event-sourced journals. All three implement the same pattern.</p>
+<h3>A checkpoint-per-step runtime</h3>
+<p>LangGraph's runtime is the worked example: each agent has a <code>thread_id</code>; state is a typed dict; each super-step writes a row to the checkpoints table. On resume, the runtime replays from the last checkpoint, not from scratch. Agents can <code>interrupt()</code> waiting for human input; the runtime persists and releases the worker. When input arrives, any worker can resume.</p>
+<p>This is a widely used production design in 2026. One cost to know: full snapshots of append-only state, such as a growing message list, make total checkpoint storage grow with the square of the number of steps; LangChain added delta channels in May 2026 that store per-step diffs with a full snapshot every K steps.</p>
+<h3>MegaAgent's per-agent queue</h3>
+<p>arXiv:2408.09955 describes MegaAgent, a system that organises LLM agents into groups without predefined procedures; its largest experiment, a national policy simulation, ran 590 agents. Architecture:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">agent i:
+  state ∈ {Idle, Processing, Response}
+  in_queue   &lt;- messages addressed to agent i
+  out_queue  -&gt; replies + side effects
+
+coordinators:
+  intra-group chat  (agents in the same group)
+  inter-group admin chat  (high-level routing)
+</code></pre></div>
+<p>The two-layer coordination lets intra-group conversation happen densely while inter-group traffic stays sparse, because only admin agents talk across groups. In the Processing state an agent batches its queued messages into one model call, and in Response it checks its output before sending.</p>
+<h3>Async vs thread-per-job</h3>
+<p>LLM calls are I/O-bound. A thread waiting for the next token is idle almost all the time. Each OS thread reserves a stack (8 MB of virtual memory by default on Linux) and uses some tens of kilobytes of resident memory, plus scheduler overhead; at 10,000 concurrent calls that adds up.</p>
+<p>Fibers (Python <code>asyncio</code>, Go goroutines, Rust <code>tokio</code>) cooperatively yield on I/O, and each costs only a few kilobytes. The same 10,000 calls fit comfortably in one process. At LLM-agent scale, async is not an optimization — it is the architecture.</p>
+<p>Exception: CPU-bound post-processing (embedding, tokenizer tricks) still wants threads or processes. Separate your I/O layer from your CPU layer.</p>
+<h3>Bedi's counterpoint</h3>
+<p>"Scaling Agentic Software" (Ashpreet Bedi of Agno, April 2026) argues that most teams over-engineer before they have measured load: "One FastAPI process. One Postgres database." may be enough for a multi-agent product with auth, persistence and observability, with queues, Redis or separate vector stores added only when load proves the need. The pragmatic default:</p>
+<ul>
+<li>FastAPI + Postgres.</li>
+<li>Each agent run is a row; state updated in-place with optimistic concurrency.</li>
+<li>Background jobs via <code>pg_notify</code> or a simple Celery worker.</li>
+<li>Retry policy in application code.</li>
+</ul>
+<p>Bedi leaves the breaking point to load tests rather than a number; measure your own. Upgrade when you see it failing.</p>
+<p>The rule: adopt durable-execution frameworks when you hit a concrete problem that simple architectures cannot solve. Premature adoption burns time on ceremonies that do not pay off.</p>
+<h3>Exactly-once semantics</h3>
+<p>For paid agent runs, you need "exactly-once effective" (at-least-once delivery + idempotent consumer). The engineering moves:</p>
+<ul>
+<li><strong>Dedup key per run.</strong> Include it in every side-effect call.</li>
+<li><strong>Outbox pattern.</strong> Side effects write to a table first, then a separate process executes them. Both steps idempotent.</li>
+<li><strong>Compensating transactions.</strong> When a side effect succeeds but its tracking write fails, schedule a compensate.</li>
+</ul>
+<p>These are database-engineering patterns, not LLM-specific. The LLM tax is only that LLM calls are slow; everything else is standard distributed systems.</p>
+<h3>Rainbow deployment</h3>
+<p>Anthropic's multi-agent research system uses "rainbow deployments": multiple versions of the agent runtime run concurrently so long-running agents do not have to be killed on every code deploy. Canary new versions on a slice of traffic; retire old versions when their agents finish.</p>
+<p>This is standard for long-running stateful systems; the 2026 adaptation is that agents can live for hours, so deployment cycles must accommodate.</p>
+<h3>The canonical production checklist</h3>
+<ul>
+<li>Durable state (checkpoints, snapshots, or outbox + replayable log).</li>
+<li>Idempotent side effects.</li>
+<li>Async I/O layer for LLM calls.</li>
+<li>At-least-once delivery with dedup.</li>
+<li>Rainbow/canary deployment for stateful workloads.</li>
+<li>Observability: per-agent traces, super-step audit, retry counter.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="sw-checkpoint-replay"></div></figure></p>
+
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Exactly-once effect.</strong> Delivery is at least once, so a step may run <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8304em;vertical-align:-0.136em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> times. A side effect <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">e</span></span></span></span> applied with key <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">κ</span></span></span></span> is idempotent if
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1491em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">apply</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">κ</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">apply</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">κ</span><span class="mclose">)</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">for all </span></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.</span></span></span></span></span></div>
+The key must be stable across retries, for example (run id, step number), not a fresh random id per attempt.</p>
+<p><strong>Checkpoint growth.</strong> If state is an append-only list that gains about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> bytes per step, the full snapshot after step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span> is about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span></span></span></span>, and storing every snapshot costs
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:3.0954em;vertical-align:-1.2671em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8829em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2671em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.355em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.01em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.485em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span><span class="mopen mtight">(</span><span class="mord mathnormal mtight" style="margin-right:0.13889em;">T</span><span class="mbin mtight">+</span><span class="mord mtight">1</span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mpunct">,</span></span></span></span></span></div>
+against <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span></span></span></span> for deltas. The ratio, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/2</span></span></span></span>, grows with the length of the run.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A charge that happens twice</div><div class="co-body"><ul>
+<li>Steps are numbered 1 to 3. Step 2 of run-7 bills the customer 10, then the worker crashes before writing the checkpoint for step 2.</li>
+<li>The last checkpoint is step 1, so the new worker re-runs step 2 and bills 10 again.</li>
+<li>Total billed: 40 for three steps of 10, while the checkpoint says 30.</li>
+<li>With the key (run-7, 2) recorded by the payment service, the retry is recognised and the total is 30.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Resuming from the last checkpoint means no duplicate side effects."<br>
+  ✓ Anything done after the last checkpoint runs again; the lesson's store billed 40 for 30 of work without a dedup key.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Two workers on one thread will raise an error."<br>
+  ✓ The lesson's <code>INSERT OR REPLACE</code> silently overwrote worker A's step; a lease or a plain <code>INSERT</code> would have caught it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Each thread costs about 1 MB of RAM."<br>
+  ✓ Here each waiting thread took about 16 KB resident and 8 MB of reserved virtual memory; 2,000 asyncio tasks took about 1 MB in all.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "MegaAgent ran thousands of concurrent agents."<br>
+  ✓ Its largest experiment used 590 agents.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A three-step run bills 10 per step. The worker crashes after billing step 2 but before writing its checkpoint, and a new worker resumes from the last checkpoint. With the lesson's <code>CheckpointStore</code> and no dedup key, how much is the customer billed? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Breaking the lesson's checkpoint store the way production does</div><div class="co-body"><p>The lesson's <code>CheckpointStore</code> and <code>AgentQueue</code>: a side effect before a crash, two workers resuming one thread, the queue's throughput, and the memory of 2,000 waiting threads against 2,000 asyncio tasks. Runs in about 2 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson&#x27;s CheckpointStore, AgentQueue and async/thread demo (imported from main.py), tested on the three
+# things durable execution must also get right: side effects across a crash, two workers on one thread, and what
+# a thread really costs. Runs in about 2 seconds.
+import asyncio, os, sqlite3, tempfile, threading, time
+from main import CheckpointStore, AgentQueue, AgentState
+
+def db():
+    f = tempfile.NamedTemporaryFile(suffix=&quot;.db&quot;, delete=False); f.close(); return f.name
+
+print(&quot;1. a side effect, then a crash before the checkpoint is written&quot;)
+for dedup in (False, True):
+    path = db(); store = CheckpointStore(path); charges = []; seen = set()
+    def charge(key, amount):
+        if dedup and key in seen:
+            return
+        seen.add(key); charges.append(amount)
+    def worker(crash_after_charge_at=None):
+        last = store.latest(&quot;run-7&quot;); step, state = (last[0] + 1, last[1]) if last else (0, {&quot;billed&quot;: 0})
+        while step &lt; 3:
+            charge((&quot;run-7&quot;, step), 10)                         # e.g. bill the customer for this step
+            if step == crash_after_charge_at:
+                raise RuntimeError(&quot;crash between the side effect and the checkpoint&quot;)
+            state[&quot;billed&quot;] += 10; store.write(&quot;run-7&quot;, step, dict(state)); step += 1
+    try:
+        worker(crash_after_charge_at=1)
+    except RuntimeError:
+        pass
+    worker()
+    print(f&quot;   dedup key {&#x27;on &#x27; if dedup else &#x27;off&#x27;}: customer charged {sum(charges)} for 3 steps of 10 (checkpoint says {store.latest(&#x27;run-7&#x27;)[1][&#x27;billed&#x27;]})&quot;)
+    os.unlink(path)
+
+print(&quot;\n2. two workers resume the same thread at once (no lease)&quot;)
+path = db(); s1, s2 = CheckpointStore(path), CheckpointStore(path)
+s1.write(&quot;t-9&quot;, 0, {&quot;notes&quot;: [&quot;plan&quot;]})
+step_a, st_a = s1.latest(&quot;t-9&quot;); step_b, st_b = s2.latest(&quot;t-9&quot;)
+s1.write(&quot;t-9&quot;, step_a + 1, {&quot;notes&quot;: st_a[&quot;notes&quot;] + [&quot;worker A: searched papers&quot;]})
+s2.write(&quot;t-9&quot;, step_b + 1, {&quot;notes&quot;: st_b[&quot;notes&quot;] + [&quot;worker B: drafted intro&quot;]})
+print(f&quot;   final state: {s1.latest(&#x27;t-9&#x27;)[1]}; worker A&#x27;s step was overwritten without an error (INSERT OR REPLACE)&quot;)
+conn = sqlite3.connect(path)
+try:
+    conn.execute(&quot;INSERT INTO checkpoints VALUES (?, ?, ?)&quot;, (&quot;t-9&quot;, 1, &quot;{}&quot;)); conn.commit()
+except sqlite3.IntegrityError as e:
+    print(f&quot;   a plain INSERT would have refused the second write: IntegrityError: {e}&quot;)
+os.unlink(path)
+
+print(&quot;\n3. the per-agent queue: one message per three steps&quot;)
+q = AgentQueue(&quot;agent-a&quot;)
+for i in range(6):
+    q.enqueue({&quot;task&quot;: i})
+steps = 0
+while q.in_queue or q.state != AgentState.IDLE:
+    q.step(); steps += 1
+print(f&quot;   6 messages took {steps} steps; each pass through processing handles one message (MegaAgent batches the queue)&quot;)
+
+print(&quot;\n4. what 2,000 waiting threads and 2,000 waiting tasks cost&quot;)
+def mem():
+    d = dict(l.split(&quot;:&quot;, 1) for l in open(&quot;/proc/self/status&quot;) if l.startswith((&quot;VmRSS&quot;, &quot;VmSize&quot;)))
+    return int(d[&quot;VmRSS&quot;].split()[0]) / 1024, int(d[&quot;VmSize&quot;].split()[0]) / 1024
+r0, v0 = mem()
+stop = threading.Event()
+ths = [threading.Thread(target=stop.wait) for _ in range(2000)]
+t0 = time.perf_counter()
+for t in ths:
+    t.start()
+t_start = time.perf_counter() - t0
+r1, v1 = mem(); stop.set()
+for t in ths:
+    t.join()
+print(f&quot;   threads: started in {t_start:.2f} s; resident memory +{r1 - r0:.0f} MB, virtual +{v1 - v0:.0f} MB &quot;
+      f&quot;(+{(r1 - r0) * 1024 / 2000:.0f} KB resident each)&quot;)
+async def tasks():
+    ev = asyncio.Event(); ra, va = mem()
+    ts = [asyncio.create_task(ev.wait()) for _ in range(2000)]
+    await asyncio.sleep(0); rb, vb = mem(); ev.set(); await asyncio.gather(*ts)
+    return rb - ra, vb - va
+dr, dv = asyncio.run(tasks())
+print(f&quot;   asyncio tasks: resident memory +{dr:.0f} MB, virtual +{dv:.0f} MB&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. a side effect, then a crash before the checkpoint is written
+   dedup key off: customer charged 40 for 3 steps of 10 (checkpoint says 30)
+   dedup key on : customer charged 30 for 3 steps of 10 (checkpoint says 30)
+
+2. two workers resume the same thread at once (no lease)
+   final state: {&#x27;notes&#x27;: [&#x27;plan&#x27;, &#x27;worker B: drafted intro&#x27;]}; worker A&#x27;s step was overwritten without an error (INSERT OR REPLACE)
+   a plain INSERT would have refused the second write: IntegrityError: UNIQUE constraint failed: checkpoints.thread_id, checkpoints.super_step
+
+3. the per-agent queue: one message per three steps
+   6 messages took 18 steps; each pass through processing handles one message (MegaAgent batches the queue)
+
+4. what 2,000 waiting threads and 2,000 waiting tasks cost
+   threads: started in 0.23 s; resident memory +31 MB, virtual +17005 MB (+16 KB resident each)
+   asyncio tasks: resident memory +1 MB, virtual +0 MB
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The crash billed the customer twice for one step.</strong> Without a dedup key the total was 40 for three steps of 10, while the checkpoint said 30: step 2's charge ran before the crash and again on resume. With the key (run, step), the retry was ignored and the total was 30.</p>
+<p><strong>Two workers lost a step without an error.</strong> Both read step 0 and both wrote step 1. The lesson's <code>INSERT OR REPLACE</code> kept worker B's note and silently dropped worker A's. A plain <code>INSERT</code> on the same primary key raised an <code>IntegrityError</code>, which is the behaviour you want; a lease would stop the second worker from starting at all.</p>
+<p><strong>The queue handles one message per three steps.</strong> Six messages took 18 steps, because each message goes through processing and response on its own. MegaAgent's Processing state batches everything queued into one model call.</p>
+<p><strong>Threads cost memory, but less than the lesson says.</strong> 2,000 waiting threads added 31 MB resident, about 16 KB each, and reserved 17 GB of virtual memory for their stacks. 2,000 asyncio tasks added about 1 MB.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Checkpointing a small real agent</div><div class="co-body"><p>This block continues from the one above. Qwen2.5-0.5B-Instruct (sampled, CPU) writes an 8-step plan with its full history checkpointed after every step. Then it crashes after the model call in step 4 and resumes on a new worker, once re-calling the model and once replaying a journal of recorded outputs. About 1 minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># This block continues from the one above. A small real agent on the lesson&#x27;s CheckpointStore: Qwen2.5-0.5B-Instruct
+# (sampled, temperature 0.8, CPU) writes an 8-step trip plan, one short step per super-step, and the full message
+# history is checkpointed after every step, as LangGraph does by default. We measure how the checkpoints grow,
+# then crash after the model call in step 4 and resume, once re-calling the model and once replaying a journal of
+# recorded model outputs. About 1 minute.
+import os, json, tempfile, warnings
+os.environ[&quot;HF_HUB_OFFLINE&quot;] = &quot;1&quot;
+warnings.filterwarnings(&quot;ignore&quot;)
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;)
+llm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;).eval()
+
+def llm_step(messages, seed):
+    ids = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=40, do_sample=True, temperature=0.8, top_k=0, top_p=1.0)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+STEPS = 8
+observed = {}
+def run(store, journal, crash_at=None, seed_base=0):
+    last = store.latest(&quot;trip&quot;)
+    step, state = (last[0] + 1, last[1]) if last else (0, {&quot;messages&quot;: [
+        {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You plan a 2-day trip to Lisbon, one short step at a time.&quot;}]})
+    while step &lt; STEPS:
+        msgs = state[&quot;messages&quot;] + [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;Step {step + 1} of {STEPS}: one sentence.&quot;}]
+        key = f&quot;trip:{step}&quot;
+        if journal is not None and key in journal:
+            reply = journal[key]                              # replay the recorded model output
+        else:
+            reply = llm_step(msgs, seed=seed_base + step)
+            observed[key] = reply                             # what the model said, for the comparison below
+            if journal is not None:
+                journal[key] = reply                          # in production the journal is durable, like the checkpoint
+        if step == crash_at:
+            raise RuntimeError(&quot;crash after the model call, before the checkpoint&quot;)
+        state = {&quot;messages&quot;: msgs + [{&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: reply}]}
+        store.write(&quot;trip&quot;, step, state); step += 1
+    return state
+
+f = tempfile.NamedTemporaryFile(suffix=&quot;.db&quot;, delete=False); f.close()
+store = CheckpointStore(f.name)
+run(store, journal=None)
+rows = store.conn.execute(&quot;SELECT super_step, length(state_json) FROM checkpoints WHERE thread_id=&#x27;trip&#x27; ORDER BY super_step&quot;).fetchall()
+sizes = [n for _, n in rows]; deltas = [sizes[0]] + [b - a for a, b in zip(sizes, sizes[1:])]
+print(f&quot;checkpoint sizes per step (bytes): {sizes}&quot;)
+print(f&quot;total stored: {sum(sizes)} bytes as full snapshots, {sum(deltas)} as deltas ({sum(sizes) / sum(deltas):.1f}x)&quot;)
+os.unlink(f.name)
+
+print(&quot;\ncrash after the model call in step 4, then resume on a new worker&quot;)
+for name, journal in ((&quot;re-call the model&quot;, None), (&quot;replay the journal&quot;, {})):
+    f = tempfile.NamedTemporaryFile(suffix=&quot;.db&quot;, delete=False); f.close(); store = CheckpointStore(f.name)
+    observed.clear()
+    try:
+        run(store, journal, crash_at=3, seed_base=100)
+    except RuntimeError:
+        pass
+    before = observed[&quot;trip:3&quot;]
+    final = run(store, journal, seed_base=900)                # the new worker&#x27;s sampler starts from a different seed
+    after = final[&quot;messages&quot;][8][&quot;content&quot;]
+    print(f&quot;   {name:19s} same step-4 text as before the crash: {before == after}&quot;)
+    print(f&quot;      before: {before[:80]!r}&quot;)
+    print(f&quot;      after:  {after[:80]!r}&quot;)
+    os.unlink(f.name)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">checkpoint sizes per step (bytes): [322, 579, 864, 1096, 1337, 1645, 1901, 2229]
+total stored: 9973 bytes as full snapshots, 2229 as deltas (4.5x)
+
+crash after the model call in step 4, then resume on a new worker
+   re-call the model   same step-4 text as before the crash: False
+      before: &quot;Don&#x27;t miss out on exploring the city by visiting iconic sights like the Teatro d&quot;
+      after:  &#x27;Be sure to check the weather forecast before heading out, especially during peak&#x27;
+   replay the journal  same step-4 text as before the crash: True
+      before: &quot;Don&#x27;t miss out on exploring the city by visiting iconic sights like the Teatro d&quot;
+      after:  &quot;Don&#x27;t miss out on exploring the city by visiting iconic sights like the Teatro d&quot;
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Snapshots grow with the run.</strong> Each checkpoint holds the whole history, from 322 bytes after step 1 to 2,229 after step 8. Storing all eight took 9,973 bytes against 2,229 as deltas, 4.5 times more after only 8 steps. The ratio keeps growing, which is why LangChain's 200-turn workload went from 5.3 GB to 129 MB with deltas.</p>
+<p><strong>Re-calling a sampled model changes the run.</strong> After the crash in step 4, the new worker called the model again and got a different sentence ("Be sure to check the weather forecast") from the one the crashed worker had produced ("Don't miss out on exploring the city"). Anything downstream that already saw the first version now disagrees with the record.</p>
+<p><strong>Replaying the journal keeps the run consistent.</strong> With model outputs recorded as they are produced, the resumed worker reused the original text. That is what Temporal does with activity results; for agents, record every model and tool result with its step.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>CheckpointStore</code> — SQLite-backed checkpoint log with thread-id keys. Each super-step appends a row.</li>
+<li><code>run_with_checkpoint(agent, thread_id)</code> — simulates a crash mid-run; a second worker resumes from last checkpoint.</li>
+<li><code>AgentQueue</code> — per-agent Idle / Processing / Response state machine with a small work queue.</li>
+<li><code>demo_async_vs_threads()</code> — runs 500 concurrent simulated "LLM calls" via asyncio and via threads; reports wall-clock and peak memory (approximated).</li>
+</ul>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>Expected output: checkpoint resume succeeds after the simulated crash, and the async version finishes 500 concurrent 50 ms calls in about 0.055 s against about 0.09 s for threads. At this size threads are only about 1.7x slower; "Use it" below measures their memory cost.</p>
+
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>CheckpointStore</code>, <code>run_agent_with_checkpoint</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Production scaling demo: checkpoints, queues, async vs threads.
+
+All stdlib. CheckpointStore uses SQLite. AgentQueue is a per-agent state
+machine with 3 states. async vs threads benchmark runs 500 concurrent
+simulated LLM calls.
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import asyncio
+import enum
+import json
+import os
+import sqlite3
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+
+
+# ---------- CheckpointStore ----------
+
+class CheckpointStore:
+    def __init__(self, path: str) -&gt; None:
+        self.conn = sqlite3.connect(path)
+        self.conn.execute(&quot;&quot;&quot;
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id TEXT NOT NULL,
+                super_step INTEGER NOT NULL,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY (thread_id, super_step)
+            )
+        &quot;&quot;&quot;)
+
+    def write(self, thread_id: str, super_step: int, state: dict) -&gt; None:
+        self.conn.execute(
+            &quot;INSERT OR REPLACE INTO checkpoints (thread_id, super_step, state_json) VALUES (?, ?, ?)&quot;,
+            (thread_id, super_step, json.dumps(state)),
+        )
+        self.conn.commit()
+
+    def latest(self, thread_id: str) -&gt; tuple[int, dict] | None:
+        row = self.conn.execute(
+            &quot;SELECT super_step, state_json FROM checkpoints WHERE thread_id = ? ORDER BY super_step DESC LIMIT 1&quot;,
+            (thread_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0], json.loads(row[1])
+
+
+def run_agent_with_checkpoint(store: CheckpointStore, thread_id: str,
+                              start: int = 0, crash_at: int | None = None, goal: int = 5) -&gt; int:
+    &quot;&quot;&quot;Run a tiny 5-step agent; optionally crash at a given step.&quot;&quot;&quot;
+    restored = store.latest(thread_id)
+    if restored:
+        super_step, state = restored
+        super_step += 1
+    else:
+        super_step = 0
+        state = {&quot;counter&quot;: start}
+
+    while state[&quot;counter&quot;] &lt; goal:
+        if crash_at is not None and super_step == crash_at:
+            print(f&quot;    worker crashes at super_step={super_step}&quot;)
+            raise RuntimeError(&quot;simulated crash&quot;)
+        state[&quot;counter&quot;] += 1
+        store.write(thread_id, super_step, dict(state))
+        super_step += 1
+    return state[&quot;counter&quot;]
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>AgentState</code>, <code>AgentQueue</code>, <code>demo_queue</code>, <code>sim_llm_call_async</code>, <code>sim_llm_call_sync</code>, <code>bench_async</code>, <code>bench_threads</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class AgentState(enum.Enum):
+    IDLE = &quot;idle&quot;
+    PROCESSING = &quot;processing&quot;
+    RESPONSE = &quot;response&quot;
+
+
+@dataclass
+class AgentQueue:
+    agent_id: str
+    state: AgentState = AgentState.IDLE
+    in_queue: list[dict] = field(default_factory=list)
+    out_queue: list[dict] = field(default_factory=list)
+
+    def enqueue(self, msg: dict) -&gt; None:
+        self.in_queue.append(msg)
+
+    def step(self) -&gt; None:
+        if self.state == AgentState.IDLE and self.in_queue:
+            self.state = AgentState.PROCESSING
+        elif self.state == AgentState.PROCESSING:
+            msg = self.in_queue.pop(0)
+            self.out_queue.append({&quot;reply_to&quot;: msg, &quot;body&quot;: f&quot;{self.agent_id} processed {msg}&quot;})
+            self.state = AgentState.RESPONSE
+        elif self.state == AgentState.RESPONSE:
+            self.state = AgentState.IDLE
+
+
+def demo_queue() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;PER-AGENT QUEUE: 3-state machine (idle / processing / response)&quot;)
+    print(&quot;=&quot; * 72)
+    a = AgentQueue(&quot;agent-a&quot;)
+    a.enqueue({&quot;task&quot;: &quot;compress logs&quot;})
+    a.enqueue({&quot;task&quot;: &quot;write summary&quot;})
+    print(f&quot;  initial: {a.state.value}  in_queue={len(a.in_queue)}&quot;)
+    for _ in range(7):
+        a.step()
+        print(f&quot;  state={a.state.value:11s} in={len(a.in_queue)} out={len(a.out_queue)}&quot;)
+
+
+# ---------- async vs threads ----------
+
+async def sim_llm_call_async(delay: float = 0.05) -&gt; None:
+    await asyncio.sleep(delay)
+
+
+def sim_llm_call_sync(delay: float = 0.05) -&gt; None:
+    time.sleep(delay)
+
+
+async def bench_async(n: int) -&gt; float:
+    t0 = time.perf_counter()
+    await asyncio.gather(*(sim_llm_call_async() for _ in range(n)))
+    return time.perf_counter() - t0
+
+
+def bench_threads(n: int) -&gt; float:
+    t0 = time.perf_counter()
+    threads = [threading.Thread(target=sim_llm_call_sync) for _ in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return time.perf_counter() - t0
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · <code>demo_async_vs_threads</code>, <code>demo_checkpoint_resume</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def demo_async_vs_threads() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;ASYNC vs THREADS: 500 concurrent &#x27;LLM calls&#x27; (50ms each)&quot;)
+    print(&quot;=&quot; * 72)
+
+    async_elapsed = asyncio.run(bench_async(500))
+    print(f&quot;  async (asyncio):  {async_elapsed:.3f} s&quot;)
+
+    thread_elapsed = bench_threads(500)
+    print(f&quot;  threads:          {thread_elapsed:.3f} s&quot;)
+
+    print(&quot;  ratio: threads are {:.1f}x slower (and allocate ~1MB per thread stack)&quot;.format(
+        thread_elapsed / async_elapsed if async_elapsed &gt; 0 else float(&quot;inf&quot;)
+    ))
+
+
+def demo_checkpoint_resume() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;CHECKPOINT RESUME: worker crashes mid-run, second worker resumes&quot;)
+    print(&quot;=&quot; * 72)
+    with tempfile.NamedTemporaryFile(suffix=&quot;.db&quot;, delete=False) as f:
+        db_path = f.name
+    try:
+        store = CheckpointStore(db_path)
+
+        print(&quot;  worker 1 starts thread t-1, targeting counter=5&quot;)
+        try:
+            run_agent_with_checkpoint(store, &quot;t-1&quot;, crash_at=3, goal=5)
+        except RuntimeError:
+            pass
+
+        last = store.latest(&quot;t-1&quot;)
+        assert last is not None
+        print(f&quot;  last checkpoint: super_step={last[0]}, state={last[1]}&quot;)
+
+        print(&quot;  worker 2 resumes thread t-1&quot;)
+        final = run_agent_with_checkpoint(store, &quot;t-1&quot;, goal=5)
+        print(f&quot;  worker 2 completed; final counter = {final}&quot;)
+    finally:
+        os.unlink(db_path)
+
+
+def main() -&gt; None:
+    demo_checkpoint_resume()
+    demo_queue()
+    demo_async_vs_threads()
+    print(&quot;\nTakeaways:&quot;)
+    print(&quot;  durable execution = persist state per super-step + idempotent resume.&quot;)
+    print(&quot;  per-agent queues with 3-state machines scale to thousands of concurrent agents.&quot;)
+    print(&quot;  async is structural for I/O-bound LLM workloads, not just an optimization.&quot;)
+    print(&quot;  Bedi&#x27;s rule: FastAPI + Postgres covers most teams; escalate on measured need.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">========================================================================
+CHECKPOINT RESUME: worker crashes mid-run, second worker resumes
+========================================================================
+  worker 1 starts thread t-1, targeting counter=5
+    worker crashes at super_step=3
+  last checkpoint: super_step=2, state={&#x27;counter&#x27;: 3}
+  worker 2 resumes thread t-1
+  worker 2 completed; final counter = 5
+
+========================================================================
+PER-AGENT QUEUE: 3-state machine (idle / processing / response)
+========================================================================
+  initial: idle  in_queue=2
+  state=processing  in=2 out=0
+  state=response    in=1 out=1
+  state=idle        in=1 out=1
+  state=processing  in=1 out=1
+  state=response    in=0 out=2
+  state=idle        in=0 out=2
+  state=idle        in=0 out=2
+
+========================================================================
+ASYNC vs THREADS: 500 concurrent &#x27;LLM calls&#x27; (50ms each)
+========================================================================
+  async (asyncio):  0.055 s
+  threads:          0.093 s
+  ratio: threads are 1.7x slower (and allocate ~1MB per thread stack)
+
+Takeaways:
+  durable execution = persist state per super-step + idempotent resume.
+  per-agent queues with 3-state machines scale to thousands of concurrent agents.
+  async is structural for I/O-bound LLM workloads, not just an optimization.
+  Bedi&#x27;s rule: FastAPI + Postgres covers most teams; escalate on measured need.
+</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>outputs/skill-scaling-advisor.md</code> advises on durable-execution choice: FastAPI + Postgres, LangGraph runtime, Temporal, or custom. Calibrated by load, state-retention needs, and deploy frequency.</p>
+
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Your research-agent platform checkpoints every step to Postgres and retries crashed runs automatically. Support reports that some customers received the same report email twice, a few runs show sections that contradict each other, and the checkpoints table has grown to 400 GB in a month for 50,000 runs. Using this lesson, what are the three causes, and what would you change? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What's current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Durable runtimes for agents.</strong> LangGraph's runtime checkpoints each super-step and resumes on any worker; Temporal, Restate and DBOS offer durable workflows that agent frameworks build on.</li>
+<li><strong>Smaller checkpoints.</strong> LangChain's delta channels (May 2026) store per-step diffs; on a 200-turn coding agent, storage fell from 5.3 GB to 129 MB.</li>
+<li><strong>Start simple, measure, then grow.</strong> Agno's Ashpreet Bedi argues one FastAPI process and one Postgres database go a long way; the outbox pattern and idempotency keys make that setup safe for side effects.</li>
+<li><strong>On your laptop</strong>: SQLite and <code>asyncio</code> are enough to build and test all of this; record model outputs with each step, and key every side effect by run and step.</li>
+</ul>
+<p>Sources: <a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents">LangChain, The runtime behind production deep agents</a>, <a href="https://www.langchain.com/blog/delta-channels-evolving-agent-runtime">LangChain, delta channels</a>, <a href="https://www.agno.com/articles/scaling-agentic-software-part-1">Bedi, Scaling Agentic Software</a>, <a href="https://arxiv.org/abs/2408.09955">MegaAgent (arXiv:2408.09955)</a>, <a href="https://www.anthropic.com/engineering/multi-agent-research-system">Anthropic, Multi-agent research system</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Checkpoint after each step so any worker can resume any run.</li>
+<li>Everything after the last checkpoint runs again: key side effects by run and step.</li>
+<li>Give each run a lease, and make checkpoint writes fail on conflict instead of overwriting.</li>
+<li>Record model outputs in the journal; re-calling a sampled model on resume changes the run.</li>
+<li>Full snapshots of growing state cost quadratic storage; store deltas past a few dozen steps.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-multi-agent"><span class="t" style="--cs-hue:290">MA</span>Cheat sheet · Multi-Agent Systems</a><a href="#cs-production-agent-runtimes"><span class="t" style="--cs-hue:30">PA</span>Cheat sheet · Production Agent Runtimes and Queues</a></div>
+<h2>Ship it</h2>
+<p>Canonical production hardening:</p>
+<ul>
+<li><strong>Start simple (Bedi's rule).</strong> FastAPI + Postgres until you measure it failing.</li>
+<li><strong>Instrument everything before optimizing.</strong> Per-run latency histogram, per-step time, retry count, failure categorization.</li>
+<li><strong>Outbox pattern for side effects.</strong> Especially payments and external API calls.</li>
+<li><strong>Rainbow deploys.</strong> Never kill in-flight agent runs during deploys.</li>
+<li><strong>Adopt durable-execution engines (Temporal / LangGraph / Restate) when</strong> you hit specific problems: hour-long human-in-the-loop waits, cross-region coordination, complex retry/compensation policies.</li>
+<li><strong>Async for the I/O layer.</strong> Threads only for CPU-bound post-processing.</li>
+</ul>
+<p><strong><code>outputs/skill-scaling-advisor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: scaling-advisor
+description: Advise on durable-execution choice for a multi-agent production system. Picks between FastAPI + Postgres, LangGraph runtime, Temporal, Restate, or custom based on concrete load and state-retention needs.
+version: 1.0.0
+phase: 16
+lesson: 22
+tags: [multi-agent, production, scaling, durable-execution, queues, checkpoints]
+---
+
+Given a multi-agent production deployment plan, recommend the durable-execution substrate.
+
+Produce:
+
+1. **Load profile.** Concurrent agent-runs (p50, p99). Per-run duration (seconds to hours). Fraction of runs requiring human-in-the-loop waits. Deploy frequency.
+2. **State profile.** Size of per-run state (KB to MB). Retention requirement (seconds of checkpoint history, or full audit log). Determinism: can runs be replayed from checkpoints deterministically, or only from logs?
+3. **Side-effect profile.** Which side effects need exactly-once (payments, external APIs, email)? Which can tolerate at-least-once (pure tool reads)? Outbox pattern needed for exactly-once.
+4. **Recommendation tier.**
+   - Tier 1 (Bedi's rule): FastAPI + Postgres. Under ~100 concurrent runs, sub-hour durations, simple retries.
+   - Tier 2: LangGraph runtime or Temporal. Hour-long runs, interrupt/resume, structured retries.
+   - Tier 3: Custom with outbox + event sourcing. Specialized needs, high throughput, strict audit.
+5. **Deploy model.** Single version or rainbow/canary? Rainbow required for long-running stateful workloads.
+6. **Async / thread boundary.** Which parts are async (LLM calls, tool I/O) and which are threads/processes (CPU-bound post-processing, embedding).
+7. **Observability.** Per-run traces, super-step audit, retry counter. Storage for traces (separate from checkpoint store).
+
+Hard rejects:
+
+- Recommending Temporal for a 10-concurrent-run prototype. Ceremony cost &gt; value.
+- Thread-per-job LLM call architectures. I/O-bound + 1MB/thread does not scale.
+- Designs without outbox pattern for paid side effects. Duplicate charges are expensive.
+- Single-version deploys for multi-hour agent runs. Users lose state on every code push.
+
+Refusal rules:
+
+- If load is unknown and untested, recommend Tier 1 plus load testing. Premature optimization burns time.
+- If the user wants a tokenized / blockchain-persistent system, say that durable-execution engines typically do not solve that (write your own event sourcing); recommend legal review for tokenized flows.
+- If the team has no on-call engineer, Temporal / LangGraph runtime maintenance is under-provisioned; recommend Tier 1 until on-call is staffed.
+
+Output: a two-page brief. Start with a one-sentence recommendation (&quot;Tier 1 (FastAPI + Postgres + outbox) for current load; escalate to LangGraph runtime when p99 run duration exceeds 10 min or concurrent runs exceed 200.&quot;), then the seven sections above. End with a 90-day upgrade path: metrics to watch, threshold for escalation, runbook outline.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Confirm checkpoint resume works; measure async vs thread concurrency difference.</li>
+<li>Implement an <strong>outbox</strong> table: every tool call writes to outbox first, then a separate goroutine/task executes. Verify idempotency by running the tool call twice.</li>
+<li>Simulate a <strong>rainbow deploy</strong>: two concurrent runtime versions; route half of new thread_ids to each; confirm that in-flight threads on the old version are not interrupted.</li>
+<li>Read LangGraph's runtime doc (linked below). Identify which features of the runtime would take the longest to replicate in a hand-rolled FastAPI + Postgres version. Is that a reason to adopt, or can you defer?</li>
+<li>Read MegaAgent (arXiv:2408.09955) Section 3. The two-layer coordination (intra-group + inter-group admin chat) is explicit. Sketch how you would map this to a message queue with two queue families.</li>
+</ol>
+
+<h2>Solutions</h2>
+<details class="qa" id="a1622-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 40, not 30</span></summary><div class="qa-a"><p><strong>40.</strong> The last checkpoint is step 1, so the new worker re-runs step 2 from the start and bills again. The run did 30 of work, the checkpoint says 30, and the customer paid 40. The same happened in the run above. A key of (run id, step), checked by the payment service, turns the second charge into a no-op.</p></div></details>
+<details class="qa" id="a1622-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Retries, re-sampling and snapshots</span></summary><div class="qa-a"><p><strong>Duplicate emails.</strong> Retries re-run every step after the last checkpoint, including the send. Fix: an idempotency key per (run, step) on the email call, or an outbox table that a separate sender drains exactly once.</p>
+<p><strong>Contradictory sections.</strong> A resumed run calls the model again for the step it was on, gets a different sample, and continues from text that earlier steps or other workers never saw. Concurrent retries without a lease can also interleave two workers on one run. Fix: journal every model and tool output with the step, replay them on resume, and hold a lease per run.</p>
+<p><strong>400 GB of checkpoints.</strong> Full snapshots of a growing history cost storage roughly quadratic in run length. Fix: store deltas with periodic full snapshots, expire old checkpoints after a run completes, and keep large artifacts out of the state.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1622-qa1"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Your multi-agent prototype runs in one process with an in-memory event loop. In production, runs last hours while they wait for human input, worker processes crash and lose everything, peak load is ten times the average, and users are charged per run so a retried side effect is a double charge. Design the layer that goes under the agents, and say what you would build first.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 15 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Put a durable execution layer under the agents: persist the full run state after each step under a run id, so that when a worker crashes its lease expires and any other worker resumes from the last checkpoint. That needs serializable state, a deterministic resume, and idempotent side effects. For the charge, use a deduplication key per run and an outbox so that side effects are written as intent first and executed once, use asynchronous I/O for the model calls, and deploy new versions beside old ones so that in-flight runs are never killed. Build the simplest version first, a web service with a relational database, and adopt a workflow engine when a measured problem demands it.</p>
+<p><strong>The resume path.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">worker crashes mid-step
+  -&gt; lease times out
+  -&gt; another worker picks up the run id
+  -&gt; resumes from the last checkpoint
+  -&gt; no duplicate side effect
+</code></pre></div>
+<p>Three requirements make this work:</p>
+<ol>
+<li><strong>Serializable state.</strong> Everything the agent holds must be persistable. A closure with a live database connection does not survive a crash.</li>
+<li><strong>Deterministic resume.</strong> Given the same state and the same inputs, the agent takes the same actions, or defers to a recorded result for the model calls.</li>
+<li><strong>Idempotent side effects.</strong> Every external call carries a key, or writes to a table first and is executed by a separate process.</li>
+</ol>
+<p>Graph runtimes write a checkpoint after each step under a thread id. Workflow engines write after each activity. Event-sourced runtimes keep a journal. The pattern is the same.</p>
+<p><strong>The waiting run.</strong></p>
+<p>A run that waits hours for a human must not hold a worker. The runtime persists the run, releases the worker, and any worker resumes when the input arrives. That is what makes the checkpoint the unit of the system rather than the process.</p>
+<p><strong>Exactly once, effectively.</strong></p>
+<p>At-least-once delivery plus an idempotent consumer is the only kind of exactly-once you get.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Move</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Deduplication key per run</td>
+<td>Included in every side-effect call so a retry is recognized</td>
+</tr>
+<tr>
+<td>Outbox</td>
+<td>Intent is written to a table, and a separate executor performs it and marks it done</td>
+</tr>
+<tr>
+<td>Compensating transaction</td>
+<td>When the effect succeeded and the tracking write failed, schedule the reverse</td>
+</tr>
+</tbody>
+</table></div>
+<p>These are database patterns. The only agent-specific tax is that model calls are slow.</p>
+<p><strong>Concurrency.</strong></p>
+<p>Model calls are I/O bound, and a thread waiting for the next token is idle 99 percent of the time. At 10,000 concurrent calls, threads reserve about 80 GB of virtual address space for stacks and hundreds of megabytes of resident memory, plus scheduler overhead, while cooperative fibers fit easily in one process. Use asynchronous I/O for the model layer and threads or processes only for CPU-bound work such as embedding.</p>
+<p><strong>Deploys.</strong></p>
+<p>Long-running stateful agents cannot be hot-swapped. Run several versions of the runtime at once, send a slice of new runs to the new version, and retire the old version when its runs finish.</p>
+<p><strong>What to build first.</strong></p>
+<p>The lesson's counterpoint is that most teams over-engineer before they measure. A web service and a relational database, with each run as a row, optimistic concurrency on the state, a simple background worker and application-level retries, carries more load than most teams expect; measure where it breaks for your workload. Adopt a durable-execution engine when you hit a concrete problem the simple design cannot solve: hour-long waits at scale, cross-region coordination, or complex compensation policies.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Retry the whole run from the start when a worker dies." That repeats every side effect that already happened, which is the double charge in the prompt.</li>
+<li>"Use a thread per run; it is simpler." Threads idle while they wait for tokens, and at ten thousand concurrent calls the stacks alone exhaust memory.</li>
+<li>"Adopt a workflow engine on day one to be safe." The simple design carries about a hundred concurrent runs, and the engine's ceremony costs time until a measured problem pays for it.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why is the model call the hard part of deterministic resume? Expected: it is not deterministic, so the resume must replay the recorded result of the call rather than make it again.</li>
+<li><em>(level 3)</em> What does the lease do? Expected: it marks a run as owned by one worker for a bounded time, so a crash frees the run for another worker without two workers running it at once.</li>
+<li><em>(level 4)</em> How do you test the outbox? Expected: run the same side effect twice through the executor and assert one external call, then crash the executor between the effect and the mark and assert that the compensation or the idempotent redo leaves one effect.</li>
+<li><em>(level 4)</em> Which feature of a workflow engine is hardest to replicate by hand, and is that a reason to adopt it? Expected: a reasoned pick such as durable timers for hour-long waits or compensation policies, with the rule that adoption follows a measured failure of the simple design.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1622">production scaling lesson</a> builds the checkpoint store, the per-agent queue and the asynchronous demo, and lands the start-simple rule.</p></div></details>
+<details class="qa" id="a1622-qa2"><summary><span class="qa-lvl qa-estimate">Estimate it</span><span class="qa-q">A swarm runtime uses one thread per in-flight model call. At peak it holds about 10,000 calls at once. Estimate the memory the threads take before any work is done, say what those threads are doing most of the time, and say what you would change.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Each thread reserves a stack (8 MB of virtual memory by default on Linux) and holds tens of kilobytes resident, so 10,000 threads reserve about 80 GB of address space and a few hundred megabytes of RAM before the first token arrives. Those threads are idle about 99 percent of the time, waiting for the next token from a model service. Move the model calls to cooperative fibers through asynchronous I/O, where the same 10,000 calls fit in one process, and keep threads or processes only for CPU-bound work such as embeddings.</p>
+<p><strong>The estimate.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Quantity</th>
+<th>Value</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resident memory per waiting thread (measured in "Use it")</td>
+<td>about 16 KB, plus 8 MB of reserved virtual stack</td>
+</tr>
+<tr>
+<td>Concurrent calls</td>
+<td>10,000</td>
+</tr>
+<tr>
+<td>Resident memory for the threads</td>
+<td>about 160 MB, and about 80 GB of reserved address space</td>
+</tr>
+</tbody>
+</table></div>
+<p>That is the cost of holding the calls open, not of doing anything with them. A model call is I/O bound. The thread sends a request and then waits for tokens, and it is idle for about 99 percent of its life.</p>
+<p><strong>What fibers change.</strong></p>
+<p>Cooperative fibers yield on I/O instead of holding a stack while they wait. In the lesson's demo, 500 concurrent simulated 50 ms calls finish in about 0.055 s with asyncio and about 0.09 s with threads; the bigger difference is memory, about 16 KB resident and 8 MB of reserved stack per waiting thread against a few hundred bytes per asyncio task. At agent scale, asynchronous I/O is the architecture, not an optimization.</p>
+<p><strong>The exception.</strong></p>
+<p>CPU-bound post-processing wants threads or processes: embedding, tokenizer tricks, anything that computes rather than waits. Separate the I/O layer from the CPU layer and give each its own concurrency model.</p>
+<p><strong>How this fits the rest of the runtime.</strong></p>
+<p>The asynchronous layer handles the calls in flight. Durability is a separate concern: a checkpoint per step under a run id so that a crash of the process loses the in-flight calls and nothing else, and any worker resumes from the last checkpoint. Peak load at ten times the average is a reason for both: fibers to hold the calls cheaply, and queues with leases to spread them across workers.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Add memory until the threads fit." Memory for idle stacks is waste, and the next peak needs more, while fibers remove the cost.</li>
+<li>"Make the threads smaller with a reduced stack size." A smaller stack is still a stack per idle call, and the idle time stays at 99 percent.</li>
+<li>"Use fibers for everything, including embeddings." A CPU-bound step on the cooperative loop blocks every waiting call, so the CPU layer keeps threads or processes.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why does the thread count matter more than the request count? Expected: each thread holds a stack whether or not it is doing work, so memory scales with concurrency, not with throughput.</li>
+<li><em>(level 2)</em> What breaks if you run the embedding step on the asynchronous loop? Expected: a CPU-bound task blocks the loop, so every waiting call stalls behind it, which is why CPU work goes to threads or processes.</li>
+<li><em>(level 3)</em> The memory fits after the change. What is the next limit? Expected: the model service's rate limits and the queue depth, so the runtime needs back-pressure and a lease per run rather than more concurrency.</li>
+<li><em>(level 3)</em> How do you prove the change before you ship it? Expected: run the lesson's comparison on your own call shape, measure wall-clock and peak memory for both versions at the same concurrency, and keep the numbers next to the decision.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1622">production scaling lesson</a> runs the asynchronous and thread versions side by side.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://www.langchain.com/conceptual-guides/runtime-behind-production-deep-agents">LangChain — The runtime behind production deep agents</a> — LangGraph runtime design</li>
+<li><a href="https://arxiv.org/abs/2408.09955">MegaAgent</a> — per-agent producer-consumer queue; two-layer coordination; 590 agents in its largest experiment</li>
+<li><a href="https://arxiv.org/abs/2511.21686">Matrix</a> — decentralized framework with message queues as the coordination substrate</li>
+<li><a href="https://docs.temporal.io/">Temporal docs</a> — the reference workflow engine for durable execution</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system">Anthropic — Multi-agent research system</a> — production lessons including rainbow deployment</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/16-multi-agent-and-swarms/22-production-scaling-queues-checkpoints" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1622" id="done-a1622">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1622" id="undo-a1622" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1621"><span class="pn-dir">Previous</span><span class="pn-t">16.21 · Agent Economies, Token Incentives, Reputation</span></a><a class="pn next" href="#a1623"><span class="pn-dir">Next</span><span class="pn-t">16.23 · Failure Modes — MAST, Groupthink, Monoculture, Cascading Errors</span></a></div></footer>

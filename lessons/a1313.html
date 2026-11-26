@@ -1,0 +1,615 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>MCP Tasks Extension: Durable Work on a Stateless Core</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.13</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1313" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Distinguish stateless protocol transport from durable application task state.</li>
+<li>Negotiate the <code>io.modelcontextprotocol/tasks</code> extension in per-request capabilities and <code>server/discover</code>.</li>
+<li>Return a server-directed <code>CreateTaskResult</code> with <code>resultType: "task"</code> only after durable creation.</li>
+<li>Poll with <code>tasks/get</code>, fulfill task input with <code>tasks/update</code>, and request cooperative cancellation with <code>tasks/cancel</code>.</li>
+<li>Remove the older <code>tasks/status</code>, <code>tasks/result</code>, and <code>tasks/list</code> assumptions.</li>
+<li>Subscribe to optional task notifications through <code>subscriptions/listen</code> on a POST response SSE stream.</li>
+<li>Model task expiry, restart recovery, input-key deduplication, and execution errors correctly.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 09 (transports), Phase 13 · 11 (stateless MRTR), Phase 13 · 12 (elicitation)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Stateless MCP does not mean every operation must finish in one request. The official Tasks extension gives long-running work an explicit durable handle. A server can return that handle from <code>tools/call</code>, any instance can answer <code>tasks/get</code>, and client input arrives through <code>tasks/update</code> without reviving protocol sessions.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning in the current extension</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tasks extension</td>
+<td>Optional <code>io.modelcontextprotocol/tasks</code> capability for durable async work</td>
+</tr>
+<tr>
+<td><code>CreateTaskResult</code></td>
+<td>Server-directed <code>resultType: "task"</code> response to an eligible request</td>
+</tr>
+<tr>
+<td><code>tasks/get</code></td>
+<td>Poll a full current task snapshot, including terminal result or pending input</td>
+</tr>
+<tr>
+<td><code>tasks/update</code></td>
+<td>Submit responses to a task's outstanding <code>inputRequests</code></td>
+</tr>
+<tr>
+<td><code>tasks/cancel</code></td>
+<td>Acknowledge cooperative cancellation intent</td>
+</tr>
+<tr>
+<td><code>input_required</code></td>
+<td>Task status indicating client input is outstanding</td>
+</tr>
+<tr>
+<td><code>pollIntervalMs</code></td>
+<td>Server-suggested minimum delay before another poll</td>
+</tr>
+<tr>
+<td><code>ttlMs</code></td>
+<td>Expiry duration measured from task creation</td>
+</tr>
+<tr>
+<td>Durable-before-return</td>
+<td>Rule that the task id must resolve before its handle is sent</td>
+</tr>
+<tr>
+<td><code>notifications/tasks</code></td>
+<td>Optional full task snapshot delivered on a subscribed SSE response</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Why Tasks Are an Extension</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Some tool calls take minutes: generating a long report, running a test suite, waiting for a human approval. A stateless protocol cannot hold a request open that long, and a server restart would lose it. The MCP Tasks extension (<code>io.modelcontextprotocol/tasks</code>) turns such a call into a durable task with an id. The server answers the tool call at once with "here is your task", stores the task, and does the work in the background. The client checks on it with <code>tasks/get</code> and answers questions the task raises with <code>tasks/update</code>. It can ask to stop it with <code>tasks/cancel</code>, and the stop is cooperative. Any server instance can answer, because the task lives in shared storage rather than in a connection. This lesson explains the extension. It then drives the lesson's own task server with a real background worker and a polling client, and probes cancellation, ownership and removed methods.</p></div></aside>
+<p>Tasks first appeared as an experimental core feature in 2025-11-25. The July 2026 redesign moves them into the official <code>io.modelcontextprotocol/tasks</code> extension so clients and servers can opt into the extra lifecycle without expanding the core protocol for everyone.</p>
+<p>The extension specification remains a draft surface even though it is the current official home for Tasks. Pin the extension version supported by your SDK, run conformance scenarios, and isolate wire adapters from your worker and storage domain.</p>
+<p>Use a task when the operation has one or more of these properties:</p>
+<ul>
+<li>It may outlive an ordinary request timeout.</li>
+<li>A worker queue or external job system already owns execution.</li>
+<li>The client needs to recover after its own restart.</li>
+<li>The operation pauses for user or model input during execution.</li>
+<li>Cancellation and durable result retrieval are product requirements.</li>
+</ul>
+<p>Do not create a task for a cheap deterministic lookup. A handle, persistence, polling, expiry, and cancellation are real complexity.</p>
+<h2>Stateless Core, Stateful Application</h2>
+<p>MCP 2026-07-28 removes <code>initialize</code>, <code>notifications/initialized</code>, protocol sessions, and <code>Mcp-Session-Id</code>. That does not prohibit stateful products.</p>
+<p>A task id is explicit application state:</p>
+<ul>
+<li>The server persists it before returning it.</li>
+<li>The client can store it and poll again after restart.</li>
+<li>The id can route to any replica backed by the same durable store.</li>
+<li>Authorization is checked on every task method.</li>
+<li>Expiry and deletion are defined by task fields, not a transport lifetime.</li>
+</ul>
+<p>This is operationally different from hidden state attached to a connection.</p>
+<p>Keep four lifetimes separate:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>State</th>
+<th>Lifetime</th>
+<th>Where it belongs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Protocol metadata</td>
+<td>One request</td>
+<td><code>params._meta</code>, validated again on every call</td>
+</tr>
+<tr>
+<td>Transport work</td>
+<td>One stdio request or HTTP response</td>
+<td>In-flight coordinator with a bounded deadline</td>
+</tr>
+<tr>
+<td>MRTR continuation</td>
+<td>One retry sequence</td>
+<td>Integrity-protected <code>requestState</code>, plus replay controls when needed</td>
+</tr>
+<tr>
+<td>Durable task</td>
+<td>Across requests, replicas, restarts, and reconnects</td>
+<td>Shared application store keyed by an authorized <code>taskId</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Moving a task record into process memory does not make MCP stateful. It makes the application unreliable. The protocol stays stateless, but a later <code>tasks/get</code> routed to another replica cannot recover the record. Persist before returning the handle, then make every task method resolve the same shared record under tenant and principal checks.</p>
+<h2>Capability Negotiation</h2>
+<p>The client advertises support on every eligible request:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;_meta&quot;: {
+    &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+    &quot;io.modelcontextprotocol/clientCapabilities&quot;: {
+      &quot;extensions&quot;: {
+        &quot;io.modelcontextprotocol/tasks&quot;: {}
+      }
+    },
+    &quot;io.modelcontextprotocol/clientInfo&quot;: {
+      &quot;name&quot;: &quot;lesson-client&quot;,
+      &quot;version&quot;: &quot;1.0.0&quot;
+    }
+  }
+}
+</code></pre></div>
+<p>The server returns exact <code>supportedVersions</code>, capabilities, <code>ttlMs</code>, and <code>cacheScope</code> from <code>server/discover</code>, with the same extension under capabilities. Because it advertises tools, it also implements mandatory <code>tools/list</code>. That result returns a deterministic <code>generate_report</code> descriptor, valid object <code>inputSchema</code>, <code>resultType: "complete"</code>, server identity metadata, and public cache hints.</p>
+<p>A task method from a client that did not declare the extension returns <code>-32021</code>, Missing Required Client Capability, with <code>data.requiredCapabilities</code> set to <code>{"extensions":{"io.modelcontextprotocol/tasks":{}}}</code>. An unsupported protocol string returns <code>-32022</code> with exact <code>supported</code> and <code>requested</code> data; a missing or non-string version returns <code>-32602</code>.</p>
+<p>An envelope without a JSON-RPC <code>id</code> is a notification. The receiver may process it, but it emits no JSON-RPC result or error. A Streamable HTTP adapter returns <code>202 Accepted</code> with no body for an accepted notification.</p>
+<p>At present, only <code>tools/call</code> supports task-augmented execution. Design your internal abstraction so future request types do not require rewriting storage.</p>
+<h2>Server-Directed Task Creation</h2>
+<p>The old client flag <code>params._meta.task.required</code> is gone. The client declares extension support, then the server decides whether a particular <code>tools/call</code> becomes a task.</p>
+<p>Request:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;generate_report&quot;,
+    &quot;arguments&quot;: {&quot;size&quot;: &quot;large&quot;},
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {
+        &quot;extensions&quot;: {
+          &quot;io.modelcontextprotocol/tasks&quot;: {}
+        }
+      }
+    }
+  }
+}
+</code></pre></div>
+<p>Response:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;task&quot;,
+    &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+    &quot;status&quot;: &quot;working&quot;,
+    &quot;statusMessage&quot;: &quot;Preparing report outline.&quot;,
+    &quot;createdAt&quot;: &quot;2026-08-21T10:30:00Z&quot;,
+    &quot;lastUpdatedAt&quot;: &quot;2026-08-21T10:30:00Z&quot;,
+    &quot;ttlMs&quot;: 900000,
+    &quot;pollIntervalMs&quot;: 1000
+  }
+}
+</code></pre></div>
+<p>The server must not return this handle until a <code>tasks/get</code> for the id can resolve. In an eventually consistent store, wait for read visibility before answering. Otherwise a client can receive a valid-looking id and immediately get "not found."</p>
+<p>A task response is unsolicited in the sense that the client does not request task mode. It is not unnegotiated: the current request still must advertise the extension.</p>
+<h2>The Task Shape</h2>
+<p>Every task carries:</p>
+<ul>
+<li><code>taskId</code>: stable server-generated identifier;</li>
+<li><code>status</code>: <code>working</code>, <code>input_required</code>, <code>completed</code>, <code>cancelled</code>, or <code>failed</code>;</li>
+<li><code>createdAt</code> and <code>lastUpdatedAt</code>: ISO 8601 timestamps;</li>
+<li><code>ttlMs</code>: expiry duration from creation, or <code>null</code> for no advertised limit;</li>
+<li>optional <code>pollIntervalMs</code>: the server's current minimum suggested polling cadence;</li>
+<li>optional <code>statusMessage</code>: user-facing or model-facing context.</li>
+</ul>
+<p>Status-specific fields appear only when relevant:</p>
+<ul>
+<li><code>input_required</code> includes <code>inputRequests</code>.</li>
+<li><code>completed</code> includes the original request's <code>result</code> shape.</li>
+<li><code>failed</code> includes a JSON-RPC <code>error</code> object.</li>
+</ul>
+<p>The client should honor <code>pollIntervalMs</code>. A server may rate-limit more aggressive polling and may change the interval over the task lifetime.</p>
+<h2>Poll with <code>tasks/get</code></h2>
+<p>The client asks for a current snapshot:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-http">POST /mcp HTTP/1.1
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tasks/get
+Mcp-Name: tsk_786512e29e0d
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;method&quot;: &quot;tasks/get&quot;,
+  &quot;params&quot;: {
+    &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {
+        &quot;extensions&quot;: {
+          &quot;io.modelcontextprotocol/tasks&quot;: {}
+        }
+      }
+    }
+  }
+}
+</code></pre></div>
+<p><code>tasks/get</code> itself completed, so its result always has <code>resultType: "complete"</code>. The nested task can still have <code>status: "working"</code> or <code>status: "input_required"</code>.</p>
+<p>This distinction prevents a common parser bug:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">result.resultType = complete    means the tasks/get RPC finished
+result.status = working        means the represented job is still running
+</code></pre></div>
+<p>There is no <code>tasks/result</code> call. When the task completes, the next <code>tasks/get</code> response inlines the original <code>CallToolResult</code> under <code>result</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+  &quot;status&quot;: &quot;completed&quot;,
+  &quot;createdAt&quot;: &quot;2026-08-21T10:30:00Z&quot;,
+  &quot;lastUpdatedAt&quot;: &quot;2026-08-21T10:34:12Z&quot;,
+  &quot;ttlMs&quot;: 900000,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;complete&quot;,
+    &quot;content&quot;: [
+      {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;Generated large report with approved outline.&quot;}
+    ],
+    &quot;structuredContent&quot;: {&quot;size&quot;: &quot;large&quot;, &quot;approved&quot;: true},
+    &quot;isError&quot;: false,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/serverInfo&quot;: {
+        &quot;name&quot;: &quot;tasks-demo&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  },
+  &quot;_meta&quot;: {
+    &quot;io.modelcontextprotocol/serverInfo&quot;: {
+      &quot;name&quot;: &quot;tasks-demo&quot;,
+      &quot;version&quot;: &quot;1.0.0&quot;
+    }
+  }
+}
+</code></pre></div>
+<p>The outer <code>resultType</code> says the <code>tasks/get</code> RPC completed. The nested <code>result.resultType</code> says the original tool call completed. That nested discriminator is required. The nested <code>CallToolResult</code> SHOULD also carry its own <code>io.modelcontextprotocol/serverInfo</code>; this lesson includes it instead of storing an untyped payload.</p>
+<p>There is no <code>tasks/list</code>. Sessionless servers cannot safely infer which tasks belong in a connection-scoped list. Applications that need history should expose an authorized domain tool with explicit filters and ownership rules.</p>
+<h2>Input During Task Execution</h2>
+<p>Task input and core MRTR look similar but use different continuations.</p>
+<h3>Input needed before task creation</h3>
+<p>Return core <code>resultType: "input_required"</code> from the original <code>tools/call</code>. The client fulfills it and retries that original call. Only create the task after those synchronous MRTR rounds finish.</p>
+<h3>Input needed after task creation</h3>
+<p>Set the task to <code>input_required</code>. <code>tasks/get</code> exposes the outstanding <code>inputRequests</code>, and the client sends responses through <code>tasks/update</code>. The client does not retry the original <code>tools/call</code>.</p>
+<p>Snapshot:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+  &quot;status&quot;: &quot;input_required&quot;,
+  &quot;createdAt&quot;: &quot;2026-08-21T10:30:00Z&quot;,
+  &quot;lastUpdatedAt&quot;: &quot;2026-08-21T10:31:00Z&quot;,
+  &quot;ttlMs&quot;: 900000,
+  &quot;inputRequests&quot;: {
+    &quot;approve_outline&quot;: {
+      &quot;method&quot;: &quot;elicitation/create&quot;,
+      &quot;params&quot;: {
+        &quot;mode&quot;: &quot;form&quot;,
+        &quot;message&quot;: &quot;Approve the generated report outline?&quot;,
+        &quot;requestedSchema&quot;: {
+          &quot;type&quot;: &quot;object&quot;,
+          &quot;properties&quot;: {&quot;approved&quot;: {&quot;type&quot;: &quot;boolean&quot;}},
+          &quot;required&quot;: [&quot;approved&quot;]
+        }
+      }
+    }
+  }
+}
+</code></pre></div>
+<p>Update:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-http">POST /mcp HTTP/1.1
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tasks/update
+Mcp-Name: tsk_786512e29e0d
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 4,
+  &quot;method&quot;: &quot;tasks/update&quot;,
+  &quot;params&quot;: {
+    &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+    &quot;inputResponses&quot;: {
+      &quot;approve_outline&quot;: {
+        &quot;action&quot;: &quot;accept&quot;,
+        &quot;content&quot;: {&quot;approved&quot;: true}
+      }
+    },
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {
+        &quot;extensions&quot;: {
+          &quot;io.modelcontextprotocol/tasks&quot;: {}
+        }
+      }
+    }
+  }
+}
+</code></pre></div>
+<p>The success response is an empty acknowledgement plus <code>resultType: "complete"</code>. The state change may be eventually consistent, so the client continues polling or listening.</p>
+<p>Each <code>inputRequests</code> key must be unique for the entire task lifetime. Repeated <code>tasks/get</code> snapshots may show the same outstanding key; clients deduplicate the UI and servers ignore responses for unknown, superseded, or already fulfilled keys. A partial update can leave the task in <code>input_required</code> until all required keys are answered.</p>
+<h2>Cancellation Is Cooperative</h2>
+<p><code>tasks/cancel</code> signals intent and returns an empty complete acknowledgement. That acknowledgement does not guarantee the worker stopped. Work may finish first, ignore cancellation, or transition later.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-http">POST /mcp HTTP/1.1
+Content-Type: application/json
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tasks/cancel
+Mcp-Name: tsk_786512e29e0d
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 5,
+  &quot;method&quot;: &quot;tasks/cancel&quot;,
+  &quot;params&quot;: {
+    &quot;taskId&quot;: &quot;tsk_786512e29e0d&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {
+        &quot;extensions&quot;: {
+          &quot;io.modelcontextprotocol/tasks&quot;: {}
+        }
+      }
+    }
+  }
+}
+</code></pre></div>
+<p>For all three task methods, <code>Mcp-Name</code> mirrors <code>params.taskId</code>. It does not repeat the JSON-RPC method name. <code>code/main.py</code> centralizes this rule in <code>make_http_request</code>.</p>
+<p>The lesson worker honors cancellation immediately, making repeated calls idempotent. A production client must still treat cancellation as cooperative rather than infer a final task status from the acknowledgement.</p>
+<p>Do not use <code>notifications/cancelled</code> to cancel a task. That notification belongs to request cancellation, not durable Tasks.</p>
+<p>The distinction matters at the routing boundary. Request cancellation targets one in-flight JSON-RPC operation or its request-scoped HTTP response. If <code>tools/call</code> has already returned <code>resultType: "task"</code>, that request is complete and closing its transport cannot name or stop the durable job. <code>tasks/cancel</code> is a new authorized RPC. It carries <code>params.taskId</code>, mirrors that id in <code>Mcp-Name</code>, resolves the task's owning backend, records cooperative cancellation intent, and returns an acknowledgement without claiming the worker has stopped.</p>
+<p>A gateway must therefore keep request coordinators and task routes in different tables. The request table can disappear when the response finishes. The task route must survive until terminal state and retention expiry. <a href="#a1329">[Lesson 13.29](#a1329): MCP Reliability, Cancellation, and Flow Control</a> builds the race, timeout, idempotency, backpressure, and retry rules for both paths.</p>
+<h2>Optional Notifications</h2>
+<p>Polling is the baseline. A client that wants push updates sends <code>subscriptions/listen</code> with task ids. For Streamable HTTP, this is a POST whose response is a request-scoped SSE stream. There is no standalone GET event stream and no protocol session to keep alive.</p>
+<p>The server acknowledges the accepted ids with <code>notifications/subscriptions/acknowledged</code> and can then send full snapshots through <code>notifications/tasks</code>. The acknowledgement and every task notification carry <code>io.modelcontextprotocol/subscriptionId</code> in <code>_meta</code>, equal to the <code>subscriptions/listen</code> request id. Each task notification is otherwise equivalent to what <code>tasks/get</code> would return at that moment.</p>
+<p>Clients must still declare the Tasks extension. They should reconnect and resume from durable task ids rather than depend on event replay or <code>Last-Event-ID</code>.</p>
+<h2>Failure Semantics</h2>
+<p>Use the two error layers correctly.</p>
+<h3>Protocol error</h3>
+<p>Invalid method parameters or an unknown task id return a JSON-RPC error, commonly <code>-32602</code>. Missing extension support returns <code>-32021</code> with the required capability object.</p>
+<h3>Task execution outcome</h3>
+<ul>
+<li>A normal tool result with <code>isError: true</code> is still a <code>completed</code> task because the tool call produced its defined result.</li>
+<li>A JSON-RPC error during deferred execution makes the task <code>failed</code> and stores that JSON-RPC error under <code>error</code>.</li>
+<li>User refusal can produce <code>cancelled</code>, a completed refusal result, or another domain-specific safe outcome. Document the choice.</li>
+</ul>
+<h2>Durability, Expiry, and Ownership</h2>
+<p>Persist at least the task id, status, timestamps, ttl, poll interval, original operation ownership, result or error, outstanding input requests, and all issued input keys.</p>
+<p>The storage key must include or resolve an authoritative tenant and principal. Knowing a task id must not grant access. Check ownership on every <code>tasks/get</code>, <code>tasks/update</code>, <code>tasks/cancel</code>, and subscription.</p>
+<p><code>ttlMs</code> is measured from creation and may change. A client can treat it as a backstop when a task has stopped producing observable updates. A server may fail and later delete an expired task. Do not describe it as a promise to retain a completed result for that many milliseconds after completion.</p>
+<p>Use atomic writes or transactions. The lesson writes a temporary file and atomically renames it. A multi-replica service should use a shared durable store and a worker lease or equivalent concurrency control.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tp-task-lifecycle"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Task states.</strong> A task moves through
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">working</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel amsrm">⇄</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">input_required</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">working</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord text"><span class="mord">completed</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">failed</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">cancelled</span></span><span class="mclose">}</span><span class="mpunct">,</span></span></span></span></span></div>
+and the three on the right are terminal: no request changes a terminal task. <code>tasks/update</code> moves <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">input_required</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">→</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">working</span></span></span></span></span> only for an answer to an open input key; <code>tasks/cancel</code> moves any non-terminal state to cancelled once the worker acknowledges.</p>
+<p><strong>Polling cost.</strong> For a task that runs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span> seconds with poll interval <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>, a client makes about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mord">/</span><span class="mord mathnormal">p</span><span class="mclose">⌉</span></span></span></span> <code>tasks/get</code> calls, and learns of completion at most <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> late:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8095em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">requests</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2408em;vertical-align:-0.8804em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">extra latency</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mord">.</span></span></span></span></span></div>
+Notifications on <code>subscriptions/listen</code> remove both costs, but they are optional; polling must always work.</p>
+<p><strong>Ownership without an oracle.</strong> For principal <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span> and task <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>, the server answers <code>tasks/get</code> only if <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">owner</span></span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">u</span></span></span></span>, and otherwise returns exactly the same error as for a task that does not exist, so ids cannot be probed.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A 10-minute report</div><div class="co-body"><ul>
+<li>With <code>pollIntervalMs = 1000</code> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">600</span></span></span></span> s, a client makes about 600 <code>tasks/get</code> calls and hears of completion at most 1 s late.</li>
+<li>With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">30</span></span></span></span> s: 20 calls, but up to 30 s late. Servers pick <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> from the job's length; clients honour it.</li>
+<li>The task expires <code>ttlMs = 900000</code> ms (15 minutes) after creation if nobody fetches the result, and is then deleted from the store.</li>
+<li>Another user guesses the task id: they get "task not found", identical to the answer for a random id, so they cannot even confirm the task exists.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "<code>tasks/cancel</code> stops the work immediately."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It asks; the worker stops at its next safe point and the task then reads <code>cancelled</code>.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The client must wait on <code>tasks/result</code> for the outcome."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> <code>tasks/result</code> and <code>tasks/list</code> are gone from the extension; poll <code>tasks/get</code>, which includes the result when completed.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A task belongs to the connection that created it."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It belongs to the authenticated principal and lives in shared storage; any instance can serve it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A failed task is a JSON-RPC error."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Protocol problems are errors; a task whose work failed is a completed request whose status is <code>failed</code>.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A report task needs one approval from the user in the middle. A background worker advances it every 0.4 s, and the client polls with a fresh server instance each time. Which statuses will the client see, in which order? What does another user get when asking for the same task id? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A durable task, a background worker and a polling client</div><div class="co-body"><p>The lesson's own <code>TaskService</code> (from <code>code/main.py</code>) stores tasks as JSON files. Every request is handled by a new <code>TaskService</code> instance on the same folder, standing in for any replica. A worker thread advances the task; the client polls <code>tasks/get</code> at a quarter of the suggested interval, answers the approval with <code>tasks/update</code>, and stops at a terminal status. About 2 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Drives this lesson's own task server (code/main.py) with a real background worker and a polling client.
+import tempfile, threading, time, json
+from pathlib import Path
+from main import TaskService, make_request
+
+store = Path(tempfile.mkdtemp())          # shared durable store: every &quot;replica&quot; reads the same files
+replica = lambda: TaskService(store)      # a fresh service per request = any instance can answer
+t0 = time.time()
+stamp = lambda: f&quot;{time.time() - t0:4.1f}s&quot;
+
+def worker(task_id, stop):                # a separate worker advances the task in the background
+    while not stop.is_set():
+        time.sleep(0.4)
+        replica().advance_worker(task_id)
+
+created = replica().dispatch(make_request(1, &quot;tools/call&quot;, {&quot;name&quot;: &quot;generate_report&quot;, &quot;arguments&quot;: {&quot;size&quot;: &quot;large&quot;}}))
+task = created[&quot;result&quot;]
+print(f&quot;{stamp()} tools/call -&gt; resultType={task['resultType']} taskId={task['taskId']} status={task['status']} &quot;
+      f&quot;pollIntervalMs={task['pollIntervalMs']}&quot;)
+stop = threading.Event(); threading.Thread(target=worker, args=(task[&quot;taskId&quot;], stop), daemon=True).start()
+
+req_id, answered = 2, False
+while True:
+    time.sleep(task[&quot;pollIntervalMs&quot;] / 1000 / 4)                     # honour the poll hint (scaled down 4x)
+    r = replica().dispatch(make_request(req_id, &quot;tasks/get&quot;, {&quot;taskId&quot;: task[&quot;taskId&quot;]}))[&quot;result&quot;]; req_id += 1
+    print(f&quot;{stamp()} tasks/get -&gt; {r['status']:&lt;15} {r['statusMessage']}&quot;)
+    if r[&quot;status&quot;] == &quot;input_required&quot; and not answered:
+        key = next(iter(r[&quot;inputRequests&quot;]))
+        print(f&quot;{'':6}server asks: {r['inputRequests'][key]['params']['message']!r} -&gt; user approves&quot;)
+        replica().dispatch(make_request(req_id, &quot;tasks/update&quot;, {&quot;taskId&quot;: task[&quot;taskId&quot;], &quot;inputResponses&quot;: {
+            key: {&quot;action&quot;: &quot;accept&quot;, &quot;content&quot;: {&quot;approved&quot;: True}}}})); req_id += 1; answered = True
+    if r[&quot;status&quot;] in (&quot;completed&quot;, &quot;failed&quot;, &quot;cancelled&quot;):
+        break
+stop.set()
+print(f&quot;\nresult: {r['result']['content'][0]['text']!r} {json.dumps(r['result']['structuredContent'])}&quot;)
+
+other = replica().dispatch(make_request(90, &quot;tasks/get&quot;, {&quot;taskId&quot;: task[&quot;taskId&quot;]}), principal=&quot;user-7&quot;)
+missing = replica().dispatch(make_request(91, &quot;tasks/get&quot;, {&quot;taskId&quot;: &quot;tsk_doesnotexist&quot;}))
+print(f&quot;\nanother user asks for this task -&gt; {other['error']}&quot;)
+print(f&quot;anyone asks for a task that never existed -&gt; {missing['error']}&quot;)
+print(f&quot;\nfiles in the shared store: {[p.name for p in store.glob('*.json')]}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> 0.0s tools/call -&gt; resultType=task taskId=tsk_7742ac76d464 status=working pollIntervalMs=1000
+ 0.3s tasks/get -&gt; working         Preparing report outline.
+ 0.5s tasks/get -&gt; input_required  Waiting for outline approval.
+      server asks: &#x27;Approve the generated report outline?&#x27; -&gt; user approves
+ 0.8s tasks/get -&gt; working         Generating approved report.
+ 1.0s tasks/get -&gt; completed       Report completed.
+
+result: &#x27;Generated large report with approved outline.&#x27; {&quot;approved&quot;: true, &quot;size&quot;: &quot;large&quot;}
+
+another user asks for this task -&gt; {&#x27;code&#x27;: -32602, &#x27;message&#x27;: &#x27;task not found&#x27;}
+anyone asks for a task that never existed -&gt; {&#x27;code&#x27;: -32602, &#x27;message&#x27;: &#x27;task not found&#x27;}
+
+files in the shared store: [&#x27;tsk_7742ac76d464.json&#x27;]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The tool call returns a task, not a result.</strong> <code>tools/call</code> comes back immediately with <code>resultType=task</code>, a random task id, status <code>working</code> and a suggested poll interval of 1000 ms. The work has not happened yet; the task has only been stored.</p>
+<p><strong>Any instance can answer.</strong> Every <code>tasks/get</code> went to a new <code>TaskService</code> reading the same folder, and every one knew the task: the state is in the shared store, not in a connection or a process.</p>
+<p><strong>The client follows the status.</strong> It saw <code>working</code>, then <code>input_required</code> with the server's question ("Approve the generated report outline?"). It answered with <code>tasks/update</code>, saw <code>working</code> again, and finally <code>completed</code>, with the result embedded in the task: text plus structured content. (Exact timings vary with the worker's schedule.)</p>
+<p><strong>Ownership hides existence.</strong> Another user asking for the same id gets <code>-32602 task not found</code>, word for word the same as anyone asking for an id that never existed. The store holds one JSON file, the durable task.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Cancellation, capabilities and removed methods</div><div class="co-body"><p>This block continues from the one above. It cancels a running task, lets the worker wake up afterwards, sends a late update and a second cancel, then calls without the extension declared and tries the removed <code>tasks/list</code> and <code>tasks/result</code>. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above: replica() and make_request are defined.
+def call(i, method, params, **kw):
+    out = replica().dispatch(make_request(i, method, params, **kw))
+    return out.get(&quot;result&quot;) or out.get(&quot;error&quot;)
+
+t = call(1, &quot;tools/call&quot;, {&quot;name&quot;: &quot;generate_report&quot;, &quot;arguments&quot;: {&quot;size&quot;: &quot;small&quot;}})
+print(&quot;created:&quot;, t[&quot;taskId&quot;], t[&quot;status&quot;])
+print(&quot;tasks/cancel -&gt;&quot;, call(2, &quot;tasks/cancel&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;]})[&quot;resultType&quot;], &quot;(only an acknowledgement)&quot;)
+replica().advance_worker(t[&quot;taskId&quot;])                     # the worker wakes up after the cancellation
+print(&quot;after the worker runs, tasks/get -&gt;&quot;, call(3, &quot;tasks/get&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;]})[&quot;status&quot;])
+late = call(4, &quot;tasks/update&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;], &quot;inputResponses&quot;: {
+    &quot;approve_outline&quot;: {&quot;action&quot;: &quot;accept&quot;, &quot;content&quot;: {&quot;approved&quot;: True}}}})
+print(&quot;a late tasks/update -&gt;&quot;, late[&quot;resultType&quot;], &quot;| status still&quot;,
+      call(5, &quot;tasks/get&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;]})[&quot;status&quot;])
+print(&quot;cancelling again -&gt;&quot;, call(6, &quot;tasks/cancel&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;]})[&quot;resultType&quot;], &quot;(idempotent)&quot;)
+
+print(&quot;\nclient that did not declare the tasks extension -&gt;&quot;,
+      call(7, &quot;tools/call&quot;, {&quot;name&quot;: &quot;generate_report&quot;, &quot;arguments&quot;: {}}, tasks=False))
+print(&quot;tasks/list (removed from the extension) -&gt;&quot;, call(8, &quot;tasks/list&quot;, {}))
+print(&quot;tasks/result (removed: poll tasks/get instead) -&gt;&quot;, call(9, &quot;tasks/result&quot;, {&quot;taskId&quot;: t[&quot;taskId&quot;]}))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">created: tsk_3e73a7746d78 working
+tasks/cancel -&gt; complete (only an acknowledgement)
+after the worker runs, tasks/get -&gt; cancelled
+a late tasks/update -&gt; complete | status still cancelled
+cancelling again -&gt; complete (idempotent)
+
+client that did not declare the tasks extension -&gt; {&#x27;code&#x27;: -32021, &#x27;message&#x27;: &#x27;missing required client capability&#x27;, &#x27;data&#x27;: {&#x27;requiredCapabilities&#x27;: {&#x27;extensio
+tasks/list (removed from the extension) -&gt; {&#x27;code&#x27;: -32601, &#x27;message&#x27;: &#x27;method not found&#x27;}
+tasks/result (removed: poll tasks/get instead) -&gt; {&#x27;code&#x27;: -32601, &#x27;message&#x27;: &#x27;method not found&#x27;}</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Cancellation is a request.</strong> <code>tasks/cancel</code> returns a plain acknowledgement. When the worker next looks at the task, it finds it already terminal and does nothing; <code>tasks/get</code> reports <code>cancelled</code>.</p>
+<p><strong>Terminal means terminal.</strong> A late <code>tasks/update</code> is accepted as a message but changes nothing (still <code>cancelled</code>), and a second <code>tasks/cancel</code> is a harmless acknowledgement: retries are safe.</p>
+<p><strong>The extension must be declared, per request.</strong> A <code>tools/call</code> from a client that did not list <code>io.modelcontextprotocol/tasks</code> in its capabilities gets <code>-32021</code>, with the missing capability in the error data, instead of a task it might not understand.</p>
+<p><strong>Removed methods are really gone.</strong> <code>tasks/list</code> and <code>tasks/result</code> from the 2025 experimental design return <code>-32601</code> method not found; clients poll <code>tasks/get</code> instead.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements a deterministic task service:</p>
+<ul>
+<li><code>server/discover</code> returns <code>supportedVersions</code>, cache hints, and the Tasks extension.</li>
+<li><code>tools/list</code> returns a deterministic, cacheable <code>generate_report</code> descriptor with a valid input schema.</li>
+<li><code>tools/call</code> creates and persists the task before returning <code>resultType: "task"</code>.</li>
+<li>A new service instance reloads the same task, demonstrating restart recovery.</li>
+<li><code>tasks/get</code> returns complete task snapshots.</li>
+<li>The worker moves from <code>working</code> to <code>input_required</code>.</li>
+<li><code>tasks/update</code> accepts a form response and returns an empty complete acknowledgement.</li>
+<li>The worker stores a nested <code>CallToolResult</code> with its own <code>resultType</code> and server identity, then transitions to <code>completed</code>.</li>
+<li><code>tasks/cancel</code> is idempotent in this implementation.</li>
+<li>The HTTP builder sets <code>Mcp-Name</code> to <code>params.taskId</code> for <code>tasks/get</code>, <code>tasks/update</code>, and <code>tasks/cancel</code>.</li>
+<li>Notification helpers use <code>notifications/subscriptions/acknowledged</code> and <code>notifications/tasks</code>, both tagged with the listen request id.</li>
+<li>Id-less notifications produce no JSON-RPC response.</li>
+</ul>
+<p>The worker advances explicitly instead of sleeping in a background thread. That makes every state transition deterministic and keeps the protocol example separate from queue mechanics.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>From the repository root:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/13-mcp-async-tasks/code
+python3 main.py
+npx tsx main.ts
+python3 -m unittest discover tests -v
+</code></pre></div>
+<p>Expected result sequence:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">id=0 resultType=complete status=ack
+id=1 resultType=task status=working
+id=2 resultType=complete status=working
+id=3 resultType=complete status=input_required
+id=4 resultType=complete status=ack
+id=5 resultType=complete status=completed
+</code></pre></div>
+<p>Also verify that <code>tasks/status</code>, <code>tasks/result</code>, and <code>tasks/list</code> return method-not-found in the modern service.
+Verify that <code>tools/list</code> is deterministic and every current HTTP task method mirrors its task id through <code>Mcp-Name</code>.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A server keeps tasks in a dictionary inside the process, sets <code>pollIntervalMs</code> to 10, and gives task ids as increasing integers (<code>task-1</code>, <code>task-2</code>, ...). It runs as three replicas behind a load balancer. List what fails. (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Tasks moved out of the core</strong> in MCP 2026-07-28: experimental tasks from 2025-11-25 became the official extension <code>io.modelcontextprotocol/tasks</code>, with <code>tasks/get</code> polling, <code>tasks/update</code> for input, <code>tasks/cancel</code>, and no <code>tasks/list</code> or <code>tasks/result</code>.</li>
+<li><strong>Extensions</strong> are negotiated through the <code>extensions</code> field of client and server capabilities; servers advertise them in <code>server/discover</code>.</li>
+<li><strong>SDK status</strong>: the Python SDK 2.x removed its experimental tasks API and offers a generic <code>Extension</code> mechanism (new methods such as <code>tasks/get</code> are added as <code>MethodBinding</code>s); check your SDK's release notes before relying on built-in task support.</li>
+<li><strong>Production pattern</strong>: tasks in a database or queue (Postgres, Redis, a workflow engine), workers separate from request handlers, and optional change notifications on <code>subscriptions/listen</code>.</li>
+</ul>
+<p>Sources: <a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">MCP 2026-07-28 changelog</a>, <a href="https://modelcontextprotocol.io/docs/extensions/overview">MCP extensions overview</a>, <a href="https://py.sdk.modelcontextprotocol.io/whats-new/">MCP Python SDK: what's new in v2</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Long work becomes a task: an id returned at once, the work done in the background.</li>
+<li>Tasks live in durable shared storage, owned by a principal, with an expiry.</li>
+<li>Poll with <code>tasks/get</code>, answer with <code>tasks/update</code>, ask to stop with <code>tasks/cancel</code>.</li>
+<li>Terminal states never change; cancellation is cooperative and idempotent.</li>
+<li>Non-owners and nonexistent ids get the same answer.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-tasks-elicitation-apps"><span class="t" style="--cs-hue:280">MT</span>Cheat sheet · MCP Tasks, Elicitation and Apps</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-task-store-designer.md</code> now produces an extension-aware design: capability negotiation, durable-before-return creation, current methods, input update flow, ownership, expiry, cancellation, subscription, and migration from the removed experimental methods.</p>
+<p><strong><code>outputs/skill-task-store-designer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: task-store-designer
+description: Design durable MCP work with the current Tasks extension, stateless requests, explicit ownership, polling, input updates, and cancellation.
+version: 2.0.0
+phase: 13
+lesson: 13
+tags: [mcp, tasks, extension, durable-state, stateless]
+---
+
+Design long-running MCP work against the `io.modelcontextprotocol/tasks` extension.
+
+Produce:
+
+1. Eligibility decision. Explain why the operation needs a task instead of a synchronous `tools/call`.
+2. Capability contract. Show exact `supportedVersions`, capabilities, `ttlMs`, and `cacheScope` in `server/discover`, plus the Tasks extension in per-request client capabilities. If tools are advertised, include mandatory deterministic `tools/list` descriptors with a valid object `inputSchema`, server identity metadata, and cache hints. Use `-32021` with a `requiredCapabilities` object when the extension is absent, and `-32022` with exact `supported` and `requested` data for an unsupported version.
+3. Creation transaction. Persist the task until `tasks/get` can resolve it, then return server-directed `resultType: &quot;task&quot;`.
+4. State shape. Include `taskId`, `status`, `statusMessage`, ISO timestamps, `ttlMs`, `pollIntervalMs`, authoritative owner, original operation reference, result or error, outstanding input requests, and all issued input keys. A completed task's nested `CallToolResult` has required `resultType: &quot;complete&quot;` and SHOULD include its own `io.modelcontextprotocol/serverInfo` metadata.
+5. Current methods. Define `tasks/get`, `tasks/update`, and `tasks/cancel`. For Streamable HTTP, each request sets `Mcp-Name` to `params.taskId`. Do not introduce `tasks/status`, `tasks/result`, or `tasks/list`.
+6. Input continuation. Separate pre-creation MRTR from post-creation `tasks/get` plus `tasks/update`. Require lifetime-unique input keys and partial-response handling.
+7. Durability plan. Choose atomic filesystem storage, a transactional database, or a shared queue and store. Include worker leasing and restart behavior.
+8. Ownership policy. Authorize every task method and subscription by tenant and principal. Never treat task-id knowledge as permission.
+9. Cancellation contract. State that acknowledgement is cooperative and may not lead to `cancelled`.
+10. Notification option. Use `subscriptions/listen` on a POST response SSE stream and `notifications/tasks`, with polling as the baseline. Put `io.modelcontextprotocol/subscriptionId`, equal to the listen request id, in the acknowledgement and every task notification. An id-less notification receives no JSON-RPC response; an accepted HTTP notification receives `202` with no body.
+11. Expiry policy. Interpret `ttlMs` from creation, define purge behavior, and avoid leaking whether another tenant's task exists.
+12. Migration map. Replace client-requested task flags and the removed experimental methods with the current extension flow.
+
+Hard rejects:
+
+- Returning a task handle before durable read visibility.
+- Returning `resultType: &quot;task&quot;` to a request that did not advertise the extension.
+- Using `params._meta.task.required`, `tasks/status`, `tasks/result`, or `tasks/list` as the current API.
+- Using `initialize`, `Mcp-Session-Id`, sticky routing, or hidden transport-session state as the task store.
+- Treating `tasks/cancel` acknowledgement as proof that the worker stopped.
+- Reusing an `inputRequests` key during one task lifetime.
+- Returning a task to a caller that is not its authoritative owner.
+- Implementing notification delivery through standalone GET, session SSE, or `Last-Event-ID` replay.
+
+Refusal rules:
+
+- Refuse a task for a fast deterministic lookup unless the caller gives a concrete durability requirement.
+- Refuse an in-memory-only production store when work must survive process restart.
+- Refuse an unbounded result payload; store large artifacts externally and return an authorized resource handle.
+- Refuse a history endpoint without explicit tenant ownership, filtering, pagination, and retention policy.
+
+Output a one-page design with a lifecycle table, wire methods, persistence transaction, ownership rules, input flow, polling cadence, cancellation semantics, subscription option, expiry cleanup, failure model, and legacy migration map.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Add a second outstanding input key. Send a partial <code>tasks/update</code> and prove the task remains <code>input_required</code> until both keys are answered.</li>
+<li>Add tenant ownership to the store and reject a valid task id presented by the wrong authenticated principal.</li>
+<li>Add a worker lease with expiry. Demonstrate that two service instances cannot complete the same task concurrently.</li>
+<li>Implement a POST-response SSE adapter for <code>subscriptions/listen</code>. Do not add GET, <code>Last-Event-ID</code>, or a session header.</li>
+<li>Add expiry cleanup. Distinguish an expired task from a malformed task id without leaking cross-tenant existence.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1313-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · working, input_required, working, completed</span></summary><div class="qa-a"><p><code>working</code>, then <code>input_required</code> (with the approval question), then <code>working</code> again after the client's <code>tasks/update</code>, then <code>completed</code> with the result. A slow poll could skip a short-lived state, which is why clients must handle whatever status they find rather than expect every step.</p>
+<p>Another user gets <code>-32602 task not found</code>, exactly the answer for an id that does not exist, so the id leaks nothing.</p></div></details>
+<details class="qa" id="a1313-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Lost tasks, a polling storm, guessable ids</span></summary><div class="qa-a"><ul>
+<li><strong>Tasks vanish across replicas.</strong> A task created on replica 1 lives in replica 1's dictionary; <code>tasks/get</code> on replica 2 or 3 says "not found" two times in three. A restart or deploy loses every task. Tasks need a shared, durable store.</li>
+<li><strong>A polling storm.</strong> <code>pollIntervalMs: 10</code> invites every client to ask 100 times per second per task. A thousand running tasks become 100,000 requests per second for status that rarely changes. Choose the interval from the job's expected length (seconds to minutes), and rate-limit clients that ignore it.</li>
+<li><strong>Guessable ids.</strong> With <code>task-1</code>, <code>task-2</code>, ... anyone can enumerate tasks, and if ownership is checked inconsistently (or errors differ for "not yours" and "does not exist"), they learn which exist and maybe read other users' results. Ids should be long and random, every access checked against the owner, and both failure cases answered identically.</li>
+</ul></div></details>
+<h2>Legacy Compatibility</h2>
+<p>The 2025-11-25 experimental surface used client-requested task augmentation, <code>tasks/status</code>, <code>tasks/result</code>, and optional <code>tasks/list</code>. Keep those names only inside a pinned legacy adapter. A current client uses the extension capability, accepts server-directed handles, polls <code>tasks/get</code>, supplies input with <code>tasks/update</code>, and reads the final result from the task snapshot.</p>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://tasks.extensions.modelcontextprotocol.io/specification/draft/tasks">Official MCP Tasks extension</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr">MCP 2026-07-28 Multi Round-Trip Requests</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http">MCP 2026-07-28 Streamable HTTP</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/13-mcp-async-tasks" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1313" id="done-a1313">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1313" id="undo-a1313" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1312"><span class="pn-dir">Previous</span><span class="pn-t">13.12 · Explicit Scope and Stateless Elicitation</span></a><a class="pn next" href="#a1314"><span class="pn-dir">Next</span><span class="pn-t">13.14 · MCP Apps on the Stateless Protocol</span></a></div></footer>

@@ -1,0 +1,415 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-12">Phase 12 · Multimodal AI</a></nav><h1>ColPali and Vision-Native Document RAG</h1><div class="m-meta"><span class="chip chip-num">Lesson 12.23</span><span class="chip">180 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1223" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain the difference between bi-encoder retrieval (one vector per document) and late-interaction retrieval (many vectors per document).</li>
+<li>Describe ColBERT's MaxSim operation and how ColPali generalizes it from text tokens to image patches.</li>
+<li>Build a tiny ColPali-like indexer: page → patch embeddings → MaxSim over query-term embeddings → top-k pages.</li>
+<li>Compare ColPali + Qwen2.5-VL generator vs text-RAG + GPT-4 on an invoices / financial reports use case.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 11 (LLM Engineering — RAG basics), Phase 12 · 05 (LLaVA)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 180 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, multi-vector indexer + MaxSim scorer), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Traditional RAG parses PDFs into text, splits into chunks, embeds chunks, stores vectors. Every step loses signal: OCR drops chart data, chunking breaks table rows, text embeddings ignore figures. ColPali (Faysse et al., July 2024) asked the simpler question: why extract text at all? Embed the page image directly via PaliGemma, use ColBERT-style late interaction for retrieval, and keep all the layout, figures, fonts, and formatting signal the document carries. On its own benchmark, ViDoRe, ColPali scored 81.3 nDCG@5 against 67.0 for the best text pipeline; VisRAG, a related design, reported 20–40% better end-to-end answers than text RAG</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Late interaction</td>
+<td>"ColBERT-style"</td>
+<td>Retrieval using per-token or per-patch embeddings + MaxSim, not a single doc vector</td>
+</tr>
+<tr>
+<td>MaxSim</td>
+<td>"Max-over-patches"</td>
+<td>For each query token, pick the highest-similarity document token; sum across query</td>
+</tr>
+<tr>
+<td>Bi-encoder</td>
+<td>"Single-vector"</td>
+<td>One vector per document; faster but loses granularity</td>
+</tr>
+<tr>
+<td>Multi-vector</td>
+<td>"Many-vectors-per-doc"</td>
+<td>Store $N_p$ vectors per document / page; storage cost grows but recall improves</td>
+</tr>
+<tr>
+<td>Patch embedding</td>
+<td>"Page feature"</td>
+<td>One vector per image patch from a VLM encoder, cached per page</td>
+</tr>
+<tr>
+<td>ViDoRe</td>
+<td>"Vision doc bench"</td>
+<td>ColPali's benchmark suite for visual document retrieval</td>
+</tr>
+<tr>
+<td>PQ quantization</td>
+<td>"Product quantization"</td>
+<td>Split each vector into sub-vectors and store a codebook index for each; shrinks storage many times at some cost in accuracy</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>The usual way to search PDFs (text RAG) first turns each page into text with OCR, cuts the text into chunks and stores one vector per chunk. Charts, table layout and badly scanned pages get lost on the way. ColPali skips the text step: a vision-language model looks at the page image and produces many small vectors, one per patch of the page. A question is also turned into one vector per word piece. Each word piece then finds its best-matching patch, and the page's score is the sum of those best matches. This is called late interaction, or MaxSim, from ColBERT. The price is storage, because each page has about a thousand vectors instead of one. This lesson explains ColBERT, ColPali and their relatives. It then runs a real 256M-parameter ColPali-family model (ColSmol) against OCR plus a text embedder on rendered pages, and measures how much pooling and binary quantization shrink the index. No model is trained.</p></div></aside>
+<p>Text-RAG on PDFs throws away most of the document. A financial report's Q3 revenue growth is usually in a chart; a medical report's findings are in annotated images; a legal contract's signature block is a layout fact, not a text fact.</p>
+<p>The text-RAG pipeline:</p>
+<ol>
+<li>PDF → text via OCR / pdftotext.</li>
+<li>Text → 300-500 token chunks.</li>
+<li>Chunk → bi-encoder embedding (one vector).</li>
+<li>User query → embedding → cosine similarity → top-k chunks.</li>
+<li>Chunks + query → LLM.</li>
+</ol>
+<p>Five lossy steps. Charts not captured. Tables broken across chunks. Multi-column layout flattens. Figure annotations disappear.</p>
+<p>ColPali's fix: skip OCR, embed the page image directly. Use ColBERT-style late interaction for retrieval so the model can attend to fine-grained patches at query time.</p>
+<h2>Idea 1 · ColBERT (2020)</h2>
+<p>ColBERT (Khattab &amp; Zaharia, arXiv:2004.12832) is a text retrieval method. Instead of one vector per document, it produces one vector per token. At query time:</p>
+<ul>
+<li>Query tokens get their own embeddings (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> vectors).</li>
+<li>Document tokens get embeddings (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> vectors, typically cached).</li>
+<li>Score = sum over query tokens of max over document tokens of cosine similarity: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>.</li>
+</ul>
+<p>This is the MaxSim operation. Each query token "picks" its best-matching document token. The final score is the sum.</p>
+<p>Pros: strong recall, handles term-level semantics. Cons: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> vectors per document, storage expensive.</p>
+<h2>Idea 2 · ColPali</h2>
+<p>ColPali (Faysse et al., arXiv:2407.01449) applies the ColBERT pattern to images.</p>
+<ul>
+<li>Each page is encoded by PaliGemma-3B at 448×448 pixels: SigLIP's 1,024 patch embeddings pass through the language model together with a short text prompt, and a linear layer projects every output to 128 dimensions. That is about 1,030 vectors per page (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>).</li>
+<li>Each user query (text) is encoded into query-token embeddings: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> vectors.</li>
+<li>Score = <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>, i.e., MaxSim over query-text-tokens and page-image-patches.</li>
+<li>Retrieve top-k pages by total score.</li>
+</ul>
+<p>At document-ingestion time: embed every page with PaliGemma, store all patch embeddings. At query time: embed the query tokens, compute MaxSim against all stored page embeddings, return top-k pages.</p>
+<p>Pros: on ViDoRe, 81.3 nDCG@5 against 67.0 for the best text pipeline (OCR plus image captions, embedded with BGE-M3), and indexing needs no OCR or layout step. Each patch vector captures local layout and content.</p>
+<p>Cons: storage. 1,030 vectors × 128 dimensions × 2 bytes is about 256 KB per page, against about 1.5 KB for one 768-dimensional vector in 16 bits. Mitigated by token pooling (merging similar vectors), quantization (int8 or binary) and compressed multi-vector indexes such as ColBERTv2's PLAID.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Bi-encoder</strong> (one vector per page): <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord"><span class="mord mathbf">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathbf">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>.</p>
+<p><strong>Late interaction (MaxSim).</strong> With unit vectors <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7779em;vertical-align:-0.3473em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.109em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3473em;"><span></span></span></span></span></span></span></span></span></span> for the query and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9503em;vertical-align:-0.2559em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.109em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2559em;"><span></span></span></span></span></span></span></span></span></span> for the page:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">s</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">d</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.2143em;vertical-align:-1.2777em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.9367em;"><span style="top:-1.8723em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.4083em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:-0.109em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2819em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2777em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3557em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mrel mtight">≤</span><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">≤</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3488em;margin-left:-0.109em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1512em;"><span></span></span></span></span></span></span></span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.8804em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-2.453em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.247em;"><span></span></span></span></span></span></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div>
+Each query vector keeps only its best match; the page needs a good match for every part of the query, anywhere on it.</p>
+<p><strong>Cost per page</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> dot products of dimension <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span></span></span></span>. <strong>Storage per page</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> bytes for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>-byte values, or <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mord">/8</span></span></span></span> bytes in binary (the sign of each dimension).</p>
+<p><strong>Token pooling</strong> replaces the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> page vectors by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span> cluster means (pool factor <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span>), with no retraining.</p>
+<p><strong>nDCG@5</strong>, ViDoRe's metric, for one relevant page found at rank <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord"><span class="mord mathrm">nDCG@5</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord">1/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span><span class="arraycolsep" style="width:1em;"></span><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">5</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord">5.</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">MaxSim by hand, and what it costs</div><div class="co-body"><ul>
+<li>A 3-vector query against page A: best matches 0.9, 0.2, 0.3, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.4</span></span></span></span>. Against page B: 0.5, 0.5, 0.5, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.5</span></span></span></span>. B wins: it matches every part of the query moderately, while A matches one part very well and misses the rest.</li>
+<li>ColPali page: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">030</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span> bytes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">263</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">680</span></span></span></span> bytes, about 256 KB. In binary: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">030</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">16</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">480</span></span></span></span> bytes, about 16 KB.</li>
+<li>A 20-vector query against a 1,135-vector ColSmol page: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">1</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">135</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">22</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">700</span></span></span></span> dot products of 128 dimensions, about 2.9M multiply-adds. A bi-encoder with 384 dimensions needs 384: about 7,600 times less.</li>
+<li>nDCG@5 if the right page comes 1st: 1. 3rd: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>. 6th: 0.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "ColPali runs OCR and embeds the text."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It embeds the page image; there is no OCR step anywhere.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "MaxSim averages the similarity of all patches."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Each query vector takes only its single best patch; the page score is the sum of those maxima.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Shrinking a multi-vector index needs a new model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Token pooling and binary quantization are applied at indexing time, to the same vectors.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Vision retrieval replaces the generator."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It returns pages; a VLM still has to read them to answer.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Ten rendered pages, four of them look-alike distractors, and six questions. One of the right pages is a bad scan on which OCR finds no words. Which retriever finds that page: OCR plus a text embedder, or ColSmol on the image? And does either fall for the distractors? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Vision retrieval against OCR plus text retrieval</div><div class="co-body"><p>Ten pages are rendered with Pillow: a bar chart, tables, notices, invoices, a roadmap and four look-alike distractors. One page is degraded like a bad scan. Text RAG reads each page with Tesseract and embeds the text with bge-small (one vector per page). Vision RAG embeds each page image with ColSmol-256M (<code>vidore/colSmol-256M</code>, about 0.5 GB, loaded with Sentence Transformers' <code>MultiVectorEncoder</code>) and scores with MaxSim. About a minute and a half on a 2-core CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time
+import numpy as np, torch, pytesseract
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from sentence_transformers import MultiVectorEncoder, SentenceTransformer
+
+F = &quot;/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf&quot;
+font = lambda s: ImageFont.truetype(F, s)
+
+def page(title, lines=(), table=(), bars=(), boxes=()):
+    im = Image.new(&quot;RGB&quot;, (850, 1100), &quot;white&quot;); d = ImageDraw.Draw(im)
+    d.text((60, 60), title, font=font(38), fill=&quot;black&quot;)
+    for i, l in enumerate(lines):
+        d.text((60, 170 + 44 * i), l, font=font(28), fill=&quot;black&quot;)
+    for i, (k, v) in enumerate(table):
+        d.text((80, 180 + 60 * i), k, font=font(28), fill=&quot;black&quot;); d.text((520, 180 + 60 * i), v, font=font(28), fill=&quot;black&quot;)
+        d.line((60, 225 + 60 * i, 790, 225 + 60 * i), fill=&quot;gray&quot;)
+    for i, (label, v) in enumerate(bars):          # values only as bar heights
+        x = 110 + i * 170
+        d.rectangle((x, 900 - v * 10, x + 100, 900), fill=(40, 90, 160))
+        d.text((x + 5, 915), label, font=font(24), fill=&quot;black&quot;)
+    for i, b in enumerate(boxes):
+        d.rectangle((60, 180 + 170 * i, 790, 300 + 170 * i), outline=&quot;black&quot;, width=3)
+        d.text((90, 220 + 170 * i), b, font=font(32), fill=&quot;black&quot;)
+    return im
+
+def bad_scan(im, seed=0):                          # skewed, blurred, noisy: OCR gives up (Lesson 12.22)
+    im = im.convert(&quot;L&quot;).rotate(3, expand=True, fillcolor=255).filter(ImageFilter.GaussianBlur(1))
+    a = np.asarray(im, float) + np.random.default_rng(seed).normal(0, 40, (im.size[1], im.size[0]))
+    return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8)).convert(&quot;RGB&quot;)
+
+pages = [  # pages 0-5 answer the queries; 6-9 are look-alike distractors
+    page(&quot;Quarterly revenue by region&quot;, bars=((&quot;North&quot;, 42), (&quot;South&quot;, 18), (&quot;East&quot;, 65), (&quot;West&quot;, 31))),
+    page(&quot;Headcount by department&quot;, table=((&quot;Department&quot;, &quot;People&quot;), (&quot;Engineering&quot;, &quot;120&quot;), (&quot;Sales&quot;, &quot;45&quot;), (&quot;Finance&quot;, &quot;12&quot;))),
+    page(&quot;Office relocation notice&quot;, lines=(&quot;From 1 June our London team moves to&quot;, &quot;8 Dock Street, Canary Wharf.&quot;,
+                                            &quot;The old building closes on 31 May.&quot;)),
+    bad_scan(page(&quot;Fire evacuation procedure&quot;, lines=(&quot;When the alarm sounds, leave by the&quot;, &quot;nearest exit. Do not use the lifts.&quot;,
+                                                      &quot;Meet at the assembly point in the car park.&quot;))),
+    page(&quot;Invoice INV-2026-0042&quot;, lines=(&quot;Bill to: Northwind Garden Supplies&quot;, &quot;Cordless drill x3    $567.00&quot;, &quot;Total due            $1,022.40&quot;)),
+    page(&quot;Product roadmap 2026&quot;, boxes=(&quot;Q1: Mobile app&quot;, &quot;Q2: Offline mode&quot;, &quot;Q3: Single sign-on&quot;)),
+    page(&quot;Quarterly revenue by product&quot;, bars=((&quot;Drills&quot;, 50), (&quot;Saws&quot;, 22), (&quot;Gloves&quot;, 9), (&quot;Bits&quot;, 35))),
+    page(&quot;Fire extinguisher inspection log&quot;, table=((&quot;Floor&quot;, &quot;Last checked&quot;), (&quot;Ground&quot;, &quot;3 Feb&quot;), (&quot;First&quot;, &quot;3 Feb&quot;), (&quot;Second&quot;, &quot;4 Feb&quot;))),
+    page(&quot;Invoice INV-2026-0043&quot;, lines=(&quot;Bill to: Contoso Builders&quot;, &quot;Safety gloves x40    $250.00&quot;, &quot;Total due            $300.00&quot;)),
+    page(&quot;Headcount plan 2027&quot;, table=((&quot;Department&quot;, &quot;Target&quot;), (&quot;Engineering&quot;, &quot;150&quot;), (&quot;Sales&quot;, &quot;60&quot;), (&quot;Finance&quot;, &quot;14&quot;))),
+]
+queries = [&quot;which region brought in the most revenue&quot;, &quot;how many engineers do we have now&quot;,
+           &quot;new office address after the move&quot;, &quot;what to do when the fire alarm sounds&quot;,
+           &quot;amount due for Northwind Garden Supplies&quot;, &quot;when will single sign-on ship&quot;]
+
+# Text RAG: OCR every page, one bge-small vector per page.
+ocr = [pytesseract.image_to_string(p) for p in pages]
+bge = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;, device=&quot;cpu&quot;)
+P = bge.encode(ocr, normalize_embeddings=True)
+Q = bge.encode([&quot;Represent this sentence for searching relevant passages: &quot; + q for q in queries], normalize_embeddings=True)
+text_scores = Q @ P.T
+
+# Vision RAG: ColSmol-256M embeds each page image as many 128-d vectors; MaxSim scores them.
+t0 = time.time()
+col = MultiVectorEncoder(&quot;vidore/colSmol-256M&quot;, device=&quot;cpu&quot;)
+doc_emb = col.encode_document(pages, batch_size=1)      # one page at a time keeps memory low
+q_emb = col.encode_query(queries)
+vis_scores = col.similarity(q_emb, doc_emb).float().numpy()
+print(f&quot;ColSmol-256M: {len(pages)} pages, {tuple(doc_emb[0].shape)} vectors each; &quot;
+      f&quot;query 0 -&gt; {tuple(q_emb[0].shape)}; {time.time() - t0:.0f} s on CPU&quot;)
+print(f&quot;OCR words per page: {[len(t.split()) for t in ocr]}&quot;)
+
+rank = lambda s, i: int((s[i] &gt; s[i][i]).sum()) + 1
+top = lambda s, i: int(np.argmax(s[i]))
+print(f&quot;\n{'query':&lt;42}{'OCR+bge':&gt;8}{'ColSmol':&gt;9}   rank of the right page (top pick if wrong)&quot;)
+for i, q in enumerate(queries):
+    rt, rv = rank(text_scores, i), rank(vis_scores, i)
+    note = lambda r, s: f&quot;{r}&quot; if r == 1 else f&quot;{r} (p{top(s, i)})&quot;
+    print(f&quot;{q:&lt;42}{note(rt, text_scores):&gt;8}{note(rv, vis_scores):&gt;9}&quot;)
+for name, s in ((&quot;OCR+bge&quot;, text_scores), (&quot;ColSmol&quot;, vis_scores)):
+    r = [rank(s, i) for i in range(len(queries))]
+    print(f&quot;{name:&lt;8} recall@1 {np.mean([x == 1 for x in r]):.0%}   MRR {np.mean([1 / x for x in r]):.2f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ColSmol-256M: 10 pages, (1135, 128) vectors each; query 0 -&gt; (20, 128); 71 s on CPU
+OCR words per page: [8, 11, 23, 0, 14, 12, 8, 16, 13, 11]
+
+query                                      OCR+bge  ColSmol   rank of the right page (top pick if wrong)
+which region brought in the most revenue         1        1
+how many engineers do we have now                1        1
+new office address after the move                1        1
+what to do when the fire alarm sounds       3 (p7)        1
+amount due for Northwind Garden Supplies         1        1
+when will single sign-on ship                    1        1
+OCR+bge  recall@1 83%   MRR 0.89
+ColSmol  recall@1 100%   MRR 1.00</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Each page becomes 1,135 vectors.</strong> ColSmol turns every 850×1100 page into 1,135 vectors of 128 dimensions (image tiles plus a short prompt), and a short question into about 20. Indexing 10 pages took a little over a minute on a 2-core CPU, so a laptop can index a few thousand pages an hour; a GPU is much faster.</p>
+<p><strong>OCR reads nothing from the bad scan.</strong> Tesseract finds 8 to 23 words on each clean page and 0 on the degraded fire-evacuation page. Text RAG cannot retrieve a page whose text it never saw. Its top pick for the fire question is page 7, the clean "Fire extinguisher inspection log", which shares the word "fire". The right page comes third.</p>
+<p><strong>The image retriever still finds it.</strong> ColSmol ranks the degraded page first: blurred, rotated and noisy text is still recognisable as an evacuation notice to a model that looks at the pixels.</p>
+<p><strong>Neither fell for the other distractors.</strong> "How many engineers do we have now" picked the current headcount over the 2027 plan, and the Northwind invoice over the Contoso one, in both systems. Clean, short pages are easy for text RAG too; the gap opens where text extraction fails.</p>
+<p><strong>Ten pages prove the mechanism, not the size of the gain.</strong> Use a benchmark such as ViDoRe, or better your own pages and questions, to measure how much vision retrieval helps.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Shrinking the index without retraining</div><div class="co-body"><p>This block continues from the one above and reuses its page and query vectors. It stores the real ColSmol vectors in float32, bf16 and binary form, and pools them by Ward clustering at factors 2, 3 and 4. For each version it checks whether the right pages still rank first and how closely the scores follow the uncompressed ones. Then it scales the storage to a million pages. A few seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above: pages, queries, doc_emb, q_emb and vis_scores are already defined.
+import numpy as np, torch
+from scipy.cluster.hierarchy import linkage, fcluster
+
+D = [e.float().numpy() for e in doc_emb]                 # one (n_vectors, 128) array per page, unit length
+Qv = [q.float().numpy() for q in q_emb]
+
+def maxsim(q, d):                                        # sum over query vectors of the best page vector
+    return (q @ d.T).max(axis=1).sum()
+
+def evaluate(docs, qs=Qv, sim=maxsim):
+    S = np.array([[sim(q, d) for d in docs] for q in qs])
+    ranks = [int((S[i] &gt; S[i][i]).sum()) + 1 for i in range(len(qs))]
+    return S, ranks
+
+def pool(d, factor):                                     # token pooling: Ward clustering, then cluster means
+    labels = fcluster(linkage(d, &quot;ward&quot;), t=max(1, len(d) // factor), criterion=&quot;maxclust&quot;)
+    m = np.stack([d[labels == c].mean(0) for c in np.unique(labels)])
+    return m / np.linalg.norm(m, axis=1, keepdims=True)
+
+def binary_sim(q, d):                                    # 1 bit per dimension: sign agreement
+    return ((np.sign(q) @ np.sign(d).T) / q.shape[1]).max(axis=1).sum()
+
+full, r_full = evaluate(D)
+n = D[0].shape[0]
+print(f&quot;one page: {n} vectors x 128 dims&quot;)
+print(f&quot;\n{'index':&lt;28}{'bytes/page':&gt;11}{'vectors':&gt;9}{'right page ranks':&gt;22}{'score corr.':&gt;12}&quot;)
+rows = [(&quot;float32&quot;, D, maxsim, 4 * 128), (&quot;bfloat16&quot;, D, maxsim, 2 * 128), (&quot;binary (1 bit/dim)&quot;, D, binary_sim, 16)]
+for f in (2, 3, 4):
+    rows.append((f&quot;bf16, pooled x{f}&quot;, [pool(d, f) for d in D], maxsim, 2 * 128))
+rows.append((&quot;binary, pooled x3&quot;, [pool(d, 3) for d in D], binary_sim, 16))
+for name, docs, sim, bytes_per_vec in rows:
+    S, r = evaluate(docs, sim=sim)
+    nv = np.mean([len(d) for d in docs])
+    corr = np.corrcoef(S.ravel(), full.ravel())[0, 1]
+    print(f&quot;{name:&lt;28}{nv * bytes_per_vec:&gt;11,.0f}{nv:&gt;9.0f}{str(r):&gt;22}{corr:&gt;12.3f}&quot;)
+
+# What a million pages would need, and what brute-force MaxSim would cost per query.
+pages_n, nq = 1_000_000, Qv[0].shape[0]
+print(f&quot;\nfor {pages_n:,} pages:&quot;)
+for name, per_page in ((&quot;one 384-d float32 vector per page (bge-small)&quot;, 384 * 4),
+                       (&quot;one 2,304-d 16-bit vector per page (VisRAG)&quot;, 2304 * 2),
+                       (&quot;ColSmol, bfloat16&quot;, n * 128 * 2), (&quot;ColSmol, binary&quot;, n * 16),
+                       (&quot;ColSmol, binary, pooled x3&quot;, n / 3 * 16)):
+    print(f&quot;  {name:&lt;48}{per_page * pages_n / 1e9:&gt;8.1f} GB&quot;)
+flops = 2 * nq * n * 128 * pages_n
+print(f&quot;brute-force MaxSim, one {nq}-vector query: {flops / 1e12:.1f} TFLOP &quot;
+      f&quot;(about {flops / 1e11:.0f} s at 100 GFLOP/s on a laptop CPU)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">one page: 1135 vectors x 128 dims
+
+index                        bytes/page  vectors      right page ranks score corr.
+float32                         581,120     1135    [1, 1, 1, 1, 1, 1]       1.000
+bfloat16                        290,560     1135    [1, 1, 1, 1, 1, 1]       1.000
+binary (1 bit/dim)               18,160     1135    [1, 1, 1, 1, 1, 1]       0.956
+bf16, pooled x2                 145,152      567    [1, 1, 1, 1, 1, 1]       1.000
+bf16, pooled x3                  96,768      378    [1, 1, 1, 1, 1, 1]       0.999
+bf16, pooled x4                  72,448      283    [1, 1, 1, 1, 1, 1]       0.999
+binary, pooled x3                 6,048      378    [1, 1, 1, 1, 1, 1]       0.948
+
+for 1,000,000 pages:
+  one 384-d float32 vector per page (bge-small)        1.5 GB
+  one 2,304-d 16-bit vector per page (VisRAG)          4.6 GB
+  ColSmol, bfloat16                                  290.6 GB
+  ColSmol, binary                                     18.2 GB
+  ColSmol, binary, pooled x3                           6.1 GB
+brute-force MaxSim, one 20-vector query: 5.8 TFLOP (about 58 s at 100 GFLOP/s on a laptop CPU)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Binary vectors keep the ranking.</strong> Storing only the sign of each dimension cuts a page from 290,560 bytes (bf16) to 18,160, 16 times less. All six right pages still rank first, and the scores correlate 0.956 with the full ones.</p>
+<p><strong>Pooling barely moves the scores.</strong> Merging similar vectors by Ward clustering keeps the correlation at 0.999 or more even at factor 4 (283 vectors per page). Neighbouring patches of a page, such as blank margin or a run of text, carry nearly the same vector, so their mean loses little.</p>
+<p><strong>Together: 48 times smaller.</strong> Binary plus pooling at factor 3 stores a page in 6,048 bytes, with correlation 0.948 and every right page still first. On a small, easy set every method ranks perfectly; on a real corpus, measure the recall loss before choosing a setting.</p>
+<p><strong>At a million pages, storage and compute decide the design.</strong> bf16 ColSmol vectors need about 290 GB, binary 18 GB, binary and pooled 6 GB, against 1.5 GB for one bge-small vector per page. Brute-force MaxSim over a million pages is about 5.8 trillion operations per query, roughly a minute on a laptop CPU. So large systems first find a few hundred candidate pages cheaply, then score only those with MaxSim.</p></div></aside>
+<h2>Idea 3 · ColQwen2 and ColSmol</h2>
+<p>ColQwen2 (illuin-tech, 2024) swaps PaliGemma for Qwen2-VL-2B with dynamic resolution, so the number of vectors follows the page's size and shape; it scores higher on ViDoRe. ColQwen2.5 followed in 2025.</p>
+<p>ColSmol is the smaller-scale variant for local / edge use: built on SmolVLM-256M or -500M with LoRA adapters, trained on the same 127k query-page pairs. The 256M version runs on a laptop CPU (measured below).</p>
+<h2>Idea 4 · VisRAG</h2>
+<p>VisRAG (Yu et al., arXiv:2410.10594) is a different variant: it pools each page into a single 2,304-dimensional vector (about 4.5 KB) from MiniCPM-V 2.0, by position-weighted mean pooling, and retrieves with ordinary cosine search. Its paper reports in-domain MRR@10 of 77.9 against 76.5 for ColPali, and 20–40% better end-to-end answers than text-based RAG.</p>
+<p>The trade-off: many vectors per page for fine-grained matching, one vector per page for cheap search at scale. Which one wins on quality depends on the documents and the queries; test both on your own pages.</p>
+<h2>Idea 5 · M3DocRAG</h2>
+<p>M3DocRAG (Cho et al., arXiv:2411.04952) extends multi-modal retrieval to multi-page multi-document reasoning. ColPali retrieves pages across documents (its M3DocVQA benchmark has 3,368 PDFs with 41,005 pages), and Qwen2-VL 7B answers from up to 4 retrieved page images. An inverted-file index (Faiss IVF) cut retrieval from 21 s to 1.8 s per query over those 40k pages.</p>
+<h2>Idea 6 · ViDoRe — the benchmark</h2>
+<p>ColPali's companion benchmark. Visual Document Retrieval Evaluation. Its tasks reuse academic visual QA sets (DocVQA, InfoVQA, TAT-DQA, ArxivQA, TabFQuAD) and add practical topics (energy, government reports, healthcare, AI, sustainability). Metric: nDCG@5.</p>
+<p>ColPali scored 81.3 average nDCG@5 on ViDoRe; the best text pipeline scored 67.0, and OCR with BM25 65.5. ViDoRe V2 (2025) added longer, harder queries over larger document sets, on which all scores are much lower.</p>
+<h2>Idea 7 · The end-to-end RAG pipeline</h2>
+<p>For a vision-native RAG:</p>
+<ol>
+<li>Ingest: PDF → page images → PaliGemma encoding → store all patch embeddings.</li>
+<li>Query: user text → query-token embeddings → MaxSim against all indexed pages → top-k pages.</li>
+<li>Generate: top-k page images + query → VLM (Qwen2.5-VL or Claude) → answer.</li>
+</ol>
+<p>No OCR anywhere. Figures, charts, fonts, layout all flow into the answer.</p>
+<h2>Idea 8 · Storage math</h2>
+<p>A 50-page financial report with ColPali's 1,030 vectors per page and 128-dim embeddings:</p>
+<ul>
+<li>ColPali: 50 × 1,030 × 128 × 2 bytes (bf16) ≈ 13 MB; with binary quantization (1 bit per dimension) about 0.8 MB.</li>
+<li>Text-RAG: 50 chunks * 768-dim * 4 bytes = ~150 kB.</li>
+</ul>
+<p>ColPali in bf16 takes about 86 times the storage of the float32 text vectors. Binary quantization plus token pooling at factor 3 brings it to under 2 times (measured on real ColSmol vectors below), usually tolerable.</p>
+<h2>Idea 9 · When text-RAG still wins</h2>
+<ul>
+<li>Pure-text documents with no layout signal (wiki articles, chat logs). Text-RAG is simpler and storage-cheaper.</li>
+<li>Multi-million-page archives where storage dominates cost.</li>
+<li>Strict regulatory requirements demanding extractable OCR text alongside the retrieval.</li>
+</ul>
+<p>For visually rich documents (financial reports, scientific papers, slides, manuals, scanned forms), vision-native retrieval tends to win in 2026; measure it on your own pages.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="mm-maxsim"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>Toy patch encoder: maps a "page" (small grid of feature vectors) to an array of patch embeddings.</li>
+<li>MaxSim scorer: computes the ColBERT-style score between a query token embedding set and a page patch set.</li>
+<li>Indexes 5 toy pages, runs 3 queries, returns top-k with scores.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team indexes one million pages with a ColPali-family model, stores every vector in bf16 and scores each query with brute-force MaxSim over all pages. What happens to memory and latency, and how do production systems avoid it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>ColPali-family retrievers</strong> are used in production document search: ColQwen2 (2B, fits an 8 GB laptop GPU in bf16) and ColQwen2.5 (3B, more comfortable in 8-bit on such a card) for quality, ColSmol (256M and 500M) for CPUs and edge devices. They load through the <code>colpali-engine</code> library or Sentence Transformers' <code>MultiVectorEncoder</code>, as above.</li>
+<li><strong>Vector databases with multi-vector fields</strong>: Vespa, Qdrant and Weaviate can store several vectors per document and score them with MaxSim, usually as a reranking stage after a cheaper first search.</li>
+<li><strong>Index compression</strong>: token pooling (about a third of the vectors at factor 3, no retraining) and binary quantization are standard ways to cut multi-vector storage.</li>
+<li><strong>Single-vector alternatives</strong>: VisRAG-style pooled page vectors and hosted multimodal embedding APIs (such as Cohere Embed v4 and Voyage's multimodal models) embed a page image as one vector, at a fraction of the storage.</li>
+<li><strong>Harder benchmarks</strong>: ViDoRe V2 (2025) uses longer, more realistic queries over larger document sets; retrieval scores there are far below V1's.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2407.01449">ColPali (arXiv 2407.01449)</a>, <a href="https://arxiv.org/abs/2410.10594">VisRAG (arXiv 2410.10594)</a>, <a href="https://arxiv.org/abs/2411.04952">M3DocRAG (arXiv 2411.04952)</a>, <a href="https://answer.ai/posts/colbert-pooling.html">token pooling (Answer.AI)</a>, <a href="https://huggingface.co/blog/manu/vidore-v2">ViDoRe V2</a>, <a href="https://huggingface.co/vidore/colSmol-256M">colSmol-256M model card</a>, <a href="https://github.com/illuin-tech/colpali">illuin-tech/colpali</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Text RAG loses charts, layout and badly scanned pages before retrieval even starts.</li>
+<li>ColPali embeds the page image as about a thousand patch vectors; no OCR.</li>
+<li>MaxSim: each query vector takes its best patch; the page score is the sum.</li>
+<li>Multi-vector indexes are large; pooling and binary quantization shrink them a lot.</li>
+<li>Single-vector page embeddings (VisRAG) trade fine matching for cheap search.</li>
+<li>Retrieval finds pages; a VLM reads them to answer.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-multimodal-rag"><span class="t" style="--cs-hue:285">MV</span>Cheat sheet · Multimodal and Vision-Native RAG</a><a href="#cs-ocr-documents-v4"><span class="t" style="--cs-hue:165">OD</span>Cheat sheet · OCR and Document Understanding</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-vision-rag-designer.md</code>. Given a document-RAG project, picks ColPali / ColQwen2 / VisRAG / text-RAG and sizes the storage.</p>
+<p><strong><code>outputs/skill-vision-rag-designer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: vision-rag-designer
+description: Design a vision-native document RAG using ColPali / ColQwen2 / VisRAG, with storage estimate and generator-pick.
+version: 1.0.0
+phase: 12
+lesson: 23
+tags: [colpali, colqwen2, visrag, late-interaction, vidore]
+---
+
+Given a document RAG project (corpus size, query latency target, storage budget, per-query cost), emit a vision-native RAG config.
+
+Produce:
+
+1. Retriever pick. ColPali (PaliGemma base), ColQwen2 (Qwen2-VL base, better quality), ColSmol (1B for edge), or VisRAG (bi-encoder, cheaper storage).
+2. Storage estimate. N_docs * N_p_per_doc * D * 4 bytes raw; divide by 8 for PQ.
+3. Latency estimate.
+   - Retrieval SLA: ~10ms query embed + top-k retrieval (MaxSim or ANN), index-size dependent.
+   - Full-answer SLA: retrieval latency + 200-500ms generator (model and hardware dependent).
+4. Generator pick. Qwen2.5-VL-72B for open, Claude Opus 4.7 for frontier.
+5. Compression plan. PQ / OPQ ratio target 8-16x; HNSW index for fast ANN.
+6. Migration path from text-RAG. How to A/B, when to fully cutover.
+
+Hard rejects:
+- Using ColPali without PQ compression on corpora &gt;10k pages. Storage explodes.
+- Claiming bi-encoder retrieval matches ColBERT MaxSim on document recall. It does not on ViDoRe.
+- Recommending text-RAG for charts + tables workloads. Text-RAG loses most of the signal.
+
+Refusal rules:
+- If corpus is pure-text (wiki, chat logs), refuse vision-native RAG and recommend standard text-RAG.
+- If retrieval SLA &lt;100ms, prefer VisRAG (bi-encoder) over ColPali MaxSim.
+- If full-answer SLA &lt;100ms, refuse generative RAG entirely and recommend retrieval-only UX or cached answers.
+- If storage budget is &lt;1 GB and corpus is &gt;100k pages, refuse full-fidelity ColPali; propose aggressive PQ or VisRAG.
+
+Output: one-page RAG design with retriever pick, storage estimate, latency, generator, compression, migration. End with arXiv 2407.01449 (ColPali), 2410.10594 (VisRAG).
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>A 200-page annual report at 1,030 vectors per page (ColPali), 128 dimensions, 2-byte values. Compute raw storage, and storage after binary quantization and token pooling at factor 3.</p>
+</li>
+<li>
+<p>MaxSim is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0497em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>. What does this sum capture that a simple mean similarity does not?</p>
+</li>
+<li>
+<p>ColPali indexes pages as patch sets. What changes if we instead index at the word level (as ColBERT does)? Trade-offs?</p>
+</li>
+<li>
+<p>Design the end-to-end pipeline for a 1M-page corpus with a latency budget of 500ms per query. Pick ColQwen2 / VisRAG and justify.</p>
+</li>
+<li>
+<p>Read M3DocRAG (arXiv:2411.04952). How does it retrieve across thousands of PDFs quickly, and how many retrieved pages can its generator see at once?</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1223-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Only the image retriever finds the bad scan</span></summary><div class="qa-a"><p>Only ColSmol. Tesseract read 0 words from the bad scan, so the text retriever had nothing to match and put the clean "Fire extinguisher inspection log" first; the right page came third. ColSmol, which embeds the pixels, ranked the scanned page first.</p>
+<p>Neither fell for the other distractors: the current headcount beat the 2027 plan and the Northwind invoice beat the Contoso one in both systems. Clean, short text pages are easy for text RAG too. The gap appears where text extraction fails: bad scans, charts with no text values, layout that carries meaning. That is ColPali's argument, and why you should measure on your own documents before choosing.</p></div></details>
+<details class="qa" id="a1223-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Hundreds of gigabytes and a minute per query</span></summary><div class="qa-a"><p>Memory: at about 1,135 vectors per page, 128 dimensions and 2 bytes, a million pages need about 290 GB of vectors (ColPali's 1,030 vectors: about 260 GB). That does not fit in RAM on one ordinary server, let alone a laptop. Latency: brute-force MaxSim compares every query vector with every page vector, about 5.8 trillion operations for a 20-vector query, around a minute on a CPU and still noticeable on a GPU. Every query also has to stream the whole index through memory.</p>
+<p>Production systems split the work:</p>
+<ul>
+<li><strong>Shrink the index</strong>: binary quantization (16 times smaller) and token pooling (about 3 times at factor 3) cut 290 GB to about 6 GB, with little loss in this lesson's run; check recall on your data.</li>
+<li><strong>Retrieve candidates cheaply, then rerank</strong>: a first stage finds a few hundred likely pages with an approximate index (inverted-file clustering as in M3DocRAG, which cut 21 s to 1.8 s per query over 40k pages; PLAID-style centroid search; or one pooled vector per page). Full MaxSim scores only those candidates.</li>
+<li><strong>Use a database built for it</strong>: Vespa, Qdrant and Weaviate store multi-vector fields and run MaxSim as a reranking step.</li>
+</ul></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2407.01449">Faysse et al. — ColPali (arXiv:2407.01449)</a></li>
+<li><a href="https://arxiv.org/abs/2004.12832">Khattab &amp; Zaharia — ColBERT (arXiv:2004.12832)</a></li>
+<li><a href="https://arxiv.org/abs/2410.10594">Yu et al. — VisRAG (arXiv:2410.10594)</a></li>
+<li><a href="https://arxiv.org/abs/2411.04952">Cho et al. — M3DocRAG (arXiv:2411.04952)</a></li>
+<li><a href="https://github.com/illuin-tech/colpali">illuin-tech/colpali GitHub</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/12-multimodal-ai/23-colpali-vision-native-rag" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1223" id="done-a1223">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1223" id="undo-a1223" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1222"><span class="pn-dir">Previous</span><span class="pn-t">12.22 · Document and Diagram Understanding</span></a><a class="pn next" href="#a1224"><span class="pn-dir">Next</span><span class="pn-t">12.24 · Multimodal RAG and Cross-Modal Retrieval</span></a></div></footer>

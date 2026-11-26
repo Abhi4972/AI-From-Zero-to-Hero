@@ -1,0 +1,573 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · Agent Engineering</a></nav><h1>Tree of Thoughts and LATS: Deliberate Search</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.4</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1404" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Frame reasoning as search: nodes are "thoughts," edges are "expansions," value is "how promising."</li>
+<li>Implement a stdlib ToT-style BFS tree search with self-evaluation scoring.</li>
+<li>Extend to a toy LATS MCTS loop with select / expand / simulate / backpropagate.</li>
+<li>Decide when search is worth the token multiplier (Game of 24, code generation) and when a single trajectory is enough (simple Q&amp;A).</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 14 · 01 (Agent Loop), Phase 14 · 03 (Reflexion)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A single chain-of-thought trajectory has no room to backtrack. ToT (Yao et al., 2023) turns reasoning into a tree with self-evaluation on each node. LATS (Zhou et al., 2024) unifies ToT with ReAct and Reflexion under Monte Carlo Tree Search. Game of 24 goes from 4% (CoT) to 74% (ToT); LATS hits 92.7% pass@1 on HumanEval.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tree of Thoughts</td>
+<td>"Branching CoT"</td>
+<td>Yao et al. — tree of thought nodes with self-evaluation</td>
+</tr>
+<tr>
+<td>LATS</td>
+<td>"MCTS for LLMs"</td>
+<td>Zhou et al. — unifies ToT + ReAct + Reflexion under MCTS</td>
+</tr>
+<tr>
+<td>UCT</td>
+<td>"Upper confidence bound"</td>
+<td>Select formula balancing exploitation (Q) and exploration (ln N / n)</td>
+</tr>
+<tr>
+<td>Value function</td>
+<td>"How good is this state"</td>
+<td>Prompted LLM score or environment reward; feeds backprop</td>
+</tr>
+<tr>
+<td>Policy</td>
+<td>"Action proposer"</td>
+<td>ReAct-style generator; emits candidate next thoughts/actions</td>
+</tr>
+<tr>
+<td>Rollout</td>
+<td>"Simulated trajectory"</td>
+<td>Walk from a node to a leaf using policy, score with value</td>
+</tr>
+<tr>
+<td>Backpropagate</td>
+<td>"Update ancestors"</td>
+<td>Push the leaf's reward up the path, updating visit counts and Q</td>
+</tr>
+<tr>
+<td>Search cost</td>
+<td>"Token explosion"</td>
+<td>100-1000x CoT on Game of 24; budget before you adopt</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0308">Zero to Agents 3.8 · Planning and reasoning patterns: ReAct, plan-and-execute, reflection and search</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A model reasoning step by step commits to its first idea; if that idea is wrong, everything after it is wrong too. <strong>Tree of Thoughts</strong> (ToT) turns reasoning into a search: at each step propose several next steps, score each one, keep the most promising, and back up from dead ends. <strong>LATS</strong> does the same with Monte Carlo tree search, the method behind game-playing programs, and lets real tool results and written reflections guide it. Everything depends on the scoring step, the <strong>value function</strong>: if it cannot tell a promising partial answer from a hopeless one, the search is no better than guessing. This lesson builds both searches on the Game of 24 (combine four numbers with + − × ÷ to make 24), then measures how good two value functions really are, including a real model's.</p></div></aside>
+<p>Chain-of-thought is a linear walk. If the first step is wrong, every subsequent step works on a bad premise. On Game of 24 (use four digits with + − × ÷ to make 24), GPT-4 CoT hits 4% accuracy. The model picks the wrong subexpression early and cannot recover.</p>
+<p>What reasoning needs is the ability to propose multiple candidates, evaluate them, pick the promising ones, and backtrack when dead ends appear. That is search. Tree of Thoughts and LATS are the two canonical formulations.</p>
+<h2>Idea 1 · Tree of Thoughts (Yao et al., NeurIPS 2023)</h2>
+<p>Each node is a coherent intermediate step ("a thought"). Each node can expand to K child thoughts. The LLM self-evaluates each node with a scoring prompt. Search explores the tree — BFS, DFS, or beam.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">                     (root: &quot;find 24 from 4 6 4 1&quot;)
+                    /               |            \
+           (&quot;6 - 4 = 2&quot;)    (&quot;4 + 1 = 5&quot;)    (&quot;4 * 6 = 24&quot;)  &lt;- Score: HIGH
+              /   \              |                  |
+          ...    ...          ...                finish
+</code></pre></div>
+<p>Self-evaluation is the load-bearing piece. The paper shows three variants: <code>sure / likely / impossible</code> classification, <code>1..10</code> numeric score, and vote among candidates. All three beat CoT substantially on Game of 24 (4% -&gt; 74% with GPT-4).</p>
+<h2>Idea 2 · LATS (Zhou et al., ICML 2024)</h2>
+<p>LATS unifies ToT, ReAct, and Reflexion under MCTS. The LLM plays three roles:</p>
+<ul>
+<li><strong>Policy</strong>: propose candidate next actions (ReAct-style).</li>
+<li><strong>Value function</strong>: score a partial trajectory (ToT-style self-eval).</li>
+<li><strong>Self-reflector</strong>: on failure, write a natural-language reflection (Reflexion-style) and use it to reseed future rollouts.</li>
+</ul>
+<p>Environment feedback (observations) mixes into the value function so the search is informed by real tool results, not just model opinions. Results at paper time: HumanEval pass@1 92.7% with GPT-4 (SOTA), WebShop average 75.9 with GPT-3.5 (approaching gradient-based fine-tuning).</p>
+<h2>Idea 3 · MCTS, minimally</h2>
+<p>Four phases per iteration:</p>
+<ol>
+<li><strong>Select</strong> — walk from root to a leaf using UCT (upper confidence bound for trees).</li>
+<li><strong>Expand</strong> — generate K children via the policy.</li>
+<li><strong>Simulate</strong> — rollout from a child using the policy, score the leaf with the value function (or environment reward).</li>
+<li><strong>Backpropagate</strong> — update visit counts and value estimates up the path.</li>
+</ol>
+<p>UCT formula: <code>Q(s, a) + c * sqrt(ln N(s) / N(s, a))</code>. First term is exploitation; second is exploration. Tune <code>c</code> per task.</p>
+<h2>Idea 4 · The cost reality</h2>
+<p>Search explodes tokens. ToT on Game of 24 generated about 5.5k tokens per puzzle and cost US$0.74 with GPT-4, more than 100 chain-of-thought samples together (US$0.47), so roughly a hundred times one chain. LATS is similar. This is not free; reserve search for:</p>
+<ul>
+<li>Tasks where a single trajectory is demonstrably insufficient (Game of 24, complex code).</li>
+<li>Tasks where wall-clock is less important than correctness.</li>
+<li>Tasks with a cheap, reliable value function (unit tests for code, explicit target for math).</li>
+</ul>
+<p>If your task has a single right answer and a noisy evaluator, search often makes things worse — it finds a "good-scoring" wrong answer.</p>
+<h2>Idea 5 · 2026 positioning</h2>
+<p>Most production agents do not run LATS. They run ReAct with tool-grounded verification (CRITIC, <a href="#a1405">Lesson 14.5</a>). Search shows up in specialized niches:</p>
+<ul>
+<li>Coding agents that run tests as the value function (HumanEval-style).</li>
+<li>Deep-research agents that explore multiple query paths.</li>
+<li>Planning-heavy workflows inside LangGraph subgraphs.</li>
+</ul>
+<p>AlphaEvolve (<a href="#a1411">Lesson 14.11</a>) is the 2025 extreme: evolutionary search over code, machine-checkable fitness, frontier gains (48 multiplications for 4×4 complex-valued matrices, the first improvement on Strassen's 1969 method in 56 years).</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tree-of-thoughts"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Beam search with a value function.</strong> From the states <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> kept at depth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>, expand every next step and keep the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> best by the value function <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8917em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0519em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop"><span class="mord mathrm">top</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.242em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">b</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">{</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.841em;vertical-align:-0.0391em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">children</span></span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0519em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mclose">}</span><span class="mspace"> </span><span class="mord text"><span class="mord"> ranked by </span></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>UCT for MCTS.</strong> At node <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>, pick the child <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> maximising
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">Q</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.04em;vertical-align:-1.1606em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8794em;"><span class="svg-align" style="top:-5em;"><span class="pstrut" style="height:5em;"></span><span class="mord" style="padding-left:1em;"><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop">ln</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mopen">(</span><span class="mord mathnormal">s</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span><span style="top:-3.8394em;"><span class="pstrut" style="height:5em;"></span><span class="hide-tail" style="min-width:1.02em;height:3.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="3.08em" viewBox="0 0 400000 3240" preserveAspectRatio="xMinYMin slice"><path d="M473,2793
+c339.3,-1799.3,509.3,-2700,510,-2702 l0 -0
+c3.3,-7.3,9.3,-11,18,-11 H400000v40H1017.7
+s-90.5,478,-276.2,1466c-185.7,988,-279.5,1483,-281.5,1485c-2,6,-10,9,-24,9
+c-8,0,-12,-0.7,-12,-2c0,-1.3,-5.3,-32,-16,-92c-50.7,-293.3,-119.7,-693.3,-207,-1200
+c0,-1.3,-5.3,8.7,-16,30c-10.7,21.3,-21.3,42.7,-32,64s-16,33,-16,33s-26,-26,-26,-26
+s76,-153,76,-153s77,-151,77,-151c0.7,0.7,35.7,202,105,604c67.3,400.7,102,602.7,104,
+606zM1001 80h400000v40H1017.7z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.1606em;"><span></span></span></span></span></span><span class="mpunct">,</span></span></span></span></span></div>
+the average reward so far plus a bonus for rarely tried children; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> trades exploring against exploiting.</p>
+<p><strong>How good is a value function?</strong> Its <strong>AUC</strong> is the probability that a randomly chosen good state scores higher than a randomly chosen bad one (ties count half):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">AUC</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8213em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">+</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8213em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">−</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord">.</span></span></span></span></span></div>
+1.0 is a perfect ranking; 0.5 is a coin flip; below 0.5 is worse than random.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Is a random beam enough for 4 6 4 1?</div><div class="co-body"><ul>
+<li>After one step there are 19 distinct states, and 3 of them can still reach 24.</li>
+<li>A random value function keeps 8 of the 19; the chance that none of the 3 good states is among them is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2451em;vertical-align:-0.35em;"></span><span class="mord"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">(</span></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8951em;"><span style="top:-2.355em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span><span style="top:-3.144em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">16</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">)</span></span></span><span class="mord">/</span><span class="mord"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size1">(</span></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8951em;"><span style="top:-2.355em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">8</span></span></span></span><span style="top:-3.144em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">19</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size1">)</span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">12870/75582</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.17</span></span></span></span>.</li>
+<li>So random keeping finds a good state 83% of the time, and keeps <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">3/19</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.3</span></span></span></span> good states on average.</li>
+<li>A value function earns its cost only if it beats this. The lesson's heuristic keeps the state "24 and 4 and 1" first because it contains 24, yet no way remains to use the 4 and the 1 and still end at 24.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Search always beats one chain of thought."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only when the value function ranks states better than chance; otherwise it is expensive guessing.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A state that already shows the target is nearly done."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> In the Game of 24 every number must be used; "24 with 4 and 1 left over" is a dead end.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The model can judge its own partial work."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Small models in particular judge poorly; measure the judge against ground truth before trusting it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "MCTS returns the answer."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It returns the best leaf it found; check that the leaf is a complete, valid solution.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>For the lesson's puzzle 4 6 4 1, rank every first step by (a) the lesson's heuristic "how close is some number to 24" and (b) a 0.5B model asked ToT's "sure / likely / impossible" question. Which ranks the 3 good states better than random? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Grading two value functions against exact search</div><div class="co-body"><p>Exact search over fractions labels every state after the first step as "24 still reachable" or not, using every number once. The lesson's own <code>value()</code> and a real model (Qwen2.5-0.5B, ToT's value prompt with five examples, read from one forward pass as P(sure) + ½ P(likely)) then score the same states. About 10 seconds after the model loads.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The value function is the load-bearing piece. For the lesson's puzzle, every state after one step is
+# labelled by exact search (can 24 still be reached using all the numbers?), then scored by the
+# lesson's heuristic and by a real model used the way ToT uses it (&quot;sure / likely / impossible&quot;).
+import itertools, os, time, torch
+from fractions import Fraction as Fr
+os.environ.setdefault(&quot;HF_HUB_OFFLINE&quot;, &quot;1&quot;)            # the model is already in the local cache
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+from main import NUMBERS, TARGET, Node, value as lesson_value
+
+def steps(state):
+    &quot;&quot;&quot;All (description, next state) pairs: any two numbers, any order, + - * /. Exact fractions.&quot;&quot;&quot;
+    out = []
+    for i, j in itertools.permutations(range(len(state)), 2):
+        a, b = state[i], state[j]; rest = [state[k] for k in range(len(state)) if k not in (i, j)]
+        for op, v in ((&quot;+&quot;, a + b), (&quot;-&quot;, a - b), (&quot;*&quot;, a * b), (&quot;/&quot;, a / b if b else None)):
+            if v is not None and not (op in &quot;+*&quot; and i &gt; j):           # skip mirror duplicates
+                out.append((f&quot;{a}{op}{b}={v}&quot;, tuple(sorted(rest + [v], reverse=True))))
+    return out
+def solutions(state, trace=()):
+    if len(state) == 1:
+        return [trace] if state[0] == TARGET else []
+    return [s for d, nxt in steps(state) for s in solutions(nxt, trace + (d,))]
+def reachable(state):
+    return bool(solutions(state))
+
+start = tuple(sorted(map(Fr, NUMBERS), reverse=True))
+sols = solutions(start)
+print(f&quot;numbers {NUMBERS}: {len(sols)} exact solutions using every number once, e.g.&quot;)
+for s in sorted(set(sols))[:3]:
+    print(&quot;   &quot; + &quot;, &quot;.join(s))
+first = {}
+for desc, nxt in steps(start):
+    first.setdefault(nxt, desc)
+states = list(first)
+truth = {s: reachable(s) for s in states}
+print(f&quot;\n{len(states)} distinct states after one step; {sum(truth.values())} can still reach 24&quot;)
+
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); llm = AutoModelForCausalLM.from_pretrained(M).eval()
+VALUE = (&quot;Evaluate if the given numbers can reach 24 using each number exactly once with + - * / &quot;
+         &quot;(sure/likely/impossible).\n10 14: 10 + 14 = 24. sure\n11 12: 11 + 12 = 23, 12 - 11 = 1, 11 * 12 = 132. impossible\n&quot;
+         &quot;4 4 10: 10 - 4 = 6, 6 * 4 = 24. sure\n1 3 3: 1 * 3 * 3 = 9, (1 + 3) * 3 = 12. impossible\n&quot;
+         &quot;5 7 8: 5 + 7 + 8 = 20, (8 - 5) * 7 = 21. likely\n{nums}:&quot;)
+WORDS = [tok.encode(&quot; &quot; + w)[0] for w in (&quot;sure&quot;, &quot;likely&quot;, &quot;impossible&quot;)]
+def llm_value(state):
+    &quot;&quot;&quot;ToT's value prompt, read from one forward pass: P(sure) + 0.5 P(likely), renormalised over the three words.&quot;&quot;&quot;
+    nums = &quot; &quot;.join(str(x) if x.denominator == 1 else f&quot;{x.numerator}/{x.denominator}&quot; for x in state)
+    ids = tok(VALUE.format(nums=nums), return_tensors=&quot;pt&quot;)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        logits = llm(ids).logits[0, -1]
+    p = torch.softmax(logits[WORDS], 0).tolist()
+    return p[0] + 0.5 * p[1]
+started = time.perf_counter()
+heur = {s: lesson_value(Node(state=tuple(float(x) for x in s), trace=[])) for s in states}
+model = {s: llm_value(s) for s in states}
+secs = time.perf_counter() - started
+def auc(score):
+    pos = [score[s] for s in states if truth[s]]; neg = [score[s] for s in states if not truth[s]]
+    return sum((p &gt; n) + 0.5 * (p == n) for p in pos for n in neg) / (len(pos) * len(neg))
+def kept(score, k=8):
+    top = sorted(states, key=lambda s: -score[s])[:k]
+    return sum(truth[s] for s in top)
+print(f&quot;\n{'value function':&lt;30}{'AUC':&gt;6}{'solvable in its top 8':&gt;24}&quot;)
+print(f&quot;{'lesson heuristic (near 24)':&lt;30}{auc(heur):&gt;6.2f}{kept(heur):&gt;24}&quot;)
+print(f&quot;{'Qwen 0.5B, ToT value prompt':&lt;30}{auc(model):&gt;6.2f}{kept(model):&gt;24}&quot;)
+print(f&quot;{'random':&lt;30}{0.5:&gt;6.2f}{8 * sum(truth.values()) / len(states):&gt;24.1f}  (expected)&quot;)
+print(f&quot;\nmodel calls {len(states)}, {secs / len(states):.2f} s each&quot;)
+print(&quot;lesson heuristic's top 3:&quot;, [(first[s], round(heur[s], 3), truth[s]) for s in sorted(states, key=lambda s: -heur[s])[:3]])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">numbers [4, 6, 4, 1]: 6 exact solutions using every number once, e.g.
+   1-6=-5, 4*-5=-20, 4--20=24
+   6+1=7, 7*4=28, 28-4=24
+   6-1=5, 5*4=20, 20+4=24
+
+19 distinct states after one step; 3 can still reach 24
+
+value function                   AUC   solvable in its top 8
+lesson heuristic (near 24)      0.41                       1
+Qwen 0.5B, ToT value prompt     0.21                       0
+random                          0.50                     1.3  (expected)
+
+model calls 19, 0.30 s each
+lesson heuristic&#x27;s top 3: [(&#x27;6*4=24&#x27;, -0.0, False), (&#x27;4*4=16&#x27;, -0.08, False), (&#x27;6+4=10&#x27;, -0.14, False)]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The puzzle has six exact solutions</strong>, none of which passes through "6 × 4 = 24": for example 6 + 1 = 7, 7 × 4 = 28, 28 − 4 = 24. Only 3 of the 19 first steps keep 24 reachable.</p>
+<p><strong>The lesson's heuristic ranks worse than chance (AUC 0.41).</strong> It prefers states that contain a number near 24, so its first choice is 6 × 4 = 24, a dead end. This is also why the lesson's own run (Build it, below) ends at 27 for ToT, and why its MCTS reports the leaf (24, 4), which is not a finished answer: two numbers are left. The doc's warning, "search finds a good-scoring wrong answer", is exactly what the toy does.</p>
+<p><strong>The model is worse still (AUC 0.21).</strong> Asked ToT's question with five examples, Qwen2.5-0.5B puts none of the 3 good states in its top 8. Each judgement is one forward pass (about 0.3 s on the CPU), so the cost is low; the problem is that the judge does not know.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Fifteen more puzzles</div><div class="co-body"><p>This block continues from the one above. Fifteen random solvable puzzles; for each, a beam keeps the 1, 3 or 5 best first steps by each value function, and the puzzle counts as solved if any kept state can still reach 24. About two minutes, all of it the model's 407 value calls.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Fifteen more solvable puzzles. For each, ToT keeps the b best first steps by a value function; the
+# puzzle counts as solved if any kept state can still reach 24 (later steps searched exactly).
+# Continues from the block above (steps, reachable, llm_value, lesson_value).
+import random
+rng = random.Random(0); puzzles = []
+while len(puzzles) &lt; 15:
+    nums = tuple(sorted((Fr(rng.randint(1, 13)) for _ in range(4)), reverse=True))
+    if nums not in puzzles and reachable(nums):
+        puzzles.append(nums)
+fns = {&quot;lesson heuristic&quot;: lambda s: lesson_value(Node(state=tuple(float(x) for x in s), trace=[])),
+       &quot;Qwen 0.5B value&quot;: llm_value, &quot;random&quot;: lambda s: rng.random()}
+solved = {name: {1: 0, 3: 0, 5: 0} for name in fns}; aucs = {name: [] for name in fns}
+started = time.perf_counter(); calls = 0; frac = []
+for nums in puzzles:
+    sts = list({nxt: d for d, nxt in steps(nums)})
+    tr = {s: reachable(s) for s in sts}; frac.append(sum(tr.values()) / len(sts))
+    for name, fn in fns.items():
+        sc = {s: fn(s) for s in sts}; calls += len(sts) if name.startswith(&quot;Qwen&quot;) else 0
+        order = sorted(sts, key=lambda s: -sc[s])
+        for b in (1, 3, 5):
+            solved[name][b] += any(tr[s] for s in order[:b])
+        pos = [sc[s] for s in sts if tr[s]]; neg = [sc[s] for s in sts if not tr[s]]
+        if pos and neg:
+            aucs[name].append(sum((p &gt; n) + 0.5 * (p == n) for p in pos for n in neg) / (len(pos) * len(neg)))
+print(f&quot;15 puzzles, e.g. {[tuple(int(x) for x in p) for p in puzzles[:4]]}&quot;)
+print(f&quot;on average {100 * sum(frac) / len(frac):.0f}% of first steps keep 24 reachable\n&quot;)
+print(f&quot;{'value function':&lt;20}{'mean AUC':&gt;9}{'solved, keep 1':&gt;16}{'keep 3':&gt;8}{'keep 5':&gt;8}&quot;)
+for name in fns:
+    print(f&quot;{name:&lt;20}{sum(aucs[name]) / len(aucs[name]):&gt;9.2f}{solved[name][1]:&gt;16}{solved[name][3]:&gt;8}{solved[name][5]:&gt;8}&quot;)
+print(f&quot;\nQwen value calls: {calls} in {time.perf_counter() - started:.0f} s&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">15 puzzles, e.g. [(9, 8, 7, 5), (13, 8, 6, 5), (13, 5, 3, 2), (13, 10, 9, 5)]
+on average 15% of first steps keep 24 reachable
+
+value function       mean AUC  solved, keep 1  keep 3  keep 5
+lesson heuristic         0.54               3       8       9
+Qwen 0.5B value          0.49               2       5       7
+random                   0.50               3       7       9
+
+Qwen value calls: 407 in 119 s</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Across 15 puzzles, no value function beats random.</strong> Mean AUC is 0.54 for the heuristic, 0.49 for the model and 0.50 for random. Keeping 5 first steps solves 9, 7 and 9 puzzles. On average only 15% of first steps keep 24 reachable, so a beam needs a judge that actually finds them.</p>
+<p><strong>For comparison, GPT-4 as the judge took ToT from 4% (one chain of thought) to 74%</strong> in the paper. The search procedure is the same here; the difference is entirely the quality of the value function. With a weak judge, use a real check instead (here exact search is cheap) or do not search.</p>
+<p><strong>407 model calls took two minutes</strong> on two CPU cores. Search multiplies calls; that cost only pays when each call carries information.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li>A tiny ToT BFS on a stylized "pick arithmetic ops" task.</li>
+<li>A toy LATS MCTS loop on the same task (Select / Expand / Simulate / Backpropagate) with UCT selection.</li>
+<li>A value function that composes a symbolic score plus a self-eval score.</li>
+</ul>
+<p>Run it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>The trace shows ToT expanding three candidates per node with BFS, compared to LATS converging on the best rollout via MCTS. Token counts printed for both.</p>
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>Node</code>, <code>evaluate</code>, <code>expand</code>, <code>value</code>, <code>NUMBERS</code>, <code>TARGET</code>, <code>OPS</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy Tree-of-Thoughts BFS and LATS MCTS on a stylized arithmetic search.
+
+Task: given integers [4, 6, 4, 1], find an expression using +, -, *, / that
+evaluates to 24. This mirrors the Game of 24 benchmark from Yao et al.
+
+ToT is a BFS with a prompted value function. LATS is MCTS over the same
+search space with UCT selection.
+
+Stdlib only; no LLM. Value function is symbolic (distance from 24).
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import itertools
+import math
+import random
+from dataclasses import dataclass, field
+
+
+NUMBERS = [4, 6, 4, 1]
+TARGET = 24
+OPS = [&quot;+&quot;, &quot;-&quot;, &quot;*&quot;, &quot;/&quot;]
+
+
+@dataclass
+class Node:
+    state: tuple[float, ...]
+    trace: list[str]
+    visits: int = 0
+    value_sum: float = 0.0
+    children: list[&quot;Node&quot;] = field(default_factory=list)
+
+    @property
+    def q(self) -&gt; float:
+        return self.value_sum / self.visits if self.visits else 0.0
+
+
+def evaluate(a: float, op: str, b: float) -&gt; float | None:
+    if op == &quot;+&quot;:
+        return a + b
+    if op == &quot;-&quot;:
+        return a - b
+    if op == &quot;*&quot;:
+        return a * b
+    if op == &quot;/&quot;:
+        return a / b if b != 0 else None
+    return None
+
+
+def expand(node: Node) -&gt; list[Node]:
+    children: list[Node] = []
+    state = node.state
+    if len(state) &lt; 2:
+        return children
+    for i, j in itertools.combinations(range(len(state)), 2):
+        for op in OPS:
+            a, b = state[i], state[j]
+            v = evaluate(a, op, b)
+            if v is None:
+                continue
+            remaining = [s for k, s in enumerate(state) if k not in (i, j)]
+            new_state = tuple(sorted(remaining + [v], reverse=True))
+            step = f&quot;{a}{op}{b}={v}&quot;
+            children.append(Node(state=new_state, trace=node.trace + [step]))
+    return children
+
+
+def value(node: Node) -&gt; float:
+    if len(node.state) == 1:
+        result = node.state[0]
+        return 1.0 if abs(result - TARGET) &lt; 1e-6 else -abs(result - TARGET) / 100.0
+    best_distance = min(abs(v - TARGET) for v in node.state)
+    return -best_distance / 100.0
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>tot_bfs</code>, <code>uct</code>, <code>select</code>, <code>simulate</code>, <code>backprop</code>, <code>mcts</code>, <code>_all_leaves</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tot_bfs(root: Node, max_expansions_per_level: int = 8,
+            max_depth: int = 3) -&gt; tuple[Node | None, int]:
+    frontier = [root]
+    expansions = 0
+    for _ in range(max_depth):
+        scored: list[tuple[float, Node]] = []
+        for node in frontier:
+            for child in expand(node):
+                expansions += 1
+                scored.append((value(child), child))
+                if value(child) &gt; 0.99:
+                    return child, expansions
+        scored.sort(key=lambda p: p[0], reverse=True)
+        frontier = [n for _, n in scored[:max_expansions_per_level]]
+    best = max(frontier, key=value) if frontier else None
+    return best, expansions
+
+
+def uct(parent: Node, child: Node, c: float = 1.4) -&gt; float:
+    if child.visits == 0:
+        return float(&quot;inf&quot;)
+    return child.q + c * math.sqrt(math.log(parent.visits) / child.visits)
+
+
+def select(node: Node) -&gt; Node:
+    while node.children:
+        node = max(node.children, key=lambda ch: uct(node, ch))
+    return node
+
+
+def simulate(node: Node, depth: int, rng: random.Random) -&gt; float:
+    current = node
+    for _ in range(depth):
+        options = expand(current)
+        if not options:
+            break
+        current = rng.choice(options)
+    return value(current)
+
+
+def backprop(path: list[Node], reward: float) -&gt; None:
+    for n in path:
+        n.visits += 1
+        n.value_sum += reward
+
+
+def mcts(root: Node, iterations: int, rng: random.Random) -&gt; tuple[Node, int]:
+    expansions = 0
+    for _ in range(iterations):
+        path = [root]
+        cur = root
+        while cur.children:
+            cur = max(cur.children, key=lambda ch: uct(cur, ch))
+            path.append(cur)
+        if cur.visits &gt; 0 and len(cur.state) &gt; 1:
+            cur.children = expand(cur)
+            expansions += len(cur.children)
+            if cur.children:
+                cur = cur.children[0]
+                path.append(cur)
+        reward = simulate(cur, depth=max(0, 3 - len(cur.trace)), rng=rng)
+        backprop(path, reward)
+    best_leaf = max(_all_leaves(root), key=value, default=root)
+    return best_leaf, expansions
+
+
+def _all_leaves(node: Node) -&gt; list[Node]:
+    if not node.children:
+        return [node]
+    out: list[Node] = []
+    for ch in node.children:
+        out.extend(_all_leaves(ch))
+    return out
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · imports and setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;TREE OF THOUGHTS + LATS: Phase 14, Lesson 04&quot;)
+    print(&quot;=&quot; * 70)
+    print(f&quot;numbers: {NUMBERS}  target: {TARGET}&quot;)
+
+    root_tot = Node(state=tuple(sorted(NUMBERS, reverse=True)), trace=[])
+    best_tot, n_tot = tot_bfs(root_tot)
+    print(&quot;\nToT BFS&quot;)
+    print(&quot;-&quot; * 60)
+    if best_tot is not None:
+        print(f&quot;  best trace: {best_tot.trace}&quot;)
+        print(f&quot;  final state: {best_tot.state}  value: {value(best_tot):.3f}&quot;)
+    print(f&quot;  expansions: {n_tot}&quot;)
+
+    rng = random.Random(7)
+    root_lats = Node(state=tuple(sorted(NUMBERS, reverse=True)), trace=[])
+    root_lats.children = expand(root_lats)
+    for ch in root_lats.children:
+        ch.visits = 0
+    best_lats, n_lats = mcts(root_lats, iterations=80, rng=rng)
+    print(&quot;\nLATS MCTS&quot;)
+    print(&quot;-&quot; * 60)
+    print(f&quot;  best trace: {best_lats.trace}&quot;)
+    print(f&quot;  final state: {best_lats.state}  value: {value(best_lats):.3f}&quot;)
+    print(f&quot;  node expansions: {n_lats}&quot;)
+
+    print()
+    print(&quot;Paper headlines (for reference):&quot;)
+    print(&quot;  ToT Game-of-24:  GPT-4 CoT 4%  -&gt; ToT 74%&quot;)
+    print(&quot;  LATS HumanEval:  pass@1 92.7% with GPT-4 (SOTA at paper time)&quot;)
+    print(&quot;  Cost: ToT uses 100-1000x the tokens of CoT. Use with intent.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+TREE OF THOUGHTS + LATS: Phase 14, Lesson 04
+======================================================================
+numbers: [4, 6, 4, 1]  target: 24
+
+ToT BFS
+------------------------------------------------------------
+  best trace: [&#x27;6*4=24&#x27;, &#x27;4-1=3&#x27;, &#x27;24+3=27&#x27;]
+  final state: (27,)  value: -0.030
+  expansions: 152
+
+LATS MCTS
+------------------------------------------------------------
+  best trace: [&#x27;6*4=24&#x27;, &#x27;24*1=24&#x27;]
+  final state: (24, 4)  value: 0.000
+  node expansions: 286
+
+Paper headlines (for reference):
+  ToT Game-of-24:  GPT-4 CoT 4%  -&gt; ToT 74%
+  LATS HumanEval:  pass@1 92.7% with GPT-4 (SOTA at paper time)
+  Cost: ToT uses 100-1000x the tokens of CoT. Use with intent.</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>LangGraph ships ToT-style exploration as subgraph patterns; LangGraph's LATS tutorial is the reference implementation, and LlamaIndex has a LATS agent package (<code>llama-index-agent-lats</code>). For most 2026 production agents this pattern lives behind an <code>if task_complexity &gt; threshold: use_search()</code> gate — see the evaluator-optimizer pattern in Lesson 05.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team ships LATS for a coding agent and uses the model's own 1-to-10 score of each partial program as the value, because running tests is slow. The scores look sensible in demos. What does the search optimise, and what should the value be? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Search lives where checking is cheap.</strong> Coding agents generate several candidate patches and keep the ones that pass tests; AlphaEvolve and its open counterparts (OpenEvolve, ShinkaEvolve) search over programs with an automatic score.</li>
+<li><strong>Reasoning models moved much of the search inside the model.</strong> OpenAI's o-series, Claude's extended thinking, Gemini thinking models and DeepSeek-R1 explore and backtrack in their own reasoning tokens, so explicit ToT over a frontier model is rarer than in 2023.</li>
+<li><strong>Best-of-n with a verifier</strong> (sample several answers, keep the one a checker or reward model prefers) is the common production form of "search", in LangGraph map-reduce graphs and evaluation pipelines alike.</li>
+<li><strong>On your laptop</strong>: value calls are single forward passes, so a 0.5B model scores about three states per second on a CPU and far faster on the RTX 4060; the limit is the judge's quality, as this lab shows, not speed.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2305.10601">Tree of Thoughts (arXiv:2305.10601)</a>, <a href="https://arxiv.org/abs/2310.04406">LATS (arXiv:2310.04406)</a>, <a href="https://langchain-ai.github.io/langgraph/tutorials/lats/lats/">LangGraph LATS tutorial</a>, <a href="https://deepmind.google/blog/alphaevolve-a-gemini-powered-coding-agent-for-designing-advanced-algorithms/">AlphaEvolve (Google DeepMind)</a>, <a href="https://github.com/codelion/openevolve">OpenEvolve</a>, <a href="https://arxiv.org/abs/2501.12948">DeepSeek-R1 (arXiv:2501.12948)</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>ToT and LATS turn reasoning into search over partial solutions.</li>
+<li>The value function decides everything; measure it (AUC) against ground truth.</li>
+<li>A value no better than chance makes search cost more for nothing.</li>
+<li>Prefer values from real checks: tests, exact rules, tool results.</li>
+<li>Confirm the returned leaf is a complete, valid answer.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-agent-reasoning-patterns-v5"><span class="t" style="--cs-hue:280">RR</span>Cheat sheet · ReAct, ReWOO, Reflexion and Tree of Thoughts</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-search-policy.md</code> selects between linear ReAct, ToT, LATS, and evolutionary search given task shape, budget, and evaluator fidelity.</p>
+<p><strong><code>outputs/skill-search-policy.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: search-policy
+description: Pick a search strategy (ReAct, ToT, LATS, evolutionary) given task shape, token budget, and evaluator quality.
+version: 1.0.0
+phase: 14
+lesson: 04
+tags: [tree-of-thoughts, lats, mcts, search, value-function]
+---
+
+Given a task shape (single-answer / multi-answer / open-ended), a token budget, and an available evaluator (scalar test / heuristic / self-eval), produce a search strategy recommendation with concrete parameters.
+
+Produce:
+
+1. Decision. One of: linear ReAct, beam ToT (with beam width k), BFS ToT (with max depth), DFS ToT with pruning, MCTS LATS (with iterations and UCT c), evolutionary search (only if evaluator is programmatic and checkable).
+2. Parameters. For every strategy, concrete numeric defaults: beam width, depth cap, branching factor K, rollouts per level, UCT c (default 1.4), timeout.
+3. Value function. Specify exactly what scores a node. Options: unit-test pass rate, numeric distance to target, prompted LLM score with format (sure/likely/impossible or 1..10 or vote), or environment reward.
+4. Token budget estimate. Worst-case tokens = branching_factor ^ depth * avg_prompt_tokens. Show the number. If it exceeds the user's budget, recommend a cheaper strategy.
+5. Failure modes. For each chosen strategy, list the top-two failure modes and their mitigations (e.g. LATS + noisy evaluator -&gt; add tool-grounded verification per CRITIC, Lesson 05).
+
+Hard rejects:
+
+- Recommending search when the evaluator is unreliable (self-eval only, no ground truth). Fall back to ReAct + CRITIC.
+- Setting branching factor K higher than 5 without a compelling reason. K=3-5 is the paper default; K=10 explodes cost.
+- Applying LATS to chat-style tasks. Search does not help conversational Q&amp;A with no programmatic target.
+- Evolutionary search without a machine-checkable fitness. AlphaEvolve is only interesting when fitness is programmatic (run tests, measure speed, verify theorem).
+
+Refusal rules:
+
+- If token budget &lt; 5x single-trajectory cost, refuse search and recommend ReAct + Reflexion (Lesson 03).
+- If wall-clock latency budget &lt; 10 seconds, refuse LATS and recommend ReAct.
+- If the task is pure information retrieval, refuse search and recommend ReWOO (Lesson 02).
+
+Output: a recommendation block (chosen strategy, parameters, value function, budget estimate) plus a &quot;what to read next&quot; note pointing to Lesson 05 (CRITIC) for evaluator reliability, Lesson 11 (AlphaEvolve) for evolutionary variants, or Lesson 30 (eval-driven development) for benchmark-grade validation.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run the toy LATS with UCT c=0.1 vs c=2.0. What changes in the trace?</li>
+<li>Swap the value function for a noisier scorer (add random jitter). Does MCTS still find the best leaf? What is the minimum signal-to-noise it tolerates?</li>
+<li>Implement beam-search ToT (keep top-k at each level) and compare to BFS. Which is better on a tight token budget?</li>
+<li>Read LATS Section 5.1. Reproduce the HumanEval trajectory count: how many rollouts does it take to hit the reported pass@1?</li>
+<li>Read the LATS paper's discussion on "when LATS helps less." Write a one-paragraph decision rule mapping task shape to search strategy.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1404-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Neither does</span></summary><div class="qa-a"><p>Neither. The lesson's heuristic has an AUC of 0.41 and keeps 1 good state in its top 8; the model has an AUC of 0.21 and keeps none; random keeping would hold 1.3 on average. The heuristic is misled by states that contain 24 but cannot use the remaining numbers; the 0.5B model cannot do the arithmetic its value prompt asks about.</p></div></details>
+<details class="qa" id="a1404-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Search that optimises the judge</span></summary><div class="qa-a"><p>It optimises the model's opinion, not correctness. MCTS is good at finding whatever the value function rewards, so it will find partial programs that look finished and well commented, and that the model scores 9 out of 10, whether or not they work. The more search budget, the more reliably it finds such "good-scoring wrong answers", as the toy's 6 × 4 = 24 shows on a small scale.</p>
+<p>Use a value grounded in execution: the fraction of unit tests passed, compile and type-check results, or a test run on the partial program where possible. LATS's own HumanEval result used test feedback as part of its value. If tests are slow, run a fast subset during search and the full suite only on the final candidates.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2305.10601">Yao et al., Tree of Thoughts (arXiv:2305.10601)</a> — the canonical paper</li>
+<li><a href="https://arxiv.org/abs/2310.04406">Zhou et al., LATS (arXiv:2310.04406)</a> — MCTS with Reflexion feedback</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview">LangGraph overview</a> — subgraph patterns for search</li>
+<li><a href="https://arxiv.org/abs/2506.13131">AlphaEvolve (arXiv:2506.13131)</a> — evolutionary search with programmatic evaluators</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/14-agent-engineering/04-tree-of-thoughts-lats" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1404" id="done-a1404">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1404" id="undo-a1404" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1403"><span class="pn-dir">Previous</span><span class="pn-t">14.3 · Reflexion: Verbal Reinforcement Learning</span></a><a class="pn next" href="#a1405"><span class="pn-dir">Next</span><span class="pn-t">14.5 · Self-Refine and CRITIC: Iterative Output Improvement</span></a></div></footer>

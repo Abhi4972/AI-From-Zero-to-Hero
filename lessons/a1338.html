@@ -1,0 +1,688 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>Calling Conventions and Stack Frames: System V, Windows x64, and AArch64</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.38</span><span class="chip">140 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1338" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Pick the calling convention from the object header: ELF x86-64 is the System V psABI, COFF AMD64 is Microsoft x64, ELF AArch64 is AAPCS64, Mach-O arm64 is Apple's variant.</li>
+<li>Decode the prologue of one function byte by byte for each ABI and place every saved register, the return address, and the frame pointer at its offset from the entry stack pointer.</li>
+<li>Infer the parameter registers of a function from the registers it reads before it writes them, and the stack argument slots from the loads above the entry stack pointer.</li>
+<li>Tell the independent register sequences of System V from the positional slots of Microsoft x64, and both from the NGRN and NSRN counters of AAPCS64.</li>
+<li>Check every inference against the source signature, the rule in the specification, and the compiler's own unwind data in <code>.pdata</code>, <code>.xdata</code>, and <code>.eh_frame</code>.</li>
+<li>Compare how Ghidra, IDA, Binary Ninja, radare2, rizin, and angr name and recover the same facts, and record where their output disagrees with the source.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 32 (ELF from scratch), Phase 13 · 33 (disassembly and control flow)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 140 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript, C, x86-64 and AArch64 assembly. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A disassembly shows which registers a function reads. Only the ABI says what those registers mean, and the ABI is chosen by the object header, so this lesson reads the header first and then checks every register against the rule that put it there.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A calling convention is the agreement between a function and its callers about where arguments go, where the result comes back, which registers a function may overwrite, and how the stack is laid out. Without it, a reverse engineer cannot tell which register holds which parameter. Linux and macOS on x86-64 use the System V rules: integers in <code>rdi, rsi, rdx, rcx, r8, r9</code>, floating-point values in <code>xmm0</code> to <code>xmm7</code> counted separately, and a 128-byte "red zone" below the stack pointer. Windows uses different rules, and ARM64 has its own. The compiler also writes a second description of each function's stack frame for exception handling and debuggers. This lesson checks the System V predictions on a live process in gdb, then reads GCC's frame description two ways and compares it with the lesson's analysis of clang's build.</p></div></aside>
+<p>You compiled <code>convention.c</code> for Linux x86-64 at <code>-O2</code> and asked radare2 6.2.4 for the arguments of <code>eight_args</code>. It answered with seven: <code>rdi</code>, <code>rsi</code>, <code>rdx</code>, <code>r8</code>, <code>r9</code>, <code>rsp+0x8</code>, and <code>rsp+0x10</code>. The C source has eight parameters. The bytes read <code>%rcx</code> exactly once, in <code>leaq (%rdx,%rcx), %rax</code>, and the tool's variable recovery did not count a register that only appears inside an address.</p>
+<p>You then opened the Windows build of the same file in rizin 0.9.1. It reported the convention as <code>amd64</code> and found <code>r8</code>, <code>rcx</code>, <code>rdx</code>, and three stack slots. The object is COFF, so the convention is Microsoft x64, the fourth register argument is <code>r9</code>, and there are four stack slots. The two tools miss different registers in the same source.</p>
+<p>A listing is a sequence of instructions. A calling convention is a contract that lives outside the listing: which registers carry arguments, which the callee must preserve, where the return address and the stack arguments sit, and what the caller must leave above the stack pointer. Four documents define the contracts that matter here. The System V AMD64 psABI (Version 1.0, build dated 12 March 2025) sections 3.2.1 to 3.2.3. The Microsoft x64 calling convention, stack usage, and prolog and epilog pages (page dates from 2018-12-17 to 2025-03-19). The Arm AAPCS64 release 2025Q4 (23 January 2026) sections 6.1 to 6.9. Apple's arm64 platform notes. This lesson reads those rules, applies them to one C file compiled three ways, and builds the analyzer that turns a listing into a checked list of parameter locations, saved registers, and frame offsets.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="re-38-three-frames"></div></figure></p>
+<h2>One Header Picks the Rulebook</h2>
+<p><code>convention.c</code> has twelve functions: <code>leaf_add</code>, <code>eight_args</code>, <code>mixed</code>, <code>by_value</code>, <code>big_ret</code>, <code>sum_varargs</code>, <code>keeps</code>, and five callers of <code>extern</code> functions with the same shapes. The structs use <code>long long</code>, because <code>long</code> is 4 bytes on the MSVC target and 8 bytes on the others, and a struct that changes size changes convention. Apple clang 17.0.0 compiled it seven times from this machine: <code>-target x86_64-unknown-linux-gnu</code>, <code>x86_64-pc-windows-msvc</code>, and <code>aarch64-unknown-linux-gnu</code> at <code>-O0</code> and <code>-O2</code>, and <code>arm64-apple-macos</code> at <code>-O2</code>. No Linux or Windows headers are installed, so the file declares what it needs and includes only clang's own <code>stdarg.h</code> and <code>stddef.h</code>.</p>
+<p><code>describe_object()</code> in <code>code/main.py</code> reads the 4-byte magic number and one machine field and names the contract:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Header</th>
+<th>Field</th>
+<th>Value</th>
+<th>Rulebook</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>7f 45 4c 46</code> ELF</td>
+<td><code>e_machine</code> at offset 0x12</td>
+<td>62</td>
+<td>System V AMD64 psABI</td>
+</tr>
+<tr>
+<td><code>64 86</code> COFF</td>
+<td><code>Machine</code> at offset 0</td>
+<td>0x8664</td>
+<td>Microsoft x64</td>
+</tr>
+<tr>
+<td><code>7f 45 4c 46</code> ELF</td>
+<td><code>e_machine</code></td>
+<td>183</td>
+<td>AAPCS64</td>
+</tr>
+<tr>
+<td><code>cf fa ed fe</code> Mach-O 64</td>
+<td><code>cputype</code> at offset 4</td>
+<td>0x0100000c</td>
+<td>AAPCS64 with Apple differences</td>
+</tr>
+</tbody>
+</table></div>
+<p>The three contracts disagree on almost every row of the table that follows. Every value is quoted from the document named in the header row, and every one is checked by a test against the fixtures.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Rule</th>
+<th>System V psABI</th>
+<th>Microsoft x64</th>
+<th>AAPCS64</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Integer arguments</td>
+<td><code>%rdi %rsi %rdx %rcx %r8 %r9</code>, next free register</td>
+<td><code>RCX RDX R8 R9</code>, by position</td>
+<td><code>x0</code> to <code>x7</code>, by NGRN</td>
+</tr>
+<tr>
+<td>Floating-point arguments</td>
+<td><code>%xmm0</code> to <code>%xmm7</code>, next free register</td>
+<td><code>XMM0</code> to <code>XMM3</code>, by position</td>
+<td><code>v0</code> to <code>v7</code>, by NSRN</td>
+</tr>
+<tr>
+<td>Integer result</td>
+<td><code>%rax</code>, then <code>%rdx</code></td>
+<td><code>RAX</code></td>
+<td><code>x0</code>, then <code>x1</code></td>
+</tr>
+<tr>
+<td>Floating-point result</td>
+<td><code>%xmm0</code>, then <code>%xmm1</code></td>
+<td><code>XMM0</code></td>
+<td><code>v0</code></td>
+</tr>
+<tr>
+<td>Result too large for registers</td>
+<td>address passed in <code>%rdi</code> "as if it were the first argument", returned in <code>%rax</code></td>
+<td>pointer in <code>RCX</code>, arguments shifted right, returned in <code>RAX</code></td>
+<td>address in <code>x8</code>, <code>x0</code> to <code>x7</code> untouched</td>
+</tr>
+<tr>
+<td>Callee-saved</td>
+<td><code>%rbp %rbx %r12</code> to <code>%r15</code></td>
+<td><code>RBX RBP RDI RSI RSP R12</code> to <code>R15</code>, <code>XMM6</code> to <code>XMM15</code></td>
+<td><code>r19</code> to <code>r29</code>, <code>SP</code>, low 64 bits of <code>v8</code> to <code>v15</code></td>
+</tr>
+<tr>
+<td>First stack argument on entry</td>
+<td><code>8(%rsp)</code></td>
+<td><code>40(%rsp)</code>, above a 32-byte shadow store</td>
+<td><code>0(sp)</code></td>
+</tr>
+<tr>
+<td>Below the stack pointer</td>
+<td>128-byte red zone</td>
+<td>"considered volatile"</td>
+<td>no red zone (Apple: 128 bytes)</td>
+</tr>
+<tr>
+<td>Alignment at the call</td>
+<td><code>(%rsp + 8)</code> multiple of 16 on entry</td>
+<td>16-byte aligned outside prolog and epilog</td>
+<td><code>SP mod 16 = 0</code></td>
+</tr>
+<tr>
+<td>Variadic marker</td>
+<td><code>%al</code> holds an upper bound on vector registers used</td>
+<td>floats duplicated in the integer register</td>
+<td>none in registers; Apple uses 8-byte stack slots</td>
+</tr>
+</tbody>
+</table></div>
+<h2>System V: Two Independent Register Sequences and a Red Zone</h2>
+<p>psABI 3.2.3 classifies every eightbyte of every argument as INTEGER, SSE, or MEMORY and then assigns registers from two lists that do not interact. "INTEGER" takes "the next available register of the sequence %rdi, %rsi, %rdx, %rcx, %r8 and %r9". SSE takes <code>%xmm0</code> to <code>%xmm7</code>. "If there are no registers available for any eightbyte of an argument, the whole argument is passed on the stack", and memory arguments "are pushed on the stack in reversed (right-to-left) order".</p>
+<p><code>eight_args(a, b, c, d, e, f, g, h)</code> at <code>-O2</code> is 27 bytes:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      10: 48 01 fe                      addq    %rdi, %rsi
+      13: 48 8d 04 0a                   leaq    (%rdx,%rcx), %rax
+      17: 48 01 f0                      addq    %rsi, %rax
+      1a: 4c 01 c0                      addq    %r8, %rax
+      1d: 4c 01 c8                      addq    %r9, %rax
+      20: 48 03 44 24 08                addq    0x8(%rsp), %rax
+      25: 48 03 44 24 10                addq    0x10(%rsp), %rax
+      2a: c3                            retq
+</code></pre></div>
+<p>Six registers, then two loads at <code>8(%rsp)</code> and <code>16(%rsp)</code>. Figure 3.3 of the psABI puts "memory argument eightbyte 0" at <code>16(%rbp)</code> when <code>%rbp</code> is the frame base, which is <code>8(%rsp)</code> on entry before any push. <code>g</code> is at 8, <code>h</code> at 16.</p>
+<p><code>mixed(int i, double d, long long l, float f)</code> shows the two lists. The ints take <code>%edi</code> and <code>%rsi</code>, the first and second INTEGER registers. The double and the float take <code>%xmm0</code> and <code>%xmm1</code>, the first and second SSE registers. The first instruction is <code>cvtsi2sd %edi, %xmm2</code>, and <code>%xmm2</code> is a scratch register that the function writes before it reads. An analyzer that treats the destination of <code>cvtsi2sd</code> as a read invents a third floating-point argument. radare2 did exactly that and reported <code>mixed</code> as <code>(double arg1, double arg2, double arg3)</code> in <code>xmm0</code>, <code>xmm1</code>, <code>xmm2</code>.</p>
+<p><code>by_value(struct pair p)</code> passes a 16-byte struct as two INTEGER eightbytes in <code>%rdi</code> and <code>%rsi</code>, and returns it the same way: <code>leaq 0x1(%rdi), %rax; leaq -0x1(%rsi), %rdx; retq</code>. <code>big_ret(long long seed)</code> returns 32 bytes, which is class MEMORY, and the psABI says "the caller provides space for the return value and passes the address of this storage in %rdi as if it were the first argument". <code>seed</code> moves to <code>%rsi</code>, and the function starts with <code>movq %rdi, %rax</code> because "On return %rax will contain the address that has been passed in by the caller in %rdi".</p>
+<p>The red zone is the other System V signature. psABI 3.2.2: "The 128-byte area beyond the location pointed to by %rsp is considered to be reserved and shall not be modified by signal or interrupt handlers." At <code>-O0</code>, <code>eight_args</code> is <code>pushq %rbp; movq %rsp, %rbp</code> and then six stores to <code>-0x8(%rbp)</code> through <code>-0x30(%rbp)</code> with no <code>subq</code>. The stores sit 48 bytes below the stack pointer. The <code>-O2</code> build of <code>sum_varargs</code> allocates 88 bytes with <code>subq $0x58, %rsp</code> and then writes the register save area at <code>-0x58(%rsp)</code> down to <code>-0x80(%rsp)</code>: 128 bytes below the stack pointer, the whole red zone. Build the same file with <code>-mno-red-zone</code> and <code>leaf_add</code> gains a <code>pushq %rax</code> and an <code>addq $0x8, %rsp</code> to hold its 8 bytes of locals above the stack pointer.</p>
+<p>Variadic calls add one register. "%al is used as hidden argument to specify the number of vector registers used", an upper bound from 0 to 8. <code>call_varargs</code> sets it with <code>xorl %eax, %eax</code> at <code>-O2</code> and <code>movb $0x0, %al</code> at <code>-O0</code>. <code>sum_varargs</code> reads it first: <code>testb %al, %al; je</code> skips eight <code>movaps %xmmN</code> saves when no vector register was used.</p>
+<h2>Microsoft x64: Positions, a Shadow Store, and No Red Zone</h2>
+<p>The Microsoft rules are positional. "Integer arguments are passed in registers RCX, RDX, R8, and R9. Floating point arguments are passed in XMM0L, XMM1L, XMM2L, and XMM3L." and "Any floating-point and double-precision arguments in the first four parameters are passed in XMM0 - XMM3, depending on position." The same <code>mixed</code> arrives as <code>%ecx</code>, <code>%xmm1</code>, <code>%r8</code>, <code>%xmm3</code>: slot 0 is an int, so <code>RCX</code>; slot 1 is a double, so <code>XMM1</code>; slot 3 is a float, so <code>XMM3</code>. <code>XMM0</code> and <code>XMM2</code> stay empty.</p>
+<p>The caller must also leave room. "The caller must always allocate sufficient space to store four register parameters, even if the callee doesn't take that many parameters." The pages call it the shadow store or the home addresses, and the four slots are "effectively owned by the called function". On entry <code>0(%rsp)</code> is the return address, <code>8(%rsp)</code> to <code>39(%rsp)</code> are the four homes, and the first stack argument is at <code>40(%rsp)</code>. <code>eight_args</code> at <code>-O2</code> reads <code>0x28(%rsp)</code>, <code>0x30(%rsp)</code>, <code>0x38(%rsp)</code>, <code>0x40(%rsp)</code>: 40, 48, 56, 64.</p>
+<p>The caller side shows the arithmetic. <code>call8</code> at <code>-O2</code> is <code>subq $0x48, %rsp</code> and then stores of 5, 6, 7, 8 at <code>0x20(%rsp)</code> to <code>0x38(%rsp)</code> before <code>movl $1, %ecx</code> and friends. 72 bytes is 32 for the shadow store, 32 for four stack arguments, and 8 so that the return address is on a 16-byte boundary. <code>call_varargs</code> has only register arguments and still allocates <code>subq $0x28, %rsp</code>: 32 for the shadow store and 8 for alignment. <code>keeps</code> pushes three nonvolatile registers (24 bytes) and then <code>subq $0x20, %rsp</code>, so that <code>ext</code> finds its 32-byte shadow store below the return address.</p>
+<p>Structs follow their own rule. "Any argument that doesn't fit in 8 bytes, or isn't 1, 2, 4, or 8 bytes, must be passed by reference." and "16-byte arguments are passed by reference." <code>by_value</code> therefore receives a pointer to a copy in <code>%rdx</code>, after a hidden result pointer in <code>%rcx</code>: "the caller must allocate memory for the return value and pass a pointer to it as the first argument. The remaining arguments are then shifted one argument to the right." <code>call_pair</code> builds the copy at <code>0x20(%rsp)</code> with <code>movaps</code>, passes <code>leaq 0x20(%rsp), %rdx</code>, passes the result buffer with <code>leaq 0x38(%rsp), %rcx</code>, and reads <code>.b</code> back from <code>0x40(%rsp)</code>.</p>
+<p>There is no red zone. "All memory beyond the current address of RSP is considered volatile: The OS, or a debugger, may overwrite this memory during a user debug session, or an interrupt handler." The <code>-O0</code> <code>leaf_add</code> needs 8 bytes of locals and gets them with <code>pushq %rax</code> at entry and <code>popq %rcx</code> before <code>retq</code>, two single-byte instructions instead of a <code>subq</code> and an <code>addq</code>. The stack-usage page defines the leaf that may do this: "A leaf function is one that does not require a function table entry. It can't make changes to any nonvolatile registers, including RSP".</p>
+<p>Variadic callees home their registers. "For vararg or unprototyped functions, any floating point values must be duplicated in the corresponding general-purpose register." <code>sum_varargs</code> at <code>-O2</code> stores <code>%rdx</code>, <code>%r8</code>, <code>%r9</code> to <code>0x18(%rsp)</code>, <code>0x20(%rsp)</code>, <code>0x28(%rsp)</code> after one <code>pushq %rax</code>, which is entry offsets 16, 24, 32: the homes of the second, third, and fourth register parameters. Its <code>va_list</code> is <code>leaq 0x18(%rsp), %rax</code>, the home of <code>%rdx</code>, the first unnamed argument.</p>
+<h2>AAPCS64, and What Apple Changes</h2>
+<p>AAPCS64 6.8.2 walks a list of rules with two counters. C.9: an integral argument "is copied to the least significant bits in x[NGRN]" and NGRN increments. C.1 does the same for floating-point arguments with NSRN. C.12: a composite of at most <code>8 - NGRN</code> double-words is "copied into consecutive general-purpose registers". C.13 sets "The NGRN is set to 8" once an argument goes to the stack, so nothing returns to registers afterwards. <code>eight_args</code> uses <code>x0</code> to <code>x7</code> and never touches the stack. <code>mixed</code> is <code>w0</code>, <code>d0</code>, <code>x1</code>, <code>s1</code>. <code>by_value</code> is <code>x0</code> and <code>x1</code> in and out.</p>
+<p>6.9 says a result that would be passed in registers "is returned in the same registers", otherwise "The address of the memory block shall be passed as an additional argument to the function in x8". <code>big_ret</code> writes <code>str x0, [x8]</code>, <code>stur q0, [x8, #0x8]</code>, <code>str x9, [x8, #0x18]</code> and never writes <code>x0</code>. <code>call_big</code> sets <code>mov x8, sp</code>, and <code>seed</code> stays in <code>x0</code>, because 6.9 adds "there is no requirement for the callee to preserve the value stored in x8" and <code>x8</code> is not one of the argument registers.</p>
+<p>6.1.1: "A subroutine invocation must preserve the contents of the registers r19-r29 and SP." 6.4.5.2: at a public interface "SP mod 16 = 0". The stack is full-descending and "No thread is permitted to access (for reading or for writing) the inactive region" below it, so the Linux <code>-O0</code> <code>leaf_add</code> emits <code>sub sp, sp, #0x10</code> for 8 bytes of locals where System V used the red zone.</p>
+<p>6.4.6 defines the frame record: "a frame record of two 64-bit values on the stack ... The lowest addressed double-word shall point to the previous frame record and the highest addressed double-word shall contain the value passed in LR on entry to the current function." and "The location of the frame record within a stack frame is not specified." clang shows both positions in this one file. <code>keeps</code> at <code>-O2</code> on Linux puts the record at the bottom with <code>stp x29, x30, [sp, #-0x30]!; mov x29, sp</code>. The same function at <code>-O0</code> puts it at the top with <code>sub sp, sp, #0x20; stp x29, x30, [sp, #0x10]; add x29, sp, #0x10</code>.</p>
+<p>Apple's arm64 notes keep the registers and the alignment and change the frame, the red zone, and variadic calls. "The frame pointer register (x29) must always address a valid frame record. Some functions, such as leaf functions or tail calls, may opt not to create an entry in this list." The Apple build of <code>keeps</code> saves <code>x22, x21, x20, x19</code> first and puts the record on top: <code>stp x29, x30, [sp, #0x20]; add x29, sp, #0x20</code>. "The platforms reserve register x18. Don't use this register." "The ARM64 red zone consists of the 128 bytes immediately below the stack pointer", and clang still emitted <code>sub sp, sp, #0x10</code> for the <code>-O0</code> leaf, so the compiler does not use it by default. Variadic arguments are assigned "to the appropriate number of 8-byte stack slots" and "the type va_list is an alias for char*". <code>call_varargs</code> on Apple stores 10, 20, 30 to <code>[sp]</code>, <code>[sp, #8]</code>, <code>[sp, #0x10]</code> and passes only <code>w0</code>; the Linux build passes <code>w1</code>, <code>w2</code>, <code>w3</code> and tail-calls with <code>b extva</code>. The Apple <code>sum_varargs</code> reads <code>add x8, sp, #0x10</code>, the caller's stack pointer, as its <code>va_list</code>; the Linux <code>sum_varargs</code> saves <code>x1</code> to <code>x7</code> and <code>q0</code> to <code>q7</code> into a 224-byte frame and initialises the structure fields <code>__gr_offs</code> to -56 and <code>__vr_offs</code> to -128 with one <code>mov x8, #-0x38; movk x8, #0xff80, lsl #32</code>.</p>
+<p>Symbols differ too. Mach-O prefixes every C symbol with <code>_</code>, so the listing shows <code>_keeps</code> and the first function appears under the private label <code>ltmp0</code>. The analyzer renames labels through the symbol table.</p>
+<h2>Decode One Prologue by Hand, Three Times</h2>
+<p><code>keeps(int n)</code> calls <code>ext(i)</code> in a loop and keeps <code>n</code>, <code>i</code>, and <code>acc</code> across the call, so every ABI must save registers. Read the first bytes of the <code>-O2</code> build for each target.</p>
+<p>System V, 4 bytes:</p>
+<ol>
+<li><code>55</code> is <code>push r64</code> with the register in the low three bits: <code>50 + 5</code>, <code>%rbp</code>. Depth 8, <code>%rbp</code> saved at entry offset -8.</li>
+<li><code>41 56</code>: <code>41</code> is REX with <code>B</code> set, <code>56</code> is <code>50 + 6</code>. REX.B extends 6 to 14: <code>pushq %r14</code> at -16.</li>
+<li><code>53</code> is <code>50 + 3</code>: <code>pushq %rbx</code> at -24.</li>
+</ol>
+<p>Three pushes are 24 bytes. The return address adds 8, and 32 is a multiple of 16, so the <code>callq ext</code> inside the loop is aligned without a <code>subq</code>. There is no <code>movq %rsp, %rbp</code>, so this build has no frame pointer. The body uses <code>%rbp</code> as the callee-saved register that holds <code>acc</code> (<code>xorl %ebp, %ebp</code>, <code>addl %eax, %ebp</code>). The epilogue is the mirror: <code>5b 41 5e 5d c3</code>.</p>
+<p>Microsoft x64, 7 bytes:</p>
+<ol>
+<li><code>56</code> is <code>pushq %rsi</code> at -8. <code>57</code> is <code>pushq %rdi</code> at -16. <code>53</code> is <code>pushq %rbx</code> at -24. All three are nonvolatile here, and <code>RDI</code> and <code>RSI</code> were argument registers under System V.</li>
+<li><code>48 83 ec 20</code>: REX.W, opcode <code>83 /5</code> with an 8-bit immediate, ModRM <code>ec</code> is <code>11 101 100</code>: <code>subq $0x20, %rsp</code>. Depth 56.</li>
+</ol>
+<p>56 plus the return address is 64, aligned. The 32 bytes are the shadow store that <code>ext</code> is owed. The epilog page allows only "an add RSP,constant or lea RSP,constant[FPReg], followed by a series of zero or more 8-byte register pops and a return or a jmp", and the bytes are <code>48 83 c4 20 5b 5f 5e c3</code>.</p>
+<p>AArch64, 16 bytes in four words, little-endian:</p>
+<ol>
+<li><code>a9bd7bfd</code> is <code>stp</code> with pre-index. Bits 31:30 <code>10</code> select 64-bit registers, bits 25:23 <code>011</code> select pre-index, bit 22 is 0 for store. imm7 at bits 21:15 is <code>1111010</code>, which is -6, scaled by 8: -48. Rt2 at 14:10 is 30, Rn at 9:5 is 31 (<code>sp</code>), Rt at 4:0 is 29. <code>stp x29, x30, [sp, #-0x30]!</code>: the stack pointer drops 48, <code>x29</code> goes to -48 and <code>x30</code> to -40.</li>
+<li><code>f9000bf5</code> is <code>str</code> with an unsigned 12-bit offset scaled by 8: imm12 at 21:10 is 2, Rn is <code>sp</code>, Rt is 21. <code>str x21, [sp, #0x10]</code>, entry offset -32.</li>
+<li><code>910003fd</code> is <code>add</code> immediate: imm12 is 0, Rn is <code>sp</code>, Rd is 29. <code>mov x29, sp</code>: the frame pointer points at the record at -48.</li>
+<li><code>a9024ff4</code> is <code>stp</code> with a signed offset: imm7 is 4, scaled to 32. Rt2 is 19, Rt is 20. <code>stp x20, x19, [sp, #0x20]</code>: <code>x20</code> at -16, <code>x19</code> at -8.</li>
+</ol>
+<p>The frame is 48 bytes: <code>x29</code> at 0, <code>x30</code> at 8, <code>x21</code> at 16, 8 bytes of padding at 24, <code>x20</code> at 32, <code>x19</code> at 40. The lowest word of the record points to the previous record and the next word holds LR, as 6.4.6 requires. <code>cmp w0, #0x1</code> sits between the first and second store; the scheduler moved it into the prologue, and the analyzer tolerates a compare or an arithmetic instruction between stack operations.</p>
+<h2>The Compiler Wrote the Same Facts Twice</h2>
+<p>A prologue parse is one derivation. The compiler emits a second one for the unwinder, and the two must agree.</p>
+<p>On Windows the second derivation is <code>.pdata</code> and <code>.xdata</code>. Build the <code>-O2</code> object without <code>-fno-asynchronous-unwind-tables</code> and <code>llvm-objdump -h</code> shows <code>.xdata</code> of 0x34 bytes and <code>.pdata</code> of 0x48 bytes. 0x48 is 72, six <code>RUNTIME_FUNCTION</code> entries of 12 bytes with three <code>IMAGE_REL_AMD64_ADDR32NB</code> relocations each. The six are <code>sum_varargs</code>, <code>keeps</code>, <code>call8</code>, <code>call_varargs</code>, <code>call_pair</code>, and <code>call_big</code>. The other six functions are leaves, and the exception handling page says "If the search doesn't find a function table entry, the code is assumed to be part of a leaf function, and RSP directly addresses the return pointer."</p>
+<p>The <code>.xdata</code> bytes for <code>keeps</code> are <code>01 07 04 00 07 32 03 30 02 70 01 60</code>. <code>UNWIND_INFO</code> starts with Version in 3 bits and Flags in 5 bits: version 1, no flags. SizeOfProlog is 7, CountOfCodes is 4, FrameRegister and FrameOffset are 0. Each <code>UNWIND_CODE</code> is an offset in the prolog and a byte of opcode and info. <code>07 32</code>: at offset 7, op 2 is <code>UWOP_ALLOC_SMALL</code>, info 3 means <code>3 * 8 + 8 = 32</code> bytes. <code>03 30</code>: op 0 is <code>UWOP_PUSH_NONVOL</code>, register 3 is <code>rbx</code>. <code>02 70</code>: <code>rdi</code>. <code>01 60</code>: <code>rsi</code>. The codes are stored in reverse order of execution, and they name the same three pushes and the same 32-byte allocation as the bytes <code>56 57 53 48 83 ec 20</code>. The <code>sum_varargs</code> entry is <code>01 01 01 00 01 02 00 00</code>: a 1-byte prolog with one code, <code>UWOP_ALLOC_SMALL</code> of 8 bytes. That is how the unwinder sees <code>pushq %rax</code>: an allocation, because <code>%rax</code> is volatile and nothing is being saved.</p>
+<p>On Linux the second derivation is <code>.eh_frame</code>, which psABI 4.2.4 defines and DWARF 5 section 6.4 encodes. <code>llvm-dwarfdump --eh-frame</code> on the relocatable object prints one FDE per function and resolves the <code>R_X86_64_PC32</code> relocations, so the ranges are usable. For <code>keeps</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  DW_CFA_def_cfa_offset: +16
+  DW_CFA_def_cfa_offset: +24
+  DW_CFA_def_cfa_offset: +32
+  DW_CFA_offset: RBX -32
+  DW_CFA_offset: R14 -24
+  DW_CFA_offset: RBP -16
+</code></pre></div>
+<p>The CFA is the stack pointer before the call, 8 above the entry stack pointer, so <code>RBP -16</code> is entry offset -8, <code>R14 -24</code> is -16, <code>RBX -32</code> is -24, and the deepest CFA offset of 32 is the 24-byte frame plus the return address. The AArch64 FDE for <code>keeps</code> says <code>DW_CFA_def_cfa: W29 +48</code> with <code>W29 -48</code>, <code>W30 -40</code>, <code>W21 -32</code>, <code>W20 -16</code>, <code>W19 -8</code>. There the CFA is the entry stack pointer itself, so the offsets are the frame offsets without conversion, and the CFA is defined from <code>x29</code> while the frame record is live. <code>eh_frame_cross_check()</code> runs this comparison for all 12 FDEs of both objects. One entry needed care: <code>call8</code> under System V pushes two outgoing arguments mid-body, so its deepest CFA offset is 32 while its prologue frame is 8, and the check compares the deepest stack pointer the body reaches, 24, plus 8.</p>
+<h2>What the Tools Call This</h2>
+<p>Every tool in this field has a data structure for the calling convention and a pass that assigns one to a function. The names differ and the gaps differ. The closed tools are described from their documentation; the open ones were run on the fixtures and their output is captured beside the objects.</p>
+<p><strong>Ghidra 12.1.4 (Apache-2.0).</strong> The rules live in compiler specification files, <code>.cspec</code>, next to the SLEIGH language. <code>x86-64-gcc.cspec</code> declares a <code>&lt;default_proto&gt;</code> named <code>__stdcall</code>, "Derived from System V Application Binary Interface AMD64 Architecture Processor Supplement April 2016", with <code>&lt;pentry&gt;</code> lists for <code>XMM0_Qa</code> to <code>XMM7_Qa</code> and <code>RDI, RSI, RDX, RCX, R8, R9</code>, a stack entry at offset 8, a <code>join_dual_class</code> rule for types up to 16 bytes, outputs <code>XMM0_Qa, XMM1_Qa, RAX, RDX</code>, and <code>hidden_return</code> for the rest. <code>x86-64-win.cspec</code> declares <code>__fastcall</code> with four <code>&lt;group&gt;</code> elements that pair <code>XMM0_Qa</code> with <code>RCX</code>, <code>XMM1_Qa</code> with <code>RDX</code>, and so on, which is the positional rule, a stack entry at offset 40, <code>convert_to_ptr</code> for structs of 3, 5, 6, or 7 bytes with the comment "only structs of size 8,16,32,64 bits can be packed to register", <code>unaffected</code> listing <code>RBX RBP RDI RSI RSP R12</code> to <code>R15</code> and <code>XMM6</code> to <code>XMM15</code>, and a <code>localrange</code> of stack 8 to 39, which is the shadow store. <code>AARCH64.cspec</code> declares <code>__cdecl</code> whose first entry is <code>x8</code> with <code>storage="hiddenret"</code>, then <code>q0</code> to <code>q7</code> and <code>x0</code> to <code>x7</code>, <code>convert_to_ptr</code> for structs of 17 bytes or more, and <code>killedbycall</code> including <code>x8</code> with the comment "indirect result location register, which is not reflected in the pentry list". The decompiler's final stage is named "Establish Function's Prototype"; the analyzers are "Call Convention ID" and "Decompiler Parameter ID"; the program option "Prototype Evaluation" picks the default model.</p>
+<p><strong>IDA Pro and IDA Free (Hex-Rays, commercial; current release 9.4, build 9.4.260714).</strong> The function type is a C declaration set through SetType, and "IDA will use the type information to comment the disassembly with the information about function arguments." Locations that no standard convention produces are written in IDA's own convention: <code>int __usercall func@&lt;ebx&gt;(int x, int y@&lt;esi&gt;)</code> puts the result in <code>EBX</code> and <code>y</code> in <code>ESI</code>, and <code>@&lt;^12.4&gt;</code> names a stack location by offset and size. <code>__userpurge</code> is the same with callee stack cleanup. The same page lists <code>__spoils</code> for the clobbered set, <code>__hidden</code>, <code>__return_ptr</code>, and <code>__struct_ptr</code> for the implicit arguments this lesson recovers by hand. The decompiler's "Decompile as call" action accepts a <code>__usercall</code> prototype for one instruction. IDA Free supports x86 and x86-64 only.</p>
+<p><strong>Binary Ninja 6.0 "Krypton" (Vector 35, commercial, with a Free edition that decompiles x86, x86_64, ARMv7, and AArch64).</strong> A <code>Platform</code> "contains all information related to the execution environment of the binary, mainly the calling conventions used, the operating system, and the architecture", and the list includes <code>linux-x86_64</code>, <code>windows-x86_64</code>, <code>linux-aarch64</code>, and <code>mac-aarch64</code>, each with a <code>default_calling_convention</code>. A <code>CallingConvention</code> has <code>int_arg_regs</code>, <code>float_arg_regs</code>, <code>callee_saved_regs</code>, <code>caller_saved_regs</code>, <code>int_return_reg</code>, <code>high_int_return_reg</code>, <code>float_return_reg</code>, and two flags that encode the differences in this lesson directly: <code>arg_regs_share_index</code>, "When True, the Nth argument consumes the Nth slot of both the integer and float register lists regardless of its type", and <code>stack_reserved_for_arg_regs</code>, "the shadow/home space used by the Windows x64 calling convention". <code>eligible_for_heuristics</code>, <code>required_arg_regs</code>, and <code>required_clobbered_regs</code> drive its heuristic convention detection. Platform types are C headers under <code>types/platform/</code>, one per platform name.</p>
+<p><strong>radare2 6.2.4 (LGPL-3.0, run here).</strong> <code>afcl</code> lists the conventions the architecture plugin knows: <code>amd64 amd64syscall dlang golang golang_abi0 ms p9 reg swift</code> for x86-64 and <code>arm64 dlang golang p9 reg swift</code> for AArch64. <code>afc</code> reports the convention of the current function, <code>afcr</code> prints <code>cc.amd64.arg0: rdi</code> through <code>arg5: r9</code> and <code>ret0: rax</code>, and the profiles are SDB files named <code>cc-ARCH-BITS.sdb</code>. radare2 picked <code>amd64</code> for the ELF object and <code>ms</code> for the COFF object, which is the correct split. <code>afv</code> lists arguments and variables, and <code>afs</code> prints a signature. On the Linux <code>-O2</code> object <code>afv</code> found seven arguments for <code>eight_args</code> and dropped <code>rcx</code>; on the Windows object it found <code>rcx, rdx, r8</code> and four stack slots and dropped <code>r9</code>. Both missing registers appear only inside a <code>lea</code>. On <code>mixed</code> it reported <code>double arg1 @ xmm0, arg2 @ xmm1, arg3 @ xmm2</code> on Linux and no arguments at all on Windows. On AArch64 it found <code>x0</code> to <code>x7</code> for <code>eight_args</code>, and for <code>big_ret</code> it listed <code>x0</code> and <code>double arg2 @ d1</code> where the function reads <code>x8</code> and loads a constant into <code>q1</code>. Every <code>afs</code> signature starts with <code>void</code>, because the return type is not inferred. At <code>-O0</code>, where every argument is stored to the frame, <code>afv</code> found all eight arguments of <code>eight_args</code> with <code>rbp+0x10</code> and <code>rbp+0x18</code> for the stack pair.</p>
+<p><strong>rizin 0.9.1 (LGPL-3.0, run here) and Cutter 2.5.0.</strong> <code>afcl</code> lists <code>amd64 amd64syscall ms reg swift</code>. <code>afc</code> returned <code>amd64</code> for the COFF object, so the Microsoft profile exists and was not selected from the format. <code>afi</code> listed seven arguments for <code>eight_args</code> on Linux, again without <code>rcx</code>, and on Windows <code>r8, rcx, rdx</code> with three stack slots, without <code>r9</code> and without the slot at <code>0x40</code>. <code>afv</code> does not exist; the listing command is <code>afvl</code>. Cutter is the graphical front end over rizin.</p>
+<p><strong>angr 10.0.3 (BSD-2, run here).</strong> <code>CFGFast</code> followed by <code>CompleteCallingConventions(recover_variables=True)</code> sets <code>function.calling_convention</code> to <code>SimCCSystemVAMD64</code>, <code>SimCCMicrosoftAMD64</code>, or <code>SimCCAArch64</code>, by binary format, and <code>function.prototype</code> to a signature. It recovered all eight arguments of <code>eight_args</code> on all three targets, the hidden pointer of <code>big_ret</code> on x86-64 as <code>(BOT*, long long) -&gt; BOT*</code>, the by-reference struct of the Windows <code>by_value</code> as <code>(BOT*, BOT*) -&gt; BOT*</code>, and the System V variadic <code>sum_varargs</code> as <code>(long long, ...)</code>. Its gaps are different from radare2's: <code>mixed</code> came back as <code>(long long, long long, double, float)</code> on System V and AArch64, the right registers in the wrong order, because the integer list is printed before the float list; the AArch64 <code>big_ret</code> came back as <code>(long long) -&gt; double</code>, so the <code>x8</code> convention was missed and the vector stores were read as a result; and the AArch64 <code>sum_varargs</code> came back with 16 parameters, the whole register save area.</p>
+<p><strong>Others.</strong> Hopper 6.6.0 is a commercial disassembler and decompiler for macOS and Linux; its convention handling was not run or documented for this lesson. lldb 1703 and gdb show the live frame with <code>frame info</code> and <code>register read</code>, which is lesson 42's dynamic view of the same offsets. Compiler Explorer shows the three listings side by side from source, which is the fastest way to confirm a rule before you look for it in bytes.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Concept</th>
+<th>Ghidra</th>
+<th>IDA</th>
+<th>Binary Ninja</th>
+<th>radare2 / rizin</th>
+<th>angr</th>
+<th>this lesson</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The convention object</td>
+<td><code>prototype</code> in a <code>.cspec</code></td>
+<td>calling convention keyword in the function type</td>
+<td><code>CallingConvention</code> on a <code>Platform</code></td>
+<td><code>afc</code> name, <code>cc-ARCH-BITS.sdb</code></td>
+<td><code>SimCC</code> subclass</td>
+<td><code>expected_locations(abi, name)</code></td>
+</tr>
+<tr>
+<td>Default per target</td>
+<td><code>&lt;default_proto&gt;</code> per cspec</td>
+<td>compiler setting</td>
+<td><code>Platform.default_calling_convention</code></td>
+<td><code>afc=</code>, <code>anal.cc</code></td>
+<td>by format</td>
+<td><code>describe_object()</code></td>
+</tr>
+<tr>
+<td>Argument registers</td>
+<td><code>&lt;pentry&gt;</code> list, <code>&lt;group&gt;</code> for positional</td>
+<td><code>@&lt;reg&gt;</code> in <code>__usercall</code></td>
+<td><code>int_arg_regs</code>, <code>float_arg_regs</code>, <code>arg_regs_share_index</code></td>
+<td><code>cc.NAME.argN</code></td>
+<td><code>ARG_REGS</code>, <code>FP_ARG_REGS</code></td>
+<td><code>INT_ARG_REGS</code>, <code>FLOAT_ARG_REGS</code></td>
+</tr>
+<tr>
+<td>Shadow store</td>
+<td><code>localrange</code> stack 8 to 39</td>
+<td>implicit</td>
+<td><code>stack_reserved_for_arg_regs</code></td>
+<td><code>cc.ms.argn=stack</code></td>
+<td><code>STACKARG_SP_DIFF</code></td>
+<td><code>STACK_ARG_BASE[WIN64] = 40</code></td>
+</tr>
+<tr>
+<td>Hidden result pointer</td>
+<td><code>hidden_return</code>, <code>storage="hiddenret"</code></td>
+<td><code>__return_ptr</code>, <code>__hidden</code></td>
+<td>return type too large for <code>int_return_reg</code></td>
+<td>not modelled</td>
+<td><code>BOT*</code> first argument</td>
+<td><code>HIDDEN_RETURN_REG</code></td>
+</tr>
+<tr>
+<td>Callee-saved</td>
+<td><code>&lt;unaffected&gt;</code></td>
+<td><code>__spoils</code> lists the opposite</td>
+<td><code>callee_saved_regs</code></td>
+<td>profile</td>
+<td><code>CALLEE_CLEANUP</code> and arch</td>
+<td><code>CALLEE_SAVED</code></td>
+</tr>
+<tr>
+<td>Assigning one to a function</td>
+<td>"Call Convention ID" analyzer, "Establish Function's Prototype"</td>
+<td>user or type library</td>
+<td>heuristic detection with <code>required_arg_regs</code></td>
+<td><code>afc</code>, <code>afva</code>, <code>aaft</code></td>
+<td><code>CallingConventionAnalysis</code></td>
+<td>read-before-write plus the rulebook</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>System V classification.</strong> Arguments are assigned left to right with two independent counters: integer-class arguments take the next of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">rdi</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">rsi</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">rdx</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">rcx</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">r8</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">r9</span></span><span class="mclose">)</span></span></span></span>, floating-point arguments the next of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord texttt">xmm0</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner">…</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord texttt">xmm7</span></span><span class="mclose">)</span></span></span></span>. When a sequence runs out, the argument goes on the stack: the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>-th stack argument (from 0) is at
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord text"><span class="mord texttt">rsp</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">]</span><span class="mspace" style="margin-right:1em;"></span><span class="mord text"><span class="mord">at function entry</span></span><span class="mpunct">,</span></span></span></span></span></div>
+because <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord text"><span class="mord texttt">rsp</span></span><span class="mclose">]</span></span></span></span> holds the return address. Microsoft x64 instead uses one positional counter: argument <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span></span></span></span> uses slot <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span></span></span></span> in either <code>rcx, rdx, r8, r9</code> or <code>xmm0-3</code>.</p>
+<p><strong>Frames from CFI.</strong> With the canonical frame address <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">CFA</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7025em;vertical-align:-0.2719em;"></span><span class="mord"><span class="mord text"><span class="mord texttt">rsp</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2142em;"><span style="top:-2.4281em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord text mtight"><span class="mord mtight">before call</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2719em;"><span></span></span></span></span></span></span></span></span></span>, a rule <code>c-16</code> for <code>r12</code> means its saved copy is at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">CFA</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>, and the return address is always at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">CFA</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Placing `mixed(int i, double d, i64 l, float f)` by hand</div><div class="co-body"><ul>
+<li>System V: <code>i</code> is integer #1 → <code>rdi</code>; <code>d</code> is floating #1 → <code>xmm0</code>; <code>l</code> is integer #2 → <code>rsi</code> (not <code>rdx</code>: the counters are independent); <code>f</code> is floating #2 → <code>xmm1</code>.</li>
+<li>Microsoft x64: positions 1 to 4 → <code>rcx</code>, <code>xmm1</code>, <code>r8</code>, <code>xmm3</code> (each position uses one slot, of the matching kind).</li>
+<li><code>eight_args</code> has 8 integers: 6 in registers, <code>g</code> at <code>[rsp+8]</code>, <code>h</code> at <code>[rsp+16]</code> on entry.</li>
+<li><code>big_ret</code> returns a 32-byte struct: too big for <code>rax:rdx</code>, so the caller passes a hidden pointer in <code>rdi</code>, and the visible argument <code>seed</code> moves to <code>rsi</code>.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The third argument is always in <code>rdx</code>."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only if the first two are integers; floating-point arguments use their own sequence.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Linux and Windows x64 pass arguments the same way."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Different registers, a 32-byte shadow store on Windows, and no red zone there.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A struct return comes back in <code>rax</code>."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Small structs use <code>rax:rdx</code>; larger ones use a hidden pointer the caller passes in the first integer register.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Prologue analysis is the only way to find saved registers."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The compiler's CFI (<code>.eh_frame</code>, <code>.pdata/.xdata</code>) records them too; check one against the other.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>At the first instruction of <code>mixed(1, 2.5, 3, 4.5f)</code>, which registers hold 1, 2.5, 3 and 4.5? At <code>big_ret(9)</code>, which register holds 9? At <code>sum_varargs(3, 10, 20, 30)</code>, what is in <code>al</code>? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The System V rules on a live process</div><div class="co-body"><p><code>convention.c</code> plus a small driver are built with GCC <code>-O2 -fno-inline</code>. For each function, the lesson's <code>expected_locations(SYSV, name)</code> predicts where every argument lives; gdb stops at the function's first instruction and reads exactly those registers and stack slots. About two seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The System V rules, checked on a live process: build convention.c with this machine's GCC, stop at each
+# function's first instruction in gdb, and read every register or stack slot the lesson predicts.
+import os, re, pathlib, subprocess, tempfile
+from main import expected_locations, SYSV, FIXTURES
+tmp = pathlib.Path(tempfile.mkdtemp())
+(tmp / &quot;driver.c&quot;).write_text(r'''
+typedef long long i64; struct pair { i64 a; i64 b; }; struct big { i64 v[4]; };
+i64 eight_args(i64,i64,i64,i64,i64,i64,i64,i64); double mixed(int,double,i64,float);
+struct pair by_value(struct pair); struct big big_ret(i64); int sum_varargs(int, ...); int keeps(int);
+int ext(int x) { return x; }                                    /* the externals convention.c calls */
+i64 ext8(i64 a,i64 b,i64 c,i64 d,i64 e,i64 f,i64 g,i64 h) { return a + h; }
+double extmixed(int i, double d, i64 l, float f) { return d; } int extva(int n, ...) { return n; }
+struct pair extpair(struct pair p) { return p; } struct big extbig(i64 s) { struct big b = {{s, s, s, s}}; return b; }
+int main(void) {
+    volatile double r = 0; struct pair p = {5, 6};
+    r += eight_args(1, 2, 3, 4, 5, 6, 7, 8); r += mixed(1, 2.5, 3, 4.5f); r += by_value(p).b;
+    r += big_ret(9).v[2]; r += sum_varargs(3, 10, 20, 30); r += keeps(3); return (int)r &amp; 1;
+}''')
+exe = tmp / &quot;conv&quot;
+subprocess.run([&quot;gcc&quot;, &quot;-O2&quot;, &quot;-fno-inline&quot;, str(tmp / &quot;driver.c&quot;), str(FIXTURES / &quot;convention.c&quot;), &quot;-o&quot;, str(exe)], check=True)
+CALLS = {&quot;eight_args&quot;: [1, 2, 3, 4, 5, 6, 7, 8], &quot;mixed&quot;: [1, 2.5, 3, 4.5], &quot;by_value&quot;: [[5, 6]], &quot;big_ret&quot;: [9], &quot;sum_varargs&quot;: [3]}
+def gdb_expr(loc, ctype):
+    if loc.startswith(&quot;stack+&quot;): return f&quot;*(long*)($rsp+{loc[6:]})&quot;          # at entry, [rsp] is the return address
+    if loc.startswith(&quot;xmm&quot;): return f&quot;${loc}.{'v4_float' if ctype == 'float' else 'v2_double'}[0]&quot;
+    return f&quot;(long)${loc}&quot;
+script = [&quot;set pagination off&quot;] + [f&quot;break {f}&quot; for f in CALLS] + [&quot;run&quot;]
+for f in CALLS:
+    exp = expected_locations(SYSV, f)
+    items = [(p[&quot;name&quot;], loc, gdb_expr(loc, p[&quot;type&quot;])) for p in exp[&quot;parameters&quot;] for loc in p[&quot;location&quot;]]
+    if exp[&quot;hidden&quot;]: items.insert(0, (&quot;(hidden return pointer)&quot;, exp[&quot;hidden&quot;], f&quot;/x ${exp['hidden']}&quot;))
+    if exp[&quot;variadic&quot;]: items.append((&quot;(vector regs used, al)&quot;, &quot;al&quot;, &quot;$al&quot;))
+    for n, l, e in items: script.append(f'output {e}\necho |{f}|{n}|{l}\\n')
+    script.append(&quot;continue&quot;)
+(tmp / &quot;cmds.gdb&quot;).write_text(&quot;\n&quot;.join(script) + &quot;\n&quot;)
+env = {k: v for k, v in os.environ.items() if k not in (&quot;PYTHONPATH&quot;, &quot;PYTHONHOME&quot;)}
+out = subprocess.run([&quot;gdb&quot;, &quot;-q&quot;, &quot;-batch&quot;, &quot;-x&quot;, str(tmp / &quot;cmds.gdb&quot;), str(exe)], capture_output=True, text=True, timeout=60, env=env).stdout
+rows = re.findall(r&quot;^(\S+)\|(\w+)\|([^|]+)\|([^|\n]+)$&quot;, out, re.M)
+for value, func, name, loc in rows:
+    args = CALLS[func]; idx = [p[&quot;name&quot;] for p in expected_locations(SYSV, func)[&quot;parameters&quot;]].index(name) if not name.startswith(&quot;(&quot;) else None
+    want = args[idx] if idx is not None else None
+    if isinstance(want, list): want = want[[l for p in expected_locations(SYSV, func)[&quot;parameters&quot;] for l in p[&quot;location&quot;]].index(loc)]
+    ok = &quot;&quot; if want is None else (&quot;ok&quot; if float(value) == float(want) else f&quot;MISMATCH (expected {want})&quot;)
+    print(f&quot;{func:&lt;12} {name:&lt;24} predicted {loc:&lt;9} gdb reads {value:&lt;16} {ok}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">eight_args   a                        predicted rdi       gdb reads 1                ok
+eight_args   b                        predicted rsi       gdb reads 2                ok
+eight_args   c                        predicted rdx       gdb reads 3                ok
+eight_args   d                        predicted rcx       gdb reads 4                ok
+eight_args   e                        predicted r8        gdb reads 5                ok
+eight_args   f                        predicted r9        gdb reads 6                ok
+eight_args   g                        predicted stack+8   gdb reads 7                ok
+eight_args   h                        predicted stack+16  gdb reads 8                ok
+mixed        i                        predicted rdi       gdb reads 1                ok
+mixed        d                        predicted xmm0      gdb reads 2.5              ok
+mixed        l                        predicted rsi       gdb reads 3                ok
+mixed        f                        predicted xmm1      gdb reads 4.5              ok
+by_value     p                        predicted rdi       gdb reads 5                ok
+by_value     p                        predicted rsi       gdb reads 6                ok
+big_ret      (hidden return pointer)  predicted rdi       gdb reads 0x7fffffff62c0   
+big_ret      seed                     predicted rsi       gdb reads 9                ok
+sum_varargs  count                    predicted rdi       gdb reads 3                ok
+sum_varargs  (vector regs used, al)   predicted al        gdb reads 0                </code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Every prediction holds on the live process.</strong> For <code>eight_args</code>, the first six values are in <code>rdi</code> to <code>r9</code> and the seventh and eighth are at <code>[rsp+8]</code> and <code>[rsp+16]</code> at entry, above the return address.</p>
+<p><strong>The two counters are visible.</strong> In <code>mixed</code>, 1 is in <code>edi</code>, 2.5 in <code>xmm0</code>, 3 in <code>rsi</code> (the second integer register, not the third), and 4.5 as a float in the low lane of <code>xmm1</code>.</p>
+<p><strong>Structs follow their size.</strong> The 16-byte <code>pair</code> arrives split across <code>rdi</code> and <code>rsi</code>; <code>big_ret</code>'s 32-byte result needs a hidden pointer, a stack address in <code>rdi</code>, so <code>seed = 9</code> is in <code>rsi</code>.</p>
+<p><strong>Variadic calls carry a count.</strong> At <code>sum_varargs</code>, <code>al</code> is 0: the caller tells the callee how many vector registers it used for variable arguments (none here), so the callee knows whether to save <code>xmm0-7</code> in its register save area.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The second copy of the facts: CFI for `keeps`</div><div class="co-body"><p>This block continues from the one above. <code>readelf --debug-dump=frames-interp</code> prints GCC's <code>.eh_frame</code> table for <code>keeps</code>; gdb stops inside <code>ext</code> (called from <code>keeps</code>) and unwinds into <code>keeps</code>'s frame using that table; the lesson's <code>analyze_fixture</code> gives its own prologue analysis of clang's build of the same function. About a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above. The second copy of the facts: GCC's .eh_frame for `keeps`, read two ways,
+# by readelf and by gdb unwinding a live stack, next to the lesson's analysis of clang's build.
+from main import analyze_fixture
+cfi = subprocess.run([&quot;readelf&quot;, &quot;--debug-dump=frames-interp&quot;, str(exe)], capture_output=True, text=True).stdout
+keeps_addr = int(subprocess.run([&quot;nm&quot;, str(exe)], capture_output=True, text=True).stdout.split(&quot; T keeps&quot;)[0].split(&quot;\n&quot;)[-1], 16)
+fde = next(block for block in cfi.split(&quot;\n\n&quot;) if f&quot;pc={keeps_addr:016x}&quot; in block)
+rows = [l.split() for l in fde.splitlines()[2:] if l.strip()]
+header = fde.splitlines()[1].split()
+print(&quot;readelf CFI table for keeps (GCC -O2):&quot;)
+print(&quot;   &quot; + &quot;  &quot;.join(f&quot;{h:&lt;16}&quot; if i == 0 else f&quot;{h:&lt;8}&quot; for i, h in enumerate(header)))
+for r in rows: print(&quot;   &quot; + &quot;  &quot;.join(f&quot;{c:&lt;16}&quot; if i == 0 else f&quot;{c:&lt;8}&quot; for i, c in enumerate(r)))
+script = [&quot;set pagination off&quot;, &quot;break ext&quot;, &quot;run&quot;, &quot;up&quot;, &quot;info frame&quot;, &quot;continue&quot;] * 1
+(tmp / &quot;frame.gdb&quot;).write_text(&quot;\n&quot;.join(script) + &quot;\n&quot;)
+gdb_out = subprocess.run([&quot;gdb&quot;, &quot;-q&quot;, &quot;-batch&quot;, &quot;-x&quot;, str(tmp / &quot;frame.gdb&quot;), str(exe)], capture_output=True, text=True, timeout=60, env=env).stdout
+saved = gdb_out.split(&quot;Saved registers:&quot;)[1].strip().split(&quot;\n&quot;)[0]
+print(&quot;\ngdb, stopped in ext and looking at the keeps frame, finds saved registers:&quot;, saved.strip())
+clang = analyze_fixture(&quot;convention-x86_64-linux-O2&quot;)[&quot;keeps&quot;]
+print(&quot;lesson's prologue analysis of clang -O2 keeps, saved:&quot;, clang.saved)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">readelf CFI table for keeps (GCC -O2):
+   LOC               CFA       rbx       rbp       r12       ra      
+   0000000000001490  rsp+8     u         u         u         c-8     
+   0000000000001496  rsp+16    u         u         c-16      c-8     
+   0000000000001497  rsp+24    u         c-24      c-16      c-8     
+   0000000000001498  rsp+32    c-32      c-24      c-16      c-8     
+   00000000000014bc  rsp+24    c-32      c-24      c-16      c-8     
+   00000000000014bd  rsp+16    c-32      c-24      c-16      c-8     
+   00000000000014bf  rsp+8     c-32      c-24      c-16      c-8     
+   00000000000014c0  rsp+32    c-32      c-24      c-16      c-8     
+   00000000000014c3  rsp+24    c-32      c-24      c-16      c-8     
+   00000000000014c6  rsp+16    c-32      c-24      c-16      c-8     
+   00000000000014c8  rsp+8     c-32      c-24      c-16      c-8     
+
+gdb, stopped in ext and looking at the keeps frame, finds saved registers: rbx at 0x7fffffff6280, rbp at 0x7fffffff6288, r12 at 0x7fffffff6290, rip at 0x7ffffff
+lesson&#x27;s prologue analysis of clang -O2 keeps, saved: [(&#x27;rbp&#x27;, -8), (&#x27;r14&#x27;, -16), (&#x27;rbx&#x27;, -24)]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The CFI table is a row per instruction range.</strong> At <code>keeps</code>'s entry the CFA is <code>rsp+8</code> and only the return address is known (<code>c-8</code>). After three pushes the CFA is <code>rsp+32</code>, with <code>r12</code> at <code>c-16</code>, <code>rbp</code> at <code>c-24</code> and <code>rbx</code> at <code>c-32</code>. The later rows unwind the epilogue pushes and pops, including a second exit path.</p>
+<p><strong>gdb's unwinder agrees with the table.</strong> Stopped in <code>ext</code> and looking at <code>keeps</code>'s frame, gdb finds <code>rbx</code>, <code>rbp</code>, <code>r12</code> and <code>rip</code> at four consecutive 8-byte slots, exactly the <code>c-32</code>, <code>c-24</code>, <code>c-16</code>, <code>c-8</code> layout.</p>
+<p><strong>The two compilers chose different registers.</strong> The lesson's analysis of clang's <code>-O2</code> build finds <code>rbp</code>, <code>r14</code> and <code>rbx</code> saved; GCC uses <code>rbx</code>, <code>rbp</code> and <code>r12</code>. Both follow the convention (all are callee-saved); which ones a function uses is the compiler's choice, so a reverse engineer reads them from the code or the CFI, never from memory of another build.</p></div></aside>
+<h2>Build it</h2>
+<p>Run the demo:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/38-calling-conventions-and-stack-frames
+python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>The output is one JSON report. For each of the seven objects it names the format, the machine, and the ABI, and for each of the twelve functions it gives the prologue bytes, the saved registers with entry offsets, the frame size, the frame pointer, the parameter registers, the stack argument offsets, the spills, the return register or hidden pointer, the call depths, and the outgoing registers and stores of the callers. Every function ends with its checks: the rule, the expected value from the signature, the observed value from the bytes, and whether they agree. The report ends with the two unwind cross-checks and the tool captures. Across the 84 function analyses, 489 checks run and all 489 agree.</p>
+<p>Expected shape:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;objects&quot;: {
+    &quot;convention-x86_64-windows-O2&quot;: {
+      &quot;format&quot;: &quot;COFF&quot;, &quot;machine&quot;: &quot;AMD64&quot;, &quot;abi&quot;: &quot;Microsoft x64&quot;, &quot;checks&quot;: &quot;73/73 agree&quot;,
+      &quot;functions&quot;: {
+        &quot;keeps&quot;: {
+          &quot;prologue&quot;: [&quot;56  pushq %rsi&quot;, &quot;57  pushq %rdi&quot;, &quot;53  pushq %rbx&quot;, &quot;48 83 ec 20  subq $0x20, %rsp&quot;],
+          &quot;frameBytes&quot;: 56,
+          &quot;savedRegisters&quot;: [{&quot;register&quot;: &quot;rsi&quot;, &quot;entryOffset&quot;: -8}, {&quot;register&quot;: &quot;rdi&quot;, &quot;entryOffset&quot;: -16}, {&quot;register&quot;: &quot;rbx&quot;, &quot;entryOffset&quot;: -24}],
+          &quot;parameterRegisters&quot;: [&quot;rcx&quot;],
+          &quot;returnRegisters&quot;: [&quot;rax&quot;],
+          &quot;calls&quot;: [{&quot;callee&quot;: &quot;ext&quot;, &quot;depth&quot;: 56}],
+          &quot;checks&quot;: [{&quot;rule&quot;: &quot;Microsoft x64: the caller must always allocate ...&quot;, &quot;expected&quot;: &quot;at least 32 bytes ...&quot;, &quot;observed&quot;: [56], &quot;agree&quot;: true}, &quot;...&quot;]
+        }
+      }
+    }
+  },
+  &quot;sehCrossCheck&quot;: [&quot;...&quot;],
+  &quot;ehFrameCrossCheck&quot;: {&quot;...&quot;: &quot;...&quot;}
+}
+</code></pre></div>
+<p>Read <code>code/main.py</code> in this order:</p>
+<ol>
+<li><code>describe_object()</code> reads the ELF, COFF, or Mach-O header and the symbol table and returns the ABI and the function list.</li>
+<li><code>parse_listing()</code> splits the <code>llvm-objdump -d -r</code> text into functions, keeps the relocation target of every call and jump, and strips comments with the marker of the right syntax: <code>#</code> for AT&amp;T, <code>//</code> and <code>;</code> for AArch64, where <code>#</code> introduces an immediate.</li>
+<li><code>effect_x86()</code> and <code>effect_arm()</code> turn one instruction into reads, address reads, writes, loads, stores, and a stack pointer delta. The last AT&amp;T operand is the destination; the first AArch64 operand is the destination except in stores, compares, and branches. <code>lea</code> reads an address and loads nothing. The destination of <code>mov</code>, <code>cvtsi2sd</code>, <code>setcc</code>, and the zero idiom <code>xor r, r</code> is a write only. A call writes the whole volatile set. A pre-indexed store moves <code>sp</code> before the access and a post-indexed load moves it after.</li>
+<li><code>analyze_function()</code> walks the body once up to the first <code>ret</code> or tail jump. It tracks the depth of the stack pointer below its entry value, so a memory operand <code>disp(%rsp)</code> is at entry offset <code>disp - depth</code> and <code>disp(%rbp)</code> is at <code>frame_pointer + disp</code>. It records argument-class registers that are read before they are written, loads at or above the first stack argument offset of the ABI, stores of argument registers into the frame, accesses below the current stack pointer, and the depth at every call.</li>
+<li><code>_return_registers()</code> keeps a result register when its last access before the exit is a write. A read as a data operand kills the candidate; a read as an address base does not, which is what keeps <code>rax</code> alive in <code>big_ret</code> under Microsoft x64, where <code>movq %rcx, %rax</code> is followed by stores through <code>(%rax)</code>.</li>
+<li><code>expected_locations()</code> applies the three rulebooks to a C signature: the two System V lists with eightbyte classes, the Microsoft positional slots with by-reference structs, and the AAPCS64 counters with <code>x8</code> for results above 16 bytes.</li>
+<li><code>run_checks()</code> compares the two and adds the frame rules: callee-saved registers written must be saved, <code>(rsp + 8) % 16 == 0</code> or <code>sp % 16 == 0</code> at every call, 32 bytes of shadow at every Microsoft call, no access below the stack pointer under Microsoft and AAPCS64 and at most 128 bytes under System V, and an epilogue that mirrors the prologue with the stack pointer back at its entry value.</li>
+<li><code>seh_cross_check()</code> and <code>eh_frame_cross_check()</code> read the unwind data of the objects built without <code>-fno-asynchronous-unwind-tables</code> and compare it with the prologue parse.</li>
+</ol>
+<p>Three more commands exist. <code>python3 code/main.py analyze convention-x86_64-windows-O2 keeps</code> prints one function. <code>python3 code/main.py object FILE</code> prints the header's verdict. <code>python3 code/main.py seh</code> prints the decoded <code>UNWIND_INFO</code> of every function that has one.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>Use the analyzer in this order on a new object you built.</p>
+<ol>
+<li>Run <code>python3 code/main.py object FILE.o</code> and write down the ABI it names. If the header and your build command disagree, stop; one of them is wrong.</li>
+<li>Capture <code>llvm-objdump -d -r FILE.o</code> next to the object and run the analysis. Read the prologue bytes and the saved registers before anything else, and compare the frame size with the pushes and the <code>sub</code>.</li>
+<li>Read the parameter registers and the stack offsets against your source signature. A register that the signature does not explain is a hidden pointer, a variadic marker, or a scratch register that the analyzer mistook for an argument. The last case is a bug in the effect table. Fix it with a general rule for that instruction.</li>
+<li>Read the checks that disagree, if any. Each names the rule it rests on, so the first thing to check is the rule, then the bytes, then the analyzer.</li>
+<li>When the object has unwind data, run the cross-check. Two derivations that agree are the strongest evidence this lesson produces.</li>
+<li>When another tool is installed, capture its output with the exact command and compare. Where it agrees you have three derivations. Where it differs you have a specific register and a specific instruction to look at, and that is a finding for lesson 35.</li>
+</ol>
+<h2>Interactive Lab</h2>
+<h3>Lab A: one instruction, three effects</h3>
+<p>From the <code>code</code> directory, open Python:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/38-calling-conventions-and-stack-frames/code
+python3 -q
+</code></pre></div>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from main import *
+effect(Instruction(0, &quot;48 8d 04 0a&quot;, &quot;leaq&quot;, &quot;(%rdx,%rcx), %rax&quot;), SYSV)
+effect(Instruction(0, &quot;f2 0f 2a d7&quot;, &quot;cvtsi2sd&quot;, &quot;%edi, %xmm2&quot;), SYSV)
+effect(Instruction(0, &quot;a9bd7bfd&quot;, &quot;stp&quot;, &quot;x29, x30, [sp, #-0x30]!&quot;), AAPCS64)
+</code></pre></div>
+
+<p>Write down the reads, the address reads, the writes, and the stack delta you expect before each call. Then change <code>[sp, #-0x30]!</code> to <code>[sp], #0x30</code> with <code>ldp</code> and watch the delta move from <code>sp_delta</code> to <code>post_sp_delta</code>.</p>
+<h3>Lab B: the frame of keeps</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">info, listing = load_fixture(&quot;convention-aarch64-linux-O2&quot;)
+keeps = analyze_function(&quot;keeps&quot;, listing[&quot;keeps&quot;], info.abi)
+keeps.saved
+keeps.frame_pointer
+[c.to_dict() for c in frame_cells(keeps)]
+</code></pre></div>
+
+<p>Compare the offsets with the hand decode above. Then load <code>convention-arm64-macos-O2</code> and run the same three lines; the record moves to -16 and four registers sit below it. Then load <code>convention-x86_64-linux-O2-fp</code> and read <code>saved</code> for <code>keeps</code>: the frame pointer is back, and so is a <code>pushq %rax</code> whose only job is to make <code>(rsp + 8)</code> a multiple of 16 at the call.</p>
+<h3>Lab C: read-before-write on mixed</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">info, listing = load_fixture(&quot;convention-x86_64-linux-O2&quot;)
+mixed = analyze_function(&quot;mixed&quot;, listing[&quot;mixed&quot;], info.abi)
+mixed.param_registers
+mixed.return_registers
+expected_locations(SYSV, &quot;mixed&quot;)[&quot;parameters&quot;]
+expected_locations(WIN64, &quot;mixed&quot;)[&quot;parameters&quot;]
+</code></pre></div>
+
+<p>The System V list is <code>rdi, xmm0, rsi, xmm1</code> and the Microsoft list is <code>rcx, xmm1, r8, xmm3</code>. Now load the Windows object and run the first three lines again. Then open the radare2 capture for the Linux object and find <code>[afv mixed]</code>: three doubles. Find the instruction that explains the third one.</p>
+<h3>Lab D: the unwinder's second opinion</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">for row in seh_cross_check():
+    print(row[&quot;function&quot;], row[&quot;sizeOfProlog&quot;], row[&quot;unwindPushes&quot;], row[&quot;unwindAllocBytes&quot;], row[&quot;agree&quot;])
+for row in eh_frame_cross_check(&quot;convention-x86_64-linux-O2-eh&quot;):
+    print(row[&quot;function&quot;], row[&quot;cfiSaved&quot;], row[&quot;cfiMaxOffset&quot;], row[&quot;deepestStack&quot;], row[&quot;agree&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">sum_varargs 1 [] 8 True
+keeps 7 [&#x27;rbx&#x27;, &#x27;rdi&#x27;, &#x27;rsi&#x27;] 32 True
+call8 4 [] 72 True
+call_varargs 4 [] 40 True
+call_pair 4 [] 72 True
+call_big 4 [] 72 True
+leaf_add {} 8 8 True
+eight_args {} 8 8 True
+mixed {} 8 8 True
+by_value {} 8 8 True
+big_ret {} 8 8 True
+sum_varargs {} 96 96 True
+keeps {&#x27;rbx&#x27;: -32, &#x27;r14&#x27;: -24, &#x27;rbp&#x27;: -16} 32 32 True
+call8 {} 32 32 True
+call_mixed {} 8 8 True
+call_varargs {} 8 8 True
+call_pair {} 16 16 True
+call_big {} 48 48 True</code></pre></div></div></aside>
+<p>Find the <code>pushq %rax</code> of <code>sum_varargs</code> in the SEH table and explain why the unwind code records it as an allocation. Then find <code>call8</code> in the <code>.eh_frame</code> table and explain the 32.</p>
+<h2>Practice Lab</h2>
+<p>Add a fourth target and a fourth rulebook.</p>
+<p>Requirements:</p>
+<ul>
+<li>Compile <code>convention.c</code> with <code>-target x86_64-apple-macos -O2</code> and capture its listing. Extend <code>describe_object()</code> to read the Mach-O <code>cputype</code> 0x01000007 and map it to the System V psABI, which Apple follows on x86-64, with the <code>_</code> symbol prefix.</li>
+<li>Check that every function agrees with the System V checks. Record the one difference you find in the prologues: Darwin keeps the frame pointer at every optimization level.</li>
+<li>Add a <code>-fstack-protector-strong</code> build of the Linux x86-64 object. Extend the prologue scan so the canary load from <code>%fs:0x28</code> and the store below the locals are recorded as a <code>canary</code> cell, and the compare before <code>ret</code> as the check that guards the epilogue.</li>
+<li>Add a test that fails when a canary store is counted as a spilled argument.</li>
+<li>Write the frame of <code>with_canary</code>-style code by hand before you run the analyzer, and keep the drawing beside the test.</li>
+</ul>
+<p>Success means <code>python3 code/main.py</code> reports the new object with every check agreeing, and the frame cells of the protected function show the canary between the locals and the saved registers.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A tool labels every x86-64 function's parameters <code>rdi, rsi, rdx, rcx</code> in order, whatever the binary's platform and the parameter types. It is used on a Windows DLL and on a Linux library with <code>double</code> parameters. What does it get wrong in each? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Conventions in use</strong>: System V AMD64 psABI (Linux, BSD, macOS x86-64), Microsoft x64 (Windows, with <code>__vectorcall</code> as a variant), AAPCS64 for ARM64 Linux and Windows-on-ARM, and Apple's ARM64 variant (stricter stack alignment and different variadic rules). Intel APX adds 16 more general-purpose registers in new compilers.</li>
+<li><strong>Tools</strong>: Ghidra, IDA and Binary Ninja apply these conventions automatically from the file format, and allow overriding per function; gdb and lldb unwind with <code>.eh_frame</code> and DWARF CFI; <code>readelf</code>, <code>llvm-dwarfdump</code> and <code>llvm-objdump --unwind-info</code> print them.</li>
+<li><strong>Debug info</strong>: DWARF 5 location lists record where each parameter lives over time, which is what debuggers use in optimized code.</li>
+<li><strong>On your laptop (Windows)</strong>: the ROG runs Microsoft x64 natively; for System V experiments use WSL2, where gdb works as shown.</li>
+</ul>
+<p>Sources: <a href="https://gitlab.com/x86-psABIs/x86-64-ABI">x86-64 psABI</a>, <a href="https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention">Microsoft x64 calling convention</a>, <a href="https://github.com/ARM-software/abi-aa">AAPCS64</a>, <a href="https://dwarfstd.org/dwarf5std.html">DWARF 5</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>The file format picks the rulebook: System V, Microsoft x64 or AAPCS64.</li>
+<li>System V counts integer and floating-point arguments separately; Windows counts positions.</li>
+<li>Stack arguments start at <code>[rsp+8]</code> on entry; big struct returns use a hidden pointer.</li>
+<li>Callee-saved registers appear in the prologue and again in the CFI; check one against the other.</li>
+<li>Verify on a live process when you can: the registers do not lie.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a1338-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · rdi, xmm0, rsi, xmm1; rsi; zero</span></summary><div class="qa-a"><p>In <code>mixed(1, 2.5, 3, 4.5f)</code>: 1 in <code>edi</code> (low half of <code>rdi</code>), 2.5 in <code>xmm0</code>, 3 in <code>rsi</code>, 4.5 in the low 32 bits of <code>xmm1</code>. In <code>big_ret(9)</code>, 9 is in <code>rsi</code>, because <code>rdi</code> carries the hidden pointer to the 32-byte return buffer. In <code>sum_varargs(3, 10, 20, 30)</code>, <code>al</code> is 0: no vector registers carry variable arguments.</p></div></details>
+<details class="qa" id="a1338-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Wrong registers on two platforms</span></summary><div class="qa-a"><p><strong>The Windows DLL</strong> uses the Microsoft x64 convention: the first four arguments are in <code>rcx</code>, <code>rdx</code>, <code>r8</code>, <code>r9</code> (or <code>xmm0-3</code> by position). Labelling <code>rdi</code> and <code>rsi</code> as parameters is wrong; on Windows they are callee-saved registers, so the tool will show them being "used" when the function merely saves them, and miss the real arguments. It will also misread the 32-byte shadow store above the return address as locals or arguments.</p>
+<p><strong>The Linux library</strong> uses System V but with two independent sequences: in <code>f(int a, double x, int b)</code>, <code>b</code> is in <code>rsi</code>, and <code>x</code> is in <code>xmm0</code>. A tool that numbers integer registers by position shifts every argument after the first <code>double</code>, labels <code>rdx</code> as <code>b</code> (it is unused), and never shows <code>x</code> at all.</p>
+<p>The fix is to choose the convention from the file format and target (PE/COFF versus ELF or Mach-O, and the machine), classify each parameter by type, and keep separate counters where the ABI requires them.</p></div></details>
+<h2>Lesson Artifact</h2>
+<p>This lesson includes <code>outputs/skill-calling-conventions-and-stack-frames.md</code>. Use it to turn an object you built, its listing, and the C signatures into parameter locations, a frame layout, a return register, and a check of every inference against the rule it rests on and against the compiler's unwind data. It requires the header's ABI verdict first, forbids reading <code>cvtsi2sd</code> or <code>xor r, r</code> destinations as reads, and ends with the first disagreement.</p>
+<h2>Verify It</h2>
+<p>Run the demo and the deterministic suite:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/38-calling-conventions-and-stack-frames
+python3 code/main.py
+npx tsx code/main.ts
+python3 -m unittest discover -s code/tests -v
+</code></pre></div>
+<p>Verification should prove:</p>
+<ul>
+<li>the ELF, COFF, and Mach-O headers of the seven objects name System V, Microsoft x64, AAPCS64, and Apple arm64</li>
+<li>every object's symbol table lists the same twelve functions, with the Mach-O <code>_</code> prefix and the <code>ltmp0</code> label resolved</li>
+<li>the listing parser keeps <code>ext</code> as the call target and keeps AArch64 immediates such as <code>#-0x30</code> intact</li>
+<li><code>leaq (%rdx,%rcx), %rax</code> reads two address registers and loads nothing; <code>xorl %eax, %eax</code> and <code>cvtsi2sd</code> are write-only; a pre-indexed <code>stp</code> moves <code>sp</code> before the store and a post-indexed <code>ldp</code> after the load</li>
+<li><code>keeps</code> at <code>-O2</code> is <code>55 41 56 53</code> on System V with a 24-byte frame and no frame pointer, <code>56 57 53 48 83 ec 20</code> on Microsoft x64 with a 56-byte frame, and <code>a9bd7bfd</code> first on AArch64 with the record at -48</li>
+<li>the Apple build puts the record at -16 above four saved registers</li>
+<li>every function has a frame pointer at <code>-O0</code> on Linux and none at <code>-O2</code>, and <code>-fno-omit-frame-pointer</code> brings it back with an alignment push</li>
+<li>the <code>-O0</code> leaf uses 8 bytes of red zone under System V, <code>pushq %rax</code> under Microsoft x64, and <code>sub sp, sp, #0x10</code> under AAPCS64; <code>-mno-red-zone</code> removes the red zone use</li>
+<li>every epilogue mirrors its prologue and the stack pointer is back at entry</li>
+<li><code>eight_args</code> reads six registers and slots 8 and 16, four registers and slots 40 to 64, or <code>x0</code> to <code>x7</code>, at both optimization levels</li>
+<li><code>mixed</code> is <code>rdi, xmm0, rsi, xmm1</code> under System V and <code>rcx, xmm1, r8, xmm3</code> under Microsoft x64, with <code>xmm0</code> as the result on both</li>
+<li>the 16-byte struct travels in two registers under System V and AAPCS64 and by reference behind a hidden pointer under Microsoft x64</li>
+<li>the 32-byte struct returns through <code>rdi</code>, <code>rcx</code>, or <code>x8</code></li>
+<li>the variadic callee reads <code>%al</code>, homes <code>rdx, r8, r9</code> at 16, 24, 32, saves <code>x1</code> to <code>x7</code> and <code>q0</code> to <code>q7</code>, or reads the caller's stack pointer on Apple</li>
+<li>the callers set the expected registers, store 7 and 8 at 0 and 8 or 5 to 8 at 32 to 56, zero <code>%al</code> for the variadic call, and pass the result buffer address in <code>rdi</code>, <code>rcx</code>, or <code>x8</code></li>
+<li>all 489 checks agree with their rules</li>
+<li>the six <code>UNWIND_INFO</code> entries match the prologue parse and the leaves have none</li>
+<li>the 24 FDEs match the saved-register offsets and the deepest stack pointer</li>
+<li>the tool captures record radare2's <code>amd64</code> and <code>ms</code>, rizin's <code>amd64</code> on the COFF object, the missing <code>rcx</code>, the three doubles, and angr's prototypes</li>
+<li>the figure data embedded in the site module equals the analyzer's output</li>
+</ul>
+<h2>Production Failure Modes</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>What the weak tool reports</th>
+<th>What the analysis must prove</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COFF object read as System V</td>
+<td><code>rdi</code> and <code>rsi</code> as arguments that the function never reads</td>
+<td>The header says 0x8664; the convention is Microsoft x64</td>
+</tr>
+<tr>
+<td>Register read only inside a <code>lea</code></td>
+<td>Seven arguments for an eight-argument function</td>
+<td>Base and index registers are reads</td>
+</tr>
+<tr>
+<td><code>cvtsi2sd</code> destination counted as a read</td>
+<td>A third double argument in <code>xmm2</code></td>
+<td>The first write to <code>xmm2</code> is a write; <code>mixed</code> has two SSE arguments</td>
+</tr>
+<tr>
+<td>Positional slots read as sequences</td>
+<td><code>xmm0</code> named as the double argument on Windows</td>
+<td>Slot 1 is <code>XMM1</code>, slot 3 is <code>XMM3</code></td>
+</tr>
+<tr>
+<td><code>push rbp</code> taken as a frame pointer</td>
+<td>A frame pointer in an <code>-O2</code> function that uses <code>rbp</code> as an accumulator</td>
+<td>Only <code>mov %rsp, %rbp</code> after the push creates one</td>
+</tr>
+<tr>
+<td>Red zone measured from the entry stack pointer</td>
+<td>216 bytes "below the stack pointer"</td>
+<td>128 bytes below the current stack pointer after an 88-byte <code>sub</code></td>
+</tr>
+<tr>
+<td>Shadow store treated as locals</td>
+<td>Stack arguments at 8 to 32</td>
+<td>Microsoft stack arguments start at 40</td>
+</tr>
+<tr>
+<td><code>lea</code> treated as a load</td>
+<td>A stack argument at <code>0x60(%rsp)</code> in a variadic callee</td>
+<td><code>lea</code> computes <code>overflow_arg_area</code>; it loads nothing</td>
+</tr>
+<tr>
+<td>Hidden pointer read as a normal argument</td>
+<td><code>big_ret(void *, long long)</code></td>
+<td>The pointer is stored through and copied to <code>rax</code>, <code>rax</code>, or stays in <code>x8</code></td>
+</tr>
+<tr>
+<td>Deepest CFA compared with the prologue frame</td>
+<td>A mismatch on a caller that pushes outgoing arguments</td>
+<td>Compare with the deepest stack pointer the body reaches</td>
+</tr>
+<tr>
+<td>Convention asserted from the ISA</td>
+<td><code>amd64</code> for a COFF object</td>
+<td>The format picks the rulebook, then the ISA picks the registers</td>
+</tr>
+<tr>
+<td>Prototype trusted from one tool</td>
+<td>Three doubles, or sixteen variadic parameters</td>
+<td>The source signature or a second derivation must agree</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Operational Rule</h2>
+<p>Read the header before the first instruction, and name the rulebook. Place every saved register and every argument at an offset from the entry stack pointer, and check it against the rule that put it there and against the unwind data the compiler wrote for the same frame. Treat a tool's prototype as a claim until the bytes or the source confirm it.</p>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-reverse-engineering"><span class="t" style="--cs-hue:200">RE</span>Cheat sheet · Reverse Engineering with rea</a></div>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://gitlab.com/x86-psABIs/x86-64-ABI">System V Application Binary Interface, AMD64 Architecture Processor Supplement, Version 1.0 (sections 3.2.1 to 3.2.3, 4.2.4)</a></li>
+<li><a href="https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention">Microsoft x64 calling convention</a></li>
+<li><a href="https://learn.microsoft.com/en-us/cpp/build/stack-usage">Microsoft x64 stack usage</a></li>
+<li><a href="https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog">Microsoft x64 prolog and epilog</a></li>
+<li><a href="https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64">Microsoft x64 exception handling: RUNTIME_FUNCTION, UNWIND_INFO, UNWIND_CODE</a></li>
+<li><a href="https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst">Arm Procedure Call Standard for the Arm 64-bit Architecture (AAPCS64), release 2025Q4</a></li>
+<li><a href="https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms">Apple: Writing ARM64 code for Apple platforms</a></li>
+<li><a href="https://dwarfstd.org/doc/DWARF5.pdf">DWARF Debugging Information Format Version 5, section 6.4 Call Frame Information</a></li>
+<li><a href="https://github.com/llvm/llvm-project/blob/main/clang/lib/Driver/ToolChains/CommonArgs.cpp">Clang driver frame-pointer defaults, <code>useFramePointerForTargetByDefault</code> in <code>CommonArgs.cpp</code></a></li>
+<li><a href="https://clang.llvm.org/docs/ClangCommandLineReference.html">Clang command line reference: <code>-fomit-frame-pointer</code>, <code>-momit-leaf-frame-pointer</code></a></li>
+<li><a href="https://fedoraproject.org/wiki/Changes/fno-omit-frame-pointer">Fedora 38 change: frame pointers by default</a></li>
+<li><a href="https://ubuntu.com/blog/ubuntu-performance-engineering-with-frame-pointers-by-default">Ubuntu 24.04: performance engineering with frame pointers by default</a></li>
+<li><a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/x86-64-gcc.cspec">Ghidra compiler specification: <code>x86-64-gcc.cspec</code></a></li>
+<li><a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/x86/data/languages/x86-64-win.cspec">Ghidra compiler specification: <code>x86-64-win.cspec</code></a></li>
+<li><a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Processors/AARCH64/data/languages/AARCH64.cspec">Ghidra compiler specification: <code>AARCH64.cspec</code></a></li>
+<li><a href="https://docs.hex-rays.com/ida-actions/settype">Hex-Rays: SetType and the <code>__usercall</code> convention</a></li>
+<li><a href="https://docs.hex-rays.com/ida-actions/hx_userdefinedcall">Hex-Rays: Decompile as call</a></li>
+<li><a href="https://api.binary.ninja/binaryninja.callingconvention-module.html">Binary Ninja API 6.0: <code>callingconvention</code> module</a></li>
+<li><a href="https://api.binary.ninja/binaryninja.platform-module.html">Binary Ninja API 6.0: <code>platform</code> module</a></li>
+<li><a href="https://docs.binary.ninja/guide/types/platformtypes.html">Binary Ninja user documentation: platform types</a></li>
+<li><a href="https://book.rada.re/analysis/calling_conventions.html">The Official Radare2 Book: calling conventions</a></li>
+<li><a href="https://book.rada.re/analysis/code_analysis.html">The Official Radare2 Book: code analysis</a></li>
+<li><a href="https://docs.angr.io/en/latest/analyses/decompiler.html">angr documentation: decompiler analysis passes, including calling convention recovery</a></li>
+<li><a href="https://github.com/radareorg/radare2/releases/tag/6.2.4">radare2 6.2.4 release</a></li>
+<li><a href="https://github.com/rizinorg/rizin/releases/tag/v0.9.1">rizin 0.9.1 release</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/38-calling-conventions-and-stack-frames" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1338" id="done-a1338">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1338" id="undo-a1338" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1337"><span class="pn-dir">Previous</span><span class="pn-t">13.37 · The Reverse Engineering Landscape: History, Tool Families, and How a Decompiler Is Built</span></a><a class="pn next" href="#a1339"><span class="pn-dir">Next</span><span class="pn-t">13.39 · Compiler Idioms: What Optimization Does to Your Code and How to Read It Back</span></a></div></footer>

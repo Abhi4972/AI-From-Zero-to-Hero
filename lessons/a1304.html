@@ -1,0 +1,498 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>Structured Output — JSON Schema, Pydantic, Zod, Constrained Decoding</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.4</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1304" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Write a JSON Schema 2020-12 for an extraction target using the right constraints (enum, min/max, required, pattern).</li>
+<li>Explain why strict mode and constrained decoding give different guarantees from "validate after generation".</li>
+<li>Distinguish the three failure modes: parse error, schema violation, model refusal.</li>
+<li>Ship an extraction pipeline with typed repair and typed refusal handling.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 02 (function calling deep dive)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, JSON Schema 2020-12 subset). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>"Ask the model nicely to return JSON" fails some of the time, and far more often on small models. Structured outputs close that gap with constrained decoding: the model is literally prevented from emitting a token that would violate the schema. OpenAI's strict mode, Anthropic's schema-typed tool use, Gemini's <code>responseSchema</code>, Pydantic AI's <code>output_type</code>, and Zod's <code>.parse</code> are five surface forms of the same idea. This lesson builds the schema validator and the strict-mode contract learners will use for every production</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON Schema 2020-12</td>
+<td>"The schema spec"</td>
+<td>IETF-draft schema dialect every modern provider speaks</td>
+</tr>
+<tr>
+<td>Strict mode</td>
+<td>"Guaranteed schema"</td>
+<td>OpenAI flag that enforces schema via constrained decoding</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>"Logit masking"</td>
+<td>Decode-time enforcement that masks invalid next-tokens</td>
+</tr>
+<tr>
+<td>Refusal</td>
+<td>"Model declines"</td>
+<td>Typed outcome when input cannot fit the schema</td>
+</tr>
+<tr>
+<td>Parse error</td>
+<td>"Invalid JSON"</td>
+<td>Output did not parse as JSON; impossible under strict</td>
+</tr>
+<tr>
+<td>Schema violation</td>
+<td>"Wrong shape"</td>
+<td>Parsed but violated types / required / enum / range</td>
+</tr>
+<tr>
+<td><code>additionalProperties: false</code></td>
+<td>"No extras allowed"</td>
+<td>Forbids unknown fields; required in OpenAI strict</td>
+</tr>
+<tr>
+<td>Pydantic BaseModel</td>
+<td>"Typed output"</td>
+<td>Python class that emits and validates JSON Schema</td>
+</tr>
+<tr>
+<td>Zod schema</td>
+<td>"TypeScript output type"</td>
+<td>TS runtime schema for provider output validation</td>
+</tr>
+<tr>
+<td>Grammar enforcement</td>
+<td>"Open-weights constrained decode"</td>
+<td>FSM-based logit masking, as in outlines / guidance</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Programs need data in an exact shape: a field called <code>quantity</code> holding a number, <code>priority</code> being one of three words, and nothing else. Asking a model to "reply in JSON" usually works, but sometimes the model adds a sentence, wraps the JSON in code fences, or invents a field. Structured outputs fix the shape at the source. While the model generates, the decoder only allows tokens that keep the output valid for a JSON Schema, so the result always parses and always fits. This is constrained decoding. It guarantees the format, not the truth: the values can still be wrong. This lesson describes schemas, Pydantic models, refusals and retries. It then runs a real 0.5B model with and without a schema constraint on eight emails, and looks inside the constraint to see which tokens it allows at each step. No model is trained.</p></div></aside>
+<p>An agent reading a purchase-order email needs to turn free text into <code>{customer, line_items, total_usd}</code>. Three approaches.</p>
+<p><strong>Approach one: prompt for JSON.</strong> "Reply in JSON with fields customer, line_items, total_usd." Works most of the time on frontier models, much less on small ones. Fails in six ways: missing brace, trailing comma, wrong types, hallucinated fields, truncated at token limit, leaked prose or code fences around the JSON (the run below shows the last one on every email).</p>
+<p><strong>Approach two: validate after generation.</strong> Generate freely, parse, validate against schema, retry on failure. Reliable but expensive — you pay for every retry, and truncation bugs cost one extra turn per occurrence.</p>
+<p><strong>Approach three: constrained decoding.</strong> The provider enforces the schema at decode time. Invalid tokens are masked out of the sampling distribution. The output is guaranteed to parse and guaranteed to validate. Failure collapses to one mode: refusal (the model decides the input does not fit the schema).</p>
+<p>Every 2026 frontier provider ships some form of approach three.</p>
+<ul>
+<li><strong>OpenAI.</strong> <code>response_format: {type: "json_schema", strict: true}</code> plus <code>refusal</code> in the response if the model declines.</li>
+<li><strong>Anthropic.</strong> <code>output_config.format</code> with <code>type: "json_schema"</code> constrains the reply to a schema, and <code>strict: true</code> on a tool constrains its inputs. A declined request ends with <code>stop_reason: "refusal"</code>.</li>
+<li><strong>Gemini.</strong> <code>responseMimeType: "application/json"</code> with <code>responseSchema</code> (or <code>responseJsonSchema</code> for plain JSON Schema) at request level.</li>
+<li><strong>Pydantic AI.</strong> <code>output_type=InvoiceModel</code> makes the run result's <code>.output</code> an <code>InvoiceModel</code> instance, using the provider's structured output or a tool call under the hood.</li>
+<li><strong>Zod (TypeScript).</strong> Runtime parser that validates provider output against a Zod schema; OpenAI's Node SDK turns a Zod schema into a response format with <code>zodResponseFormat</code> and parses the reply with <code>.parse()</code>.</li>
+</ul>
+<p>The common thread: declare the schema once, enforce it end to end.</p>
+<h2>Idea 1 · JSON Schema 2020-12 — the lingua franca</h2>
+<p>Every provider accepts JSON Schema 2020-12. The constructs you use most:</p>
+<ul>
+<li><code>type</code>: one of <code>object</code>, <code>array</code>, <code>string</code>, <code>number</code>, <code>integer</code>, <code>boolean</code>, <code>null</code>.</li>
+<li><code>properties</code>: map of field name to subschema.</li>
+<li><code>required</code>: list of field names that must appear.</li>
+<li><code>enum</code>: closed set of allowed values.</li>
+<li><code>minimum</code> / <code>maximum</code> (numbers), <code>minLength</code> / <code>maxLength</code> / <code>pattern</code> (strings).</li>
+<li><code>items</code>: subschema applied to every array element.</li>
+<li><code>additionalProperties</code>: <code>false</code> forbids extra fields (default varies by mode).</li>
+</ul>
+<p>OpenAI strict mode adds requirements: every property must be listed in <code>required</code>, <code>additionalProperties: false</code> on every object, and an object (not <code>anyOf</code>) at the root; <code>$defs</code> and <code>$ref</code> are fine. If you break these, the API returns 400 at request time. Anthropic's structured outputs likewise need <code>additionalProperties: false</code> and do not enforce <code>minimum</code>, <code>maximum</code>, <code>minLength</code> or <code>maxLength</code>; the SDK helpers move those into descriptions and check them after decoding.</p>
+<h2>Idea 2 · Pydantic, the Python binding</h2>
+<p>Pydantic v2 generates JSON Schema from dataclass-shaped models via <code>model_json_schema()</code>. Pydantic AI wraps this so you write:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json
+from decimal import Decimal
+from pydantic import BaseModel, Field, ValidationError
+
+class LineItem(BaseModel):
+    sku: str
+    quantity: int = Field(ge=1)
+    unit_price_usd: Decimal
+
+class Invoice(BaseModel):
+    customer: str
+    line_items: list[LineItem]
+    total_usd: Decimal = Field(ge=0)
+
+schema = Invoice.model_json_schema()
+print(json.dumps(schema)[:400] + &quot; ...&quot;)
+ok = Invoice.model_validate_json('{&quot;customer&quot;: &quot;Acme&quot;, &quot;total_usd&quot;: &quot;42.50&quot;, '
+                                 '&quot;line_items&quot;: [{&quot;sku&quot;: &quot;A-1&quot;, &quot;quantity&quot;: 2, &quot;unit_price_usd&quot;: 21.25}]}')
+print(&quot;\nparsed:&quot;, repr(ok.total_usd), ok.line_items[0])
+try:
+    Invoice.model_validate_json('{&quot;customer&quot;: &quot;Acme&quot;, &quot;total_usd&quot;: -5, &quot;line_items&quot;: [{&quot;sku&quot;: &quot;A-1&quot;, &quot;quantity&quot;: 0}]}')
+except ValidationError as e:
+    for err in e.errors():
+        print(&quot;error at&quot;, &quot;.&quot;.join(map(str, err[&quot;loc&quot;])), &quot;-&gt;&quot;, err[&quot;msg&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{&quot;$defs&quot;: {&quot;LineItem&quot;: {&quot;properties&quot;: {&quot;sku&quot;: {&quot;title&quot;: &quot;Sku&quot;, &quot;type&quot;: &quot;string&quot;}, &quot;quantity&quot;: {&quot;minimum&quot;: 1, &quot;title&quot;: &quot;Quantity&quot;, &quot;type&quot;: &quot;integer&quot;}, &quot;unit_pric
+
+parsed: Decimal(&#x27;42.50&#x27;) sku=&#x27;A-1&#x27; quantity=2 unit_price_usd=Decimal(&#x27;21.25&#x27;)
+error at line_items.0.quantity -&gt; Input should be greater than or equal to 1
+error at line_items.0.unit_price_usd -&gt; Field required
+error at total_usd -&gt; Input should be greater than or equal to 0</code></pre></div></div></aside>
+<p>and the agent framework translates the schema into OpenAI strict mode, Anthropic <code>input_schema</code>, or Gemini <code>responseSchema</code> at the edge. The model's output comes back as a typed <code>Invoice</code> instance. Validation errors raise <code>ValidationError</code> with typed error paths.</p>
+<h2>Idea 3 · Zod, the TypeScript binding</h2>
+<p>Zod (<code>z.object({customer: z.string(), ...})</code>) is the TS equivalent. OpenAI's Node SDK exposes <code>zodResponseFormat(Invoice)</code> which translates to the API's JSON Schema payload.</p>
+<h2>Idea 4 · Refusals</h2>
+<p>Strict mode cannot force the model to answer. If the request is declined, OpenAI fills a <code>refusal</code> field and Anthropic ends with <code>stop_reason: "refusal"</code>; your code must handle this as a first-class outcome, not a failure. Note what strict mode does not catch: an input that does not fit the schema ("the email was a poem, not an invoice"). The model will usually produce a well-formed, made-up invoice rather than refuse, so the schema itself must have a way to say "not applicable" (measured below).</p>
+<h2>Idea 5 · Constrained decoding in the open</h2>
+<p>Open-weights implementations use three techniques.</p>
+<ol>
+<li><strong>Grammar-based decoding</strong> (<code>outlines</code>, <code>guidance</code>, <code>lm-format-enforcer</code>): build a deterministic finite automaton from the schema; at every step, mask the logits of tokens that would violate the FSM.</li>
+<li><strong>Logit masking with a JSON parser</strong>: run a streaming JSON parser in lockstep with the model; at every step, compute the valid-next-token set.</li>
+<li><strong>Inference-engine support</strong>: vLLM, SGLang and llama.cpp accept a JSON Schema or grammar per request and apply the mask with fast engines such as XGrammar or llguidance.</li>
+</ol>
+<p>Commercial providers do this behind the scenes. With precomputed token masks the overhead is small (microseconds per token in the run below), and fixed parts of the output, such as key names, can even be emitted without sampling.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Constrained decoding.</strong> Let <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">A</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊆</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.08222em;">V</span></span></span></span> be the set of tokens that keep the output so far a prefix of some string valid under the schema. At each step the model's distribution is renormalised over that set:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0519em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8019em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5877em;vertical-align:-1.1607em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2253em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span><span class="mrel mtight">∈</span><span class="mord mathnormal mtight">A</span><span class="mopen mtight">(</span><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2963em;"><span style="top:-2.357em;margin-left:-0.0359em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1709em;"><span></span></span></span></span></span></span><span class="mclose mtight">)</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4747em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathbf">1</span><span class="mopen">[</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">t</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">A</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">t</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)]</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.1607em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord">.</span></span></span></span></span></div>
+Every complete output is then valid by construction. In practice the logits of disallowed tokens are set to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">∞</span></span></span></span> before sampling.</p>
+<p><strong>What it does not change.</strong> Within <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span>, the model's preferences are untouched: if the model puts most weight on a wrong but valid value, that value is chosen.</p>
+<p><strong>Retries without constraints.</strong> If a free-form output is valid with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>, the expected number of attempts until a valid one is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/</span><span class="mord mathnormal">p</span></span></span></span>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> attempts all fail with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0991em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">How narrow is the mask?</div><div class="co-body"><ul>
+<li>Qwen's vocabulary has 151,936 tokens. At the very start of the output the schema allows 7 of them (the forms of <code>{</code>), 0.005%.</li>
+<li>After <code>"priority": "</code> only 13 tokens remain: pieces of <code>low</code>, <code>normal</code> and <code>urgent</code>. A model that would have written "High" cannot.</li>
+<li>Inside the free-text <code>customer</code> string, 147,137 tokens (96.8%) are allowed: the schema says nothing about what a name contains.</li>
+<li>Without constraints, with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span></span></span></span> per attempt, 3 attempts all fail with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">1</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.001</span></span></span></span>, at a cost of about 1.1 attempts on average. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>: 2 attempts on average and a 12.5% chance that 3 attempts all fail.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "With a schema, the extracted data is correct."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is well-formed; the values are only as good as the model.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "If the input doesn't fit, a strict model refuses."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Usually it fills the schema anyway; give the schema an explicit "not applicable" path.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Constrained decoding is slow."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> With precomputed masks it costs microseconds per token, far less than the model itself.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Pydantic's schema can be sent to any strict mode unchanged."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Strict modes have rules (all fields required, <code>additionalProperties: false</code>, limited keywords); check or transform the schema first.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 0.5B model extracts orders from eight emails, two of which are not orders at all, first from a prompt alone and then with xgrammar constraining it to the schema. How many outputs will parse in each mode? Will the constrained version notice the two non-orders? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Prompt-only JSON against constrained decoding on a real model</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct extracts <code>is_order</code>, <code>customer</code>, <code>quantity</code>, <code>product</code> and <code>priority</code> from eight short emails. The same prompt runs twice: once free, once with XGrammar's logits processor compiled from the JSON Schema. Each output is parsed, validated with <code>jsonschema</code> and scored on three fields against the expected values; a common repair step (stripping code fences) is also scored. About 80 seconds on CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, time, torch, jsonschema, xgrammar as xgr
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging
+logging.set_verbosity_error()
+
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); model = AutoModelForCausalLM.from_pretrained(M).eval()
+SCHEMA = {&quot;type&quot;: &quot;object&quot;, &quot;additionalProperties&quot;: False,
+          &quot;required&quot;: [&quot;is_order&quot;, &quot;customer&quot;, &quot;quantity&quot;, &quot;product&quot;, &quot;priority&quot;],
+          &quot;properties&quot;: {&quot;is_order&quot;: {&quot;type&quot;: &quot;boolean&quot;}, &quot;customer&quot;: {&quot;type&quot;: &quot;string&quot;},
+                         &quot;quantity&quot;: {&quot;type&quot;: &quot;integer&quot;, &quot;minimum&quot;: 0}, &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+                         &quot;priority&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;low&quot;, &quot;normal&quot;, &quot;urgent&quot;]}}}
+EMAILS = [  # (text, expected quantity, expected priority, is it an order?)
+    (&quot;Hi, this is Priya from Northwind. Please send 40 boxes of A4 paper. Not urgent.&quot;, 40, &quot;low&quot;, True),
+    (&quot;URGENT: Contoso needs 3 replacement drill motors by tomorrow morning. - Sam&quot;, 3, &quot;urgent&quot;, True),
+    (&quot;Order from Fabrikam: 12 safety helmets, standard delivery is fine. Regards, Lee&quot;, 12, &quot;normal&quot;, True),
+    (&quot;Can you ship 250 cable ties to Tailspin? We need them ASAP, production is stopped.&quot;, 250, &quot;urgent&quot;, True),
+    (&quot;Hello! Just saying thanks for the great service last month. Best, Ana&quot;, 0, &quot;low&quot;, False),
+    (&quot;Woodgrove would like 6 ergonomic chairs. No rush at all, whenever convenient.&quot;, 6, &quot;low&quot;, True),
+    (&quot;Our office party is on Friday, everyone is welcome to join.&quot;, 0, &quot;low&quot;, False),
+    (&quot;Litware here: 18 laptop stands please, usual priority. Thanks, Kim&quot;, 18, &quot;normal&quot;, True)]
+PROMPT = (&quot;Extract the order from the email as JSON with keys is_order (boolean), customer (string), &quot;
+          &quot;quantity (integer), product (string), priority (one of low, normal, urgent).\nEmail: {}&quot;)
+
+info = xgr.TokenizerInfo.from_huggingface(tok, vocab_size=model.config.vocab_size)
+compiled = xgr.GrammarCompiler(info).compile_json_schema(json.dumps(SCHEMA))
+
+def extract(email, constrained):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: PROMPT.format(email)}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    kw = {&quot;logits_processor&quot;: [xgr.contrib.hf.LogitsProcessor(compiled)]} if constrained else {}
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=90, do_sample=False, **kw)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+import re
+def score(outputs, label, secs):
+    parsed = valid = correct = 0
+    for text, (email, qty, prio, is_order) in zip(outputs, EMAILS):
+        try:
+            obj = json.loads(text); parsed += 1
+            jsonschema.validate(obj, SCHEMA); valid += 1
+            correct += (obj[&quot;quantity&quot;] == qty) + (obj[&quot;priority&quot;] == prio) + (obj[&quot;is_order&quot;] == is_order)
+        except (json.JSONDecodeError, jsonschema.ValidationError):
+            pass
+    n = len(EMAILS)
+    print(f&quot;{label:&lt;38} parses {parsed}/{n}  valid {valid}/{n}  correct fields {correct}/{3 * n}  {secs}&quot;)
+
+t = time.time(); free = [extract(e[0], False) for e in EMAILS]; t_free = time.time() - t
+t = time.time(); cons = [extract(e[0], True) for e in EMAILS]; t_cons = time.time() - t
+print(&quot;prompt only, first output:      &quot; + repr(free[0][:120]))
+print(&quot;constrained, first output:      &quot; + repr(cons[0][:120]) + &quot;\n&quot;)
+score(free, &quot;prompt only&quot;, f&quot;{t_free:.0f} s&quot;)
+unfence = [re.sub(r&quot;^```(?:json)?\s*|\s*```$&quot;, &quot;&quot;, x.strip()) for x in free]   # a common repair step
+score(unfence, &quot;prompt only, code fences stripped&quot;, &quot;&quot;)
+score(cons, &quot;constrained decoding (xgrammar)&quot;, f&quot;{t_cons:.0f} s&quot;)
+print(&quot;\nconstrained outputs, quantity / priority / is_order vs expected:&quot;)
+for text, (email, qty, prio, is_order) in zip(cons, EMAILS):
+    o = json.loads(text)
+    print(f&quot;  {o['quantity']:&gt;4} {o['priority']:&lt;7} {str(o['is_order']):&lt;6} expected {qty:&gt;4} {prio:&lt;7} {is_order}&quot;
+          f&quot;   {email[:42]}...&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">prompt only, first output:      &#x27;```json\n{\n  &quot;is_order&quot;: true,\n  &quot;customer&quot;: &quot;Priya&quot;,\n  &quot;quantity&quot;: 40,\n  &quot;product&quot;: &quot;A4 paper&quot;,\n  &quot;priority&quot;: &quot;normal&quot;\n}
+constrained, first output:      &#x27;{\n    &quot;is_order&quot;: true,\n    &quot;customer&quot;: &quot;Priya&quot;,\n    &quot;quantity&quot;: 40,\n    &quot;product&quot;: &quot;A4 paper&quot;,\n    &quot;priority&quot;: &quot;normal&quot;&#x27;
+
+prompt only                            parses 0/8  valid 0/8  correct fields 0/24  37 s
+prompt only, code fences stripped      parses 8/8  valid 8/8  correct fields 16/24  
+constrained decoding (xgrammar)        parses 8/8  valid 8/8  correct fields 16/24  35 s
+
+constrained outputs, quantity / priority / is_order vs expected:
+    40 normal  True   expected   40 low     True   Hi, this is Priya from Northwind. Please s...
+     3 urgent  True   expected    3 urgent  True   URGENT: Contoso needs 3 replacement drill ...
+    12 normal  True   expected   12 normal  True   Order from Fabrikam: 12 safety helmets, st...
+   250 urgent  True   expected  250 urgent  True   Can you ship 250 cable ties to Tailspin? W...
+     1 normal  True   expected    0 low     False   Hello! Just saying thanks for the great se...
+     6 normal  True   expected    6 low     True   Woodgrove would like 6 ergonomic chairs. N...
+     5 normal  True   expected    0 low     False   Our office party is on Friday, everyone is...
+    18 normal  True   expected   18 normal  True   Litware here: 18 laptop stands please, usu...</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Prompt only: 0 of 8 outputs parse.</strong> Every reply wrapped the JSON in a <code>```json</code> code fence, so <code>json.loads</code> fails on all of them. The JSON inside was fine: after the common repair of stripping fences, all 8 parse and validate. Leaked formatting is the most common way prompted JSON breaks.</p>
+<p><strong>Constrained: 8 of 8 parse and validate, with no repair.</strong> The grammar never allowed a code fence or any text outside the object. The two modes then agree on the content (16 of 24 fields right in both), and took about the same time: the mask costs almost nothing.</p>
+<p><strong>The values are where the errors are.</strong> The model labelled "not urgent" and "no rush" as <code>normal</code> instead of <code>low</code>. Worse, it turned the thank-you note and the party invitation into orders with invented quantities (1 and 5) and <code>is_order: true</code>. The schema forced every email into the shape of an order, and a small model filled it in. Constrained decoding guarantees the format; it cannot make a model judge correctly.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Inside the mask</div><div class="co-body"><p>This block continues from the one above and reuses its compiled schema. A grammar matcher is fed different prefixes of an output, and the block counts how many of the 151,936 tokens the schema allows next, with examples. Then it times the mask computation per token. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above: tok, model, info (xgrammar TokenizerInfo), compiled and SCHEMA are defined.
+import time, numpy as np, xgrammar as xgr
+
+def allowed_after(prefix):
+    &quot;&quot;&quot;Feed the prefix to a grammar matcher and list the tokens the schema allows next.&quot;&quot;&quot;
+    m = xgr.GrammarMatcher(compiled)
+    for t in tok(prefix, add_special_tokens=False)[&quot;input_ids&quot;]:
+        assert m.accept_token(t), f&quot;prefix leaves the grammar at token {tok.decode([t])!r}&quot;
+    mask = xgr.allocate_token_bitmask(1, info.vocab_size)
+    m.fill_next_token_bitmask(mask)
+    bits = np.unpackbits(mask.numpy().view(np.uint8), bitorder=&quot;little&quot;)[: info.vocab_size]
+    ok = np.flatnonzero(bits)
+    return len(ok), [tok.decode([int(i)]) for i in ok[:8]]
+
+V = info.vocab_size
+print(f&quot;vocabulary: {V:,} tokens\n&quot;)
+for prefix in ['', '{', '{&quot;is_order&quot;: ', '{&quot;is_order&quot;: true, &quot;customer&quot;: &quot;Pri',
+               '{&quot;is_order&quot;: true, &quot;customer&quot;: &quot;Priya&quot;, &quot;quantity&quot;: ',
+               '{&quot;is_order&quot;: true, &quot;customer&quot;: &quot;Priya&quot;, &quot;quantity&quot;: 40, &quot;product&quot;: &quot;paper&quot;, &quot;priority&quot;: &quot;']:
+    n, sample = allowed_after(prefix)
+    print(f&quot;after {prefix[-34:]!r:&lt;38} {n:&gt;7,} allowed ({100 * n / V:6.3f}%)  e.g. {sample[:6]}&quot;)
+
+# What the mask costs per generated token.
+m = xgr.GrammarMatcher(compiled); mask = xgr.allocate_token_bitmask(1, V)
+ids = tok('{&quot;is_order&quot;: true, &quot;customer&quot;: &quot;Priya&quot;, &quot;quantity&quot;: 40, &quot;product&quot;: &quot;A4 paper&quot;, &quot;priority&quot;: &quot;low&quot;}',
+          add_special_tokens=False)[&quot;input_ids&quot;]
+t = time.perf_counter()
+for i in ids:
+    m.fill_next_token_bitmask(mask); m.accept_token(i)
+per_token = (time.perf_counter() - t) / len(ids)
+print(f&quot;\nmask computation: {per_token * 1e6:.0f} microseconds per token over {len(ids)} tokens &quot;
+      f&quot;(the 0.5B model itself needs tens of milliseconds per token on this CPU)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">vocabulary: 151,936 tokens
+
+after &#x27;&#x27;                                           7 allowed ( 0.005%)  e.g. [&#x27;{&#x27;, &#x27;{\n&#x27;, &#x27;{\r\n&#x27;, &#x27;{\n\n&#x27;, &#x27;{&quot;&#x27;, &#x27;{\r\n\r\n&#x27;]
+after &#x27;{&#x27;                                        425 allowed ( 0.280%)  e.g. [&#x27;&quot;&#x27;, &#x27;\t&#x27;, &#x27;\n&#x27;, &#x27;\r&#x27;, &#x27; &#x27;, &#x27;  &#x27;]
+after &#x27;{&quot;is_order&quot;: &#x27;                            443 allowed ( 0.292%)  e.g. [&#x27;f&#x27;, &#x27;t&#x27;, &#x27;\t&#x27;, &#x27;\n&#x27;, &#x27;\r&#x27;, &#x27; &#x27;]
+after &#x27;&quot;is_order&quot;: true, &quot;customer&quot;: &quot;Pri&#x27;   147,137 allowed (96.841%)  e.g. [&#x27;!&#x27;, &#x27;&quot;&#x27;, &#x27;#&#x27;, &#x27;$&#x27;, &#x27;%&#x27;, &#x27;&amp;&#x27;]
+after &#x27; &quot;customer&quot;: &quot;Priya&quot;, &quot;quantity&quot;: &#x27;       432 allowed ( 0.284%)  e.g. [&#x27;0&#x27;, &#x27;1&#x27;, &#x27;2&#x27;, &#x27;3&#x27;, &#x27;4&#x27;, &#x27;5&#x27;]
+after &#x27; &quot;product&quot;: &quot;paper&quot;, &quot;priority&quot;: &quot;&#x27;        13 allowed ( 0.009%)  e.g. [&#x27;l&#x27;, &#x27;n&#x27;, &#x27;u&#x27;, &#x27;ur&#x27;, &#x27;lo&#x27;, &#x27;no&#x27;]
+
+mask computation: 10 microseconds per token over 34 tokens (the 0.5B model itself needs tens of milliseconds per token on this CPU)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The mask is very narrow where the schema is specific.</strong> At the start, 7 of 151,936 tokens are allowed: the different ways of writing <code>{</code>. After <code>"quantity":</code> about 430 tokens remain, the digit pieces (plus whitespace). After <code>"priority": "</code> only 13 remain, pieces of <code>low</code>, <code>normal</code> and <code>urgent</code>: a model cannot write "High" here even if it wants to.</p>
+<p><strong>It is wide where the schema says little.</strong> Inside the <code>customer</code> string, 96.8% of the vocabulary is allowed. The schema constrains the structure, not the content of free text; for that you need enums, patterns, or checks after decoding.</p>
+<p><strong>It is cheap.</strong> Computing the mask takes about 9 microseconds per token here, thousands of times less than a forward pass of even a 0.5B model on this CPU. That is why inference engines can offer structured output at almost no speed cost.</p></div></aside>
+<h2>Idea 6 · The three failure modes</h2>
+<ol>
+<li><strong>Parse error.</strong> The output is not valid JSON. Cannot happen under strict mode. Can still happen on non-strict providers.</li>
+<li><strong>Schema violation.</strong> The output parses but violates the schema. Cannot happen under strict mode. Common outside it.</li>
+<li><strong>Refusal.</strong> The model declines. Must be handled as a typed outcome.</li>
+</ol>
+<h2>Idea 7 · Retry strategy</h2>
+<p>When you are outside strict mode (non-strict tools, prompt-only JSON, models without constrained decoding), the recovery pattern is:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">generate -&gt; parse -&gt; validate -&gt; if fail, inject error and retry, max 3x
+</code></pre></div>
+<p>One retry is usually enough. Three retries catches weak-model flakes. Beyond three is a sign of a bad schema: the model cannot satisfy it for some inputs, and the prompt or the schema needs fixing.</p>
+<h2>Idea 8 · Small-model support</h2>
+<p>Constrained decoding works on small models: it guarantees the shape of the output whatever the model's size. It does not make the values right. In the run below a 0.5B model goes from 0 of 8 parseable outputs to 8 of 8, but still gets a third of the fields wrong and invents orders from emails that contain none. This is the main reason structured outputs matter in production: they turn format failures into content questions you can measure.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="constrained-decoding"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> ships a minimal JSON Schema 2020-12 validator in stdlib (types, required, enum, min/max, pattern, items, additionalProperties). It wraps an <code>Invoice</code> schema and runs a fake LLM output through the validator, demonstrating parse error, schema violation, and refusal paths. Swap the fake output for any provider's real response in production.</p>
+<p>What to look at:</p>
+<ul>
+<li>The validator returns a typed <code>[ValidationError]</code> list with path and message. That is the shape you want surfaced to the retry prompt.</li>
+<li>The refusal branch does NOT retry. It logs and returns a typed refusal. Phase 14 · 09 uses refusals as a safety signal.</li>
+<li>The <code>additionalProperties: false</code> check fires on the adversarial test input, showing why strict mode shuts the door on hallucinated fields.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Make every field of an extraction schema required and non-nullable, turn on strict mode, and feed it a newsletter that contains no order. What does the pipeline store, and how do you change the schema so the model can say "nothing here"? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>OpenAI Structured Outputs</strong> (<code>response_format</code> with <code>json_schema</code> and <code>strict: true</code>, or <code>strict</code> tools): guaranteed schema match, a <code>refusal</code> field, documented schema limits.</li>
+<li><strong>Anthropic structured outputs</strong> (<code>output_config.format</code> with <code>json_schema</code>, and <code>strict: true</code> tools): <code>client.messages.parse(..., output_format=Model)</code> in the Python SDK; numeric and length constraints are checked by the SDK, not enforced by decoding.</li>
+<li><strong>Gemini</strong> <code>responseSchema</code> / <code>responseJsonSchema</code> with <code>responseMimeType: application/json</code>.</li>
+<li><strong>Open models</strong>: XGrammar (used here), llguidance and Outlines power structured output in vLLM, SGLang, llama.cpp and Ollama, so a laptop-sized model (0.5B–4B, or 7B in 4-bit on an 8 GB GPU) gets the same format guarantee.</li>
+<li><strong>Typed bindings</strong>: Pydantic and Pydantic AI in Python, Zod in TypeScript, Instructor across providers.</li>
+</ul>
+<p>Sources: <a href="https://developers.openai.com/api/docs/guides/structured-outputs">OpenAI structured outputs</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Claude structured outputs</a>, <a href="https://github.com/mlc-ai/xgrammar">XGrammar</a>, <a href="https://ai.pydantic.dev/output/">Pydantic AI output</a>, <a href="https://json-schema.org/draft/2020-12/release-notes">JSON Schema 2020-12</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Prompting for JSON fails in ways you must repair; constrained decoding removes format failures.</li>
+<li>The mask lets through only tokens that keep the output valid; inside strings it allows almost anything.</li>
+<li>A valid output is not a correct output: score the values.</li>
+<li>Give the schema a way to say "not applicable", or the model will invent data.</li>
+<li>Handle refusals as a typed outcome; retry only format errors, and only a few times.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-structured-outputs-v4"><span class="t" style="--cs-hue:215">SO</span>Cheat sheet · Structured Outputs and Constrained Decoding</a><a href="#cs-tool-calling"><span class="t" style="--cs-hue:30">TC</span>Cheat sheet · Tool Calling and Structured Outputs</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-structured-output-designer.md</code>. Given a free-text extraction target (invoices, support tickets, resumes, etc.), the skill produces a JSON Schema 2020-12 that is strict-mode-compatible and a Pydantic model that mirrors it, with typed refusal and retry handling stubbed in.</p>
+<p><strong><code>outputs/skill-structured-output-designer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: structured-output-designer
+description: Design a strict-mode-compatible JSON Schema plus Pydantic model for a free-text extraction target, with typed refusal and retry handling stubbed in.
+version: 1.0.0
+phase: 13
+lesson: 04
+tags: [structured-output, json-schema, pydantic, strict-mode, extraction]
+---
+
+Given a free-text extraction target (invoices, resumes, support tickets, research summaries), produce a production-ready extraction contract: JSON Schema 2020-12, Pydantic model, refusal handler, and retry policy.
+
+Produce:
+
+1. JSON Schema 2020-12. Every property typed. `required` lists every property. `additionalProperties: false` on every object. Enums used for closed value sets. No `$ref`. No ambiguous `oneOf` / `anyOf`. Validated against OpenAI strict-mode requirements.
+2. Pydantic v2 BaseModel. Mirror of the schema with Python types. `model_json_schema()` must produce a schema equivalent to (1).
+3. Refusal handler. Typed `Refusal(reason: str, category: str)` outcome. List the categories: `safety`, `input_mismatch`, `insufficient_info`.
+4. Retry policy. Three retry shapes: (a) inject validation errors and retry once (outside strict mode); (b) accept refusal as final (strict mode); (c) escalate to a stronger model on repeated refusal.
+5. Test vectors. Ten inputs covering happy path, adversarial fields, partial input, and a refusal-triggering case. Each with expected outcome.
+
+Hard rejects:
+- Any schema with untyped fields. Fails strict mode and validator both.
+- Any schema missing `additionalProperties: false`. Leaks hallucinations.
+- Any schema using `oneOf` without a discriminator field. Ambiguous decoding.
+- Any Pydantic model without its JSON Schema round-trip checked.
+
+Refusal rules:
+- If the target domain includes personally identifying data without a documented purpose, refuse and route to Phase 18 (ethics) for the lawful-basis argument.
+- If the user asks for a schema that cannot be expressed in JSON Schema 2020-12 (e.g. recursive arbitrary graphs), refuse and propose the closest expressible relaxation.
+- If the extraction target is &quot;extract structured data from anything&quot;, refuse and ask for the specific domain.
+
+Output: a one-page contract with the schema JSON, the Pydantic class, the refusal and retry policy, and the ten test vectors. End with a note on the first provider to target and why.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code>. Add a fourth test case whose <code>total_usd</code> is a negative number. Confirm the validator rejects it with the <code>minimum</code> constraint path.</p>
+</li>
+<li>
+<p>Extend the validator to support <code>oneOf</code> with a discriminator. The common case: <code>line_item</code> is either a product or a service, tagged by <code>kind</code>. Strict mode has subtle rules here; check OpenAI's structured outputs guide.</p>
+</li>
+<li>
+<p>Write the same Invoice schema as a Pydantic BaseModel and compare <code>model_json_schema()</code> output to your hand-rolled schema. Identify the one field Pydantic sets by default that the hand-rolled version omits.</p>
+</li>
+<li>
+<p>Measure refusal rates. Construct ten inputs that should not be extractable (a song lyric, a math proof, a blank email) and run them through a real provider with strict mode. Count refusals vs hallucinated outputs. This is your ground truth for refusal-aware retries.</p>
+</li>
+<li>
+<p>Read OpenAI's structured outputs guide top to bottom. Identify the one construct it explicitly forbids in strict mode that plain JSON Schema allows. Then design a schema that uses the forbidden construct non-essentially and refactor it to be strict-compatible.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1304-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 0 then 8 parse, and both non-orders become orders</span></summary><div class="qa-a"><p>Prompt only: 0 of 8 parse, because every reply comes wrapped in a code fence. Stripping the fences rescues all 8. Constrained: 8 of 8 parse and validate as generated.</p>
+<p>The constrained version does not notice the non-orders. Both get <code>is_order: true</code> and invented quantities (1 for the thank-you note, 5 for the party invitation). The schema demanded an order-shaped object, and constrained decoding made sure the model produced one. Format correctness and content correctness are separate problems.</p></div></details>
+<details class="qa" id="a1304-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A made-up order, stored as fact</span></summary><div class="qa-a"><p>The pipeline stores a made-up order. Every field must be present and non-null, and decoding is constrained to the schema, so the model has to put some customer name, some quantity and some product into the object, whatever the newsletter says. Nothing fails, nothing is flagged, and the bad record looks exactly like a good one. That is worse than a parse error, which at least stops the pipeline.</p>
+<p>Fixes, in the schema itself:</p>
+<ul>
+<li><strong>A discriminated union</strong>: <code>{"kind": "order", ...}</code> or <code>{"kind": "not_an_order", "reason": ...}</code>, so "nothing here" is a valid answer.</li>
+<li><strong>Nullable fields</strong> (<code>"type": ["integer", "null"]</code>) with an instruction to use <code>null</code> when the email does not say.</li>
+<li><strong>A decision field first</strong>, before the details, so the model commits to "is this an order?" before it starts inventing details.</li>
+</ul>
+<p>Then measure: run known non-orders through the pipeline and count how many come out as orders. In this lesson's run, a 0.5B model still chose "order" for every email even with these options; a larger model, or a separate classification step, is needed for reliable judgement.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1304-qa3"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Design the extraction service for purchase-order emails. The input is free text; the output is a typed record with a customer, line items and a total. Cover the schema, the enforcement mode, the retry and refusal handling, and how you prove it works before it touches the accounting system.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 20 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Write one JSON Schema 2020-12 with the constraints that matter: required fields, enums for closed sets, a minimum of zero on the total, additional properties forbidden, and any reasoning field ahead of any decision field. Run it in the provider's strict schema mode so that a response that finishes cannot have a parse error or a schema violation, check the stop reason so that a response cut at the token limit goes to the error path, and treat a refusal as a typed outcome that goes to a review queue. Prove it with a labeled set of real emails scored per field, a refusal check on inputs that must not extract, and a run beside the human process before any record is written.</p>
+<p><strong>The schema.</strong></p>
+<ul>
+<li><code>type</code>, <code>properties</code> and <code>required</code> for the shape; every property listed as required, with null allowed where the source can lack a value.</li>
+<li><code>enum</code> for closed sets such as currency or status; <code>minimum</code> on the total; <code>pattern</code>, <code>minLength</code> and <code>maxLength</code> on identifiers; <code>items</code> for the line items.</li>
+<li><code>additionalProperties: false</code> everywhere, which blocks invented fields and which strict mode demands.</li>
+<li>Field order as logic: any <code>reasoning</code> field before <code>total</code> or <code>status</code>, because the model commits to the first field it writes.</li>
+</ul>
+<p>In Python, a Pydantic model generates this schema; the service keeps the schema as the contract and the model as its binding.</p>
+<p><strong>The enforcement mode.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A hosted frontier model, a flat schema</td>
+<td>the provider's strict schema mode</td>
+</tr>
+<tr>
+<td>Several providers, retries acceptable</td>
+<td>a retry library over the Pydantic model, which is portable and does not touch logits</td>
+</tr>
+<tr>
+<td>A local model, validity required</td>
+<td>a grammar engine, finite state for a flat schema and context-free for a recursive one</td>
+</tr>
+</tbody>
+</table></div>
+<p>Strict mode is the default here: a finished output parses and validates by construction. Two failures remain: the refusal, and a response cut at the token limit, which can still fail to parse. Check the stop reason before you read the output, and send an incomplete response to the error path.</p>
+<p><strong>Retry and refusal.</strong></p>
+<p>Outside strict mode: generate, parse, validate, inject the typed errors and retry, at most three times. More than three means the schema or the prompt is wrong for some inputs. In every mode: a refusal is a first-class outcome with a reason attached. Log it, return it typed, send it to the review queue, and never retry it, because forcing a record on an input that does not fit produces an invented record.</p>
+<p><strong>Proof before accounting sees a record.</strong></p>
+<ol>
+<li><strong>A labeled set</strong> of real emails with gold records; the structured outputs lesson uses 50 documents. Report exact match, accuracy per field and type compliance.</li>
+<li><strong>A refusal check.</strong> Construct inputs that must not extract, such as a lyric, a proof or a blank email, and count refusals against invented outputs.</li>
+<li><strong>A confidence per field</strong> from repeated extraction or token probabilities, with low-confidence records routed to a human.</li>
+<li><strong>A schema version</strong> on every record, and a schema diff that separates breaking changes from non-breaking ones before any deploy.</li>
+<li><strong>A side-by-side run</strong> against the human process on the labeled set, with the service writing nothing until the field-level numbers clear the bar you set with finance.</li>
+</ol>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Prompt for JSON and parse it, the model is good." That works 85 to 95 percent of the time and fails six different ways; accounting needs the contract.</li>
+<li>"Retry refusals until the model gives a record." A refusal says the input does not fit; forcing a record invents one.</li>
+<li>"Validation after generation is as good as strict mode." It is reliable but pays for every retry, and a truncated output costs a turn each time.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why forbid additional properties? Expected: it blocks invented fields, and strict mode requires it everywhere.</li>
+<li><em>(level 3)</em> You expect to switch providers next year. Which mode do you pick? Expected: a retry library over the Pydantic model for portability, or keep the schema identical across providers so each strict mode receives the same contract.</li>
+<li><em>(level 4)</em> How do you version the schema once records exist? Expected: a version field on each record and a schema diff that separates breaking changes from non-breaking ones. Strict mode makes every field required, so an added field is breaking too, because the records written before it do not contain it; removed fields and changed types are breaking, and relaxed constraints are not.</li>
+<li><em>(level 4)</em> Which failure can this design not remove, and where does it go? Expected: a wrong value with the right type; it goes to the field-level eval and the confidence flags, and the low-confidence records go to review.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The lesson <a href="#a1304">structured output</a> gives the schema constructs, the strict mode rules, the retry pattern and the refusal handling, the lesson <a href="#a1103">structured outputs</a> sets the labeled eval and the schema diff, and the lesson constrained decoding gives the mode table and the field order rule.</p></div></details>
+<details class="qa" id="a1304-qa4"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">An extraction service turns purchase-order emails into typed records. Name the ways a structured output call can fail, say which of them disappear under strict schema enforcement, and describe how the code should treat what remains.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 7 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Three ways: a parse error, where the output is not JSON; a schema violation, where it parses but breaks a type, a required field, an enum or a range; and a refusal, where the model decides the input does not fit the schema. Strict enforcement removes the first two by construction for a response that finishes. The refusal stays, and it must be a typed outcome that the code logs and returns, never a retry. A response cut at the token limit can still fail to parse, so check the stop reason before you read the output.</p>
+<p><strong>Three approaches, three failure profiles.</strong></p>
+<ol>
+<li><strong>Prompt for JSON.</strong> Works 85 to 95 percent of the time on a frontier model. Fails six ways: a missing brace, a trailing comma, wrong types, invented fields, truncation at the token limit, and leaked prose such as "here is your JSON".</li>
+<li><strong>Validate after generation.</strong> Generate freely, parse, validate against the schema, and on failure inject the error and retry. Reliable but you pay for every retry.</li>
+<li><strong>Constrained decoding.</strong> The provider masks invalid tokens at decode time, so a finished output parses and validates by construction. The model-side failure collapses to one mode, refusal; a response cut at the token limit and a request error still need their own error path.</li>
+</ol>
+<p><strong>The retry loop, when you are outside strict mode.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">generate -&gt; parse -&gt; validate -&gt; if fail, inject the error and retry, at most 3 times
+</code></pre></div>
+<p>One retry is usually enough. Three catches weak-model flakes. Beyond three means the schema or the prompt is wrong for some inputs, and the fix is there, not in a fourth attempt. The validator should return a typed error list with a path and a message for each failure, which is the shape the retry prompt needs.</p>
+<p><strong>The refusal branch.</strong></p>
+<p>The model declines because the input does not fit, for example the email was a poem and not an order, or because of a safety reason. The refusal carries the reason. Log it, return it typed, and do not retry. The lesson also uses refusals as a safety signal downstream.</p>
+<p><strong>One schema setting that matters.</strong></p>
+<p><code>additionalProperties: false</code> forbids fields the schema did not name, which is how strict mode shuts the door on invented fields. Strict mode requires it everywhere.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"A refusal is a failed call, retry it." It is a first-class outcome with a reason attached; log it and return it typed.</li>
+<li>"Strict mode removes every failure." It removes parse errors and schema violations for a finished response; refusals, truncated responses and wrong values with the right type remain.</li>
+<li>"Retry until it validates." Past three retries the cost grows and the schema is the real problem.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> How many retries, and what does needing more tell you? Expected: at most three; one is usually enough, and beyond three the schema or the prompt is wrong for some inputs.</li>
+<li><em>(level 2)</em> Why must the refusal branch not retry? Expected: the model declined for a reason, often fit or safety; a retry wastes cost and can push a wrong extraction through.</li>
+<li><em>(level 3)</em> What does the retry prompt need from the validator? Expected: a typed error list with a path and a message per failure, so the model knows which field to fix.</li>
+<li><em>(level 3)</em> Which schema setting blocks invented fields? Expected: additional properties set to false, which strict mode requires everywhere.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The lesson <a href="#a1304">structured output</a> names the three failure modes, the retry pattern and the refusal branch, and the lesson <a href="#a1103">structured outputs</a> covers validation with error feedback.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://platform.openai.com/docs/guides/structured-outputs">OpenAI — Structured outputs</a> — strict mode, refusals, and schema requirements</li>
+<li><a href="https://openai.com/index/introducing-structured-outputs-in-the-api/">OpenAI — Introducing structured outputs</a> — August 2024 launch post explaining the decoding guarantee</li>
+<li><a href="https://ai.pydantic.dev/output/">Pydantic AI — Output</a> — typed output_type bindings that serialize to each provider</li>
+<li><a href="https://json-schema.org/draft/2020-12/release-notes">JSON Schema — 2020-12 release notes</a> — the canonical spec</li>
+<li><a href="https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/structured-outputs">Microsoft — Structured outputs in Azure OpenAI</a> — enterprise deployment notes and strict-mode caveats</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/04-structured-output" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1304" id="done-a1304">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1304" id="undo-a1304" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1303"><span class="pn-dir">Previous</span><span class="pn-t">13.3 · Parallel Tool Calls and Streaming with Tools</span></a><a class="pn next" href="#a1305"><span class="pn-dir">Next</span><span class="pn-t">13.5 · Tool Schema Design — Naming, Descriptions, Parameter Constraints</span></a></div></footer>

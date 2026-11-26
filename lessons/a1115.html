@@ -1,0 +1,545 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-11">Phase 11 · LLM Engineering</a></nav><h1>Prompt Caching and Context Caching</h1><div class="m-meta"><span class="chip chip-num">Lesson 11.15</span><span class="chip">60 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1115" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 11 · 01 (Prompt Engineering), Phase 11 · 05 (Context Engineering), Phase 11 · 11 (Caching and Cost)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Your system prompt is 4,000 tokens. Your RAG context is 20,000 tokens. You send both with every request. You also pay for both — every time. Prompt caching lets the provider keep that prefix warm on their side and bill you 5-10% of the normal rate on reuse (Claude and GPT-6.2 models, November 2026). Used correctly, it cuts inference cost by 50–90% and first-token latency by 40–85%.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prompt caching</td>
+<td>"Makes long prompts cheap"</td>
+<td>Reusing a provider-side KV-cache for matching prefixes; repeated input tokens billed at 5-10% of the normal price on current Anthropic and OpenAI models.</td>
+</tr>
+<tr>
+<td><code>cache_control</code></td>
+<td>"The Anthropic marker"</td>
+<td>Content-block attribute that declares "everything up to here is cacheable"; <code>{"type": "ephemeral"}</code>.</td>
+</tr>
+<tr>
+<td>Cache write</td>
+<td>"Paying the premium"</td>
+<td>The first request that populates the cache; billed at ~1.25x input rate on Anthropic, free on OpenAI.</td>
+</tr>
+<tr>
+<td>Cache read</td>
+<td>"The discount"</td>
+<td>Subsequent requests matching the prefix; billed at 5% (Anthropic Opus and Sonnet 5.5, OpenAI GPT-6.2) or 10% (Haiku 5.5) of the input price; Gemini discounted, see pricing.</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>"How long it lives"</td>
+<td>Seconds the cache stays warm; Anthropic 5m default (extendable 1h), OpenAI best-effort up to 1h, Gemini user-set.</td>
+</tr>
+<tr>
+<td>Extended TTL</td>
+<td>"1-hour Anthropic cache"</td>
+<td><code>{"type": "ephemeral", "ttl": "1h"}</code>; 2x write premium but worth it for batch reuse.</td>
+</tr>
+<tr>
+<td>Prefix match</td>
+<td>"Why my cache missed"</td>
+<td>Caches only hit when every token from the start up to the breakpoint is byte-identical.</td>
+</tr>
+<tr>
+<td>Context caching (Gemini)</td>
+<td>"The explicit one"</td>
+<td>Google's named, storage-billed cache object; best for multi-day reuse of large corpora.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Before a model writes its first word it processes the whole prompt (prefill) and keeps the result, the key-value (KV) cache, in memory. If the next request starts with exactly the same text (the same system prompt, tools and examples), that work can be reused instead of repeated. Providers sell this as prompt caching: the repeated part is billed at a small fraction of the normal price and the answer starts sooner. The catch is that only an identical prefix counts: one changed token near the top and everything after it is recomputed. This lesson covers the three providers' versions, the break-even arithmetic with November 2026 prices, and then does prefix caching by hand on a real 0.5B model: it times the first token with and without a cached prefix, checks the outputs match, and shows how a timestamp at the top destroys the cache. No model is trained.</p></div></aside>
+<p>A coding agent sends the same 15,000-token system prompt to Claude on every turn of a conversation. Twenty turns at $2/M input tokens (Claude Sonnet 5.5) is $0.60 in input cost alone — before any of the user's actual messages. Multiply by 10,000 daily conversations and the bill hits $6,000/day for text that never changes.</p>
+<p>You cannot shrink the prompt without hurting quality. You cannot avoid sending it — the model needs it on every turn. The only move is to stop paying full price for a prefix the provider has already seen.</p>
+<p>That move is prompt caching. Anthropic shipped it in August 2024 (with a 1-hour extended-TTL variant in 2025), OpenAI automated it later that year, Google shipped explicit context caching alongside Gemini 1.5, and all three now offer it as a first-class feature on their frontier models.</p>
+<h2>The idea</h2>
+<p><img alt="Prompt caching: write once, read cheap" src="repo-assets/phases/11-llm-engineering/15-prompt-caching/assets/prompt-caching.svg" /></p>
+<p><strong>The mechanic.</strong> When a request's prefix matches one from a recent request, the provider serves the KV-cache from the previous run instead of re-encoding the tokens. You pay a small write premium the first time and a large read discount every time after.</p>
+<p><strong>Three provider flavors in 2026.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Provider (Nov 2026)</th>
+<th>API style</th>
+<th>Price of a cache hit</th>
+<th>Write premium</th>
+<th>Default TTL</th>
+<th>Min cacheable</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>Explicit <code>cache_control</code> markers on content blocks</td>
+<td>5% of input (Opus 5.5, Sonnet 5.5), 10% (Haiku 5.5)</td>
+<td>25% (5-minute cache), 100% (1-hour cache)</td>
+<td>5 min, refreshed on each hit (1 hour optional)</td>
+<td>model-specific, see docs</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>Automatic prefix detection</td>
+<td>5% of input on GPT-6.2 Sol and Astra</td>
+<td>none</td>
+<td>best effort</td>
+<td>model-specific, see docs</td>
+</tr>
+<tr>
+<td>Google (Gemini)</td>
+<td>Implicit caching, plus an explicit <code>CachedContent</code> API</td>
+<td>discounted cached tokens; explicit caches add a storage fee</td>
+<td>storage per token-hour (explicit)</td>
+<td>user-set for explicit caches</td>
+<td>model-specific, see docs</td>
+</tr>
+</tbody>
+</table></div>
+<p>Discounts have grown with each model generation (OpenAI's went from 50% on GPT-4o-era models to 95% now), so read the pricing page of the model you use.</p>
+<p><strong>The invariant.</strong> All three cache prefixes only. If any token differs between requests, everything after the first differing token is a miss. Put the <em>stable</em> parts at the top, the <em>variable</em> parts at the bottom.</p>
+<h2>Idea 1 · The cache-friendly layout</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[system prompt]          &lt;-- cache this
+[tool definitions]       &lt;-- cache this
+[few-shot examples]      &lt;-- cache this
+[retrieved documents]    &lt;-- cache if reused, else don't
+[conversation history]   &lt;-- cache up to last turn
+[current user message]   &lt;-- never cache (different every time)
+</code></pre></div>
+<p>Violate the order — put the user message above the system prompt, interleave dynamic retrievals between few-shots — and the cache never hits.</p>
+<h2>Idea 2 · The break-even calculation</h2>
+<p>Anthropic's 25% write premium (5-minute TTL) pays for itself on the first read, because a cache read costs 0.05x on Opus 5.5 and Sonnet 5.5. 1 write + 1 read averages 0.65x cost per request (saves 35%); 1 write + 10 reads averages 0.16x (saves 84%). The 1-hour TTL charges 2x for the write, so that block needs two reads to come out ahead. Rule of thumb: cache anything you expect to reuse at least 3 times within the TTL; that clears break-even on either TTL.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="prompt-cache-hit"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Average input cost per request</strong> for a cached prefix of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span></span></span></span> tokens reused <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> times after one write, relative to sending it uncached every time (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> requests):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.5678em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">c</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1408em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">saving</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord accent"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.5678em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">c</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">ˉ</span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">)</span><span class="mpunct">,</span></span></span></span></span></div>
+with write multiplier <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> (1.25 for 5 minutes, 2 for 1 hour on Anthropic, 1 on OpenAI) and read multiplier <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span></span></span></span> (0.05 on Sonnet 5.5 and GPT-6.2 Sol).</p>
+<p><strong>Break-even</strong>: caching wins once <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>, that is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2484em;vertical-align:-0.4033em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02691em;">w</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.4033em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.26</span></span></span></span> (one read) for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.25</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.05</span></span></span></span> (two reads) for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>.</p>
+<p><strong>Why the first token comes sooner</strong>: prefill work grows with the number of uncached tokens <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> (linearly for the projections, quadratically for attention), so a hit that leaves <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6891em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≪</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> tokens to process cuts the time to first token by roughly <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">new</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> until the per-request overhead dominates.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A 15,000-token rubric, 20 turns, Sonnet 5.5</div><div class="co-body"><ul>
+<li>Uncached: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">15</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">300</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span></span></span></span> tokens at $2 per million: $0.60 per conversation.</li>
+<li>Cached (5-minute TTL, refreshed by each turn): one write at 1.25x and 19 reads at 0.05x: $15{,}000 \times (1.25 + 19 \times 0.05) \times 2 \times 10^{-6} = \$0.066$, 89% less.</li>
+<li>10,000 conversations a day: from $6,000 to $660 a day for the same rubric.</li>
+<li>With a timestamp above the rubric every turn is a write at 1.25x: $0.75 per conversation, more than not caching at all.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Prompt caching reuses old answers."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It reuses the processed prompt (the KV cache); every answer is generated fresh, and identical to an uncached run.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A similar system prompt hits the cache."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only an identical token prefix does; the first differing token ends the reusable part.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Caching only matters for cost."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It also cuts the time to first token, often by most of the prefill time (measured below).</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Two requests share a long rubric and differ only in the user's code. Recomputing everything versus reusing the cached rubric: how much faster is the first token, and will the next-token prediction be the same? (Solution P1.)</p></div></aside>
+<h2>Step 1 · Anthropic prompt caching with explicit markers</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import anthropic
+
+client = anthropic.Anthropic()
+
+SYSTEM = [
+    {
+        &quot;type&quot;: &quot;text&quot;,
+        &quot;text&quot;: &quot;You are a senior Python reviewer. Follow the rubric exactly.\n\n&quot; + RUBRIC_15K_TOKENS,
+        &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+    }
+]
+
+def review(code: str):
+    return client.messages.create(
+        model=&quot;claude-opus-5-5&quot;,
+        max_tokens=1024,
+        system=SYSTEM,
+        messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: code}],
+    )
+</code></pre></div>
+
+<p>The <code>cache_control</code> marker tells Anthropic to store the block for 5 minutes. Reuse within that window hits; reuse after expires and writes again.</p>
+<p><strong>Response usage fields:</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">response = review(code_a)
+response.usage
+# InputTokensUsage(
+#     input_tokens=120,
+#     cache_creation_input_tokens=15023,   # paid at 1.25x
+#     cache_read_input_tokens=0,
+#     output_tokens=340,
+# )
+
+response_b = review(code_b)
+response_b.usage
+# cache_creation_input_tokens=0
+# cache_read_input_tokens=15023           # paid at 0.05x on Opus 5.5
+</code></pre></div>
+
+<p>Check both fields in CI — if <code>cache_read_input_tokens</code> stays at zero across requests, your cache keys are drifting.</p>
+<h2>Step 2 · one-hour extended TTL</h2>
+<p>For long-running batch jobs, the 5-minute default expires between jobs. Set <code>ttl</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: RUBRIC, &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;, &quot;ttl&quot;: &quot;1h&quot;}}
+</code></pre></div>
+
+<p>A 1-hour cache write costs 2x the base input price (instead of 1.25x for 5 minutes), so it comes out ahead after two reads and pays back fast on any batch reusing the prefix many times.</p>
+<h2>Step 3 · OpenAI automatic caching</h2>
+<p>OpenAI gives you nothing to configure. A long enough prefix that matches a recent request is billed at the cached-input price automatically (5% of the input price on GPT-6.2 Sol).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from openai import OpenAI
+client = OpenAI()
+
+resp = client.chat.completions.create(
+    model=&quot;gpt-6.2-sol&quot;,
+    messages=[
+        {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM_PROMPT},   # long and stable
+        {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user_msg},
+    ],
+)
+resp.usage.prompt_tokens_details.cached_tokens  # the discounted portion
+</code></pre></div>
+
+<p>Same cache-friendly layout rule applies. Two things kill OpenAI's cache that don't kill Anthropic's: changing the <code>user</code> field (used as a cache key component) and reordering tools.</p>
+<h2>Step 4 · Gemini explicit context caching</h2>
+<p>Gemini treats the cache as a first-class object you create and name:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from google import genai
+from google.genai import types
+
+client = genai.Client()
+
+cache = client.caches.create(
+    model=&quot;gemini-3.8-flash&quot;,
+    config=types.CreateCachedContentConfig(
+        display_name=&quot;rubric-v3&quot;,
+        system_instruction=RUBRIC,
+        contents=[FEW_SHOT_EXAMPLES],
+        ttl=&quot;3600s&quot;,
+    ),
+)
+
+resp = client.models.generate_content(
+    model=&quot;gemini-3.8-flash&quot;,
+    contents=[&quot;Review this code:\n&quot; + code],
+    config=types.GenerateContentConfig(cached_content=cache.name),
+)
+</code></pre></div>
+
+<p>Gemini charges storage per token-hour for as long as an explicit cache lives, and bills cached reads at a discounted rate (see its pricing page). This is the right shape when you reuse the same giant prompt across many sessions over days.</p>
+<h2>Step 5 · measuring hit rate in production</h2>
+<p>See <code>code/main.py</code> for a simulated three-provider accountant that tracks write/read/miss counts and computes blended cost per 1K requests. Gate deploys on a target hit rate — most production Anthropic setups should see &gt;80% read fraction after warmup.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Prefix caching by hand on a real model</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct with a 60-rule review rubric as the system prompt. The run times the first token of a second request three ways: recomputing the whole prompt, reusing the KV cache of the shared prefix (what a provider's prompt cache does), and with a timestamp added above the rubric. It also checks that cached and uncached runs predict the same next token. Timings change from run to run, so the output below was recorded (about a minute on CPU).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import copy, time, torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+
+# a long, stable system prompt (a review rubric) and short, changing user messages
+rules = [f&quot;Rule {i}: check that every function named in section {i} has a docstring, type hints, &quot;
+         f&quot;and a unit test covering its error path; report violations with file and line.&quot; for i in range(1, 61)]
+SYSTEM = &quot;You are a senior Python reviewer. Follow the rubric exactly.\n&quot; + &quot;\n&quot;.join(rules)
+def prompt(system, user):
+    return tok.apply_chat_template([{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: system}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: user}],
+                                   tokenize=False, add_generation_prompt=True)
+users = [&quot;Review: def add(a, b): return a + b&quot;, &quot;Review: def div(a, b): return a / b&quot;]
+full = [tok(prompt(SYSTEM, u), return_tensors=&quot;pt&quot;).input_ids for u in users]
+prefix_len = next(i for i in range(min(f.shape[1] for f in full)) if full[0][0, i] != full[1][0, i])
+print(f&quot;prompt {full[0].shape[1]} tokens; the two requests share their first {prefix_len} tokens&quot;)
+
+def first_token_time(ids, cache=None, start=0):
+    t = time.time()
+    with torch.no_grad():
+        out = model(ids[:, start:], past_key_values=cache, use_cache=True, logits_to_keep=1)   # keep only the last position's logits
+    return time.time() - t, out
+
+# warm-up, then: no cache, and a cache holding the shared prefix (what a provider keeps for you)
+first_token_time(full[0])
+t_cold, _ = first_token_time(full[1])
+_, pre = first_token_time(full[0][:, :prefix_len])
+t_warm, out = first_token_time(full[1], cache=copy.deepcopy(pre.past_key_values), start=prefix_len)
+_, ref = first_token_time(full[1])
+same = torch.allclose(out.logits[0, -1], ref.logits[0, -1], atol=1e-3)
+print(f&quot;time to first token without a cache: {t_cold:.2f} s (prefill of {full[1].shape[1]} tokens)&quot;)
+print(f&quot;with the shared prefix cached:      {t_warm:.2f} s (prefill of {full[1].shape[1] - prefix_len} tokens), &quot;
+      f&quot;{t_cold / t_warm:.0f}x faster; next-token logits identical: {same}&quot;)
+
+# the same request with a timestamp at the very top: the shared prefix collapses
+stamped = [tok(prompt(f&quot;Current time: 2026-11-25 10:3{i}:0{i}\n&quot; + SYSTEM, u), return_tensors=&quot;pt&quot;).input_ids
+           for i, u in enumerate(users)]
+p2 = next(i for i in range(min(s.shape[1] for s in stamped)) if stamped[0][0, i] != stamped[1][0, i])
+print(f&quot;\nwith a timestamp above the rubric the requests share only {p2} tokens: &quot;
+      f&quot;{full[1].shape[1] - p2} tokens must be recomputed every time&quot;)
+kv = 2 * model.config.num_hidden_layers * model.config.num_key_value_heads * (model.config.hidden_size // model.config.num_attention_heads) * 2
+print(f&quot;cache size for the shared prefix (bf16): {prefix_len * kv / 1e6:.1f} MB&quot;)
+</code></pre></div>
+<p><strong>Recorded output</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">prompt 2360 tokens; the two requests share their first 2346 tokens
+time to first token without a cache: 16.76 s (prefill of 2360 tokens)
+with the shared prefix cached:      0.29 s (prefill of 14 tokens), 57x faster; next-token logits identical: True
+
+with a timestamp above the rubric the requests share only 22 tokens: 2338 tokens must be recomputed every time
+cache size for the shared prefix (bf16): 28.8 MB
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Almost the whole prompt is shared.</strong> The two requests are 2,360 tokens long and identical for the first 2,346: the system prompt with its 60-rule rubric, plus the chat template's opening tokens. Only the 14 tokens of the user's code differ. This is the typical shape of agent and assistant traffic, and the reason prompt caching pays.</p>
+<p><strong>Reusing the prefix makes the first token 57 times faster.</strong> Recomputing everything took 16.76 s on this CPU. With the KV cache of the shared prefix kept from the first request, only 14 new tokens had to be processed: 0.29 s. Providers' GPUs are far faster in absolute terms, but the ratio is the same idea. Prefill work is skipped, so time to first token falls with the cached share of the prompt.</p>
+<p><strong>The answer does not change.</strong> The next-token logits with the cached prefix match the full recomputation (<code>allclose</code> is True). Caching reuses arithmetic that would have produced the same numbers; it is not an approximation and not a reused answer.</p>
+<p><strong>One timestamp destroys it.</strong> With "Current time: …" above the rubric, the two requests share only 22 tokens, up to the minute digit where the timestamps differ. Every one of the remaining 2,338 tokens must be recomputed, and on a provider you would pay the cache-write price for them each time.</p>
+<p><strong>The cache is not free to keep.</strong> 28.8 MB of keys and values for 2,346 tokens of a 0.5B model (bf16), about 12 KB per token. A 70B model with grouped-query attention needs about 320 KB per token, over 300 MB for a thousand-token prefix. That is why providers keep caches for minutes, not forever, and charge for writing them.</p></div></aside>
+<h2>Pitfalls that still ship in 2026</h2>
+<ul>
+<li><strong>Dynamic timestamps at the top.</strong> <code>"Current time: 2026-04-22 15:30:02"</code> at the top of the system prompt. Every request misses. Move timestamps below the cache breakpoint.</li>
+<li><strong>Tool reordering.</strong> Serialize tools in a stable order — a dict reshuffle between deploys breaks every hit.</li>
+<li><strong>Free-text near-duplicates.</strong> "You are helpful." vs "You are a helpful assistant." — one byte difference = full miss.</li>
+<li><strong>Too-small blocks.</strong> Every provider has a minimum cacheable length (it differs by model). Smaller blocks silently do not cache; check the usage fields.</li>
+<li><strong>Blind cost dashboards.</strong> Split "input tokens" into cached vs uncached. Otherwise a traffic drop looks like a cache win.</li>
+</ul>
+<h2>Use it: the same idea with real libraries</h2>
+<p>The 2026 caching stack:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Agent with stable 10k+ system prompt, many turns</td>
+<td>Anthropic <code>cache_control</code> with 5-min TTL</td>
+</tr>
+<tr>
+<td>Batch job reusing a prefix for 30+ minutes</td>
+<td>Anthropic with <code>ttl: "1h"</code></td>
+</tr>
+<tr>
+<td>Serverless endpoints on GPT-6.2, no custom infra</td>
+<td>OpenAI automatic (just make your prefix stable and long)</td>
+</tr>
+<tr>
+<td>Multi-day reuse of a giant code/doc corpus</td>
+<td>Gemini explicit <code>CachedContent</code></td>
+</tr>
+<tr>
+<td>Cross-provider fallback</td>
+<td>Keep the cacheable prefix layout identical across providers so any hit works</td>
+</tr>
+</tbody>
+</table></div>
+<p>Combine with semantic caching (Phase 11 · 11) for the user-message layer: prompt caching handles <em>token-identical</em> reuse, semantic caching handles <em>meaning-identical</em> reuse.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Serialise the agent's tool definitions from a Python <code>set</code> (or a dict built in a different order on each deploy) before the system prompt. What happens to the cache hit rate after every deploy, and on which requests? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Deep cache discounts</strong>: cached input at 5% of the input price on Claude Opus and Sonnet 5.5 and GPT-6.2, 10% on Haiku 5.5; Anthropic's 1-hour cache for batch and agent workloads.</li>
+<li><strong>Caching in open serving engines</strong>: vLLM's automatic prefix caching and SGLang's RadixAttention reuse KV blocks across requests that share prefixes, the self-hosted version of this lesson.</li>
+<li><strong>Agents designed around the cache</strong>: harnesses keep the system prompt, tools and earlier turns byte-identical and append only at the end; compaction (Lesson 11.5) is the moment the cache is rebuilt.</li>
+<li><strong>Cost dashboards split by cached, written and uncached tokens</strong> to see whether a cost change is traffic or cache behaviour.</li>
+</ul>
+<p>Sources: <a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">Claude prompt caching</a>, <a href="https://developers.openai.com/api/docs/pricing">OpenAI pricing</a>, <a href="https://ai.google.dev/gemini-api/docs/caching">Gemini context caching</a>, <a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching.html">vLLM automatic prefix caching</a>, <a href="https://arxiv.org/abs/2312.07104">SGLang, Zheng et al. 2024</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Providers reuse the KV cache of an identical prompt prefix: cheaper and faster.</li>
+<li>Stable content first (system, tools, examples), changing content last.</li>
+<li>Reads cost 5-10% of input; writes 1.25x (5 min) or 2x (1 h) on Anthropic.</li>
+<li>Break-even is one read for 5-minute caches, two for 1-hour caches.</li>
+<li>Watch cached-token fields; one timestamp or reordering at the top kills every hit.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-llm-cost-caching"><span class="t" style="--cs-hue:40">LC</span>Cheat sheet · LLM Cost, Caching and Batch APIs</a><a href="#cs-prompt-engineering"><span class="t" style="--cs-hue:230">PE</span>Cheat sheet · Prompt Engineering</a></div>
+<h2>Ship it</h2>
+<p>Save <code>outputs/skill-prompt-caching-planner.md</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-caching-planner
+description: Design a cache-friendly prompt layout and pick the right provider caching mode.
+version: 1.0.0
+phase: 11
+lesson: 15
+tags: [llm-engineering, caching, cost]
+---
+
+Given a prompt (system + tools + few-shot + retrieval + history + user) and a usage profile (requests per hour, TTL needed, provider), output:
+
+1. Layout. Reordered sections with a single cache breakpoint marked; explain which sections are stable, which are volatile.
+2. Provider mode. Anthropic cache_control, OpenAI automatic, or Gemini CachedContent. Justify from TTL and reuse pattern.
+3. Break-even. Expected reads per write within TTL; net cost vs no-cache with math.
+4. Verification plan. CI assertion that cache_read_input_tokens &gt; 0 on the second identical request; dashboard split by cached vs uncached tokens.
+5. Failure modes. List the three most likely reasons the cache will miss in this setup (dynamic timestamp, tool reorder, near-duplicate text) and how you will prevent each.
+
+Refuse to ship a cache plan that places a dynamic field above the breakpoint. Refuse to enable 1h TTL without a reuse count that makes the 2x write premium pay back.
+</code></pre></div>
+<p><strong><code>outputs/skill-prompt-caching-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-caching-planner
+description: Design a cache-friendly prompt layout and pick the right provider caching mode.
+version: 1.0.0
+phase: 11
+lesson: 15
+tags: [llm-engineering, caching, cost]
+---
+
+Given a prompt (system + tools + few-shot + retrieval + history + user) and a usage profile (requests per hour, TTL needed, provider), output:
+
+1. Layout. Reordered sections with a single cache breakpoint marked; explain which sections are stable, which are volatile.
+2. Provider mode. Anthropic cache_control, OpenAI automatic, or Gemini CachedContent. Justify from TTL and reuse pattern.
+3. Break-even. Expected reads per write within TTL; net cost vs no-cache with math.
+4. Verification plan. CI assertion that cache_read_input_tokens &gt; 0 on the second identical request; dashboard split by cached vs uncached tokens.
+5. Failure modes. List the three most likely reasons the cache will miss in this setup (dynamic timestamp, tool reorder, near-duplicate text) and how you will prevent each.
+
+Refuse to ship a cache plan that places a dynamic field above the breakpoint. Refuse to enable 1h TTL without a reuse count that makes the 2x write premium pay back.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Take a 10-turn conversation with a 5,000-token system prompt against Claude. Run it without <code>cache_control</code> and then with. Report the input-token bill for each.</li>
+<li><strong>Medium.</strong> Write a test harness that, given a prompt template and a request log, computes the expected hit rate and dollar savings per provider (Anthropic 5m, Anthropic 1h, OpenAI automatic, Gemini explicit).</li>
+<li><strong>Hard.</strong> Build a layout optimizer: given a prompt and a list of fields marked <code>stable=True/False</code>, rewrite the prompt to put a single cache breakpoint at the maximum cache-friendly position without losing information. Verify on a real Anthropic endpoint.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1115-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Much faster, and the same prediction</span></summary><div class="qa-a"><p>In this run the first token came 57 times faster: 0.29 s instead of 16.76 s, because only the 14 tokens after the shared 2,346-token prefix had to be processed. The next-token prediction was identical (the logits match the full recomputation). Caching changes how much work is redone, not what the model computes.</p></div></details>
+<details class="qa" id="a1115-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Every deploy, every request misses</span></summary><div class="qa-a"><p>Every deploy that reorders the tool list changes the prompt near its top. The cached prefix ends at the first changed token, so after each deploy every request misses until new cache entries are written, and the cost of the first request per prefix rises by the write premium. Worse, if the order changes per process or per request (a Python <code>set</code> of tool names, a dict built from an unordered source), different replicas send different prefixes, so the hit rate stays low all the time, not just after deploys. Serialise tools, examples and system text deterministically: sort tools by name, use a fixed JSON key order, and never put request-specific values above the cache breakpoint. Then alert on the cached-token share in the usage fields, so a regression shows up in a dashboard instead of in the bill.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1115-qa3"><summary><span class="qa-lvl qa-estimate">Estimate it</span><span class="qa-q">Your provider charges a 25 percent premium to write a prefix into its cache, and it bills a cache read at a tenth of the normal input price. The cache lives for five minutes. A one-hour variant costs twice the normal input price to write. How many reads does each variant need to pay off, and what rule do you give the team?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> With the five-minute cache, one write and one read average 0.675 of the normal cost per request, a saving of about 32 percent, so the cache pays off on the first read. One write and ten reads average 0.205, about 80 percent saved. The one-hour cache charges 2x for the write, so that block needs two reads before it comes out ahead. The rule: cache anything you expect to reuse at least three times inside its lifetime.</p>
+<p><strong>The arithmetic.</strong></p>
+<p>A write costs 1.25 times the normal input price, and a read costs 0.1 times it.</p>
+<ul>
+<li>One write and one read: the two requests average 0.675 of the normal price. That is 32 percent saved on the first read already.</li>
+<li>One write and ten reads: the requests average 0.205 of the normal price, about 80 percent saved.</li>
+<li>The one-hour cache writes at 2 times the normal price. With one read the average sits above the normal price, and with two reads it falls below. The lesson says the one-hour block pays back fast on any batch that reuses the prefix more than five times.</li>
+</ul>
+<p>Three reuses inside the lifetime clear the break-even on either variant, which is the rule the lesson gives.</p>
+<p><strong>What breaks the arithmetic.</strong></p>
+<ul>
+<li>A prefix that differs by one token on every request, because of a timestamp, a request id or a reshuffled tool list. Every request writes and none reads.</li>
+<li>A block below the minimum cacheable size, which is 1,024 tokens on the provider in the lesson. A smaller block silently does not cache.</li>
+<li>Requests that arrive in parallel before the first write has landed. Each one pays the write premium, and none reads.</li>
+</ul>
+<p><strong>Verify it.</strong></p>
+<p>Read the usage fields on every response: the tokens written to the cache and the tokens read from it. In CI, assert that the second identical request reads more than zero. On the dashboard, split input tokens into cached and uncached, or a traffic drop will look like a cache win.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Caching always saves money." A prefix written once and never read costs 25 percent more than no cache.</li>
+<li>"Pick the one-hour cache, it lasts longer." It writes at twice the normal input price, so a block read once costs more than without the cache.</li>
+<li>"Mark the whole prompt as cacheable." The user message changes every time, so the match ends at the first differing token, and a block below the minimum size does not cache at all.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why does the five-minute cache pay off on the first read? Expected: the write premium is a quarter and the read saves nine tenths, so the two together already average below the normal price.</li>
+<li><em>(level 2)</em> When does the one-hour cache make sense? Expected: a batch job that reuses the prefix across runs more than five minutes apart, more than five times.</li>
+<li><em>(level 3)</em> Input tokens are down and the bill is flat. What is wrong with the dashboard? Expected: it does not split cached from uncached input, so a drop in traffic looks like a cache win.</li>
+<li><em>(level 3)</em> Ten parallel requests share a prefix that nobody has cached yet. What happens to the arithmetic? Expected: all ten pay the write premium and none reads, so the cache costs more than no cache. Send one request first, then the rest.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1115">prompt caching lesson</a> gives the break-even arithmetic and the verification fields, and the caching economics lesson names the parallel-write trap.</p></div></details>
+<details class="qa" id="a1115-qa4"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">An agent fans out ten tool calls at once for every user question. All ten share the same long system prompt, and prompt caching is on. The bill is several times what the cache should allow, and the usage fields show cache writes on nearly all calls and almost no cache reads. What is happening?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> All ten requests reach the provider before the first one has finished writing the prefix into the cache. Each one sees a miss, each one pays the write premium, and none of them reads. The fix is sequential-first: send one request alone, let its cache write land, then fan out the other nine. It adds about one write latency to the first tool call and removes the inflation.</p>
+<p><strong>The mechanism.</strong></p>
+<p>Cache writes happen per request. The lesson puts the first write at about 300 ms after the provider sees the prompt. Requests that arrive inside that window find nothing to read, so each of them writes. Ten writes and zero reads, on every user question that finds the prefix cold. A question that arrives while an earlier write is still inside the cache lifetime reads it, so the trap shows when the questions are further apart than that lifetime. The lesson reports a bill of 5 to 10 times the expected cached cost from this pattern alone.</p>
+<p><strong>Read the usage fields.</strong></p>
+<p>Each response reports the tokens written to the cache and the tokens read from it. In this incident the written count is high on every request and the read count is near zero. That is the signature. A later sequential request with the same prefix does read, which separates this case from a prefix that never matches.</p>
+<p><strong>The fix.</strong></p>
+<p>Send the first request alone and wait for it to return. Its write has landed by then. Fan out the remaining nine, and each of them reads. The cost is about 300 ms on the first tool call. The lesson's exercise asks for the same fix without adding end-to-end latency: warm the prefix with one call at the start of the session, before the first fan-out, so the first tool call already reads.</p>
+<p><strong>Rule out the other cause.</strong></p>
+<p>A prefix that carries dynamic text looks the same in the usage fields: writes on every request, no reads ever. The lesson's example has the time to the minute, a user id and a reshuffled example order inside the system prompt. One field report moved the hit rate from 7 to 74 percent by moving that text below the cache boundary. Check the prompt template before you blame the fan-out.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Caching is on, so the provider should deduplicate them." Writes are per request, and the cache can be read only after the first write has landed.</li>
+<li>"Shorten the system prompt." That lowers every bill a little and leaves ten writes and zero reads in place.</li>
+<li>"Turn caching off, it costs more." It costs more only because of the arrival pattern. Sequential-first turns ten writes into one write and nine reads.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> How do you tell the fan-out trap from dynamic text in the prefix? Expected: both show writes and no reads. After the fan-out trap, a later sequential request with the same prefix reads. With dynamic text, nothing ever reads.</li>
+<li><em>(level 3)</em> How do you fix the fan-out without adding latency for the user? Expected: warm the prefix with one call when the session starts, so the first fan-out already reads.</li>
+<li><em>(level 3)</em> Does a self-hosted prefix cache have the same trap? Expected: the lesson says the self-hosted caches follow the same prefix pattern at your own compute, so measure the cached tokens on a fan-out before you assume they are shared.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The caching economics lesson names the parallelization anti-pattern and its fix, and the <a href="#a1115">prompt caching lesson</a> shows the usage fields to read.</p></div></details>
+<details class="qa" id="a1115-qa5"><summary><span class="qa-lvl qa-estimate">Estimate it</span><span class="qa-q">Your batch job sends the same 15,000-token rubric with each of twenty code reviews, spread over 40 minutes in uneven clusters, and some of the quiet stretches between clusters outlast the short cache. The provider bills a write at 1.25 times the input rate for a five-minute cache and at 2 times the input rate for a one-hour cache, and bills reads at one tenth of the input rate. Which cache do you pick, and show the break-even.</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The five-minute cache pays for itself on the first read: a write costs 1.25 times and a read 0.1 times the normal input rate, so one write plus one read averages 0.675 times, a saving of 32 percent, and one write plus ten reads averages 0.205 times, a saving of 80 percent. Each read refreshes the five-minute lifetime, so the five-minute cache expires only in a gap longer than five minutes. This batch has such gaps, so the one-hour cache fits; its write costs 2 times the input rate and it needs only two reads to come out ahead, and twenty reviews give far more. The rule of thumb is to cache anything reused at least three times within the lifetime.</p>
+<p><strong>The arithmetic.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Cost per request against uncached</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>One write, five-minute cache</td>
+<td>1.25</td>
+</tr>
+<tr>
+<td>One read</td>
+<td>0.1</td>
+</tr>
+<tr>
+<td>One write plus one read, averaged</td>
+<td>0.675, a saving of 32 percent</td>
+</tr>
+<tr>
+<td>One write plus ten reads, averaged</td>
+<td>0.205, a saving of 80 percent</td>
+</tr>
+<tr>
+<td>One write, one-hour cache</td>
+<td>2, so two reads to break even</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>The lifetime decides it.</strong></p>
+<p>Each read refreshes the five-minute lifetime. If the reviews arrive steadily over 40 minutes, every gap stays inside five minutes, the entry never expires, and the five-minute cache wins with its cheaper write. If some gaps exceed five minutes, as in this batch, each of those gaps costs a new write at the premium, and the one-hour cache holds the whole batch for one write. If instead the reviews come as a burst of a few inside one minute followed by an idle hour, each burst fits the five-minute cache and the cheaper write wins. Pick from the gaps between requests, not from the total count.</p>
+<p><strong>Prove it on the response.</strong></p>
+<p>Read the usage fields: the lesson's first request reports 15,023 tokens written at 1.25 times, and the second reports the same count read at 0.1 times with zero written. In production, gate the deploy on a read fraction above 80 percent after warmup, and split the cost dashboard into cached and uncached tokens.</p>
+<p><strong>Other provider shapes.</strong></p>
+<p>The automatic provider gives 50 percent off reads with no premium, up to an hour on a best-effort basis, so the only job is a stable prefix. The explicit cache object on the third provider is storage-billed and reads at about 25 percent of the input rate; it fits reuse of one giant prompt across days.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Always pick the longer cache to be safe." Its write costs 2 times the input rate against 1.25; with reuse inside five minutes the shorter cache is cheaper.</li>
+<li>"The write premium makes caching a loss for short jobs." One write plus one read already saves 32 percent on the five-minute cache.</li>
+<li>"Cache the user message too." It differs on every request, so it never hits; the layout leaves it below the breakpoint.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> Why does the five-minute cache break even on the first read? Expected: the write costs 1.25 times and the read 0.1 times, so two requests average 0.675 times the uncached cost.</li>
+<li><em>(level 3)</em> What does the one-hour cache need to come out ahead? Expected: two reads, because its write costs 2 times the input rate.</li>
+<li><em>(level 4)</em> The reviews arrive in bursts of several within a minute, then nothing for an hour. Does the answer change? Expected: yes; each burst lives inside a five-minute cache, so the cheaper write wins, and the one-hour cache would pay the 2 times write for reuse that never comes.</li>
+<li><em>(level 4)</em> How do you verify the saving in production rather than on paper? Expected: read the cache creation and cache read token fields on each response, gate the deploy on a read fraction above 80 percent after warmup, and split the dashboard into cached and uncached tokens.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The lesson <a href="#a1115">prompt caching</a> gives the provider table, the break-even arithmetic and the usage fields.</p></div></details>
+<details class="qa" id="a1115-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">You enabled prompt caching on a 15,000-token system prompt. The usage field for cache reads stays at zero on every request, while cache creation tokens are charged every time. What do you look for, and in what order?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Something above the cache breakpoint changes on every request. Look first for a timestamp or a request id at the top of the system prompt, then for tool definitions serialized in a changing order, then for near-duplicate text that differs by a byte between code paths, and then for a block under the minimum cacheable size. The cache matches prefixes only, so the first differing token turns everything after it into a miss.</p>
+<p><strong>The invariant.</strong></p>
+<p>All the providers cache prefixes. When a request's prefix matches a recent one, the provider serves the stored key and value cache instead of encoding the tokens again, and bills a read at a fraction of the input rate. If any token differs, everything after it is a miss. The usage fields tell the story: a creation count every time and a read count of zero means the prefix never matched.</p>
+<p><strong>The checklist, in order.</strong></p>
+<ol>
+<li><strong>A dynamic field at the top.</strong> A current time, a request id or a session id in the first lines of the system prompt misses on every request. Move it below the breakpoint with the other per-request fields.</li>
+<li><strong>Tool reordering.</strong> Tools serialized from a dictionary can change order between deploys or between processes; serialize them in a stable order.</li>
+<li><strong>Near-duplicate text.</strong> Two code paths that build the prompt with a one-byte difference produce two prefixes and no hits.</li>
+<li><strong>Too-small blocks.</strong> The explicit cache has a floor of 1,024 tokens, 2,048 on the small model; a smaller block silently does not cache.</li>
+<li><strong>On the automatic provider</strong>, a changed user field is part of the cache key, and the prefix must still be stable and above 1,024 tokens.</li>
+</ol>
+<p><strong>The layout that hits.</strong></p>
+<p>System prompt, then tool definitions, then few-shot examples, then retrieved documents if they are reused, then the history up to the last turn, then the current message, which is never cached because it is different every time.</p>
+<p><strong>Turn it into a test.</strong></p>
+<p>In CI, build two requests through the production prompt builder with the same user input, compare their cacheable prefixes, send both, and assert that the cache read token count is above zero on the second. Two hand-written identical bodies would skip the timestamp or request id that the builder adds. Split the cost dashboard into cached and uncached input tokens, or a traffic drop looks like a cache win.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Caching is automatic, there is nothing to configure." On the explicit providers you mark the block; on the automatic one the prefix still has to be stable and above 1,024 tokens, and a changed user field or tool order breaks it.</li>
+<li>"Put the user message first so the model reads it early." That places the only part that changes above everything else, and the cache never hits.</li>
+<li>"Extend the TTL to one hour, the cache is expiring." Expiry would show as writes after quiet periods, not on every request; the one-hour TTL also charges 2x for the write.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> How do you make this a test? Expected: two requests built by the production prompt builder with the same user input, with an assertion that the cache read tokens are above zero on the second; if they stay at zero the keys are drifting.</li>
+<li><em>(level 2)</em> Where does the timestamp go instead? Expected: below the breakpoint, with the other per-request fields such as the user message.</li>
+<li><em>(level 3)</em> The block is below the minimum size. What happens? Expected: nothing is cached and nothing is reported; the floor is 1,024 tokens, and 2,048 on the small model.</li>
+<li><em>(level 3)</em> Input tokens fell after your change. Is that proof it works? Expected: no; split the input tokens into cached and uncached, or a drop in traffic looks like a cache win.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The lesson <a href="#a1115">prompt caching</a> gives the prefix invariant, the cache-friendly layout, the pitfalls and the CI check.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic — Prompt caching</a> — <code>cache_control</code>, 1h TTL, break-even tables.</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching">OpenAI — Prompt caching</a> — automatic prefix matching.</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/caching">Google — Context caching</a> — <code>CachedContent</code> API and storage pricing.</li>
+<li><a href="https://www.anthropic.com/news/prompt-caching">Anthropic engineering — Prompt caching for long-context workloads</a> — original launch post with latency numbers.</li>
+<li>Phase 11 · 05 (Context Engineering) — where to slice the prompt so the cache can land.</li>
+<li>Phase 11 · 11 (Caching and Cost) — pair prompt caching with a semantic cache on user messages.</li>
+<li><a href="https://arxiv.org/abs/2211.05102">Pope et al., "Efficiently Scaling Transformer Inference" (2022)</a> — the KV-cache memory model that prompt caching exposes to users; explains why a cached prefix is ~10× cheaper to reread than to recompute.</li>
+<li><a href="https://arxiv.org/abs/2308.16369">Agrawal et al., "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills" (2023)</a> — prefill is the phase prompt caching shortcuts; this paper explains why TTFT drops dramatically on cache hit while TPOT is unaffected.</li>
+<li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al., "Fast Inference from Transformers via Speculative Decoding" (2023)</a> — prompt caching sits alongside speculative decoding, Flash Attention, and MQA/GQA as levers that bend the inference cost curve; read this for the other three.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/11-llm-engineering/15-prompt-caching" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1115" id="done-a1115">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1115" id="undo-a1115" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1114"><span class="pn-dir">Previous</span><span class="pn-t">11.14 · Model Context Protocol (MCP)</span></a><a class="pn next" href="#a1116"><span class="pn-dir">Next</span><span class="pn-t">11.16 · Agent State Machines — Graphs, Nodes, Checkpoints</span></a></div></footer>

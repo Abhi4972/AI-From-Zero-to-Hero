@@ -1,0 +1,474 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>MCP Model Input: Sampling Migration and Stateless MRTR</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.11</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1311" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why Sampling is deprecated in MCP 2026-07-28 and choose the direct model integration default for new servers.</li>
+<li>Implement a compatibility workflow that carries <code>sampling/createMessage</code> through Multi Round-Trip Requests (MRTR).</li>
+<li>Put the protocol revision and client capabilities in every request <code>_meta</code> object.</li>
+<li>Return <code>resultType: "input_required"</code> and retry the original method with a fresh JSON-RPC id.</li>
+<li>Integrity-protect <code>requestState</code> and bind it to the principal, method, arguments, and expiry.</li>
+<li>Bound model-assisted loops with capability checks, approval, response validation, and a round limit.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 07 (MCP server), Phase 13 · 10 (resources and prompts)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>MCP 2026-07-28 deprecates Sampling for new designs and removes the server-to-client request channel. If an existing workflow still needs the client's model, the server returns an <code>input_required</code> result and the client retries the original request with the model output. The reasoning loop becomes explicit, bounded, and stateless at the protocol layer.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>Meaning in 2026-07-28</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Sampling</td>
+<td>Deprecated feature that asks the client's model for a completion</td>
+</tr>
+<tr>
+<td>MRTR</td>
+<td>Stateless retry pattern for client input required during a request</td>
+</tr>
+<tr>
+<td><code>InputRequiredResult</code></td>
+<td>Result with <code>resultType: "input_required"</code></td>
+</tr>
+<tr>
+<td><code>inputRequests</code></td>
+<td>Server-assigned map of embedded elicitation, sampling, or roots requests</td>
+</tr>
+<tr>
+<td><code>inputResponses</code></td>
+<td>Current round's client results keyed like <code>inputRequests</code></td>
+</tr>
+<tr>
+<td><code>requestState</code></td>
+<td>Opaque server state echoed exactly by the client and verified by the server</td>
+</tr>
+<tr>
+<td><code>resultType</code></td>
+<td>Required discriminator for modern MCP results</td>
+</tr>
+<tr>
+<td>Direct model integration</td>
+<td>Recommended replacement for new servers that need model inference</td>
+</tr>
+<tr>
+<td>Capability gate</td>
+<td>Rule that prevents sending an embedded request the client did not advertise</td>
+</tr>
+<tr>
+<td>Loop budget</td>
+<td>Maximum rounds, tokens, bytes, time, and spend allowed for the operation</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The Decision Before the Protocol</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Sometimes an MCP server needs a language model in the middle of its work, for example to pick the most relevant files before summarising them. Older MCP let the server ask the client's model directly ("Sampling"). MCP 2026-07-28 deprecates that for new designs, and the default advice is that a server should call a model provider itself. For existing workflows there is a stateless replacement called a Multi Round-Trip Request (MRTR). The server answers "input required" and includes the model request. The client runs its own model, with its own approval rules, and then repeats the original request with the model's answer attached. An opaque, tamper-proof <code>requestState</code> string carries the server's progress between rounds. This lesson runs that loop for real: an SDK server asks twice, and a 0.5B model on the client side answers. It then shows the same exchange as raw JSON-RPC, including the errors.</p></div></aside>
+<p>A tool such as <code>summarize_repo</code> needs two kinds of work:</p>
+<ol>
+<li>Deterministic work: list files, read allowed files, validate paths, and assemble content.</li>
+<li>Model work: choose representative files and synthesize the summary.</li>
+</ol>
+<p>You now have two valid architectures.</p>
+<h3>New server: integrate with a model provider directly</h3>
+<p>This is the current default. The server owns model selection, credentials, budgets, retries, and observability. It returns one ordinary <code>tools/call</code> result to the MCP client.</p>
+<p>Choose this when the server is already a hosted service or when predictable model behavior matters more than using the host's model.</p>
+<h3>Existing Sampling workflow: migrate it to MRTR</h3>
+<p>Sampling still exists during its deprecation window. A server targeting 2026-07-28 cannot send a live <code>sampling/createMessage</code> request back to the client. It instead embeds that request in an <code>InputRequiredResult</code>.</p>
+<p>Choose this compatibility path only when using the client's model and credentials is a real product requirement. Record a removal plan because new implementations should not adopt deprecated Sampling.</p>
+<h2>The Stateless Contract</h2>
+<p>The July 2026 protocol has no <code>initialize</code> exchange, no <code>notifications/initialized</code>, and no <code>Mcp-Session-Id</code>. Every request carries the information that used to live in the handshake:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;lesson-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre></div>
+<p>The server validates the revision on every request. A missing or non-string version is invalid params, <code>-32602</code>. An unsupported string returns <code>-32022</code> with exact data <code>{"supported":["2026-07-28"],"requested":"&lt;client version&gt;"}</code>. A missing Sampling capability returns <code>-32021</code> with <code>data.requiredCapabilities</code> set to <code>{"sampling":{}}</code>.</p>
+<p>An envelope without a JSON-RPC <code>id</code> is a notification. The receiver may process it, but it emits neither a success response nor an error response. A Streamable HTTP adapter returns <code>202 Accepted</code> with no body for an accepted notification.</p>
+<p>The server also implements <code>server/discover</code> with the exact <code>supportedVersions</code> key, capabilities, <code>ttlMs</code>, and <code>cacheScope</code> so a client can learn and cache the server contract before calling a tool. Because discovery advertises <code>tools</code>, the server also implements mandatory <code>tools/list</code>. Its deterministic <code>summarize_repo</code> descriptor includes a valid object <code>inputSchema</code>, <code>resultType: "complete"</code>, server identity metadata, and public cache hints.</p>
+<p>Every successful modern result has a discriminator:</p>
+<ul>
+<li><code>resultType: "complete"</code> means the operation finished.</li>
+<li><code>resultType: "input_required"</code> means the client must fulfill embedded requests and retry.</li>
+<li>Extensions may define additional result types. The Tasks extension adds <code>"task"</code> in Lesson 13.</li>
+</ul>
+<h2>One MRTR Round</h2>
+<p>The server cannot call the client while handling the request. It returns this result instead:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 1,
+  &quot;result&quot;: {
+    &quot;resultType&quot;: &quot;input_required&quot;,
+    &quot;inputRequests&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;method&quot;: &quot;sampling/createMessage&quot;,
+        &quot;params&quot;: {
+          &quot;messages&quot;: [
+            {
+              &quot;role&quot;: &quot;user&quot;,
+              &quot;content&quot;: {
+                &quot;type&quot;: &quot;text&quot;,
+                &quot;text&quot;: &quot;Choose three representative files and return a JSON array.&quot;
+              }
+            }
+          ],
+          &quot;systemPrompt&quot;: &quot;Return only the requested value.&quot;,
+          &quot;modelPreferences&quot;: {
+            &quot;costPriority&quot;: 0.8,
+            &quot;intelligencePriority&quot;: 0.2
+          },
+          &quot;maxTokens&quot;: 400
+        }
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;
+  }
+}
+</code></pre></div>
+<p>The client verifies that it supports Sampling, applies its approval and model policies, and obtains a model response. Then it sends a new request with a different JSON-RPC id:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 2,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;summarize_repo&quot;,
+    &quot;arguments&quot;: {&quot;audience&quot;: &quot;developer&quot;},
+    &quot;inputResponses&quot;: {
+      &quot;pick_files&quot;: {
+        &quot;role&quot;: &quot;assistant&quot;,
+        &quot;content&quot;: {
+          &quot;type&quot;: &quot;text&quot;,
+          &quot;text&quot;: &quot;[\&quot;README.md\&quot;, \&quot;server.py\&quot;, \&quot;docs/intro.md\&quot;]&quot;
+        },
+        &quot;model&quot;: &quot;host-model&quot;,
+        &quot;stopReason&quot;: &quot;endTurn&quot;
+      }
+    },
+    &quot;requestState&quot;: &quot;opaque-integrity-protected-value&quot;,
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {&quot;sampling&quot;: {}}
+    }
+  }
+}
+</code></pre></div>
+<p>The retry is not a continuation of a protocol session. It is a new request that repeats the original method and arguments, adds only the current round's <code>inputResponses</code>, and echoes <code>requestState</code> byte for byte.</p>
+<p>MRTR is allowed only on <code>tools/call</code>, <code>prompts/get</code>, and <code>resources/read</code>. A server must not return <code>input_required</code> from unrelated methods.</p>
+<h2>Multi-Round State</h2>
+<p>This lesson needs two model calls:</p>
+<ol>
+<li><code>pick_files</code> returns a JSON array.</li>
+<li><code>summary</code> returns the final prose.</li>
+</ol>
+<p>Each retry carries only the responses for that round. The server therefore puts the phase and validated intermediate data into the next <code>requestState</code>.</p>
+<p>Treat that value as attacker-controlled. Signing a raw phase name is not enough. Bind the state to:</p>
+<ul>
+<li>the authenticated principal, not self-reported <code>clientInfo</code>;</li>
+<li>the originating method;</li>
+<li>a digest of the original arguments;</li>
+<li>a short expiry;</li>
+<li>the current phase and validated intermediate values.</li>
+</ul>
+<p>Use HMAC when confidentiality is not required. Use authenticated encryption when the client must not read the state. Reject a bad signature, expired value, changed principal, or changed arguments with <code>-32602</code>.</p>
+<p>The client must not parse or modify <code>requestState</code>. Its only job is to echo the exact string on the retry.</p>
+<h2>Model Preferences Are Hints</h2>
+<p><code>costPriority</code>, <code>speedPriority</code>, and <code>intelligencePriority</code> are independent preferences. They are not a probability distribution and do not need to sum to one. The client may ignore them because the client owns model policy.</p>
+<p>Keep <code>includeContext</code> at <code>"none"</code> if you maintain a legacy Sampling flow. Other context modes increase leakage risk and are themselves deprecated. Pass the minimum explicit context in the request.</p>
+<h2>Safety Invariants</h2>
+<p>The client is the trust boundary for embedded Sampling requests.</p>
+<ul>
+<li>Show the user what the server is asking the model to do when policy requires approval.</li>
+<li>Cap MRTR rounds. A malicious server can otherwise create a model-spend loop.</li>
+<li>Validate every sampling response before using it as a filename, URL, or tool input.</li>
+<li>Limit bytes and tokens per round.</li>
+<li>Refuse an input request that was not declared in current client capabilities.</li>
+<li>Keep model output out of authorization decisions.</li>
+<li>Log the originating method and input-request key without logging sensitive prompt content.</li>
+</ul>
+<p><code>clientInfo</code> and <code>serverInfo</code> are display and diagnostics metadata. Never use either as an authenticated identity.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="t3-sampling-flip"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>One round.</strong> For an original request <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">method</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">args</span></span><span class="mclose">)</span></span></span></span> and round <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">in</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3em;vertical-align:-1.25em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size4">{</span></span><span class="mord"><span class="mtable"><span class="col-align-l"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.69em;"><span style="top:-3.69em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">input_required</span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-2.25em;"><span class="pstrut" style="height:3.008em;"></span><span class="mord"><span class="mord text"><span class="mord">complete</span></span><span class="mopen">(</span><span class="mord text"><span class="mord">result</span></span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.19em;"><span></span></span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div>
+where <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8917em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span> are the input requests, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8179em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord text"><span class="mord">in</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> the client's answers to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0077em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span> the request state. Each retry is a new request with a new id but the same method and arguments.</p>
+<p><strong>Request state as a MAC.</strong> With a server key <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord">data</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">∥</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord text"><span class="mord">MAC</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord text"><span class="mord">data</span></span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">data</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord text"><span class="mord">principal</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">method</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mopen">(</span><span class="mord text"><span class="mord">args</span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">expiry</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">phase</span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">intermediate</span></span><span class="mclose">)</span><span class="mpunct">,</span></span></span></span></span></div>
+and the server rejects (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">32602</span></span></span></span>) any <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span> whose MAC does not verify, that has expired, or whose principal, method or argument hash differs from the current request. Changing one character of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span> breaks the MAC with overwhelming probability (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">128</span></span></span></span></span></span></span></span></span></span></span></span> for a 128-bit tag).</p>
+<p><strong>Bounded loops.</strong> With at most <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> rounds and at most <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> tokens per sampling request, one tool call costs the client at most <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5945em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> model tokens.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Two rounds for `summarize_repo`</div><div class="co-body"><ul>
+<li>Round 1: <code>tools/call</code> (id 1) → <code>input_required</code> with one request, "pick 2 files", <code>maxTokens = 30</code>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>.</li>
+<li>The client's model answers; the client retries (id 2) with the answer and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> unchanged.</li>
+<li>Round 2: the server validates the answer, then returns <code>input_required</code> again: "summarise these files", <code>maxTokens = 60</code>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (which now records round 1's outcome).</li>
+<li>Round 3: retry (id 3) with the summary → <code>complete</code>.</li>
+<li>Worst case with the client's limit <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">60</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">240</span></span></span></span> sampled tokens for this call, however the server behaves.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "In 2026-07-28 the server sends <code>sampling/createMessage</code> to the client."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It cannot start requests; it returns <code>input_required</code>, and the client retries.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The retry continues the same request."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is a new request with a new id, repeating method and arguments, plus answers and the state.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The client may read or tidy up <code>requestState</code>."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It must echo it byte for byte; the server treats it as attacker-controlled and verifies it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Sampling is the recommended way for a server to use a model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is deprecated; new servers call a model provider directly.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>An SDK server asks the client's model two questions in sequence; the client's model is a 0.5B open model. How many sampling requests will the client handle for one <code>tools/call</code>? If the model answers the first question in the wrong format, what should the server do with it? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">MRTR end to end, with a real model on the client</div><div class="co-body"><p>The server uses the SDK's resolver pattern: <code>summarize_repo</code> depends on <code>write_summary</code>, which depends on <code>pick_files</code>; both resolvers return <code>Sample(...)</code> requests. The SDK turns them into <code>input_required</code> rounds. On the client side, <code>sampling_callback</code> runs Qwen2.5-0.5B-Instruct and prints each request it receives. About a minute on CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import asyncio, json, torch
+from typing import Annotated
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging
+from mcp import Client
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Resolve, Sample
+from mcp.types import CreateMessageResult, SamplingMessage, TextContent
+logging.set_verbosity_error()
+
+FILES = {&quot;README.md&quot;: &quot;Notes app. Stores notes and searches them.&quot;, &quot;server.py&quot;: &quot;MCP server exposing notes tools.&quot;,
+         &quot;tests/test_api.py&quot;: &quot;Unit tests.&quot;, &quot;docs/intro.md&quot;: &quot;How to install and use the notes app.&quot;,
+         &quot;.github/ci.yml&quot;: &quot;CI config.&quot;}
+
+# Server side: a deprecated-but-supported Sampling workflow, expressed as resolvers.
+srv = MCPServer(&quot;repo-summarizer&quot;, log_level=&quot;WARNING&quot;)
+def ask(text, max_tokens):
+    return Sample([SamplingMessage(role=&quot;user&quot;, content=TextContent(type=&quot;text&quot;, text=text))],
+                  max_tokens=max_tokens, system_prompt=&quot;Answer with only what is asked.&quot;)
+async def pick_files() -&gt; Sample:
+    return ask(&quot;Which 2 of these files best explain what the project does? Answer with the two file names &quot;
+               &quot;separated by a comma, nothing else.\n&quot; + &quot;\n&quot;.join(FILES), 30)
+async def write_summary(picked: Annotated[CreateMessageResult, Resolve(pick_files)]) -&gt; Sample:
+    names = [n.strip() for n in picked.content.text.split(&quot;,&quot;) if n.strip() in FILES][:2] or [&quot;README.md&quot;]
+    return ask(&quot;Summarise the project in one sentence:\n&quot; + &quot;\n&quot;.join(f&quot;{n}: {FILES[n]}&quot; for n in names), 60)
+
+@srv.tool()
+async def summarize_repo(summary: Annotated[CreateMessageResult, Resolve(write_summary)]) -&gt; str:
+    &quot;&quot;&quot;Use when the user wants a one-sentence summary of the repository.&quot;&quot;&quot;
+    return summary.content.text.strip()
+
+# Client side: the host's own model answers each sampling request from the server.
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); model = AutoModelForCausalLM.from_pretrained(M).eval()
+rounds = []
+async def host_model(context, params):
+    prompt = params.messages[0].content.text
+    rounds.append(prompt.splitlines()[0])
+    print(f&quot;  host receives sampling request {len(rounds)} (maxTokens={params.max_tokens}): {prompt.splitlines()[0][:70]}&quot;)
+    msgs = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: params.system_prompt}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}]
+    ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = model.generate(ids, max_new_tokens=params.max_tokens, do_sample=False)
+    text = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+    print(f&quot;  host model answers: {text[:90]!r}&quot;)
+    return CreateMessageResult(role=&quot;assistant&quot;, content=TextContent(type=&quot;text&quot;, text=text),
+                               model=M, stop_reason=&quot;endTurn&quot;)
+
+async def main():
+    async with Client(srv, sampling_callback=host_model, input_required_max_rounds=4) as c:
+        print(&quot;protocol:&quot;, c.protocol_version)
+        r = await c.call_tool(&quot;summarize_repo&quot;, {})
+        print(f&quot;\nfinal result after {len(rounds)} sampling rounds: {r.content[0].text!r}&quot;)
+
+asyncio.run(main())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">protocol: 2026-07-28
+  host receives sampling request 1 (maxTokens=30): Which 2 of these files best explain what the project does? Answer with
+  host model answers: &#x27;server.py tests/test_api.py&#x27;
+  host receives sampling request 2 (maxTokens=60): Summarise the project in one sentence:
+  host model answers: &#x27;The README.md file provides instructions for creating a notes app that stores and searches&#x27;
+
+final result after 2 sampling rounds: &#x27;The README.md file provides instructions for creating a notes app that stores and searches notes.&#x27;</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>One tool call, two sampling rounds.</strong> The client called <code>summarize_repo</code> once. The SDK on the server side returned <code>input_required</code> for the first resolver; the client ran its model and retried; the server then asked the second question and the client retried again. The client's <code>sampling_callback</code> saw exactly two requests, each with the server's <code>maxTokens</code> cap (30, then 60).</p>
+<p><strong>The server validated the model's answer.</strong> Asked for two file names separated by a comma, the 0.5B model answered <code>server.py tests/test_api.py</code> with no comma. The resolver kept only names that exist in the repository and fell back to <code>README.md</code> when nothing valid remained. Model output is untrusted input: here it only chose files from a fixed list, never a path the server would open blindly.</p>
+<p><strong>The final result is ordinary.</strong> After the last retry the server returned a <code>complete</code> result whose text came from the client's model. The server never held a model key, and the client decided which model to use.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The same pattern on the wire</div><div class="co-body"><p>A one-question server runs as a subprocess, and the client is raw JSON-RPC over stdio. The output shows the <code>input_required</code> result, the retry with <code>inputResponses</code> and the echoed <code>requestState</code>, a request from a client that did not declare <code>sampling</code>, and a retry with a tampered state. About 2 seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The same pattern on the wire: one Sampling round, spoken in raw JSON-RPC over stdio.
+import json, pathlib, subprocess, sys, tempfile, textwrap
+server = pathlib.Path(tempfile.mkdtemp()) / &quot;pick_server.py&quot;
+server.write_text(textwrap.dedent('''
+    from typing import Annotated
+    from mcp.server import MCPServer
+    from mcp.server.mcpserver import Resolve, Sample
+    from mcp.types import CreateMessageResult, SamplingMessage, TextContent
+    mcp = MCPServer(&quot;pick-server&quot;, log_level=&quot;WARNING&quot;)
+    async def choose() -&gt; Sample:
+        return Sample([SamplingMessage(role=&quot;user&quot;, content=TextContent(type=&quot;text&quot;,
+                       text=&quot;Name one colour.&quot;))], max_tokens=5)
+    @mcp.tool()
+    async def favourite_colour(answer: Annotated[CreateMessageResult, Resolve(choose)]) -&gt; str:
+        &quot;&quot;&quot;Ask the client's model for a colour.&quot;&quot;&quot;
+        return f&quot;the model chose {answer.content.text}&quot;
+    mcp.run()'''))
+p = subprocess.Popen([sys.executable, str(server)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                     stderr=subprocess.DEVNULL, text=True)
+def rpc(i, params, caps={&quot;sampling&quot;: {}}):
+    meta = {&quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;, &quot;io.modelcontextprotocol/clientCapabilities&quot;: caps}
+    msg = {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: i, &quot;method&quot;: &quot;tools/call&quot;,
+           &quot;params&quot;: {&quot;name&quot;: &quot;favourite_colour&quot;, &quot;arguments&quot;: {}, **params, &quot;_meta&quot;: meta}}
+    p.stdin.write(json.dumps(msg) + &quot;\n&quot;); p.stdin.flush()
+    return json.loads(p.stdout.readline())
+
+r1 = rpc(1, {})[&quot;result&quot;]
+key, req = next(iter(r1[&quot;inputRequests&quot;].items()))
+print(f&quot;id 1 -&gt; resultType={r1['resultType']}&quot;)
+print(f&quot;   inputRequests[{key!r}] = {json.dumps(req)[:150]}&quot;)
+print(f&quot;   requestState = {r1.get('requestState')!r:.60}  ({len(r1.get('requestState') or '')} characters, opaque)&quot;)
+
+answer = {key: {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: {&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: &quot;teal&quot;}, &quot;model&quot;: &quot;host-model&quot;,
+                &quot;stopReason&quot;: &quot;endTurn&quot;}}
+r2 = rpc(2, {&quot;inputResponses&quot;: answer, **({&quot;requestState&quot;: r1[&quot;requestState&quot;]} if &quot;requestState&quot; in r1 else {})})
+print(f&quot;\nid 2 (retry, same tool and arguments, inputResponses added) -&gt; &quot;
+      f&quot;{r2['result']['resultType']}: {r2['result']['content'][0]['text']!r}&quot;)
+
+r3 = rpc(3, {}, caps={})
+err = r3.get(&quot;error&quot;) or r3[&quot;result&quot;]
+print(f&quot;\nid 3, client did not declare sampling -&gt; {json.dumps(err)[:160]}&quot;)
+tampered = r1[&quot;requestState&quot;][:-6] + (&quot;A&quot; if r1[&quot;requestState&quot;][-6] != &quot;A&quot; else &quot;B&quot;) + r1[&quot;requestState&quot;][-5:]
+r4 = rpc(4, {&quot;inputResponses&quot;: answer, &quot;requestState&quot;: tampered})
+print(f&quot;\nid 4, retry with one character of requestState changed -&gt; {json.dumps(r4.get('error') or r4['result'])[:140]}&quot;)
+p.stdin.close(); p.wait(timeout=10)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">id 1 -&gt; resultType=input_required
+   inputRequests[&#x27;__main__:choose&#x27;] = {&quot;method&quot;: &quot;sampling/createMessage&quot;, &quot;params&quot;: {&quot;maxTokens&quot;: 5, &quot;messages&quot;: [{&quot;content&quot;: {&quot;text&quot;: &quot;Name one colour.&quot;, &quot;typ
+   requestState = &#x27;v1.hKU4fIWX2duzOst9yCR5SyMZYWxqvM5jESFgquKSbv5Jl0d7hGQ6GYWO  (362 characters, opaque)
+
+id 2 (retry, same tool and arguments, inputResponses added) -&gt; complete: &#x27;the model chose teal&#x27;
+
+id 3, client did not declare sampling -&gt; {&quot;code&quot;: -32021, &quot;message&quot;: &quot;Client did not declare the sampling capability required by resolver &#x27;__main__:choose&#x27;&quot;, &quot;d
+
+id 4, retry with one character of requestState changed -&gt; {&quot;code&quot;: -32602, &quot;message&quot;: &quot;Invalid or expired requestState&quot;, &quot;data&quot;: {&quot;reason&quot;: &quot;invalid_request_sta</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Round 1 asks instead of calling.</strong> Request id 1 returns <code>resultType: input_required</code> with one entry in <code>inputRequests</code>, a <code>sampling/createMessage</code> with <code>maxTokens: 5</code>, and a 362-character <code>requestState</code> that the client cannot read (the SDK encrypts and authenticates it).</p>
+<p><strong>The retry is a new request.</strong> Id 2 repeats the same tool and arguments, adds the model's answer under the same key, and echoes <code>requestState</code> unchanged. The server completes: "the model chose teal".</p>
+<p><strong>Capabilities are checked per request.</strong> Id 3 comes from a client that did not declare <code>sampling</code>. The server refuses with <code>-32021</code> (missing required client capability) and names the capability, instead of asking for input the client cannot provide.</p>
+<p><strong>Tampering fails closed.</strong> Id 4 echoes a <code>requestState</code> with one character changed. The integrity check fails and the server answers <code>-32602</code> "Invalid or expired requestState", without trusting anything inside it.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements the full two-round flow with no third-party package:</p>
+<ul>
+<li><code>server/discover</code> returns <code>supportedVersions</code>, advertises tool support, and returns cache hints.</li>
+<li><code>tools/list</code> returns a deterministic, cacheable <code>summarize_repo</code> descriptor with an object input schema.</li>
+<li><code>tools/call</code> validates per-request metadata.</li>
+<li>The first result embeds <code>sampling/createMessage</code> for file selection.</li>
+<li>The first retry validates the model result and embeds a second request.</li>
+<li>HMAC-protected <code>requestState</code> carries the phase between independent requests.</li>
+<li>The final result uses <code>resultType: "complete"</code>.</li>
+</ul>
+<p>The fake host model makes the example deterministic. Replace only <code>fake_host_model</code> when connecting a real host. The server-side state machine should stay deterministic and testable.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>From the repository root:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/11-mcp-sampling/code
+python3 main.py
+npx tsx main.ts
+python3 -m unittest discover tests -v
+</code></pre></div>
+<p>Expected checkpoints:</p>
+<ul>
+<li>Discovery returns a complete result with <code>ttlMs</code> and <code>cacheScope</code>.</li>
+<li>Tool discovery returns the same sorted descriptor with <code>resultType</code>, server identity, and cache hints.</li>
+<li>Missing capabilities and unsupported versions use exact <code>-32021</code> and <code>-32022</code> error data.</li>
+<li>An id-less notification produces no JSON-RPC response.</li>
+<li>Request ids are <code>[1, 2, 3]</code>, proving each MRTR round is independent.</li>
+<li>The first two results are <code>input_required</code>.</li>
+<li>The final result is <code>complete</code> and contains the selected files plus summary.</li>
+<li>Changing the original arguments on a retry fails the request-state check.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A client fulfils every <code>input_required</code> sampling request automatically, with no round limit and no token cap, and a malicious server returns a new sampling request on every retry. What does the user pay, and which client-side limits stop it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Sampling is deprecated</strong> in MCP 2026-07-28 (with Roots and Logging), with at least a 12-month deprecation window; the recommended path for new servers is to call a model provider's API directly.</li>
+<li><strong>MRTR replaces server-initiated requests</strong>: <code>InputRequiredResult</code> with <code>inputRequests</code> and <code>requestState</code>, retried by the client; allowed on <code>tools/call</code>, <code>prompts/get</code> and <code>resources/read</code>.</li>
+<li><strong>SDK support</strong>: the Python SDK 2.x expresses MRTR as resolvers (<code>Resolve</code>, <code>Sample</code>, <code>Elicit</code>, <code>ListRoots</code>), protects <code>requestState</code> with an authenticated-encryption codec, and its <code>Client</code> retries automatically up to <code>input_required_max_rounds</code>.</li>
+<li><strong>Client policy</strong>: hosts show sampling requests for approval, cap rounds and tokens, and choose the model themselves; <code>modelPreferences</code> are hints only.</li>
+</ul>
+<p>Sources: <a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">MCP 2026-07-28 changelog</a>, <a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr">MCP Multi Round-Trip Requests</a>, <a href="https://py.sdk.modelcontextprotocol.io/whats-new/">MCP Python SDK: what's new in v2</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>New servers call models directly; Sampling is deprecated.</li>
+<li>Existing Sampling flows become MRTR rounds: <code>input_required</code>, then a retry with answers.</li>
+<li>Each retry is a new request: same method and arguments, new id, state echoed unchanged.</li>
+<li><code>requestState</code> is integrity-protected and bound to principal, method, arguments and expiry.</li>
+<li>The client is the trust boundary: approve, cap rounds and tokens, validate answers.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-client-transports"><span class="t" style="--cs-hue:190">MP</span>Cheat sheet · MCP Clients and Transports</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-sampling-loop-designer.md</code> is now a migration planner. It first decides whether Sampling should be removed in favor of direct model integration. If compatibility is required, it produces the MRTR rounds, state binding, capability gate, budget, validation, and removal plan.</p>
+<p><strong><code>outputs/skill-sampling-loop-designer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: sampling-loop-designer
+description: Migrate model-assisted MCP tools to direct inference or stateless 2026-07-28 MRTR with bounded compatibility sampling.
+version: 2.0.0
+phase: 13
+lesson: 11
+tags: [mcp, mrtr, sampling, stateless, migration]
+---
+
+Design model-assisted behavior for an MCP server targeting protocol revision `2026-07-28`.
+
+Start with one decision: can the server integrate directly with a model provider? Sampling is deprecated for new designs. Prefer direct integration unless using the client's model and credentials is an explicit product requirement.
+
+Produce:
+
+1. Architecture decision. Choose direct inference or compatibility Sampling and state why.
+2. Discovery contract. Show `server/discover` with exact `supportedVersions`, advertised capabilities, `ttlMs`, and `cacheScope`. If tools are advertised, include mandatory deterministic `tools/list` descriptors with valid object `inputSchema`, `resultType: &quot;complete&quot;`, server identity metadata, and cache hints.
+3. Request envelope. Include protocol version and client capabilities in `_meta` on every request. Use `-32602` for a missing or non-string version, `-32022` with exact `supported` and `requested` data for an unsupported version, and `-32021` with a `requiredCapabilities` object when Sampling is absent. Treat client identity metadata as informational only. Never emit a JSON-RPC response for an id-less notification; an accepted HTTP notification receives `202` with no body.
+4. Round table. For each MRTR round, name the `inputRequests` key, embedded request method, expected response schema, validation, and budget.
+5. Retry contract. Require the original method and arguments, a fresh JSON-RPC id, current-round `inputResponses`, and byte-exact `requestState`.
+6. State protection. Bind HMAC or authenticated encryption to the authenticated principal, method, argument digest, phase, and short expiry.
+7. Safety policy. Define approval, maximum rounds, token and byte limits, response validation, logging, and refusal behavior.
+8. Removal plan. If Sampling remains, name the condition and date for replacing it with direct integration.
+
+Hard rejects:
+
+- A new design that adopts deprecated Sampling without a documented requirement.
+- A 2026-07-28 server that sends `sampling/createMessage` as a live server-to-client request.
+- Any use of `initialize`, `notifications/initialized`, `Mcp-Session-Id`, or hidden protocol-session state.
+- Unsigned `requestState` that affects authorization, resource access, or business logic.
+- A retry that reuses the original JSON-RPC id or changes the original arguments.
+- A client model loop without capability checks, approval policy, validation, and a hard round limit.
+- `includeContext: &quot;allServers&quot;` or implicit cross-server context.
+
+Refusal rules:
+
+- Refuse covert model calls or any design that hides the server's intent from the user.
+- Refuse model output as proof of identity, authorization, or user consent.
+- Refuse a multi-round design when one deterministic tool call is sufficient.
+- Refuse to call client and server metadata an authenticated identity.
+
+Output a one-page architecture with the decision, wire flow, round table, signed state contents, safety budget, failure cases, and migration plan. End with a verdict: `direct inference`, `temporary MRTR compatibility`, or `no model required`.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Change the file-selection response to invalid JSON. Confirm the server returns <code>-32602</code> instead of trusting model output.</li>
+<li>Change <code>audience</code> between the first call and retry. Explain why the sealed state blocks cross-request reuse.</li>
+<li>Add a third round that asks the host to critique the summary. Carry the earlier summary inside signed state and cap the entire flow at three rounds.</li>
+<li>Remove Sampling by replacing the fake host callback with a server-owned model adapter. List which approval, billing, and observability responsibilities move to the server.</li>
+<li>Add an expiry test using a state value that is one second past its deadline.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1311-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Two requests, and a fallback for the bad answer</span></summary><div class="qa-a"><p>Two: the client's <code>sampling_callback</code> was called twice for one <code>tools/call</code>, once per resolver that returned a <code>Sample</code>, and the SDK's client handled the two <code>input_required</code> rounds and retries automatically.</p>
+<p>When the model answered in the wrong format (two names without the requested comma), the server did not use the text as is. It kept only valid file names and fell back to a safe default (<code>README.md</code>). A server must validate every sampled answer before it uses it as a file name, URL or tool argument.</p></div></details>
+<details class="qa" id="a1311-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · An unbounded bill</span></summary><div class="qa-a"><p>The user pays for an endless loop. Each retry triggers another <code>input_required</code> with another sampling request, and the client keeps running its model: tokens and money spent without limit, the user's model quota exhausted, and the original tool call never finishing. If the requests also carry large prompts or ask for long answers, the cost per round grows too.</p>
+<p>Client-side limits that stop it:</p>
+<ul>
+<li><strong>A round cap</strong>: the Python SDK's <code>Client(..., input_required_max_rounds=...)</code> (10 by default) aborts the call after that many rounds.</li>
+<li><strong>Per-request caps</strong>: enforce a maximum <code>maxTokens</code> and prompt size of your own, whatever the server asks for.</li>
+<li><strong>A budget per server</strong> in tokens or money, and <strong>approval</strong> for sampling requests, at least the first one from each server.</li>
+<li><strong>Capability scoping</strong>: declare <code>sampling</code> only for servers that need it; the others get <code>-32021</code> and cannot ask at all.</li>
+</ul></div></details>
+<h2>Legacy Compatibility</h2>
+<p>A client pinned to 2025-11-25 may still use the older server-initiated <code>sampling/createMessage</code> flow over a live connection. Keep that behavior in a version-specific adapter only. Do not make the sessionful path the architecture for a 2026-07-28 server.</p>
+<p>Official SDKs can translate modern <code>input_required</code> handlers for older peers. That shim is a compatibility boundary, not permission to add new session-dependent logic.</p>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr">MCP 2026-07-28 Multi Round-Trip Requests</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">MCP 2026-07-28 changelog</a></li>
+<li><a href="https://modelcontextprotocol.io/seps/2577-deprecate-roots-sampling-and-logging">MCP Sampling deprecation</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover">MCP 2026-07-28 server discovery</a></li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/11-mcp-sampling" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1311" id="done-a1311">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1311" id="undo-a1311" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1310"><span class="pn-dir">Previous</span><span class="pn-t">13.10 · MCP Resources and Prompts: Addressable Context for Stateless Servers</span></a><a class="pn next" href="#a1312"><span class="pn-dir">Next</span><span class="pn-t">13.12 · Explicit Scope and Stateless Elicitation</span></a></div></footer>

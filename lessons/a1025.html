@@ -1,0 +1,518 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · LLMs from Scratch</a></nav><h1>Speculative Decoding and EAGLE</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.25</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1025" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10 Lesson 12 (Inference Optimization), Phase 10 Lesson 04 (Pre-training Mini-GPT)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A frontier LLM generating one token requires a full forward pass over billions of parameters. That forward pass is massively over-provisioned: most of the time a much smaller model can guess the next 3-5 tokens correctly, and the big model only needs to <em>verify</em> the guess. When the guess is right you got 5 tokens for the price of one. Speculative decoding (Leviathan et al. 2023) made this exact, and EAGLE-3 (2025) pushed acceptance rates to ~4.5 tokens per verify — a 4-5x speedup at matched output distribution.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Target model</td>
+<td>"The big model"</td>
+<td>The slow, high-quality model you want samples from (p distribution)</td>
+</tr>
+<tr>
+<td>Draft model</td>
+<td>"The speculator"</td>
+<td>The small, fast predictor (q distribution); 5-30x smaller</td>
+</tr>
+<tr>
+<td>K / draft length</td>
+<td>"Look-ahead"</td>
+<td>Number of speculated tokens per verify pass</td>
+</tr>
+<tr>
+<td>α / acceptance rate</td>
+<td>"Hit rate"</td>
+<td>Per-token probability that the draft's proposal is accepted</td>
+</tr>
+<tr>
+<td>Exact rejection rule</td>
+<td>"The accept test"</td>
+<td>r &lt; p/q compare that preserves target's distribution</td>
+</tr>
+<tr>
+<td>Residual distribution</td>
+<td>"Corrected p-q"</td>
+<td>(p - q)+ /</td>
+</tr>
+<tr>
+<td>Tree drafting</td>
+<td>"Branching speculation"</td>
+<td>Draft outputs a tree of candidates, verified in one pass with tree-structured attention mask</td>
+</tr>
+<tr>
+<td>Tree attention mask</td>
+<td>"Topological mask"</td>
+<td>Causal mask encoding the tree topology so each node attends only to its ancestors</td>
+</tr>
+<tr>
+<td>Medusa heads</td>
+<td>"Parallel heads"</td>
+<td>K extra prediction heads on the target itself; no separate draft model</td>
+</tr>
+<tr>
+<td>EAGLE feature reuse</td>
+<td>"Hidden-state draft"</td>
+<td>Draft input is target's last hidden state, not raw tokens, shrinking the draft</td>
+</tr>
+<tr>
+<td>Test-time simulation loss</td>
+<td>"EAGLE-3 training"</td>
+<td>Train draft on outputs matching target's test-time distribution, not teacher forcing</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>This lesson revisits speculative decoding (<a href="#a1015">Lesson 10.15</a>) from the builder's side, with the opposite letters: here <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> is the big <em>target</em> model and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span> the small <em>draft</em>. A draft guesses a few tokens, the target checks them all in one pass, and an accept/reject rule keeps the output exactly as if the target had written alone. The new piece is the <em>tree</em>: instead of one chain of guesses, the draft offers several alternatives at each step, and a special attention mask lets the target check every branch in the same single pass. This lesson runs the lesson's toy, computes exactness, chains against trees and the effect of temperature, and then runs real greedy tree speculation with two SmolLM2 models, checking the output is identical to the target's own. No model is trained.</p></div></aside>
+<p>Decode throughput for a 70B-class model on H100 is typically 40-80 tokens/second. Each token requires a full forward pass reading all model weights from HBM. You cannot make the model smaller without changing its output. You cannot increase batch size beyond memory. You're stuck — unless you can let the model output more than one token per forward pass.</p>
+<p>Autoregressive generation looks inherently serial: <code>x_{t+1} = sample(p(· | x_{1:t}))</code>. But there is a concurrency opportunity. If you had a cheap predictor that said "the next 4 tokens are probably [a, b, c, d]" you could verify all 5 positions in a <strong>single forward pass of the big model</strong> and accept the longest matching prefix.</p>
+<p>Leviathan, Kalman, Matias (2023, "Fast Inference from Transformers via Speculative Decoding") made this exact via a clever accept/reject rule that preserves the target model's sampling distribution. The same output distribution, 2-4× faster.</p>
+<h2>Idea 1 · The Two-Model Setup</h2>
+<ul>
+<li><strong>Target model</strong> <code>M_p</code>: the big, slow, high-quality model you actually want samples from. Distribution: <code>p(x)</code>.</li>
+<li><strong>Draft model</strong> <code>M_q</code>: a small, fast, lower-quality model. Distribution: <code>q(x)</code>. 5-30× smaller.</li>
+</ul>
+<p>Per step:</p>
+<ol>
+<li>Draft model proposes <code>K</code> tokens autoregressively: <code>x_1, x_2, ..., x_K ~ q</code>.</li>
+<li>Target model runs ONE forward pass over all <code>K+1</code> positions in parallel, producing <code>p(x_k)</code> for each proposed token.</li>
+<li>Accept/reject each token left-to-right via the modified rejection-sampling rule below. Accept the longest matching prefix.</li>
+<li>If any token is rejected, sample the replacement from the corrected distribution and stop. Otherwise sample one bonus token from <code>p(· | x_1...x_K)</code>.</li>
+</ol>
+<p>If the draft matches the target perfectly, you get K+1 tokens per target-forward. If the draft is wrong at position 1, you get only 1 token.</p>
+<h2>Idea 2 · The Exactness Rule</h2>
+<p>Speculative decoding is <strong>provably equivalent in distribution to sampling from p</strong>. The rejection rule:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">For each drafted token x_t:
+    r ~ Uniform(0, 1)
+    if r &lt; p(x_t) / q(x_t):
+        accept x_t
+    else:
+        sample replacement from residual: (p - q)+ / ||(p - q)+||_1
+        stop
+</code></pre></div>
+<p>where <code>(p - q)+</code> denotes the positive part of the pointwise difference. When the draft and target agree (<code>p ≈ q</code>) acceptance is nearly 1. When they disagree, the residual distribution is constructed so that the overall sample is still exactly <code>p</code>.</p>
+<p><strong>Greedy case.</strong> For temperature=0 sampling just check <code>argmax(p) == x_t</code>. If yes, accept; if no, output <code>argmax(p)</code> and stop.</p>
+<h2>Idea 3 · Expected Speedup</h2>
+<p>If the draft model's token-level acceptance rate is <code>α</code>, the expected tokens produced per target-forward pass is:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord text"><span class="mord">tokens</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2877em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5183em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8413em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:2em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">draft length</span></span><span class="mpunct">,</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">]</span></span></span></span></span></div></p>
+<p>At <code>α = 0.8, K = 4</code>: <code>(1 - 0.8^5)/(1 - 0.8) = 3.36</code> tokens per forward. A single target forward costs roughly <code>cost_q * K + cost_p</code> (K draft steps plus one target verify). If <code>cost_p &gt;&gt; cost_q * K</code> the speedup ratio is <code>3.36× / 1 = 3.36×</code> on throughput.</p>
+<p>The only real parameter is <code>α</code>, which depends entirely on the draft-target alignment. A good draft is everything.</p>
+<h2>Idea 4 · Training the Draft: Distillation</h2>
+<p>A random small model makes a poor draft. The standard recipe is to distill from the target:</p>
+<ol>
+<li>Pick a small architecture (~1B for a 70B target, ~500M for a 7B target).</li>
+<li>Run the target model on a large text corpus; store its next-token distributions.</li>
+<li>Train the draft with KL divergence against the target's distribution (not against ground-truth tokens).</li>
+</ol>
+<p>The result: <code>α</code> typically 0.6-0.8 on coding, 0.7-0.85 on natural-language chat. Speedups 2-3× in production.</p>
+<h2>Idea 5 · EAGLE: Tree Drafting + Feature Reuse</h2>
+<p>Li, Wei, Zhang, Zhang (2024, "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty") observed two inefficiencies in standard speculative decoding:</p>
+<ol>
+<li>The draft does K serial steps, each full-stack. But the draft could reuse the target's features (hidden states) from the most recent verify — the target already computed rich representations that the draft is re-deriving from scratch.</li>
+<li>The draft outputs a linear chain. If the draft could output a <em>tree</em> of candidates (each node multiple guesses), the target's single forward pass could verify multiple candidate paths in parallel via a tree attention mask, and pick the longest accepted branch.</li>
+</ol>
+<p>EAGLE-1 changes:
+- Draft input = target's final hidden state at position t, not raw tokens.
+- Draft architecture = 1 transformer decoder layer (not a separate small model).
+- Output = tree of K = 4-8 candidates per depth, depth 4-6.</p>
+<p>EAGLE-2 (2024) adds dynamic tree topology: the tree grows wider where the draft is uncertain and stays narrow where it is confident. Raises <code>α_effective</code> without increasing verify cost.</p>
+<p>EAGLE-3 (Li et al. 2025, "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test") removes the fixed top-layer feature dependency and trains the draft with a new "test-time simulation" loss — the draft is trained on outputs that match the target's test-time distribution rather than teacher-forced training distribution. In the paper, the mean number of tokens accepted per verify for LLaMA-3.1-8B-Instruct at temperature 0 rises from 4.11 (EAGLE-2) to 6.23 (EAGLE-3). Acceptance depends on the model pair, the draft tree and the traffic: Phase 10 · 15 quotes 0.88 to 0.92 per accepted-path token on chat benchmarks, and Phase 17 · 05 plans with 0.6 to 0.8 on production general chat.</p>
+<h2>Idea 6 · Tree Attention Verification</h2>
+<p>When the draft outputs a tree, the target model verifies it in a single forward pass using a <strong>tree attention mask</strong> — a causal mask that encodes the tree topology rather than a pure line. Each token attends only to its ancestors in the tree. The verify pass is still one forward, one matmul; the topological mask costs only a few extra KV entries.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">        root
+       /    \
+      a      b
+     / \    / \
+    c  d   e   f
+</code></pre></div>
+<p>If <code>a, b</code> are competing first-token candidates and <code>c, d, e, f</code> are second-token candidates, all six positions are verified in one forward pass. The output is the longest prefix along any accepted path.</p>
+<figure class="xv" data-xv="spec-tree" aria-label="Step-through: a real draft tree, one target pass, and the accepted path."></figure>
+<h2>Idea 7 · When It Wins, When It Doesn't</h2>
+<p><strong>Wins:</strong>
+- Chat / completion with predictable text (code, common English, structured output). <code>α</code> is high.
+- Settings with unused GPU compute during decode (memory-bound phase). Tree drafting uses the available FLOPs.</p>
+<p><strong>Loses / no win:</strong>
+- Highly stochastic outputs (creative writing at high temperature) can lower <code>α</code>, though not toward <code>1/|vocab|</code>: as the temperature rises both distributions flatten and their overlap grows (computed after Build it). Measure it on your own model pair.
+- Batch serving with very high concurrency — batching already fills the FLOPs, little room for tree verification.
+- Very small target models where the draft isn't much smaller.</p>
+<p>Production shops typically report 2-3× wall-clock speedup on chat, 3-5× on code generation, and near-zero on creative writing.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="speculative-decoding"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>In this lesson's notation (target <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>, draft <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span>), a drafted <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∼</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span> is accepted with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord">1</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span></span></span></span>; otherwise the token is drawn from <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2583em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">+</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mord">/</span><span class="mopen">∥(</span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2583em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">+</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">∥</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">output</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.3em;vertical-align:-1.25em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.9em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">x</span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.25em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">min</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Greedy</strong> (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span>): accept while the drafted token equals the target's argmax; the output equals plain greedy decoding.</p>
+<p><strong>Trees.</strong> If the draft offers its top <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> tokens at depth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span> and the target's choice falls among them with probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">d</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span>, independently per depth:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord text"><span class="mord">tokens per verify</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:3.2666em;vertical-align:-1.4382em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">D</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">≤</span><span class="mord mathnormal mtight">d</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4382em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">nodes to verify</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.2666em;vertical-align:-1.4382em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8283em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">D</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.3021em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.8479em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span><span class="mrel mtight">≤</span><span class="mord mathnormal mtight">d</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∏</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.4382em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">b</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.05724em;">j</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Tree mask.</strong> Node <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> attends to the prefix, its ancestors and itself; its position is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">depth</span></span><span class="mopen">(</span><span class="mord mathnormal">i</span><span class="mclose">)</span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A tree versus a chain</div><div class="co-body"><p>The target picks the draft's 1st choice with probability 0.60, its 2nd with 0.15, its 3rd with 0.07.</p>
+<ul>
+<li>Chain of 3: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.36</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.216</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.18</span></span></span></span> tokens per verify, 3 nodes.</li>
+<li>Tree <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>: depth 1 and 2 accept with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span></span></span></span>, depth 3 with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.6</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.75</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.5625</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3375</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.65</span></span></span></span> tokens, for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span> nodes.</li>
+<li>Each extra token costs more nodes: the tree spends the target's idle compute (decoding is memory-bound) to raise acceptance, which pays at small batch and stops paying when the GPU is busy.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "At high temperature acceptance falls toward 1/|vocab|."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Overlap <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">min</span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mclose">)</span></span></span></span> grows as both distributions flatten; whether α drops depends on the models.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Verifying a tree takes one pass per branch."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> One pass: a tree attention mask lets each node see only its own ancestors (checked exactly with a real model after Use it).</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Speculative decoding changes greedy output slightly."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> With exact verification it is identical (the real run produces the same 60 tokens as plain greedy decoding).</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>With SmolLM2-135M drafting for SmolLM2-360M, greedy, which gives more tokens per verify pass: a chain of 5 drafted tokens, or a tree of 21 nodes (3 alternatives, then 2, then 1, then 1)? And will either change the output? (Solution P1.)</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code>:</p>
+<ul>
+<li>A reference <code>speculative_decode(target, draft, prompt, K, temperature)</code> that implements the exact rejection rule and verifies it preserves the target's distribution (empirical KL &lt; 0.01 vs plain target sampling).</li>
+<li>An EAGLE-style tree drafter that builds a depth-K tree with top-p branching.</li>
+<li>A tree attention mask builder that produces the right causal pattern for a verifier.</li>
+<li>An acceptance-rate harness on toy distributions over a 32-token vocabulary (the run after Use it measures real tree speculation between two real models).</li>
+</ul>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def speculative_step(p_target, q_draft, K, temperature=1.0):
+    &quot;&quot;&quot;One round of speculative decoding. Returns list of accepted tokens.&quot;&quot;&quot;
+    # 1. Draft K tokens
+    draft_tokens = []
+    q_dists = []
+    state = draft_state_init()
+    for _ in range(K):
+        probs = softmax(q_draft(state) / temperature)
+        t = np.random.choice(len(probs), p=probs)
+        draft_tokens.append(t)
+        q_dists.append(probs)
+        state = draft_step(state, t)
+
+    # 2. Target computes p at every drafted position + 1 extra
+    p_probs_all = target_forward_batched(p_target, draft_tokens, temperature)
+
+    # 3. Accept/reject left-to-right
+    accepted = []
+    for k, tok in enumerate(draft_tokens):
+        r = np.random.uniform()
+        if r &lt; p_probs_all[k][tok] / q_dists[k][tok]:
+            accepted.append(tok)
+        else:
+            residual = np.maximum(p_probs_all[k] - q_dists[k], 0)
+            residual /= residual.sum()
+            accepted.append(np.random.choice(len(residual), p=residual))
+            return accepted
+    # 4. All K accepted → sample bonus token from target
+    accepted.append(np.random.choice(len(p_probs_all[-1]), p=p_probs_all[-1]))
+    return accepted
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s toy</div><div class="co-body"><p><code>main.py</code>: the rejection rule checked against plain sampling (total variation over 20,000 samples), α and tokens per verify on toy distributions, an α sweep, and a tree attention mask for a 22-node tree (a few seconds).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # rejection rule, alpha, throughput and tree mask on toy distributions; a few seconds
+</code></pre></div>
+</div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Distribution check.</strong> With 20,000 samples, speculative sampling is as close to the target distribution as plain sampling (total variation 0.014 against 0.017; both are sampling noise), so the rule preserves the target, as the theorem says.</p>
+<p><strong>α.</strong> The "alpha hint" of 0.75 is the script's knob for building the toy draft, not a target; the measured acceptance is 0.90. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>, the measured 4.05 tokens per verify matches the formula's 4.08 for that α. The sweep shows how strongly α matters: 1.4 tokens per verify at α = 0.3, 4.5 at 0.95.</p>
+<p><strong>Tree mask.</strong> A root with 3 first choices, 2 children each and 2 grandchildren each has 1 + 3 + 6 + 12 = 22 nodes, all verified in one pass; each row of the mask lets a node see 1 to 4 positions within the tree (the root, its other ancestors and itself), and the script confirms the mask equals the ancestor sets.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Exactness, trees and temperature, computed</div><div class="co-body"><p>A: the output distribution of one speculative step, computed exactly, in this lesson's notation. B: tokens per verify for chains and trees when the target's choice is the draft's 1st, 2nd or 3rd guess with fixed probabilities. C: α as the sampling temperature changes for two similar random models.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np
+rng = np.random.default_rng(0)
+
+print(&quot;A. Exactness, computed: one speculative step with target p and draft q (this lesson's notation)&quot;)
+V = 6
+p = rng.dirichlet(np.ones(V)); q = rng.dirichlet(np.ones(V))
+acc = np.minimum(1, p / q)                          # accept a drafted x with probability min(1, p(x)/q(x))
+alpha = (q * acc).sum()
+res = np.maximum(p - q, 0); res /= res.sum()
+out = q * acc + (1 - alpha) * res
+print(f&quot;  p   = {np.round(p, 3)}\n  q   = {np.round(q, 3)}\n  out = {np.round(out, 3)}   largest |out - p| = {np.abs(out - p).max():.1e}, alpha = {alpha:.3f}&quot;)
+print()
+
+print(&quot;B. Chains against trees (greedy): the target's next token is the draft's top-1 with probability 0.60,&quot;)
+print(&quot;   its 2nd choice with 0.15, its 3rd with 0.07 (independent at each depth)&quot;)
+rank = [0.60, 0.15, 0.07]
+def expected(branch):                               # tokens per verify = 1 + expected number of accepted depths
+    e, prod = 1.0, 1.0
+    for b in branch:
+        prod *= sum(rank[:b]); e += prod
+    return e
+for label, branch in [(&quot;chain of 3&quot;, (1, 1, 1)), (&quot;chain of 5&quot;, (1, 1, 1, 1, 1)), (&quot;tree 2 x 2 x 1&quot;, (2, 2, 1)),
+                      (&quot;tree 3 x 2 x 1 x 1&quot;, (3, 2, 1, 1)), (&quot;tree 3 x 3 x 3&quot;, (3, 3, 3))]:
+    nodes = sum(int(np.prod(branch[:i + 1])) for i in range(len(branch)))
+    print(f&quot;  {label:&lt;20} {nodes:&gt;3} nodes to verify: {expected(branch):.2f} tokens per verify&quot;)
+print()
+
+print(&quot;C. Temperature and acceptance: alpha = sum(min(p_T, q_T)) for two similar random models, vocabulary 1,000&quot;)
+z = rng.normal(0, 3, 1000)
+zt, zd = z + rng.normal(0, 1.0, 1000), z + rng.normal(0, 1.0, 1000)      # target and draft logits
+sm = lambda v: np.exp(v - v.max()) / np.exp(v - v.max()).sum()
+print(f&quot;  greedy (argmax agreement): {float(zt.argmax() == zd.argmax()):.0f}&quot;)
+for T in [0.3, 0.7, 1.0, 1.5, 3.0, 10.0]:
+    print(f&quot;  T = {T:&gt;4}: alpha = {np.minimum(sm(zt / T), sm(zd / T)).sum():.3f}&quot;)
+print(f&quot;  (as T grows both become uniform and alpha -&gt; 1; 1/|vocab| would be {1 / 1000:.3f})&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. Exactness, computed: one speculative step with target p and draft q (this lesson&#x27;s notation)
+  p   = [0.174 0.261 0.005 0.001 0.141 0.418]
+  q   = [0.05  0.056 0.207 0.446 0.242 0.   ]
+  out = [0.174 0.261 0.005 0.001 0.141 0.418]   largest |out - p| = 5.6e-17, alpha = 0.252
+
+B. Chains against trees (greedy): the target&#x27;s next token is the draft&#x27;s top-1 with probability 0.60,
+   its 2nd choice with 0.15, its 3rd with 0.07 (independent at each depth)
+  chain of 3             3 nodes to verify: 2.18 tokens per verify
+  chain of 5             5 nodes to verify: 2.38 tokens per verify
+  tree 2 x 2 x 1        10 nodes to verify: 2.65 tokens per verify
+  tree 3 x 2 x 1 x 1    21 nodes to verify: 3.03 tokens per verify
+  tree 3 x 3 x 3        39 nodes to verify: 3.04 tokens per verify
+
+C. Temperature and acceptance: alpha = sum(min(p_T, q_T)) for two similar random models, vocabulary 1,000
+  greedy (argmax agreement): 0
+  T =  0.3: alpha = 0.016
+  T =  0.7: alpha = 0.234
+  T =  1.0: alpha = 0.407
+  T =  1.5: alpha = 0.594
+  T =  3.0: alpha = 0.805
+  T = 10.0: alpha = 0.942
+  (as T grows both become uniform and alpha -&gt; 1; 1/|vocab| would be 0.001)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> Even with a draft that puts almost no probability where the target does (α = 0.25), the computed output distribution equals the target's to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">17</span></span></span></span></span></span></span></span></span></span></span></span>. Here <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span> is the target and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span> the draft, the reverse of <a href="#a1015">Lesson 10.15</a>'s letters; the rule is the same.</p>
+<p><strong>B.</strong> If the target's next token is the draft's first guess 60% of the time, a chain of 3 gives 2.18 tokens per verify and a chain of 5 only 2.38: each extra drafted token is less likely to be reached. Offering the 2nd guess too at the first two depths (10 nodes) gives 2.65, and a 21-node tree 3.03. A 39-node tree adds almost nothing (3.04): beyond a point, nodes far down unlikely branches are rarely used. This is why EAGLE-2 grows trees dynamically, wide where the draft is unsure and narrow where it is confident.</p>
+<p><strong>C.</strong> For two similar models, acceptance rises with temperature, from 0.02 at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span> to 0.94 at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>: flatter distributions overlap more, and at very high temperature both approach uniform and α approaches 1, not <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1/∣</span><span class="mord mathnormal" style="margin-right:0.22222em;">V</span><span class="mord">∣</span></span></span></span>. In practice speculative decoding at high temperature disappoints for other reasons: sampled text is less predictable, and a draft trained or tuned at low temperature may match the target worse there. Measure α on your own pair and settings.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<ul>
+<li><strong>vLLM</strong> and <strong>SGLang</strong> ship first-class speculative decoding. In vLLM, pass <code>--speculative-config</code> a JSON object with <code>method</code>, <code>model</code>, and <code>num_speculative_tokens</code>; EAGLE-3 is <code>"method": "eagle3"</code>.</li>
+<li><strong>NVIDIA TensorRT-LLM</strong> supports Medusa and EAGLE trees natively.</li>
+<li><strong>Reference draft models</strong>: <code>Qwen/Qwen3-0.6B</code> (drafts for Qwen3-32B), <code>meta-llama/Llama-3.2-1B-Instruct</code> (drafts for Llama 3.x 70B).</li>
+<li><strong>Medusa heads</strong> (Cai et al. 2024, "Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"): instead of a draft model, add K parallel prediction heads to the target itself. Simpler to deploy, slightly lower acceptance than EAGLE.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Tree speculation with real models</div><div class="co-body"><p>SmolLM2-135M-Instruct drafts for SmolLM2-360M-Instruct, greedy, 60 tokens. First the tree mask is checked: a node's logits in the tree pass against a plain forward pass along its path. Then chains and trees are verified with one target pass each (a 4D attention mask and per-node positions in Hugging Face), counting passes and checking the output against plain greedy decoding. About two minutes on CPU (the draft recomputes its context for every node; real systems reuse caches).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch, transformers
+from transformers import AutoTokenizer, AutoModelForCausalLM
+transformers.logging.disable_progress_bar(); transformers.logging.set_verbosity_error()
+tok = AutoTokenizer.from_pretrained(&quot;HuggingFaceTB/SmolLM2-360M-Instruct&quot;)
+target = AutoModelForCausalLM.from_pretrained(&quot;HuggingFaceTB/SmolLM2-360M-Instruct&quot;, dtype=torch.float32).eval()
+draft = AutoModelForCausalLM.from_pretrained(&quot;HuggingFaceTB/SmolLM2-135M-Instruct&quot;, dtype=torch.float32).eval()
+
+def tree_logits(model, prefix, nodes, parents):
+    &quot;&quot;&quot;One forward pass over prefix + all tree nodes; node i sees the prefix, its ancestors and itself.&quot;&quot;&quot;
+    P, n = len(prefix), len(nodes)
+    allowed = torch.zeros(P + n, P + n, dtype=torch.bool)
+    allowed[:P, :P] = torch.tril(torch.ones(P, P, dtype=torch.bool))
+    depth = []
+    for i in range(n):
+        allowed[P + i, :P] = True
+        j, d = i, 0
+        while j != -1:
+            allowed[P + i, P + j] = True; j = parents[j]; d += 1
+        depth.append(d)
+    mask = torch.zeros(1, 1, P + n, P + n).masked_fill(~allowed, float(&quot;-inf&quot;))
+    pos = torch.tensor([list(range(P)) + [P - 1 + d for d in depth]])
+    with torch.no_grad():
+        out = model(torch.tensor([prefix + nodes]), attention_mask=mask, position_ids=pos).logits[0]
+    return out[P - 1], out[P:]                                  # logits after the prefix, and after each node
+
+prompt = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Explain in a few sentences why the sky is blue.&quot;}],
+                                 add_generation_prompt=True, tokenize=False)
+prefix = tok(prompt)[&quot;input_ids&quot;]
+
+# 1. The tree mask is exact: every node's logits equal a plain forward pass along its path
+nodes, parents = [tok.encode(&quot; The&quot;)[0], tok.encode(&quot; Light&quot;)[0], tok.encode(&quot; sky&quot;)[0], tok.encode(&quot; is&quot;)[0]], [-1, -1, 0, 2]
+_, lt = tree_logits(target, prefix, nodes, parents)
+with torch.no_grad():
+    plain = target(torch.tensor([prefix + [nodes[0], nodes[2], nodes[3]]])).logits[0, -1]
+print(f&quot;tree mask check: node ' is' (path ' The sky is') vs a plain forward pass: largest logit difference &quot;
+      f&quot;{(lt[3] - plain).abs().max():.1e}&quot;)
+
+def build_tree(prefix, branch):                                 # draft proposes its top-b tokens at each depth
+    nodes, parents, frontier = [], [], [(-1, prefix)]
+    for b in branch:
+        new = []
+        for par, seq in frontier:
+            with torch.no_grad():
+                top = draft(torch.tensor([seq])).logits[0, -1].topk(b).indices.tolist()
+            for t in top:
+                nodes.append(t); parents.append(par); new.append((len(nodes) - 1, seq + [t]))
+        frontier = new
+    return nodes, parents
+
+def generate(prefix, branch, n_new=60):
+    seq, verifies = list(prefix), 0
+    while len(seq) - len(prefix) &lt; n_new:
+        nodes, parents = build_tree(seq, branch)
+        root, lt = tree_logits(target, seq, nodes, parents)
+        verifies += 1
+        cur, want = -1, root.argmax().item()                     # target's greedy choice after the accepted part
+        while True:
+            kids = [i for i, p in enumerate(parents) if p == cur and nodes[i] == want]
+            if not kids: break
+            cur = kids[0]; seq.append(nodes[cur]); want = lt[cur].argmax().item()
+        seq.append(want)                                         # the target's own next token (correction or bonus)
+    return seq[len(prefix):len(prefix) + n_new], verifies
+
+with torch.no_grad():
+    ref = target.generate(torch.tensor([prefix]), max_new_tokens=60, do_sample=False, pad_token_id=tok.eos_token_id)[0, len(prefix):].tolist()
+print(f&quot;\ngreedy decoding of 60 tokens; target SmolLM2-360M-Instruct, draft SmolLM2-135M-Instruct&quot;)
+print(f&quot;{'draft shape':&lt;28} {'tree nodes':&gt;10} {'verify passes':&gt;14} {'tokens per pass':&gt;16} {'same as plain greedy':&gt;21}&quot;)
+for label, branch in [(&quot;chain of 3&quot;, (1, 1, 1)), (&quot;chain of 5&quot;, (1, 1, 1, 1, 1)), (&quot;tree 2 x 2 x 1&quot;, (2, 2, 1)), (&quot;tree 3 x 2 x 1 x 1&quot;, (3, 2, 1, 1))]:
+    out, v = generate(prefix, branch)
+    n_nodes = sum(1 for _ in build_tree(prefix, branch)[0])
+    print(f&quot;{label:&lt;28} {n_nodes:&gt;10} {v:&gt;14} {60 / v:&gt;16.2f} {str(out == ref[:60]):&gt;21}&quot;)
+print(&quot;\ntarget's answer: &quot; + tok.decode(ref).replace(&quot;\n&quot;, &quot; &quot;)[:160])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">tree mask check: node &#x27; is&#x27; (path &#x27; The sky is&#x27;) vs a plain forward pass: largest logit difference 0.0e+00
+
+greedy decoding of 60 tokens; target SmolLM2-360M-Instruct, draft SmolLM2-135M-Instruct
+draft shape                  tree nodes  verify passes  tokens per pass  same as plain greedy
+chain of 3                            3             22             2.73                  True
+chain of 5                            5             16             3.75                  True
+tree 2 x 2 x 1                       10             18             3.33                  True
+tree 3 x 2 x 1 x 1                   21             15             4.00                  True
+
+target&#x27;s answer: The sky is blue because of a phenomenon known as Rayleigh scattering, which occurs when sunlight enters Earth&#x27;s atmosphere and encounters tiny </code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The mask is exact.</strong> The tree pass gives the node " is" (on the path " The sky is", with a sibling branch " Light" in the same pass) exactly the logits of a plain forward pass over that path: the mask hides the sibling completely and the positions follow depth.</p>
+<p><strong>Chains and trees.</strong> All four shapes produce exactly the target's own greedy output, 60 of 60 tokens, as exact verification guarantees. A chain of 3 needs 22 target passes (2.7 tokens per pass), a chain of 5 needs 16 (3.75), and the 21-node tree 15 (4.0); the 10-node <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> tree, at 3.33, beats the chain of 3 with the same depth but not the longer chain. Trees buy acceptance at each depth; depth buys more tokens when the draft is often right, as here, where the target's answer is a fluent, predictable explanation of Rayleigh scattering.</p>
+<p>Whether fewer passes means less time depends on the hardware: each pass here verifies up to 21 extra positions, nearly free on a GPU in memory-bound decoding, not free on this CPU. The run counts passes, not seconds.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Build the tree mask but give every node the position of the last prefix token plus one, instead of its own depth. Which nodes are still verified correctly, and what happens to the rest? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>vLLM, SGLang and TensorRT-LLM</strong> ship speculative decoding with draft models, EAGLE/EAGLE-3 trees, Medusa heads, n-gram lookup and MTP heads.</li>
+<li><strong>EAGLE-3 draft checkpoints</strong> exist for Llama 3.x, Qwen3 and DeepSeek models; SpecForge (SGLang) and NVIDIA's tooling train new ones.</li>
+<li><strong>Tree verification</strong> with dynamic trees (EAGLE-2/3) is the default shape for EAGLE drafts in these engines.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2211.17192">Leviathan et al.</a>, <a href="https://arxiv.org/abs/2406.16858">EAGLE-2</a>, <a href="https://arxiv.org/abs/2503.01840">EAGLE-3</a>, <a href="https://arxiv.org/abs/2401.10774">Medusa</a>, <a href="https://docs.vllm.ai/en/latest/features/spec_decode.html">vLLM speculative decoding</a>, <a href="https://lmsys.org/blog/2025-07-25-spec-forge">SpecForge</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Accept with min(1, p/q), resample from (p − q)₊: the output is exactly p.</li>
+<li>Greedy speculation reproduces greedy decoding token for token.</li>
+<li>Trees verify several alternatives in one pass with an ancestor-only attention mask.</li>
+<li>Trees raise tokens per pass at the cost of more nodes, which idle compute pays for at small batch.</li>
+<li>Temperature changes α in model-dependent ways; measure it.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-speculative-decoding"><span class="t" style="--cs-hue:252">SD</span>Cheat sheet · Speculative Decoding: Draft, EAGLE, MTP</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-speculative-tuning.md</code> — a skill that profiles a target model's workload and chooses: draft model, K (draft length), tree width, temperature, and when to fall back to plain decode.</p>
+<p><strong><code>outputs/skill-speculative-tuning.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: speculative-tuning
+description: Profile a decode workload and pick draft model, draft length K, temperature gate, and fallback policy for speculative decoding.
+version: 1.0.0
+phase: 10
+lesson: 25
+tags: [speculative-decoding, draft-model, alpha, throughput, inference, decode-latency]
+---
+
+Given the target model (size, family, tokenizer), the workload telemetry (task mix, prompt-vs-decode token ratio, p50/p99 decode latency, accelerator and HBM headroom, average batch size, sampling temperature distribution), and the available draft checkpoints, output:
+
+1. Draft choice. Pick from same-family small (Llama-3.2-1B for Llama-70B), a distilled draft trained on the target's outputs, Medusa heads bolted on the target, or &quot;no spec decode&quot; if no draft is closer than 30 percent FLOP cost ratio. Confirm tokenizer match against the target byte-for-byte; refuse a mismatched tokenizer.
+2. Draft length K. Argmax of E[tokens] / (1 + K x c) where c is the draft-to-target cost ratio. Show the work for K in 2, 3, 4, 5, 6 using the measured alpha from a calibration run on 5_000 tokens of in-distribution data. Default K=4 for chat, K=6 for code, K=2 for high-temperature creative writing.
+3. Temperature gate. Set a temperature threshold above which spec decode is disabled. Default 0.8; lower to 0.6 if the calibration shows alpha collapsing earlier. Reject any temperature gate that depends on per-request inspection that adds more than 50 microseconds.
+4. Tree budget. If the serving stack supports tree drafting, pick a small fixed tree (depth 2, branch 3-2) for batch under 8; flat chain for batch over 32. State the verifier's KV scratch size in bytes and confirm it fits in HBM headroom.
+5. Fallback policy. Name the metric (sliding-window measured alpha over the last 1_000 verifies) and the threshold (alpha under 0.4) at which the server drops back to plain autoregressive decode for that request stream. Include the per-request lifetime of the fallback decision.
+
+Refuse spec decode at batch size above the point where the verifier is compute-bound. Above that point the unused FLOPs the speculator is meant to soak up no longer exist; throughput drops. Refuse spec decode for any task family with measured alpha under 0.4; the draft overhead dominates and wall-clock latency gets worse. Refuse a draft that has not been validated on a held-out 1_000-token sample against the target: an unvalidated draft is a silent KL drift.
+
+Example input: &quot;Llama-3.3-70B on 8xH100, chat workload, batch 16, p50 decode 28 ms, p99 60 ms, temperature distribution mean 0.4 / max 1.2, calibration shows alpha 0.78 on chat, 0.61 on code.&quot;
+
+Example output:
+- Draft: Llama-3.2-1B-Instruct. Same tokenizer, same family, ratio c approx 0.03.
+- K: 4. E[tokens/verify] = 3.4 chat, 2.5 code. K=5 gains 0.1 token chat and pays 0.03 extra c; reject.
+- Temperature gate: 0.8. Above 0.8 alpha drops below 0.45 on the calibration set.
+- Tree budget: depth 2 branch (3, 2). KV scratch 480 MB at batch 16 fits.
+- Fallback: sliding-window alpha over last 1_000 verifies under 0.40 disables spec decode for that stream for 30 s, then probes again.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement the exact rejection rule and empirically verify it. Run 10K samples via <code>speculative_decode</code> and via plain target sampling; compute TV distance between the two output distributions. Should be &lt; 0.01.</p>
+</li>
+<li>
+<p>Compute the speedup formula. Given fixed <code>α</code> and <code>K</code>, plot expected tokens per target-forward. Find the optimal <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span></span></span></span> for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5782em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0.5</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.7</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">0.9</span><span class="mclose">}</span></span></span></span>.</p>
+</li>
+<li>
+<p>Train a tiny draft. Take a 124M GPT-2 target and distill a 30M GPT-2 draft on 100M tokens with KL loss. Measure <code>α</code> on held-out text. Expected: 0.6-0.7.</p>
+</li>
+<li>
+<p>Implement EAGLE-style tree drafting. Instead of a chain, have the draft output top-3 branches at each depth. Build the tree attention mask. Verify the target accepts the longest correct branch.</p>
+</li>
+<li>
+<p>Measure failure modes. Run speculative decode at temperature=1.5 (high stochasticity). Show α collapses and the algorithm is slower than plain decode due to draft overhead.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1025-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The tree, by a little; the output is unchanged</span></summary><div class="qa-a"><p>The 21-node tree, by a little: 15 target passes for 60 tokens (4.0 per pass) against 16 for the chain of 5 (3.75), and both are far better than a chain of 3 (22 passes). Neither changes the output: every configuration reproduces plain greedy decoding token for token, because a drafted token is kept only if it is exactly the target's own choice. The tree's advantage is small here because the small draft's first guess is usually right on this predictable text; branches help most where the draft is unsure.</p></div></details>
+<details class="qa" id="a1025-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Depth 1 survives, deeper nodes break</span></summary><div class="qa-a"><p>Only the first level stays correct. With RoPE, a node's position decides how its key and query are rotated, so the target computes each node's logits as if the node were the token at that position. Depth-1 nodes really are at "last prefix position + 1", so they are verified correctly. A depth-2 node given the same position would appear to sit at the same position as its parent, so its logits are computed for a malformed sequence: the target may reject correct drafts (losing speed) or, worse, accept tokens on the basis of wrong logits, and the output would no longer match plain decoding. This is why tree verification sets each node's position from its depth, <code>P − 1 + depth</code>, as the real run does.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1025-qa3"><summary><span class="qa-lvl qa-estimate">Estimate it</span><span class="qa-q">A draft is accepted 80 percent of the time per token and proposes four tokens per step. How many tokens does one pass of the big model produce on average, how does the draft's own cost enter, and when does a longer draft stop paying?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The expected tokens per verifier pass are <code>(1 - alpha^(K + 1)) / (1 - alpha)</code>; at an acceptance of 0.8 and K of 4 that is 3.36, so about 3.36 times fewer big-model calls. The wall time per token is <code>(K c + 1)</code> over that expectation, where c is the draft's cost relative to the verifier, so a longer draft adds cost linearly while the geometric series saturates; at 0.8 acceptance and c of 0.05 the optimum sits around 5 to 7 drafts for about 3.2 times. The lever that matters is the acceptance rate: at a fixed K, a rise from 0.6 to 0.9 about doubles the expected tokens per pass.</p>
+<p><strong>The formula.</strong></p>
+<p>Each drafted token is accepted independently with probability alpha, and the step ends on the first rejected token, so the number of accepted drafts is a truncated geometric variable. Add the bonus token on full acceptance and the expectation is</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">E[tokens per verifier pass] = (1 - alpha^(K + 1)) / (1 - alpha)
+</code></pre></div>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>alpha</th>
+<th>K</th>
+<th>tokens per pass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.8</td>
+<td>4</td>
+<td>3.36</td>
+</tr>
+</tbody>
+</table></div>
+<p>At a fixed K, a higher alpha raises every term of the series, so the expectation climbs steeply as alpha nears one.</p>
+<p><strong>Where the draft's cost enters.</strong></p>
+<p>One step costs K draft forwards plus one verifier forward, <code>K c + 1</code> in verifier units. Divide by the expected tokens and you have the time per token. For a verifier at about 30 ms and a draft at about 3 ms, five drafts plus one verify is about 45 ms per step. The step emits between one and six tokens, so divide the 45 ms by the expected tokens per pass and compare the result with 30 ms for one plain token. As K grows the numerator grows linearly and the expectation flattens toward <code>1 / (1 - alpha)</code>, so there is an optimum.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>alpha</th>
+<th>c</th>
+<th>best K</th>
+<th>speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0.8</td>
+<td>0.05</td>
+<td>about 5 to 7</td>
+<td>about 3.2 times</td>
+</tr>
+<tr>
+<td>0.95</td>
+<td>0.02</td>
+<td>about 8 to 10</td>
+<td>toward 5 times</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>What moves alpha.</strong></p>
+<p>How close the draft's distribution is to the verifier's, which is a function of how the draft was built; the sampling temperature, where greedy against greedy accepts most; and the task, where code and structured output accept more than free-form prose.</p>
+<p><strong>Where the formula stops being the whole story.</strong></p>
+<p>At high concurrency the verify pass is no longer free: the decode batch already fills the memory bandwidth, and a rejected draft costs a verify and a re-roll. The production lesson's rule is that below an acceptance of about 0.55 speculation is net negative at high concurrency, so measure alpha on real traffic before you set K.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The speedup equals the draft length." Only if every draft is accepted; the geometric series and the draft cost cut it well below K.</li>
+<li>"Doubling K doubles throughput." Beyond the optimum the extra drafts are mostly rejected and their cost is paid anyway.</li>
+<li>"A draft ten times cheaper gives ten times the speedup." The draft cost sets c; the acceptance rate sets the expectation, and a cheap draft that is often wrong gains little.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 3)</em> At an acceptance of 0.95 and a draft cost of 0.02, where is the optimum? Expected: around 8 to 10 drafts, with the speedup pushing toward 5 times.</li>
+<li><em>(level 3)</em> Why does the expectation saturate as K grows? Expected: it is a geometric series; the probability that all drafts up to position K are accepted falls as alpha to the K, so late positions add almost nothing.</li>
+<li><em>(level 4)</em> How does batch size change the arithmetic? Expected: the verifier's extra work per draft is no longer hidden behind idle bandwidth, so the effective cost of verification and of a rejection rises, and the break-even acceptance climbs toward 0.45 to 0.55.</li>
+<li><em>(level 4)</em> What single measurement do you add to the dashboard? Expected: accepted draft tokens divided by proposed draft tokens, per traffic slice, so alpha is visible where the formula needs it.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1025">Phase 10 speculative decoding lesson</a> derives the expectation, the <a href="#a1015">EAGLE-3 lesson</a> adds the draft cost and the optimum, the <a href="#a0716">Phase 7 speculative decoding lesson</a> gives the millisecond example, and the production EAGLE-3 lesson sets the break-even.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2211.17192">Leviathan, Kalai, Matias, 2023 — "Fast Inference from Transformers via Speculative Decoding"</a> — the exact rejection rule and the theoretical speedup analysis</li>
+<li><a href="https://arxiv.org/abs/2302.01318">Chen, Borgeaud, Irving et al., 2023 — "Accelerating Large Language Model Decoding with Speculative Sampling"</a> — concurrent speculative-sampling paper at DeepMind</li>
+<li><a href="https://arxiv.org/abs/2401.10774">Cai, Li, Geng, Wang, Wang, Zhu, Dao, 2024 — "Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"</a> — parallel-heads alternative to a draft model</li>
+<li><a href="https://arxiv.org/abs/2401.15077">Li, Wei, Zhang, Zhang, 2024 — "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty"</a> — feature reuse and tree drafting</li>
+<li><a href="https://arxiv.org/abs/2406.16858">Li et al., 2024 — "EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees"</a> — dynamic tree topology</li>
+<li><a href="https://arxiv.org/abs/2503.01840">Li et al., 2025 — "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test"</a> — train-time test-time matching</li>
+<li><a href="https://arxiv.org/abs/2402.02057">Fu, Haotian, Peng et al., 2024 — "Break the Sequential Dependency of LLM Inference Using Lookahead Decoding"</a> — Jacobi/lookahead decoding, a speculator-free alternative</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/10-llms-from-scratch/25-speculative-decoding" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1025" id="done-a1025">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1025" id="undo-a1025" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1022"><span class="pn-dir">Previous</span><span class="pn-t">10.22 · Async and Hogwild! Inference</span></a><a class="pn next" href="#a1034"><span class="pn-dir">Next</span><span class="pn-t">10.34 · Gradient Checkpointing and Activation Recomputation</span></a></div></footer>

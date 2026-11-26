@@ -1,0 +1,390 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-12">Phase 12 · Multimodal AI</a></nav><h1>From CLIP to BLIP-2 — Q-Former as Modality Bridge</h1><div class="m-meta"><span class="chip chip-num">Lesson 12.3</span><span class="chip">180 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1203" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why a trainable bottleneck between a frozen vision encoder and frozen LLM beats end-to-end finetuning in cost and stability.</li>
+<li>Implement a cross-attention block where a fixed set of learnable queries attend to external image features.</li>
+<li>Walk through BLIP-2's two-stage pretraining: representation (ITC + ITM + ITG) then generative (LM loss with frozen decoder).</li>
+<li>Compare Q-Former to the simpler MLP projector used in LLaVA and argue when each choice wins.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 12 · 02 (CLIP), Phase 7 (Transformers)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 180 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, cross-attention + learnable-query demo). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>CLIP aligns image and text but cannot generate captions, answer questions, or hold a conversation. BLIP-2 (Salesforce, 2023) solved that with a small trainable bridge: 32 learnable query vectors attend over a frozen ViT's features via cross-attention, then slot directly into a frozen LLM's input stream. 188M parameters of bridge connected a ViT-g/14 to frozen LLMs as large as the 11B Flan-T5-XXL. Every adapter-based VLM through 2026 — MiniGPT-4, InstructBLIP, LLaVA's cousins — is a descendant. This lesson reads the Q-Former's architecture,</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Q-Former</td>
+<td>"Querying transformer"</td>
+<td>Small transformer with 32 learnable query vectors that cross-attend to frozen ViT features</td>
+</tr>
+<tr>
+<td>Learnable queries</td>
+<td>"Soft prompt for vision"</td>
+<td>A fixed set of parameters that serve as the query side of cross-attention; learned per model, shared across all inputs</td>
+</tr>
+<tr>
+<td>Cross-attention</td>
+<td>"Q from here, K/V from there"</td>
+<td>Attention where query, key, and value come from different sources; how the queries pull from ViT patches</td>
+</tr>
+<tr>
+<td>ITC</td>
+<td>"Image-text contrastive"</td>
+<td>CLIP-style loss applied to Q-Former pooled queries vs text CLS</td>
+</tr>
+<tr>
+<td>ITM</td>
+<td>"Image-text matching"</td>
+<td>Binary classifier on hard-negative-mined pairs; forces the queries to discriminate fine-grained mismatches</td>
+</tr>
+<tr>
+<td>ITG</td>
+<td>"Image-grounded text generation"</td>
+<td>Causal LM loss where text is generated conditioned on queries; forces queries to encode text-decodable content</td>
+</tr>
+<tr>
+<td>Two-stage pretraining</td>
+<td>"Representation then generative"</td>
+<td>Stage 1 trains Q-Former alone (ITC/ITM/ITG); Stage 2 attaches frozen LLM and trains only the projection + Q-Former</td>
+</tr>
+<tr>
+<td>Frozen backbone</td>
+<td>"Do not finetune"</td>
+<td>The vision encoder and LLM weights are fixed; only the bridge trains</td>
+</tr>
+<tr>
+<td>Projection head</td>
+<td>"Linear to LLM dim"</td>
+<td>Final linear layer mapping Q-Former output to the LLM's embedding dimension</td>
+</tr>
+<tr>
+<td>Perceiver resampler</td>
+<td>"Flamingo's version"</td>
+<td>Similar learnable-query cross-attention; Flamingo runs it once per image to make fixed latents, then reads them through gated cross-attention at every LLM layer</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>CLIP can tell which caption fits a picture, but it cannot write one. To make a language model talk about images, you have to feed it the image as something it can read: vectors in its own input space. BLIP-2 does this with a small trainable bridge called the Q-Former. 32 learned "query" vectors look at the frozen image encoder's patch features through cross-attention. They come out as 32 summary vectors, which a linear layer maps into the frozen language model's embedding space, in front of the text prompt. Only the bridge is trained, so the cost is a few percent of the full model. This lesson walks through the Q-Former and its two-stage training, counts the real BLIP-2 and LLaVA models part by part, and measures what each visual token costs a real language model. No model is trained.</p></div></aside>
+<p>You have a frozen ViT that produces 256 patch tokens of dim 1408 per image. You have a frozen 7B LLM that expects token embeddings of dim 4096. The obvious bridge — a linear layer from 1408 to 4096 — works, but feeding all 256 patch tokens into the LLM's context costs 256 extra tokens per image. Over a batch of 32 images that is 8192 tokens consumed by the visual modality alone.</p>
+<p>The BLIP-2 question: can you compress the 256-token image representation into far fewer tokens (say 32) while preserving enough information for the LLM to caption, answer questions, and reason about the image? And can you train this bridge without touching the frozen backbones, keeping the training cost at just the bridge's parameters?</p>
+<p>The answer: a Q-Former. 32 learnable "query" vectors that cross-attend to the ViT's patch tokens, producing a 32-token visual summary that the LLM consumes. 188M parameters total. Trained with contrastive, matching, and generative objectives before ever touching the LLM.</p>
+<h2>Idea 1 · Learnable queries</h2>
+<p>The Q-Former's core trick: instead of letting the LLM's text tokens attend to image patches, introduce a new set of 32 learnable query vectors <code>Q</code> and let <em>them</em> attend to image patches. The queries are parameters of the model — they are learned during training and the same 32 queries are used for every image.</p>
+<p>After cross-attention, each query holds a compressed summary of the image — "describe the main object", "describe the background", "count the objects", etc. The queries do not literally specialize on semantic labels; they learn whatever encoding makes downstream losses drop.</p>
+<h2>Idea 2 · Architecture</h2>
+<p>The Q-Former is a small transformer (12 layers of width 768, initialised from BERT-base; cross-attention in every other layer) with two paths:</p>
+<ol>
+<li>Query path: 32 query vectors flow through self-attention (among themselves), then cross-attention over the frozen ViT's patch tokens, then FFN.</li>
+<li>Text path: a BERT-like text encoder shares the self-attention and FFN weights with the query path. Cross-attention is disabled for the text path.</li>
+</ol>
+<p>At training time both paths run. The queries and text interact through shared self-attention, which means the queries can condition on text for tasks that need it (ITM, ITG). At inference time for VLM handoff, only the queries flow through, yielding 32 visual tokens.</p>
+<h2>Idea 3 · Two-stage training</h2>
+<p>BLIP-2 pretrains in two stages:</p>
+<p>Stage 1: representation learning (no LLM). Three losses:
+- ITC (image-text contrastive): CLIP-style contrastive between pooled query tokens and text CLS token.
+- ITM (image-text matching): binary classifier — is this image-text pair a match? Hard-negative-mined.
+- ITG (image-grounded text generation): causal LM head on text, conditioned on the queries. Forces queries to encode text-generatable content.</p>
+<p>Only the Q-Former trains. The ViT is frozen. No LLM involved.</p>
+<p>Stage 2: generative learning. Attach a frozen LLM (OPT-2.7B or Flan-T5-XL, etc.). Project the 32 query outputs to the LLM's embedding dim via a small linear layer. Prepend them to the text prompt. Train only the linear projection and the Q-Former on LM loss over the concatenated prompt + image + caption sequence.</p>
+<p>After stage 2, the Q-Former + projection is the full visual adapter. At inference: image → ViT → Q-Former → linear proj → prepended to text → frozen LLM emits output.</p>
+<h2>Idea 4 · Parameter economics</h2>
+<p>BLIP-2 with EVA-CLIP ViT-g/14 (about 1B, frozen) + OPT-6.7B (frozen) + Q-Former (trained) is about 7.8B parameters, of which only the bridge is trained. The paper counts the Q-Former as 188M, because stage 1 also uses its text path (a BERT-base text encoder). The released inference model keeps only the query path: 105M plus a 3M projection, 1.4% of the stack (measured below). Training cost reflects this: the paper's largest model trained in under 9 days on 16 A100 GPUs.</p>
+<p>Quality: BLIP-2 beat Flamingo-80B by 8.7 points on zero-shot VQAv2 with 54 times fewer trainable parameters. The bridge works.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Cross-attention with learned queries.</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">32</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight">d</span></span></span></span></span></span></span></span></span></span></span></span> are parameters; the frozen image features <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span><span class="mbin mtight">×</span><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1645em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span> supply keys and values:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">CA</span></span><span class="mopen">(</span><span class="mord mathnormal">Q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.4761em;vertical-align:-0.95em;"></span><span class="mord"><span class="mord mathrm">softmax</span></span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="minner"><span class="mopen delimcenter" style="top:0em;"><span class="delimsizing size3">(</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5261em;"><span style="top:-2.1778em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9322em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">d</span></span></span><span style="top:-2.8922em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1078em;"><span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord mathnormal">Q</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">q</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.93em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mclose delimcenter" style="top:0em;"><span class="delimsizing size3">)</span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8991em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">32</span><span class="mbin mtight">×</span><span class="mord mathnormal mtight">d</span></span></span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div>
+The output always has 32 rows, whatever <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> is: the image is compressed to a fixed budget.</p>
+<p><strong>Handoff to the LLM</strong>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathrm">QFormer</span></span><span class="mopen">(</span><span class="mord mathnormal">Q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.07847em;">X</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">p</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8491em;"></span><span class="mord"><span class="mord mathbb">R</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="mbin mtight">×</span><span class="mord mtight"><span class="mord mathnormal mtight">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.3567em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">LLM</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1433em;"><span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span>; the LLM reads <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="mpunct">;</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">text tokens</span></span><span class="mclose">]</span></span></span></span>.</p>
+<p><strong>What visual tokens cost the LLM.</strong> For <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> visual tokens, prefill work grows about linearly in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> for the weight matrices and quadratically for attention, and the KV cache grows linearly:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">KV bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">text</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Five images in one prompt</div><div class="co-body"><ul>
+<li>LLaVA-1.5 passes all <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">24</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">24</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">576</span></span></span></span> patch tokens per image; five images are 2,880 tokens before any text.</li>
+<li>BLIP-2 passes 32 per image: 160 tokens for five images, 18 times fewer.</li>
+<li>For a 7B model with full multi-head attention (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span></span></span></span>, 32 heads of 128, bf16), the KV cache is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">32</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">128</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">524</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">288</span></span></span></span> bytes per token: about 1.5 GB for 2,880 visual tokens, 84 MB for 160.</li>
+<li>The price of compression: 32 vectors must carry everything about the image. Fine detail (small text, counts, positions) is what gets lost first.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The 32 queries are computed from the image."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They are parameters, the same for every image; what they read from the image is computed by cross-attention.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "BLIP-2 fine-tunes the language model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The image encoder and the LLM stay frozen; only the Q-Former and the projection train.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Fewer visual tokens is always better."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It saves context and compute, at the cost of detail; MLP projectors won once instruction data showed that the detail matters.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>How many parameters does the released BLIP-2 OPT-6.7B actually train, as a share of the whole model? And on a real 0.5B language model, how much longer does prefill take for 576 visual tokens than for 32? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">BLIP-2 and LLaVA, part by part</div><div class="co-body"><p>BLIP-2 (OPT-2.7B and OPT-6.7B) and LLaVA-1.5-7B are built from their published configurations on PyTorch's meta device. Parameters are counted per component: frozen vision encoder, trained bridge, frozen language model. A few seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+from transformers import AutoConfig, Blip2ForConditionalGeneration, LlavaForConditionalGeneration, logging
+logging.set_verbosity_error()
+
+def count(m, prefix):
+    return sum(p.numel() for n, p in m.named_parameters() if n.startswith(prefix))
+
+# BLIP-2 and LLaVA-1.5 built from their published configs on the meta device: exact parameter counts, nothing downloaded
+for repo in [&quot;Salesforce/blip2-opt-2.7b&quot;, &quot;Salesforce/blip2-opt-6.7b&quot;]:
+    cfg = AutoConfig.from_pretrained(repo)
+    with torch.device(&quot;meta&quot;):
+        m = Blip2ForConditionalGeneration(cfg)
+    parts = {&quot;vision encoder (frozen)&quot;: count(m, &quot;vision_model&quot;),
+             &quot;Q-Former + 32 queries (trained)&quot;: count(m, &quot;qformer&quot;) + count(m, &quot;query_tokens&quot;),
+             &quot;projection to the LLM (trained)&quot;: count(m, &quot;language_projection&quot;),
+             &quot;language model (frozen)&quot;: count(m, &quot;language_model&quot;)}
+    total = sum(parts.values()); trained = parts[&quot;Q-Former + 32 queries (trained)&quot;] + parts[&quot;projection to the LLM (trained)&quot;]
+    print(f&quot;{repo}: {total / 1e9:.2f}B parameters, {trained / 1e6:.0f}M trained ({trained / total:.1%})&quot;)
+    for k, v in parts.items(): print(f&quot;   {k:&lt;34}{v / 1e6:&gt;9.1f}M&quot;)
+    q = cfg.qformer_config
+    print(f&quot;   Q-Former: {q.num_hidden_layers} layers, width {q.hidden_size}, cross-attention every {q.cross_attention_frequency} layer(s); &quot;
+          f&quot;{cfg.num_query_tokens} queries -&gt; {cfg.num_query_tokens} visual tokens for the LLM\n&quot;)
+
+cfg = AutoConfig.from_pretrained(&quot;llava-hf/llava-1.5-7b-hf&quot;)
+with torch.device(&quot;meta&quot;):
+    m = LlavaForConditionalGeneration(cfg)
+proj = count(m, &quot;model.multi_modal_projector&quot;)
+grid = cfg.vision_config.image_size // cfg.vision_config.patch_size
+print(f&quot;LLaVA-1.5-7B: projector {proj / 1e6:.1f}M parameters (2-layer MLP), every one of the {grid}x{grid} = {grid * grid} &quot;
+      f&quot;patch tokens goes to the LLM&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Salesforce/blip2-opt-2.7b: 3.74B parameters, 107M trained (2.9%)
+   vision encoder (frozen)               986.0M
+   Q-Former + 32 queries (trained)       105.2M
+   projection to the LLM (trained)         2.0M
+   language model (frozen)              2651.7M
+   Q-Former: 12 layers, width 768, cross-attention every 2 layer(s); 32 queries -&gt; 32 visual tokens for the LLM
+
+Salesforce/blip2-opt-6.7b: 7.75B parameters, 108M trained (1.4%)
+   vision encoder (frozen)               986.0M
+   Q-Former + 32 queries (trained)       105.2M
+   projection to the LLM (trained)         3.1M
+   language model (frozen)              6658.6M
+   Q-Former: 12 layers, width 768, cross-attention every 2 layer(s); 32 queries -&gt; 32 visual tokens for the LLM
+
+LLaVA-1.5-7B: projector 21.0M parameters (2-layer MLP), every one of the 24x24 = 576 patch tokens goes to the LLM</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The bridge is tiny.</strong> In BLIP-2 OPT-2.7B, the Q-Former with its 32 query vectors is 105M parameters and the projection into OPT's embedding space 2M: 107M trained out of 3.74B, 2.9%. With OPT-6.7B the bridge is the same size (only the projection grows), so the trained share falls to 1.4%. The 986M-parameter EVA-CLIP ViT-g and the language model stay frozen.</p>
+<p><strong>Why not 188M, as the paper says?</strong> The paper's count includes the Q-Former's text path and the heads used only in stage 1 (contrastive, matching and generation losses). The released model for generation keeps just the query path: 12 layers of width 768 with cross-attention to the image in every other layer.</p>
+<p><strong>LLaVA-1.5's bridge is smaller still, but sends more tokens.</strong> Its projector is a 2-layer MLP of 21M parameters. Instead of compressing, it forwards every one of the 576 patch tokens (a 24 × 24 grid from CLIP ViT-L/14 at 336 px), 18 times BLIP-2's 32. The parameter budget of the bridge says little about cost. The number of tokens it hands to the LLM says a lot, as the next run shows.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">What visual tokens cost a real language model</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct prefills a request made of n "visual tokens" plus 40 text tokens. The visual tokens are random vectors of the right width fed as <code>inputs_embeds</code>, since only their number matters for cost. n is 32 (Q-Former), 576 (LLaVA-1.5), 729 (SigLIP at 384 px) and 2,880 (five LLaVA images). The table shows prefill time on CPU and KV-cache size. About a minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time, torch
+from transformers import AutoModelForCausalLM, logging
+logging.set_verbosity_error()
+torch.manual_seed(0)
+# What visual tokens cost the language model: prefill time and KV-cache size on a real 0.5B LLM.
+# The &quot;visual tokens&quot; are random vectors of the right width, fed as inputs_embeds (only their number matters here).
+lm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;, dtype=torch.float32).eval()
+c = lm.config
+kv_per_token = 2 * c.num_hidden_layers * c.num_key_value_heads * (c.hidden_size // c.num_attention_heads) * 2   # bf16 bytes
+prompt = 40                                                        # a short text question after the image tokens
+print(f&quot;{'per request':&lt;40}{'visual tokens':&gt;14}{'prefill (s)':&gt;13}{'KV cache':&gt;10}&quot;)
+for label, n in [(&quot;1 image, Q-Former (BLIP-2)&quot;, 32), (&quot;1 image, LLaVA-1.5 (24x24 patches)&quot;, 576),
+                 (&quot;1 image, SigLIP So400m @ 384&quot;, 729), (&quot;5 images, LLaVA-1.5&quot;, 5 * 576)]:
+    x = torch.randn(1, n + prompt, c.hidden_size) * 0.02
+    with torch.no_grad():
+        lm(inputs_embeds=x[:, :8], logits_to_keep=1)               # warm-up
+        t = time.time(); lm(inputs_embeds=x, logits_to_keep=1); dt = time.time() - t
+    print(f&quot;{label:&lt;40}{n:&gt;14,}{dt:&gt;13.2f}{(n + prompt) * kv_per_token / 1e6:&gt;8.1f} MB&quot;)
+print(f&quot;\nKV cache: {kv_per_token / 1e3:.0f} KB per token for this model; a 7B model with full multi-head attention &quot;
+      f&quot;(32 layers x 32 heads x 128) needs {2 * 32 * 32 * 128 * 2 / 1e3:.0f} KB&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">per request                              visual tokens  prefill (s)  KV cache
+1 image, Q-Former (BLIP-2)                          32         0.98     0.9 MB
+1 image, LLaVA-1.5 (24x24 patches)                 576         7.84     7.6 MB
+1 image, SigLIP So400m @ 384                       729         4.14     9.4 MB
+5 images, LLaVA-1.5                              2,880        11.70    35.9 MB
+
+KV cache: 12 KB per token for this model; a 7B model with full multi-head attention (32 layers x 32 heads x 128) needs 524 KB</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Every visual token is a token the LLM must process.</strong> Prefill time rises with the number of visual tokens: 32 Q-Former tokens are cheap, 576 LLaVA tokens cost several times as much, and five LLaVA images (2,880 tokens) cost far more again. The growth is slightly faster than linear, because attention grows with the square of the sequence. Exact timings vary between runs on a shared CPU; the ordering and the rough ratios do not.</p>
+<p><strong>Memory follows the same count.</strong> The KV cache grows linearly: under 1 MB for the 32-token image, about 36 MB for five LLaVA images on this small model (12 KB per token). For a 7B model with full multi-head attention it is 524 KB per token, so the five-image prompt holds about 1.5 GB of cache per request. That limits how many users a GPU can serve at once.</p>
+<p><strong>The trade-off BLIP-2 made.</strong> Compressing to 32 tokens makes every image cheap, and is why Q-Former-style compressors still appear where many images or long videos must fit. LLaVA's choice of passing all 576 tokens costs more, but keeps detail, and with good instruction data it won on quality. Most current models sit in between, merging neighbouring patches (2 × 2 merging turns 576 tokens into 144).</p></div></aside>
+<h2>Idea 5 · InstructBLIP and the instruction-aware Q-Former</h2>
+<p>InstructBLIP (2023) extends the Q-Former with an extra input: the instruction text itself. At cross-attention time, the queries now have access to both the image patches and the instruction. The queries can specialize per-instruction ("count the cars", "describe the mood") rather than learning a single fixed summary. Benchmark gains on held-out tasks.</p>
+<h2>Idea 6 · MiniGPT-4 and the projector-only approach</h2>
+<p>MiniGPT-4 kept the Q-Former but trained only the output linear projection while freezing everything else. Cheap, but cost is quality — the queries were BLIP-2's, not yours. Good for rapid iteration, not the best architecture.</p>
+<h2>Idea 7 · Why LLaVA went simpler</h2>
+<p>LLaVA (2023, Lesson 12.05) replaced the Q-Former with a plain 2-layer MLP that projects every ViT patch token into LLM space — 576 tokens per image for a 24x24 grid, all fed to the LLM. Worse compression but lets the LLM attend over raw patches. At the time this was controversial; by late 2023 it was dominant because visual instruction data (LLaVA-Instruct-150k) proved that the MLP could be trained to preserve enough signal. The tradeoff: LLaVA's context fills faster, but it scales naturally to multi-image and video.</p>
+<p>By 2026 the MLP projector, with patch merging when tokens are scarce, has become the default. Learned-query compressors survive where token budget matters most, such as long video and many images.</p>
+<h2>Idea 8 · Gated cross-attention: Flamingo, the ancestor</h2>
+<p>Flamingo (Lesson 12.04) predated BLIP-2 and used the same cross-attention idea but inside the frozen LLM, through gated cross-attention layers inserted between its blocks, not as a single bridge at the input. BLIP-2 showed you can compress at the input only and still work. The first Idefics (2023) was an open Flamingo-style model; Idefics2 and later moved to input tokens produced by a perceiver resampler.</p>
+<h2>Idea 9 · The 2026 descendants</h2>
+<ul>
+<li>Q-Former: BLIP-2, InstructBLIP, MiniGPT-4, and some early video-language models (Video-LLaMA) for token budget reasons.</li>
+<li>Perceiver resampler: Flamingo's variant (Lesson 12.04); Idefics2 compresses each image to 64 tokens with one (Idefics3 later switched to pixel shuffle).</li>
+<li>MLP projector: LLaVA, LLaVA-NeXT, LLaVA-OneVision, Cambrian-1, and most 2024–2026 open VLMs. They usually merge neighbouring patches before the MLP to save tokens (2×2 merging in Qwen2-VL and later, pixel shuffle in InternVL).</li>
+<li>Linear projection of every patch: PaliGemma.</li>
+</ul>
+<p>All four are valid. The deciding question is whether you are constrained on token budget or on quality-per-token.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="modality-projection"></div></figure></p>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> builds a stdlib Q-Former-style cross-attention:</p>
+<ol>
+<li>Simulate 256 image patch tokens (dim 128).</li>
+<li>Instantiate 32 learnable queries (dim 128).</li>
+<li>Run scaled-dot-product cross-attention (Q from queries, K/V from patches).</li>
+<li>Project to LLM-dim (512) via a linear layer.</li>
+<li>Output the 32 LLM-ready visual tokens.</li>
+</ol>
+<p>All math in pure Python (nested loops over vectors). Toy but correct shape. The attention-weight matrix is printed so you can see which patches each query pulled from.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Train a Q-Former bridge with only the stage-2 language-modelling loss, skipping stage 1 (contrastive, matching and image-grounded generation), on a small caption dataset. What did the BLIP-2 paper find happens, and why? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>MLP projectors with token merging</strong> are the common bridge in open VLMs: Qwen2.5-VL and Qwen3-VL merge 2×2 patches, InternVL uses pixel shuffle, LLaVA-OneVision keeps an MLP with resolution-dependent pooling.</li>
+<li><strong>Learned-query compressors live on</strong> where tokens are scarce: perceiver resamplers (Idefics2) and query-based compression in long-video models.</li>
+<li><strong>Freeze, then unfreeze</strong>: most 2024–2026 recipes train the projector first with the encoder and LLM frozen, then unfreeze the LLM (and often the encoder) for instruction tuning; the fully frozen BLIP-2 setup is now mainly a low-cost option.</li>
+<li><strong>Visual tokens dominate multimodal prompts</strong>: providers bill images per patch-token (Lesson 12.1), so token-saving bridges matter in production as well as in training.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2301.12597">BLIP-2 (arXiv 2301.12597)</a>, <a href="https://arxiv.org/abs/2310.03744">LLaVA-1.5 (arXiv 2310.03744)</a>, <a href="https://arxiv.org/abs/2405.02246">Idefics2 (arXiv 2405.02246)</a>, <a href="https://arxiv.org/abs/2502.13923">Qwen2.5-VL technical report (arXiv 2502.13923)</a>, <a href="https://huggingface.co/docs/transformers/model_doc/blip-2">Hugging Face BLIP-2 documentation</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A Q-Former turns any number of image patches into 32 vectors with learned queries and cross-attention.</li>
+<li>A linear projection places them in the frozen LLM's input space, before the text.</li>
+<li>Stage 1 aligns queries with text (contrastive, matching, generation); stage 2 teaches the LLM handoff.</li>
+<li>Only about 100M parameters train; the encoder and LLM stay frozen.</li>
+<li>Visual tokens cost LLM compute and KV memory; compression trades detail for budget.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-vlm-architectures-v4"><span class="t" style="--cs-hue:265">VL</span>Cheat sheet · Vision-Language Model Architectures</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-modality-bridge-picker.md</code>. Given a target VLM configuration (vision encoder token count, LLM context budget, deployment constraints, quality target), it recommends Q-Former vs MLP vs Perceiver resampler with a short justification and a parameter-count estimate for each bridge.</p>
+<p><strong><code>outputs/skill-modality-bridge-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: modality-bridge-picker
+description: Recommend Q-Former vs MLP projector vs Perceiver resampler for a VLM configuration given token budget, quality target, and training compute.
+version: 1.0.0
+phase: 12
+lesson: 03
+tags: [blip2, qformer, vlm, modality-bridge, architecture]
+---
+
+Given a vision encoder's token count per image, the LLM's context budget, the target number of images per prompt, and the training compute budget, recommend which modality bridge to use and justify with parameter counts and token economics.
+
+Produce:
+
+1. Token budget audit. Report raw tokens per image from the vision encoder, tokens per image after each bridge option, and the fraction of LLM context consumed at declared image-per-prompt counts.
+2. Bridge comparison. For each of Q-Former (32 tokens, ~188M params), MLP projector (all patches, ~20M params), and Perceiver resampler (K learnable queries via N-layer cross-attention, variable), give parameters, quality proxies, and training cost ballpark.
+3. Recommendation. Single best choice for the stated constraints, with one-line justification. Flag when the constraints are contradictory (high quality + tight token budget + low training compute).
+4. Two-stage training trace. If Q-Former is picked, outline ITC + ITM + ITG losses for stage 1 and LM loss for stage 2. Name a representative dataset for each (COCO, LAION, Visual Genome).
+5. Ablation checklist. Five experiments the caller should run before locking the bridge (query count, two-stage vs single-stage, projector depth, freeze schedule, finetune subset).
+
+Hard rejects:
+- Any recommendation that ignores the token budget. &quot;Use MLP&quot; with 576 tokens per image fails at 10 images in a 4k context.
+- Claiming Q-Former strictly dominates MLP. At single-image high-quality tasks with unlimited context, MLP wins.
+- Treating Perceiver resampler as equivalent to Q-Former. Flamingo applies it at every LLM layer; BLIP-2 applies it once.
+
+Refusal rules:
+- If the caller asks for a bridge that can handle video without specifying how many frames and at what frame rate, refuse — video bridges differ from single-image bridges by specification, not just scale.
+- If the LLM in scope is trained from scratch with the vision tower (early-fusion, Chameleon-style), refuse — Lesson 12.11 covers that case separately.
+- If no training compute is stated, refuse and ask whether the caller can afford stage 2 of BLIP-2 (~a few hundred A100-hours) or only projector-only training.
+
+Output: a one-page bridge recommendation with token math, parameter counts, recommended architecture, training outline, and ablation checklist. End with a &quot;what to read next&quot; paragraph pointing to Lesson 12.04 (Flamingo) for cross-attention-everywhere, Lesson 12.05 (LLaVA) for MLP-only, or Lesson 12.07 (ablations) for the data-vs-architecture tradeoff.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Implement the cross-attention block in PyTorch. Verify that with 32 queries and 256 keys/values, the attention-weight matrix is 32 x 256 and each row sums to 1 after softmax.</p>
+</li>
+<li>
+<p>In BLIP-2 stage 1 the Q-Former runs three losses simultaneously: ITC, ITM, ITG. Write the forward signature for each in pseudo-code. Which one requires the text encoder path to be active?</p>
+</li>
+<li>
+<p>Compare parameter counts: Q-Former (12 layers, 768 hidden) vs a 2-layer MLP projector (1408 → 4096, two layers). At what LLM scale does the 188M Q-Former cost pay back in training efficiency?</p>
+</li>
+<li>
+<p>Read Section 3.2 of the BLIP-2 paper (arXiv:2301.12597) on how the Q-Former is initialized. Explain why initializing from BERT-base (not random) accelerates convergence.</p>
+</li>
+<li>
+<p>For a 10-minute video at 1 FPS sampled to 60 frames, compute the per-frame token cost at (Q-Former → 32 tokens/frame) vs (MLP projector → 576 tokens/frame). How many frames can each bridge fit into a 128k-token LLM context window before the prompt text gets any room?</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1203-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · About 1%, and several times the prefill</span></summary><div class="qa-a"><p>108M of 7.75B, about 1.4%: the Q-Former (105M with its 32 queries) and a 3M projection; the 986M vision encoder and the 6.66B OPT model are frozen. On Qwen2.5-0.5B, prefilling 576 visual tokens plus a 40-token question took several times as long as 32 visual tokens (about 4 times when this page was built; it varies between runs), and five LLaVA images about 30 times as long. A short request has a fixed overhead, so the ratio grows with the number of tokens.</p></div></details>
+<details class="qa" id="a1203-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Without stage 1, the bridge learns much less</span></summary><div class="qa-a"><p>The BLIP-2 paper tested exactly this (its Figure 5): without the stage-1 representation learning, zero-shot VQA accuracy dropped sharply for both OPT and Flan-T5, and the OPT model suffered catastrophic forgetting during stage 2. Stage 1 teaches the queries what to extract: the contrastive loss aligns them with text, the matching loss forces fine-grained comparison, and the generation loss makes them carry the information a caption needs. Skip it, and the queries start from random vectors. The language-modelling loss then has to discover visual features through a frozen LLM, which gives a weak, indirect signal. On a small dataset the bridge settles for whatever helps predict common caption words. Pretrain the bridge on image–text alignment first, or start from a released Q-Former checkpoint.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1203-qa3"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You are choosing the bridge between a frozen vision encoder and a language model that stays frozen, for a new product. One architect wants a query-based transformer that compresses each image to a fixed set of tokens. Another wants a plain MLP that passes every patch through. How do you decide?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Decide on the token budget, not on quality in the abstract. At a fixed number of visual tokens, the ablation studies find the connector architecture a wash, within about a point between an MLP on mean-pooled patches, a query bridge and a resampler; a full-patch MLP spends more tokens, so it sits at a different budget. The query bridge caps an image at 32 tokens whatever its resolution and costs 188M parameters plus a two-stage pretraining of its own; the MLP emits every patch, 576 for a 336-pixel image, with about 22M parameters and one language-modeling loss. Pick the compressing bridge when context binds, as with long video or many images; pick the MLP when quality per token and simplicity matter and the context is long enough.</p>
+<p><strong>The two bridges.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>Query bridge</th>
+<th>MLP</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Visual tokens per image</td>
+<td>32, fixed</td>
+<td>576 at 336 pixels, about 2880 with tiling</td>
+</tr>
+<tr>
+<td>Trainable parameters, language model frozen</td>
+<td>188M</td>
+<td>about 22M</td>
+</tr>
+<tr>
+<td>Pretraining</td>
+<td>a representation stage with contrastive, matching and generation losses, then a generative stage</td>
+<td>the language-modeling loss throughout</td>
+</tr>
+<tr>
+<td>Swap the language model</td>
+<td>retrain the bridge</td>
+<td>retrain a small head</td>
+</tr>
+<tr>
+<td>Many images and video</td>
+<td>awkward, but cheap in tokens</td>
+<td>natural concatenation, expensive in tokens</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>What the ablations say.</strong></p>
+<p>Several controlled studies reached one result. At a fixed visual-token count, the connector explains about 5 percent of the variance in benchmark scores, the per-image token count about 60 percent, and the encoder about 20. An MLP on pooled patches lands within 1 point of a 32-query bridge at the same budget. So the question is how many tokens you can afford, and which encoder you use.</p>
+<p><strong>Why the field split.</strong></p>
+<p>The compressing bridge wins where the token budget binds: long video, many images in one prompt, small contexts. The MLP won the single-image case once contexts grew to 32k and beyond, because every patch stays visible to the language model and the recipe has no stage-one losses to tune. Token budgets from the ablations: 64 per image is too few for reading text, 576 to 1024 is the sweet spot for most tasks, and 2048 and above pays only for documents and charts.</p>
+<p><strong>Hidden costs of the query bridge.</strong></p>
+<p>Its queries learn an intermediate representation that the language model must then decode, so information is lost in the bottleneck. Change the language model or the encoder, and you retrain it. An instruction-aware variant feeds the instruction into the queries so that they can specialize per question, which recovers some of the loss.</p>
+<p><strong>A decision rule.</strong></p>
+<ol>
+<li>Count the tokens per image at your resolution and multiply by the images per prompt.</li>
+<li>If it fits the context with room for text, use the MLP and spend the effort on the encoder and the data.</li>
+<li>If it does not, use a compressing bridge, and accept the retraining cost when parts change.</li>
+</ol>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The query bridge is more advanced, so it gives better answers." At the same token count the two are within about a point; its advantage is compression, not quality.</li>
+<li>"The MLP is always better because it keeps every patch." Keeping every patch costs tokens; with many images or video the context runs out before quality matters.</li>
+<li>"Pick the bridge first and the encoder later." The encoder and the token count explain most of the variance; the bridge is the last knob to turn.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why does the query bridge need a pretraining stage of its own? Expected: its queries start random and must learn to pull text-relevant content from the patches before the language model can use them; the MLP starts from patches that already carry the image.</li>
+<li><em>(level 2)</em> What do the three stage-one losses do? Expected: contrastive alignment of pooled queries with text, a matching classifier with hard negatives, and image-grounded text generation that forces the queries to encode what text needs.</li>
+<li><em>(level 3)</em> A team picked the MLP and now serves ten-minute videos. What do they hit first? Expected: the context; tokens per frame times frames exceeds any window, so they need heavy frame sampling or a compressing bridge after all.</li>
+<li><em>(level 3)</em> If the connector barely matters, where does the quality come from? Expected: the encoder, the token count, the data mix and the resolution schedule; the recipes lesson's decomposition puts the connector last.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1203">BLIP-2 lesson</a> explains the query bridge and its two-stage training, the <a href="#a1205">LLaVA lesson</a> tabulates the two bridges, and the <a href="#a1207">recipes lesson</a> gives the ablation results.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2301.12597">Li et al. — BLIP-2 (arXiv:2301.12597)</a> — the core paper.</li>
+<li><a href="https://arxiv.org/abs/2201.12086">Li et al. — BLIP (arXiv:2201.12086)</a> — the predecessor with the ITC/ITM/ITG trio.</li>
+<li><a href="https://arxiv.org/abs/2107.07651">Li et al. — ALBEF (arXiv:2107.07651)</a> — "align before fuse" — the conceptual ancestor of stage 1 training.</li>
+<li><a href="https://arxiv.org/abs/2305.06500">Dai et al. — InstructBLIP (arXiv:2305.06500)</a> — instruction-aware Q-Former.</li>
+<li><a href="https://arxiv.org/abs/2304.10592">Zhu et al. — MiniGPT-4 (arXiv:2304.10592)</a> — projector-only approach.</li>
+<li><a href="https://arxiv.org/abs/2107.14795">Jaegle et al. — Perceiver IO (arXiv:2107.14795)</a> — general architecture for learnable-query cross-attention.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/12-multimodal-ai/03-blip2-qformer-bridge" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1203" id="done-a1203">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1203" id="undo-a1203" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1202"><span class="pn-dir">Previous</span><span class="pn-t">12.2 · CLIP and Contrastive Vision-Language Pretraining</span></a><a class="pn next" href="#a1204"><span class="pn-dir">Next</span><span class="pn-t">12.4 · Flamingo and Gated Cross-Attention for Few-Shot VLMs</span></a></div></footer>

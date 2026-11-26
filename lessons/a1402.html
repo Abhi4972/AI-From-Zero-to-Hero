@@ -1,0 +1,602 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · Agent Engineering</a></nav><h1>ReWOO and Plan-and-Execute: Decoupled Planning</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.2</span><span class="chip">60 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1402" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why ReWOO's Planner / Worker / Solver split saves tokens and improves robustness over ReAct's interleaved loop.</li>
+<li>Implement a plan DAG, a dependency-ordered executor, and a solver that composes worker outputs — all stdlib.</li>
+<li>Decide when a task should run as plan-then-execute vs interleaved ReAct, using the 2026 "five workflow patterns" framing (Anthropic).</li>
+<li>Recognize when Plan-and-Act's synthetic plan data is needed for long-horizon web or mobile tasks.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 14 · 01 (Agent Loop)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>ReAct interleaves thought and action in one stream. ReWOO separates them: one big plan up front, then execute. 5x fewer tokens, +4% accuracy on HotpotQA, and you can distill the planner into a 7B model. Plan-and-Execute generalized it; Plan-and-Act scaled it to web navigation.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ReWOO</td>
+<td>"Reasoning without observations"</td>
+<td>Plan, then fetch evidence in parallel, then solve — no observations in the planning prompt</td>
+</tr>
+<tr>
+<td>Plan-and-Execute</td>
+<td>"LangChain's plan-execute pattern"</td>
+<td>ReWOO with an optional replanner node after execution</td>
+</tr>
+<tr>
+<td>Plan-and-Act</td>
+<td>"Scaled plan-execute"</td>
+<td>Explicit planner/executor split with synthetic plan training data for long-horizon tasks</td>
+</tr>
+<tr>
+<td>Evidence reference</td>
+<td>"#E1, #E2, ..."</td>
+<td>Plan-node placeholder substituted with prior worker output at dispatch time</td>
+</tr>
+<tr>
+<td>Planner distillation</td>
+<td>"Small planner, big executor"</td>
+<td>Fine-tune a small model on planner traces from a large teacher</td>
+</tr>
+<tr>
+<td>Token efficiency</td>
+<td>"Fewer round trips"</td>
+<td>5x fewer tokens on HotpotQA vs ReAct in the paper</td>
+</tr>
+<tr>
+<td>DAG executor</td>
+<td>"Topological dispatcher"</td>
+<td>Runs plan nodes in dependency order; parallel at each level</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">From Zero to Agents</div><div class="co-title">Already covered in your course</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0308">Zero to Agents 3.8 · Planning and reasoning patterns: ReAct, plan-and-execute, reflection and search</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>In the agent loop of lesson 14.1 the model decides one step at a time, and every step re-sends everything so far. <strong>ReWOO</strong> ("reasoning without observation") splits the work differently. A <strong>planner</strong> writes the whole plan at once, with placeholders such as <code>#E1</code> for results it has not seen yet. <strong>Workers</strong> then run the tools in order, filling in each placeholder; they are ordinary code, not model calls. Finally a <strong>solver</strong> reads the plan and the evidence and writes the answer. Two model calls instead of one per step, and a plan you can check before anything runs. This lesson builds it with scripted parts, then puts a real small model in the planner and solver seats and compares its token bill with the step-by-step loop.</p></div></aside>
+<p>ReAct's interleaved thought-action-observation loop is simple and flexible, but each tool call has to carry the full prior context — including every previous thought. Token usage grows quadratically with depth. Worse: when a tool fails mid-loop, the model has to re-derive the whole plan from the error observation.</p>
+<p>ReWOO (Xu et al., arXiv:2305.18323, May 2023) noticed this and made a bet: plan the whole thing up front, fetch evidence in parallel, compose the answer at the end. One LLM call to plan, N tool calls for evidence (can be parallel), one LLM call to solve. The trade is less flexibility (the plan is static) for much better token efficiency and clearer failure modes.</p>
+<h2>Idea 1 · The three roles</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Planner:  user_question -&gt; [plan_dag]
+Workers:  [plan_dag]     -&gt; [evidence]        (tool calls, possibly parallel)
+Solver:   user_question, plan_dag, evidence -&gt; final_answer
+</code></pre></div>
+<p>Planner produces a DAG. Each node names a tool, its arguments, and which earlier nodes it depends on (references like <code>#E1</code>, <code>#E2</code>). Workers execute nodes in topological order. Solver stitches everything together.</p>
+<h2>Idea 2 · Why 5x fewer tokens</h2>
+<p>ReAct grows prompt length linearly with step count. At step 10, the prompt contains thought 1 plus action 1 plus observation 1 plus thought 2 plus action 2 plus observation 2, and so on. Each intermediate step also redundantly includes the original prompt.</p>
+<p>ReWOO pays one planner prompt (large), N small worker prompts (each just the tool call, no chain), and one solver prompt. On HotpotQA the paper measures ~5x fewer tokens while scoring +4 absolute accuracy.</p>
+<h2>Idea 3 · Why it is more robust</h2>
+<p>If worker 3 fails in ReAct, the loop has to reason out of the error mid-stream. In ReWOO, worker 3 returns an error string; the solver sees it in context with the original plan and can degrade gracefully. Failure localization is per-node, not per-step.</p>
+<h2>Idea 4 · Planner distillation</h2>
+<p>The paper's second result: because the planner does not see observations, you can fine-tune a 7B model on planner outputs from a 175B teacher. The small model handles planning; the big model is not needed at inference. This is now standard — many 2026 production agents use a small planner and a big executor or vice-versa.</p>
+<h2>Idea 5 · Plan-and-Execute (2023)</h2>
+<p>The LangChain team's May 2023 post, inspired by BabyAGI and the Plan-and-Solve paper, gave the idea a pattern name: Plan-and-Execute. Up-front planner emits a step list, executor runs each step, an optional replanner can revise after observing results. This is closer to ReAct than ReWOO (the replanner brings observations back into planning) but preserves the token savings.</p>
+<h2>Idea 6 · Plan-and-Act (Erdogan et al., arXiv:2503.09572, ICML 2025)</h2>
+<p>Plan-and-Act scales the pattern to long-horizon web and mobile agents. The key contribution is synthetic plan data: a labeled trajectory generator produces training data where the plan is explicit. Planner and executor models fine-tuned on this data reached 57.58% success on WebArena-Lite and 81.36% (text only) on WebVoyager, state of the art when the paper appeared in 2025, on long tasks where a single ReAct trajectory tends to lose its way.</p>
+<h2>Idea 7 · When to pick which</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Pattern</th>
+<th>When</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ReAct</td>
+<td>Short tasks, unknown environment, need reactive exception handling</td>
+</tr>
+<tr>
+<td>ReWOO</td>
+<td>Structured tasks with known tools, token-sensitive, parallelizable evidence</td>
+</tr>
+<tr>
+<td>Plan-and-Execute</td>
+<td>Like ReWOO but with replanning after partial execution</td>
+</tr>
+<tr>
+<td>Plan-and-Act</td>
+<td>Long-horizon (&gt;30 steps), web/mobile/computer-use</td>
+</tr>
+<tr>
+<td>Tree of Thoughts</td>
+<td>Search is worth paying for (<a href="#a1404">Lesson 14.4</a>)</td>
+</tr>
+</tbody>
+</table></div>
+<p>Anthropic's Dec 2024 guidance: start with the simplest. If the task is one tool call plus a summary, do not build ReWOO. If the task is a 40-step research assignment, do not do ReAct alone.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="rewoo-plan"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>ReAct re-reads its history.</strong> With a first prompt of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> tokens, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> tokens added per step and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> tool steps plus a final answer:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">ReAct prompt tokens</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:3.1032em;vertical-align:-1.2671em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.8361em;"><span style="top:-1.8829em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">t</span><span class="mrel mtight">=</span><span class="mord mtight">0</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">∑</span></span></span><span style="top:-4.3em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.2671em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">t</span><span class="mord">Δ</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.113em;vertical-align:-0.686em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">2</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>ReWOO reads each thing once.</strong> With a planner prompt <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">plan</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span></span></span></span>, about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> generated tokens per plan line, a solver prompt with a fixed part <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> and about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">e</span></span></span></span> tokens per evidence line:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">ReWOO tokens</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">plan</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord mathnormal">e</span><span class="mpunct">,</span></span></span></span></span></div>
+linear in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span>. The tools run in between without any model tokens.</p>
+<p><strong>Dependency order.</strong> A plan is a DAG; step <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.854em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05724em;">j</span></span></span></span> can run once every <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">#</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">E</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> it references has run. Steps on the same level have no dependencies on each other and can run in parallel.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">From the run below to a ten-step task</div><div class="co-body"><ul>
+<li>The ReAct run's two prompts were 240 and 282 tokens: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">240</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">42</span></span></span></span>.</li>
+<li>Ten tool steps plus an answer: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">240</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">42</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">2</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">10</span><span class="mbin mtight">⋅</span><span class="mord mtight">11</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2640</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2310</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4950</span></span></span></span> prompt tokens.</li>
+<li>The ReWOO planner wrote 3 plan lines in 60 tokens, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">20</span></span></span></span>; its prompt is 245 tokens. The solver prompt went from 96 (1 step) to 153 (3 steps), so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4831em;"></span><span class="mord mathnormal">e</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">28.5</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0576em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">67.5</span></span></span></span>.</li>
+<li>Ten steps: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">245</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">20</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">67.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">28.5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">798</span></span></span></span> tokens.</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">4950/798</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span></span></span></span>: the same order as the paper's 5x on HotpotQA. At three steps the gap is small (1.19x below); it grows with the square of the step count.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "ReWOO's workers are model calls."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They are plain tool calls; only the planner and solver use the model.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A plan that parses is a plan that runs."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Validate it first: every line parsed, every tool exists, every reference points to an earlier step.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "ReWOO is always better."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The plan is fixed before any result is seen. When step 2 depends on what step 1 found in a way you cannot write as <code>#E1</code>, use ReAct or add a replanner.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The solver can only use the evidence."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is a model: given too little evidence, it fills the gap from memory, as the first run below shows.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The 0.5B planner gets the ReWOO paper's prompt with one example. Will its plan for the France question parse in the paper's exact <code>#E1 = tool[input]</code> format, all three lines? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">ReWOO with a real planner and solver</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct plans with the ReWOO paper's prompt format and later solves from the evidence; the workers are the lesson's <code>run_workers</code> with its <code>fake_search</code> and <code>round_million</code> tools. The plan goes through two parsers, the paper's exact format and a tolerant one, and a validator runs before any tool does. About 10 seconds after the model loads.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># ReWOO with a real model as Planner and Solver (Qwen2.5-0.5B-Instruct, greedy, CPU). The planner
+# prompt follows the ReWOO paper's format; the Workers are the lesson's run_workers and tools.
+import os, re, time, torch
+os.environ.setdefault(&quot;HF_HUB_OFFLINE&quot;, &quot;1&quot;)            # the model is already in the local cache
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+from main import Plan, PlanStep, ToolRegistry, run_workers, fake_search, rounded_million
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); llm = AutoModelForCausalLM.from_pretrained(M).eval()
+USAGE = []                                               # (role, prompt tokens, new tokens)
+def chat(role, text, max_new=150):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: text}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=max_new, do_sample=False)
+    USAGE.append((role, ids.shape[1], out.shape[1] - ids.shape[1]))
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+PLANNER = &quot;&quot;&quot;For the following task, make plans that can solve the problem step by step. For each plan, indicate which external tool together with tool input to retrieve evidence. You can store the evidence into a variable #E that can be called by later tools. (Plan, #E1, Plan, #E2, Plan, ...)
+
+Tools can be one of the following:
+search[input]: looks up a short fact on the web. Input is a search query.
+round_million[input]: rounds a number written in the input to whole millions.
+
+For example,
+Task: How many people live in the largest city of Japan, rounded to millions?
+Plan: Find the largest city of Japan. #E1 = search[largest city of Japan]
+Plan: Find the population of that city. #E2 = search[population of #E1]
+Plan: Round the population. #E3 = round_million[#E2]
+
+Begin! Each Plan should be followed by only one #E.
+Task: {task}&quot;&quot;&quot;
+SOLVER = &quot;&quot;&quot;Solve the following task. To help you, plans and the evidence each one produced are given below. Answer in one short sentence.
+
+{plans}
+Task: {task}
+Response:&quot;&quot;&quot;
+STRICT = re.compile(r&quot;Plan:\s*(.*?)\s*#E(\d+)\s*=\s*(\w+)\[(.*?)\]&quot;)              # the paper's exact format
+TOLERANT = re.compile(r&quot;Plan:\s*(.*?)\s*#E(\d+)\s*=\s*(\w+)\s*\[([^\]\n]*)\]?\s*$&quot;, re.M)  # space before [, missing ]
+def parse(text, pattern):
+    steps, plans = [], []
+    for desc, n, tool, arg in pattern.findall(text):
+        key = &quot;query&quot; if tool == &quot;search&quot; else &quot;text&quot;
+        steps.append(PlanStep(f&quot;E{n}&quot;, tool, {key: arg})); plans.append(desc)
+    return Plan(steps), plans
+
+def validate(text, plan, names):
+    &quot;&quot;&quot;Before running anything: every Plan line parsed, tools exist, references point backwards.&quot;&quot;&quot;
+    problems = []
+    if text.count(&quot;Plan:&quot;) != len(plan.steps):
+        problems.append(f&quot;{text.count('Plan:')} Plan lines but {len(plan.steps)} parsed steps&quot;)
+    seen = set()
+    for s in plan.steps:
+        if s.tool not in names: problems.append(f&quot;{s.id}: unknown tool {s.tool}&quot;)
+        for ref in re.findall(r&quot;#(E\d+)&quot;, str(s.args)):
+            if ref not in seen: problems.append(f&quot;{s.id}: refers to {ref} before it exists&quot;)
+        seen.add(s.id)
+    return problems or [&quot;ok&quot;]
+def solve(descs, plan, evidence):
+    plans = &quot;\n&quot;.join(f&quot;Plan: {d}\n#{s.id} = {s.tool}[{list(s.args.values())[0]}]\nEvidence: {evidence[s.id]}&quot;
+                      for d, s in zip(descs, plan.steps))
+    return chat(&quot;solver&quot;, SOLVER.format(plans=plans, task=TASK), max_new=60)
+
+tools = ToolRegistry(); tools.register(&quot;search&quot;, fake_search); tools.register(&quot;round_million&quot;, rounded_million)
+TASK = &quot;What is the population of the capital of France, rounded to millions?&quot;
+started = time.perf_counter()
+raw = chat(&quot;planner&quot;, PLANNER.format(task=TASK))
+print(&quot;PLANNER OUTPUT\n&quot; + &quot;\n&quot;.join(&quot;  &quot; + l for l in raw.splitlines()))
+for name, pattern in ((&quot;strict parser (paper format)&quot;, STRICT), (&quot;tolerant parser&quot;, TOLERANT)):
+    plan, descs = parse(raw, pattern)
+    print(f&quot;\n== {name}: {len(plan.steps)} steps; validation: {'; '.join(validate(raw, plan, {'search', 'round_million'}))}&quot;)
+    evidence = run_workers(plan, tools)                 # the lesson's Workers: no model call
+    for s in plan.steps:
+        print(f&quot;  {s.id}: {s.tool}({s.args}) -&gt; {evidence[s.id]}&quot;)
+    print(f&quot;  SOLVER: {solve(descs, plan, evidence)}&quot;)
+print(&quot;\nTOKENS (real, Qwen tokenizer)&quot;)
+for role, p, n in USAGE:
+    print(f&quot;  {role:&lt;8} prompt {p:&gt;4}  generated {n:&gt;3}&quot;)
+print(f&quot;seconds {time.perf_counter() - started:.0f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">PLANNER OUTPUT
+  Plan: Find the capital of France. #E1 = search[capital of France]
+  Plan: Find the population of the capital of France. #E2 = search[population of #E1
+  Plan: Round the population. #E3 = round_million [#E2]
+
+== strict parser (paper format): 1 steps; validation: 3 Plan lines but 1 parsed steps
+  E1: search({&#x27;query&#x27;: &#x27;capital of France&#x27;}) -&gt; Paris
+  SOLVER: The population of the capital of France, Paris, is approximately 2.4 million.
+
+== tolerant parser: 3 steps; validation: ok
+  E1: search({&#x27;query&#x27;: &#x27;capital of France&#x27;}) -&gt; Paris
+  E2: search({&#x27;query&#x27;: &#x27;population of #E1&#x27;}) -&gt; 11.2 million metro
+  E3: round_million({&#x27;text&#x27;: &#x27;#E2&#x27;}) -&gt; 11 million
+  SOLVER: The population of the capital of France, Paris, is 11 million.
+
+TOKENS (real, Qwen tokenizer)
+  planner  prompt  245  generated  60
+  solver   prompt   96  generated  19
+  solver   prompt  153  generated  17
+seconds 11</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The plan is right; the format is not.</strong> The planner copies the example's shape: capital, then population of <code>#E1</code>, then round <code>#E2</code>. But line 2 lacks its closing <code>]</code> and line 3 has a space before <code>[</code>. The paper's strict pattern parses only line 1.</p>
+<p><strong>The validator catches it; the solver would not.</strong> "3 Plan lines but 1 parsed steps" is reported before any tool runs. Without that check the run continues with one piece of evidence ("Paris"), and the solver fills the gap from memory: "approximately 2.4 million", a number that appears nowhere in the evidence.</p>
+<p><strong>A tolerant parser recovers the plan.</strong> Accepting a space before <code>[</code> and a missing <code>]</code> at the end of the line gives all three steps. The lesson's <code>run_workers</code> substitutes <code>#E1</code> and <code>#E2</code> (the printed arguments show the placeholders; the results show they were filled: "population of Paris" found 11.2 million) and the solver answers 11 million, which is what the evidence says. Two model calls in total, the planner's 245-token prompt and the solver's 153.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The same task as a ReAct loop</div><div class="co-body"><p>This block continues from the one above. The same model, task and tools run as a ReAct loop with native tool calls: one model call per step, each with the whole history and the tool schemas. The token counts come from the model's own tokenizer. A few seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The same task as ReAct: the model sees the tools natively and is called once per step, each time
+# with the whole history. Continues from the block above (tok, llm, tools, TASK, USAGE).
+import json
+def fn(name, doc, arg):
+    return {&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: name, &quot;description&quot;: doc, &quot;parameters&quot;: {
+        &quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {arg: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [arg]}}}
+SCHEMAS = [fn(&quot;search&quot;, &quot;Look up a short fact on the web.&quot;, &quot;query&quot;),
+           fn(&quot;round_million&quot;, &quot;Round a number written in the text to whole millions.&quot;, &quot;text&quot;)]
+msgs, react_usage = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: TASK}], []
+for step in range(6):
+    ids = tok.apply_chat_template(msgs, tools=SCHEMAS, add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=100, do_sample=False)
+    text = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+    react_usage.append((ids.shape[1], out.shape[1] - ids.shape[1]))
+    call = re.search(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, text, re.S)
+    if not call:
+        print(f&quot;  answer: {text}&quot;); break
+    data = json.loads(call.group(1))
+    obs = tools.dispatch(data[&quot;name&quot;], data.get(&quot;arguments&quot;, {}))
+    print(f&quot;  step {step}: {data['name']}({data.get('arguments')}) -&gt; {obs}&quot;)
+    msgs += [{&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;&quot;, &quot;tool_calls&quot;: [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: data}]},
+             {&quot;role&quot;: &quot;tool&quot;, &quot;name&quot;: data[&quot;name&quot;], &quot;content&quot;: obs}]
+react_total = sum(p + n for p, n in react_usage)
+rewoo_total = USAGE[0][1] + USAGE[0][2] + USAGE[2][1] + USAGE[2][2]     # planner + the solver of the good run
+print(f&quot;\nReAct calls (prompt, generated): {react_usage}  total {react_total}&quot;)
+print(f&quot;ReWOO calls (prompt, generated): {[(p, n) for r, p, n in (USAGE[0], USAGE[2])]}  total {rewoo_total}&quot;)
+print(f&quot;ReAct / ReWOO tokens: {react_total / rewoo_total:.2f}x&quot;)
+bare = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: TASK}], add_generation_prompt=True,
+                               return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;].shape[1]
+print(f&quot;tool schemas, re-sent in every ReAct prompt: {react_usage[0][0] - bare} of the first prompt's {react_usage[0][0]} tokens&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  step 0: round_million({&#x27;text&#x27;: &#x27;capital of France&#x27;}) -&gt; unknown
+  answer: The population of the capital of France, which is Paris, is approximately 24 million people.
+
+ReAct calls (prompt, generated): [(240, 23), (282, 21)]  total 566
+ReWOO calls (prompt, generated): [(245, 60), (153, 17)]  total 475
+ReAct / ReWOO tokens: 1.19x
+tool schemas, re-sent in every ReAct prompt: 197 of the first prompt&#x27;s 240 tokens</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>ReAct spent more and got it wrong.</strong> The model's first step calls <code>round_million</code> on "capital of France" (the wrong tool), gets <code>unknown</code>, and then answers from memory: 24 million, wrong by an order of magnitude and not tied to any evidence.</p>
+<p><strong>The schemas are the fixed cost.</strong> 197 of the first prompt's 240 tokens are the tool descriptions, and ReAct re-sends them on every call. Each step adds about 42 tokens of history.</p>
+<p><strong>1.19x is small, as the formula predicts.</strong> With one tool step the history has barely started to grow. The worked example projects the same numbers to ten steps: about 4950 tokens against 800, the same order as the paper's 5x. One task with a 0.5B model is an illustration, not a benchmark; the paper's figure is an average over HotpotQA.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements a toy ReWOO:</p>
+<ul>
+<li><code>Planner</code> — a scripted policy that emits a plan DAG from a prompt.</li>
+<li><code>Worker</code> — dispatches each node's tool call via the registry.</li>
+<li><code>Solver</code> — scripted composition that reads evidence and produces a final answer.</li>
+<li>Dependency resolution — references like <code>#E1</code> are substituted with earlier worker outputs.</li>
+</ul>
+<p>The demo answers "What is the population of the capital of France, rounded to millions?" using a two-step plan: (1) look up the capital, (2) look up the population, then solve.</p>
+<p>Run it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>The trace shows the full plan first, then worker results, then solver composition. Compare the token count (we print a rough character count) to a ReAct-style interleaved run — ReWOO wins on this kind of structured task.</p>
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>PlanStep</code>, <code>Plan</code>, <code>ToolRegistry</code>, <code>resolve_references</code>, <code>topological</code>, <code>run_workers</code>, <code>REFERENCE_RE</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy ReWOO — Planner, Workers, Solver. Stdlib only.
+
+Demonstrates the decoupled pattern from Xu et al. (arXiv:2305.18323):
+  1. Planner emits a DAG of (tool, args) steps with references (#E1, #E2, ...).
+  2. Workers run each step in topological order.
+  3. Solver composes the final answer from question + plan + evidence.
+
+Compare run_rewoo() vs run_react() at the bottom for token-use intuition.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+@dataclass
+class PlanStep:
+    id: str
+    tool: str
+    args: dict[str, Any]
+
+
+@dataclass
+class Plan:
+    steps: list[PlanStep]
+
+
+class ToolRegistry:
+    def __init__(self) -&gt; None:
+        self._tools: dict[str, Callable[..., str]] = {}
+
+    def register(self, name: str, fn: Callable[..., str]) -&gt; None:
+        self._tools[name] = fn
+
+    def dispatch(self, name: str, args: dict[str, Any]) -&gt; str:
+        fn = self._tools.get(name)
+        if fn is None:
+            return f&quot;error: unknown tool {name!r}&quot;
+        try:
+            return fn(**args)
+        except Exception as e:
+            return f&quot;error: {type(e).__name__}: {e}&quot;
+
+
+REFERENCE_RE = re.compile(r&quot;#E(\d+)&quot;)
+
+
+def resolve_references(value: Any, evidence: dict[str, str]) -&gt; Any:
+    if not isinstance(value, str):
+        return value
+    return REFERENCE_RE.sub(lambda m: evidence.get(f&quot;E{m.group(1)}&quot;, m.group(0)),
+                            value)
+
+
+def topological(plan: Plan) -&gt; list[PlanStep]:
+    resolved: list[PlanStep] = []
+    known: set[str] = set()
+    pending = list(plan.steps)
+    while pending:
+        progress = False
+        rest: list[PlanStep] = []
+        for step in pending:
+            refs = REFERENCE_RE.findall(str(step.args))
+            if all(f&quot;E{r}&quot; in known for r in refs):
+                resolved.append(step)
+                known.add(step.id)
+                progress = True
+            else:
+                rest.append(step)
+        if not progress:
+            raise RuntimeError(&quot;cyclic plan or unresolved reference&quot;)
+        pending = rest
+    return resolved
+
+
+def run_workers(plan: Plan, tools: ToolRegistry) -&gt; dict[str, str]:
+    evidence: dict[str, str] = {}
+    for step in topological(plan):
+        bound_args = {k: resolve_references(v, evidence) for k, v in step.args.items()}
+        evidence[step.id] = tools.dispatch(step.tool, bound_args)
+    return evidence
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>ScriptedPlanner</code>, <code>ScriptedSolver</code>, <code>fake_search</code>, <code>rounded_million</code>, <code>ReWOORun</code>, <code>run_rewoo</code>, <code>run_react_mock</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ScriptedPlanner:
+    def __init__(self, plan: Plan) -&gt; None:
+        self.plan = plan
+
+    def plan_for(self, question: str) -&gt; Plan:
+        return self.plan
+
+
+class ScriptedSolver:
+    def __init__(self, answer_template: str) -&gt; None:
+        self.template = answer_template
+
+    def solve(self, question: str, plan: Plan, evidence: dict[str, str]) -&gt; str:
+        return self.template.format(**evidence)
+
+
+def fake_search(query: str) -&gt; str:
+    if &quot;capital of france&quot; in query.lower():
+        return &quot;Paris&quot;
+    if &quot;population of paris&quot; in query.lower():
+        return &quot;11.2 million metro&quot;
+    if &quot;capital of germany&quot; in query.lower():
+        return &quot;Berlin&quot;
+    return f&quot;no result for {query!r}&quot;
+
+
+def rounded_million(text: str) -&gt; str:
+    m = re.search(r&quot;([0-9]+\.?[0-9]*)&quot;, text)
+    if not m:
+        return &quot;unknown&quot;
+    return f&quot;{round(float(m.group(1)))} million&quot;
+
+
+@dataclass
+class ReWOORun:
+    question: str
+    plan: Plan
+    evidence: dict[str, str] = field(default_factory=dict)
+    answer: str = &quot;&quot;
+    planner_chars: int = 0
+    worker_chars: int = 0
+    solver_chars: int = 0
+
+
+def run_rewoo(question: str, planner: ScriptedPlanner,
+              tools: ToolRegistry, solver: ScriptedSolver) -&gt; ReWOORun:
+    plan = planner.plan_for(question)
+    planner_chars = len(question) + sum(len(s.tool) + len(str(s.args))
+                                        for s in plan.steps)
+    evidence = run_workers(plan, tools)
+    worker_chars = sum(len(str(s.args)) + len(v) for s, v in zip(plan.steps,
+                                                                 evidence.values()))
+    answer = solver.solve(question, plan, evidence)
+    solver_chars = len(question) + worker_chars + len(answer)
+    return ReWOORun(question=question, plan=plan, evidence=evidence,
+                    answer=answer,
+                    planner_chars=planner_chars, worker_chars=worker_chars,
+                    solver_chars=solver_chars)
+
+
+def run_react_mock(question: str, tools: ToolRegistry,
+                   trajectory: list[tuple[str, dict[str, Any]]]) -&gt; int:
+    prompt_chars = len(question)
+    total = 0
+    history_chars = 0
+    for name, args in trajectory:
+        total += prompt_chars + history_chars + len(name) + len(str(args))
+        obs = tools.dispatch(name, args)
+        history_chars += len(name) + len(str(args)) + len(obs) + 40
+    total += prompt_chars + history_chars
+    return total
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · imports and setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(&quot;REWOO: Planner, Workers, Solver (Phase 14, Lesson 02)&quot;)
+    print(&quot;=&quot; * 70)
+
+    tools = ToolRegistry()
+    tools.register(&quot;search&quot;, fake_search)
+    tools.register(&quot;round_million&quot;, rounded_million)
+
+    plan = Plan(steps=[
+        PlanStep(&quot;E1&quot;, &quot;search&quot;, {&quot;query&quot;: &quot;capital of France&quot;}),
+        PlanStep(&quot;E2&quot;, &quot;search&quot;, {&quot;query&quot;: &quot;population of #E1&quot;}),
+        PlanStep(&quot;E3&quot;, &quot;round_million&quot;, {&quot;text&quot;: &quot;#E2&quot;}),
+    ])
+    planner = ScriptedPlanner(plan)
+    solver = ScriptedSolver(
+        &quot;The capital of France is {E1}; rounded population is {E3}.&quot;
+    )
+    run = run_rewoo(&quot;What is the population of the capital of France, rounded?&quot;,
+                    planner, tools, solver)
+
+    print(&quot;\nPLAN&quot;)
+    for step in run.plan.steps:
+        print(f&quot;  {step.id}: {step.tool}({step.args})&quot;)
+    print(&quot;\nEVIDENCE&quot;)
+    for k, v in run.evidence.items():
+        print(f&quot;  {k} -&gt; {v}&quot;)
+    print(f&quot;\nFINAL: {run.answer}&quot;)
+
+    react_chars = run_react_mock(
+        run.question, tools,
+        [(&quot;search&quot;, {&quot;query&quot;: &quot;capital of France&quot;}),
+         (&quot;search&quot;, {&quot;query&quot;: &quot;population of Paris&quot;}),
+         (&quot;round_million&quot;, {&quot;text&quot;: &quot;11.2 million metro&quot;})])
+    rewoo_chars = run.planner_chars + run.worker_chars + run.solver_chars
+    print(&quot;\nTOKEN INTUITION (chars, approximate)&quot;)
+    print(f&quot;  react total  : {react_chars}&quot;)
+    print(f&quot;  rewoo total  : {rewoo_chars}&quot;)
+    print(f&quot;  ratio        : {react_chars / max(rewoo_chars, 1):.2f}x&quot;)
+    print(&quot;\npaper claim: ~5x fewer tokens on HotpotQA. toy approximates the shape.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+REWOO: Planner, Workers, Solver (Phase 14, Lesson 02)
+======================================================================
+
+PLAN
+  E1: search({&#x27;query&#x27;: &#x27;capital of France&#x27;})
+  E2: search({&#x27;query&#x27;: &#x27;population of #E1&#x27;})
+  E3: round_million({&#x27;text&#x27;: &#x27;#E2&#x27;})
+
+EVIDENCE
+  E1 -&gt; Paris
+  E2 -&gt; 11.2 million metro
+  E3 -&gt; 11 million
+
+FINAL: The capital of France is Paris; rounded population is 11 million.
+
+TOKEN INTUITION (chars, approximate)
+  react total  : 873
+  rewoo total  : 495
+  ratio        : 1.76x
+
+paper claim: ~5x fewer tokens on HotpotQA. toy approximates the shape.</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>LangGraph ships Plan-and-Execute as a tutorial recipe (a custom graph), while LangChain's <code>create_agent</code> (formerly LangGraph's <code>create_react_agent</code>) is the ReAct loop. CrewAI's Flows encode the pattern directly: you define tasks up front and the Flow DAG executes them. Plan-and-Act's synthetic data approach is still mostly research; the runtime pattern (explicit plan DAG) ships in production through LangGraph and CrewAI Flows.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>To make the executor "more robust", a teammate changes <code>topological()</code> so that steps with unresolved references are skipped instead of raising, and drops the validation step. The planner then emits a cyclic plan: <code>#E1 = search[population of #E2]</code>, <code>#E2 = search[capital of #E1]</code>. What reaches the solver, and what does it answer? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Plan first, then act, is a product feature now.</strong> Coding agents such as Claude Code and Cursor have a plan mode: the agent writes a plan, a person approves or edits it, then it executes. That is Plan-and-Execute with a human as the validator.</li>
+<li><strong>Frameworks</strong>: LangGraph's plan-and-execute recipe (planner, executor and replanner nodes), CrewAI Flows (tasks declared up front), and the planning tools in the Claude Agent SDK and OpenAI Agents SDK, where the plan is a to-do list the agent keeps updating.</li>
+<li><strong>Small planner, big worker (or the reverse)</strong> is a common cost split; the ReWOO paper distilled a 175B planner into a 7B model.</li>
+<li><strong>On your laptop</strong>: the 0.5B model here plans badly enough to need a tolerant parser. A 7B to 8B instruct model in 4-bit (Ollama or llama.cpp) fits the RTX 4060's 8 GB and follows the plan format much more reliably; validate its plans anyway.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2305.18323">ReWOO (arXiv:2305.18323)</a>, <a href="https://arxiv.org/abs/2503.09572">Plan-and-Act (arXiv:2503.09572)</a>, <a href="https://www.langchain.com/blog/plan-and-execute-agents">LangChain, Plan-and-Execute Agents (May 2023)</a>, <a href="https://langchain-ai.github.io/langgraph/tutorials/plan-and-execute/plan-and-execute/">LangGraph plan-and-execute tutorial</a>, <a href="https://www.anthropic.com/research/building-effective-agents">Anthropic, Building effective agents</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>ReWOO: plan once with placeholders, run tools as code, solve once.</li>
+<li>Tokens grow linearly with steps instead of quadratically.</li>
+<li>Parse and validate the plan before any tool runs.</li>
+<li>A solver with missing evidence invents; check what it was given.</li>
+<li>Pick ReAct when each step depends on what the last one found.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-agent-reasoning-patterns-v5"><span class="t" style="--cs-hue:280">RR</span>Cheat sheet · ReAct, ReWOO, Reflexion and Tree of Thoughts</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-rewoo-planner.md</code> generates a ReWOO plan DAG from a user request, given a tool catalog. It validates the plan (acyclic, every reference resolved, every tool exists) before handing off to an executor.</p>
+<p><strong><code>outputs/skill-rewoo-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: rewoo-planner
+description: Generate a validated ReWOO plan DAG from a user request and tool catalog.
+version: 1.0.0
+phase: 14
+lesson: 02
+tags: [rewoo, plan-and-execute, planning, dag, distillation]
+---
+
+Given a user request and a tool catalog (name, input schema, description), produce a ReWOO plan: a DAG of steps with tool calls and evidence references (`#E1`, `#E2`, ...). Validate the plan before handing it to an executor.
+
+Produce:
+
+1. A plan DAG. Each node has id (`E1`, `E2`, ...), tool name, argument dict (strings may contain `#E&lt;k&gt;` references), and optional `parallel_group` label.
+2. Validation output. Acyclicity check via topological sort; reference resolution check (every `#E&lt;k&gt;` has a preceding producer); tool existence check (every tool name is in the catalog); arg schema check (each argument matches the tool's input schema).
+3. Parallelism hint. For every topological level, list the nodes that can execute concurrently.
+4. Planner/solver split recommendation. If the plan has fewer than 3 steps, recommend ReAct instead. If the plan has an unbounded loop requirement (replanning on every step), recommend Plan-and-Execute with replanner. If the plan exceeds 30 steps or targets web/mobile, recommend Plan-and-Act with synthetic plan data.
+
+Hard rejects:
+
+- Plans with cycles. ReWOO assumes a DAG; cycles are a ReAct or LATS concern.
+- Plans that reference `#E&lt;k&gt;` where `k` does not exist yet in the topological order. Emit the specific edge that fails.
+- Plans that call tools not in the catalog. Do not invent tools to make a plan work.
+- Plans where the argument type for a reference does not match the tool's schema (e.g., `#E1` substitutes a string but the tool expects an int).
+
+Refusal rules:
+
+- If the task is open-ended exploration (unknown tools needed, unknown steps), refuse and recommend ReAct or LATS (Lesson 04).
+- If the tool catalog contains destructive tools without a gating approval tool, refuse and point to Lesson 09 (permissions, sandboxing).
+
+Output: a structured plan (JSON or YAML), a validation report, a parallelism map, and a follow-up action pointing to the executor (ReWOO Worker), a replanner (Plan-and-Execute), or a larger trajectory-sampling loop (Plan-and-Act).
+
+End with a &quot;what to read next&quot; note pointing to Lesson 03 (Reflexion) if the task class has been attempted before, or Lesson 04 (LATS) if the plan would benefit from search.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Parallelize worker execution for independent plan nodes. What does it buy you on a 6-node DAG with 2 parallel groups?</li>
+<li>Add a replanner node that fires if any worker returns an error. What is the smallest change to ReWOO that makes it Plan-and-Execute?</li>
+<li>Replace <code>Planner</code> with a small model (7B class) and keep <code>Solver</code> on a frontier model. Compare end-to-end quality — where does the split fail?</li>
+<li>Read Section 4 of the ReWOO paper on planner distillation. Reproduce the 175B -&gt; 7B result conceptually: what training data do you need, and how do you score plan quality?</li>
+<li>Port the toy to Plan-and-Act's trajectory shape: plan is a sequence, not a DAG. What tradeoffs change?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1402-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Only the first line does</span></summary><div class="qa-a"><p>No. The plan's content is right (capital, population of <code>#E1</code>, round <code>#E2</code>), but only the first line matches the exact format: the second is missing its closing <code>]</code> and the third has a space before <code>[</code>. The paper's pattern therefore parses one step. Small models copy the shape of an example but slip on punctuation, which is why a planner's output needs a parser that reports what it could not read, and a validator that compares the number of plan lines with the number of parsed steps before anything runs.</p></div></details>
+<details class="qa" id="a1402-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · An empty plan and an invented answer</span></summary><div class="qa-a"><p>Nothing useful. Neither step can ever resolve its reference, so the changed <code>topological()</code> skips both, the workers produce no evidence, and the solver gets the question with an empty plan. A model asked to answer anyway answers from memory, as the solver above did with one missing step ("approximately 2.4 million"). The output looks like a normal answer and carries no sign that no tool ran.</p>
+<p>The original behaviour, raising "cyclic plan or unresolved reference", is the safe one. Keep validation before execution: every line parsed, every tool known, every reference pointing to an earlier step, no cycles. On failure, send the plan back to the planner with the error (a replanner), or stop and say why.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2305.18323">Xu et al., ReWOO: Decoupling Reasoning from Observations (arXiv:2305.18323)</a> — the canonical paper</li>
+<li><a href="https://arxiv.org/abs/2503.09572">Erdogan et al., Plan-and-Act (arXiv:2503.09572)</a> — scaled planner-executor with synthetic plans</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview">LangGraph Plan-and-Execute tutorial</a> — the framework recipe</li>
+<li><a href="https://www.anthropic.com/research/building-effective-agents">Anthropic, Building Effective Agents</a> — pick the simplest pattern that works</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/14-agent-engineering/02-rewoo-plan-and-execute" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1402" id="done-a1402">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1402" id="undo-a1402" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1401"><span class="pn-dir">Previous</span><span class="pn-t">14.1 · The Agent Loop: Observe, Think, Act</span></a><a class="pn next" href="#a1403"><span class="pn-dir">Next</span><span class="pn-t">14.3 · Reflexion: Verbal Reinforcement Learning</span></a></div></footer>

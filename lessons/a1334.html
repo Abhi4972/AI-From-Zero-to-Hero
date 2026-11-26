@@ -1,0 +1,1031 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tools &amp; Protocols</a></nav><h1>Lifting to Pseudocode: IR, SSA, and Structuring From Scratch</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.34</span><span class="chip">150 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1334" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Lift decoded x86-64 instructions to a small IR with explicit flags, loads, stores, branches, calls, and returns.</li>
+<li>Turn frame slots into local variables and System V argument registers into parameters.</li>
+<li>Build minimal SSA with phi functions on dominance frontiers, then substitute, simplify, and remove dead code.</li>
+<li>Recover <code>if</code>, <code>if</code> with <code>else</code>, <code>while</code>, and <code>do while</code> from the control-flow graph with post-dominators and back edges.</li>
+<li>Explain the multiply by <code>0x66666667</code> as a division by 10 and prove the identity.</li>
+<li>Read Ghidra pseudocode for the same functions line by line and name the instruction, or the guess, behind every difference.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 13 · 32 (ELF from scratch), Phase 13 · 33 (disassembly and control flow)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 150 minutes.</li>
+<li><strong>Code in</strong>: Python, C. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Decompiler output is a claim with a hidden derivation. When you build the derivation yourself, every line of that output becomes a thing you can check.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A decompiler turns machine code back into something like C. It does this in stages: decode the bytes into instructions, group them into blocks, translate each instruction into a small intermediate language, give every value one name (SSA form), simplify and delete what is unused, guess types from how values are used, and finally rebuild <code>if</code> statements and loops from the graph. Each stage can lose or invent information. The output is a hypothesis about the program, not the program. You trust it only after you check it, ideally by running it against the original. This lesson runs the lesson's own eight-stage lifter on code from a different compiler to see where it stops, then compiles its pseudocode and Ghidra's next to the original object and runs all three on edge cases.</p></div></aside>
+<p>You asked rea for the pseudocode of <code>percent_change</code> in <code>ledger-x86_64-O1.o</code>. Ghidra 12.1.4 answered in about ten seconds:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">undefined1  [16] percent_change(int param_1,int param_2,ulong param_3)
+
+{
+  long lVar1;
+  undefined1 auVar2 [16];
+  undefined1 auVar3 [16];
+
+  if (param_1 != 0) {
+    lVar1 = (long)((param_2 - param_1) * 100);
+    auVar3._0_8_ = lVar1 / (long)param_1 &amp; 0xffffffff;
+    auVar3._8_8_ = lVar1 % (long)param_1 &amp; 0xffffffff;
+    return auVar3;
+  }
+  auVar2._8_8_ = 0;
+  auVar2._0_8_ = param_3;
+  return auVar2 &lt;&lt; 0x40;
+}
+</code></pre></div>
+<p>The source is four lines long. It takes two <code>int</code> values and returns one <code>int</code>. Ghidra reports a 16-byte return value and a third parameter that the source does not have. The sixteen bytes of machine code are correct, and Ghidra decoded every one of them correctly. The signature is a guess, and nothing in the text marks it as one.</p>
+<p>rea returns this text as the <code>procedure_pseudo_code</code> result and attaches one limitation to the record. The limitation reads "Pseudocode is Ghidra decompiler output, not original source and not text-equivalent to Hopper output". The <code>compare_functions</code> tool diffs pseudocode as lines of text. Its own dimension record says "Assembly is opaque provider text" and that relocation normalization is unavailable. rea cannot look inside the text, and neither can an agent that only reads it.</p>
+<p>rea's DX-Ball record shows the cost. The first decompiler result was <code>FUN_00406400(void)</code> calling <code>__ftol()</code>. The instruction view showed a stack input and an x87 expression. The agent kept going only because the two views disagreed.</p>
+<p>This lesson builds the derivation that the decompiler hides. You start from the 56 instructions that lesson 33 decoded, lift them to an IR, rename into SSA, simplify, and structure. Then you place your pseudocode next to Ghidra's for <code>percent_change</code>, <code>grade</code>, and <code>total</code>, and account for every difference. The tests compile your output with clang and run it against the source over an input grid.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="lifting-stages-percent-change"></div></figure></p>
+<h2>The Fixture and the Oracle</h2>
+<p><code>code/fixtures/ledger.c</code> is the shared fixture of this part of the course:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">int percent_change(int before, int after) {
+    if (before == 0) return 0;
+    return (after - before) * 100 / before;
+}
+
+int grade(int score) {
+    switch (score / 10) {
+    case 10:
+    case 9: return 4;
+    case 8: return 3;
+    case 7: return 2;
+    case 6: return 1;
+    default: return 0;
+    }
+}
+
+int total(const int *values, int count) {
+    int sum = 0;
+    for (int i = 0; i &lt; count; i++) sum += values[i];
+    return sum;
+}
+</code></pre></div>
+<p><code>grade_label</code> is also in the file and in the object, and the demo lifts it too. The three functions above are the ones this lesson tests.</p>
+<p>The object was built with <code>clang -target x86_64-unknown-linux-gnu -O1 -fno-asynchronous-unwind-tables -c ledger.c</code>. The <code>-O0</code> object sits beside it for the stack-slot section. <code>code/fixtures/README.md</code> lists both commands, the SHA-256 of each object, and the rea command that produced the Ghidra fixtures. The build is reproducible byte for byte on the pinned toolchain.</p>
+<p>The oracle for the decoder is <code>llvm-objdump -d -r</code>. Its text for both objects is committed as <code>ledger-x86_64-O1.objdump.txt</code> and <code>ledger-x86_64-O0.objdump.txt</code>. A test parses those files and compares every instruction by address, by bytes, and by AT&amp;T text. That covers all 56 instructions at <code>-O1</code> and every instruction at <code>-O0</code>. When <code>llvm-objdump</code> is installed at the pinned path, a second test runs it live and compares again.</p>
+<p>Here is <code>percent_change</code> as the oracle prints it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">0000000000000000 &lt;percent_change&gt;:
+       0: 85 ff                         testl   %edi, %edi
+       2: 74 09                         je  0xd &lt;percent_change+0xd&gt;
+       4: 29 fe                         subl    %edi, %esi
+       6: 6b c6 64                      imull   $0x64, %esi, %eax
+       9: 99                            cltd
+       a: f7 ff                         idivl   %edi
+       c: c3                            retq
+       d: 31 c0                         xorl    %eax, %eax
+       f: c3                            retq
+</code></pre></div>
+<h2>Stage 1: Bytes to Instructions</h2>
+<p><a href="#a1333">Lesson 13.33</a> built the decoder. This lesson keeps a small copy so the code runs on its own. The copy covers exactly the opcodes that clang emitted for <code>ledger.c</code> at <code>-O0</code> and <code>-O1</code>. For anything else it raises <code>DecodeError</code> with the address and the opcode byte.</p>
+<p>The decoder follows the byte order of the Intel SDM, Volume 2, section 2.1. Prefixes come first, then the opcode, then ModR/M, then SIB, then the displacement, then the immediate. Section 2.2.1 adds the REX prefix, one byte from <code>0x40</code> to <code>0x4F</code>, which must sit directly before the opcode. REX.W selects a 64-bit operand, REX.R extends the <code>reg</code> field, REX.X extends the SIB index, and REX.B extends <code>r/m</code> or the SIB base. Section 2.1.3 defines the three ModR/M fields <code>mod</code>, <code>reg</code>, and <code>r/m</code>, and the three SIB fields <code>scale</code>, <code>index</code>, and <code>base</code>. In 64-bit mode, <code>mod = 00</code> with <code>r/m = 101</code> means a 32-bit displacement relative to the next instruction (section 2.2.1.6).</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Opcode bytes</th>
+<th>Form</th>
+<th>Fixture example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>01 29 31 39 85 89</code></td>
+<td><code>op Ev, Gv</code></td>
+<td><code>29 fe</code> <code>subl %edi, %esi</code></td>
+</tr>
+<tr>
+<td><code>03 2b 3b 8b 8d</code></td>
+<td><code>op Gv, Ev</code></td>
+<td><code>03 04 97</code> <code>addl (%rdi,%rdx,4), %eax</code></td>
+</tr>
+<tr>
+<td><code>63</code> with REX.W</td>
+<td><code>movsxd Gv, Ev</code></td>
+<td><code>48 63 c7</code> <code>movslq %edi, %rax</code></td>
+</tr>
+<tr>
+<td><code>69</code> and <code>6b</code></td>
+<td><code>imul Gv, Ev, imm</code></td>
+<td><code>48 69 c0 67 66 66 66</code></td>
+</tr>
+<tr>
+<td><code>83 /0 /5 /7</code></td>
+<td><code>add sub cmp Ev, imm8</code></td>
+<td><code>83 c1 fa</code> <code>addl $-0x6, %ecx</code></td>
+</tr>
+<tr>
+<td><code>c1 /5 /7</code></td>
+<td><code>shr sar Ev, imm8</code></td>
+<td><code>48 c1 f9 22</code> <code>sarq $0x22, %rcx</code></td>
+</tr>
+<tr>
+<td><code>f7 /7</code></td>
+<td><code>idiv Ev</code></td>
+<td><code>f7 ff</code> <code>idivl %edi</code></td>
+</tr>
+<tr>
+<td><code>ff /0 /4</code></td>
+<td><code>inc Ev</code>, <code>jmp Ev</code></td>
+<td><code>48 ff c2</code> <code>incq %rdx</code></td>
+</tr>
+<tr>
+<td><code>70</code> to <code>7f</code>, <code>eb</code>, <code>e8</code></td>
+<td><code>jcc rel8</code>, <code>jmp rel8</code>, <code>call rel32</code></td>
+<td><code>74 09</code> <code>je 0xd</code></td>
+</tr>
+<tr>
+<td><code>99</code>, <code>c3</code>, <code>90</code>, <code>0f 1f</code></td>
+<td><code>cltd</code>, <code>retq</code>, <code>nop</code></td>
+<td><code>66 0f 1f 44 00 00</code> <code>nopw (%rax,%rax)</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The <code>leaq (%rip), %rcx</code> at <code>grade+0x23</code> is seven bytes with a zero displacement. The object carries a relocation <code>R_X86_64_PC32.rodata+0x10</code> at offset <code>0x36</code>, the displacement field. The lifter resolves it in stage 3.</p>
+<h2>Stage 2: Blocks and Dominators</h2>
+<p>A basic block is a sequence of statements with one entry at the top and one exit at the bottom. That is the definition from Allen (1970), and every decompiler paper reuses it. <code>build_blocks()</code> collects leaders: the function entry, every jump target inside the function, and every address after a jump or return. Each block gets successors from its last instruction. A conditional jump has two successors and a <code>jmp</code> has one. A <code>ret</code> has none, and a block that ends in an ordinary instruction falls through to the next leader.</p>
+<p><code>total</code> at <code>-O1</code> has five blocks:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Block</th>
+<th>Instructions</th>
+<th>Successors</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0x40</code></td>
+<td><code>testl %esi, %esi</code> then <code>jle 0x5c</code></td>
+<td><code>0x5c</code>, <code>0x44</code></td>
+</tr>
+<tr>
+<td><code>0x44</code></td>
+<td><code>movl %esi, %ecx</code>, <code>xorl %edx, %edx</code>, <code>xorl %eax, %eax</code>, <code>nopw</code></td>
+<td><code>0x50</code></td>
+</tr>
+<tr>
+<td><code>0x50</code></td>
+<td><code>addl (%rdi,%rdx,4), %eax</code>, <code>incq %rdx</code>, <code>cmpq %rdx, %rcx</code>, <code>jne 0x50</code></td>
+<td><code>0x50</code>, <code>0x5b</code></td>
+</tr>
+<tr>
+<td><code>0x5b</code></td>
+<td><code>retq</code></td>
+<td>exit</td>
+</tr>
+<tr>
+<td><code>0x5c</code></td>
+<td><code>xorl %eax, %eax</code> then <code>retq</code></td>
+<td>exit</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>immediate_dominators()</code> is the iterative algorithm of Cooper, Harvey, and Kennedy (2001). It walks the blocks in reverse postorder and intersects the dominators of the processed predecessors until nothing changes. On graphs this small it finishes in two passes. For <code>total</code> it says that <code>0x44</code> dominates <code>0x50</code>. It also says that <code>0x50</code> dominates itself through the back edge, which is how stage 8 finds the loop.</p>
+<p>The same function runs twice more. <code>dominance_frontiers()</code> uses it for SSA in stage 5. <code>post_dominators()</code> runs it on the reversed graph with a virtual exit node to find joins in stage 8.</p>
+<h2>Stage 3: Lifting to a Small IR</h2>
+<p>The IR has six statement kinds: <code>Assign</code>, <code>Store</code>, <code>Branch</code>, <code>Jump</code>, <code>IndirectJump</code>, and <code>Return</code>. Expressions are constants, variables, binary operations with a width, casts (<code>sext</code>, <code>zext</code>, <code>trunc</code>), and loads. Five more shapes exist only to be simplified away later: <code>Flags</code>, <code>Cond</code>, <code>Concat</code>, <code>SignFill</code>, and <code>Symbolic</code>.</p>
+<p>Registers are variables named by their 64-bit family. A write to <code>%eax</code> is an <code>Assign</code> to <code>rax</code> with width 32, and a read of <code>%eax</code> is a read of <code>rax</code> at width 32. In 64-bit mode a 32-bit write zero-extends into the full register, so a later 64-bit read of the same value is a <code>zext</code>. The lifter does not know the reaching definition, so it records the read width and lets SSA insert the cast in stage 5.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Instruction</th>
+<th>IR statements</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>subl %edi, %esi</code></td>
+<td><code>flags = cmp(esi, edi)</code> then <code>esi = esi - edi</code></td>
+</tr>
+<tr>
+<td><code>testl %edi, %edi</code></td>
+<td><code>flags = test(edi, edi)</code></td>
+</tr>
+<tr>
+<td><code>je 0xd</code></td>
+<td><code>if je(flags) goto 0xd else goto 0x4</code></td>
+</tr>
+<tr>
+<td><code>xorl %eax, %eax</code></td>
+<td><code>eax = 0</code></td>
+</tr>
+<tr>
+<td><code>cltd</code></td>
+<td><code>edx = signfill(eax)</code></td>
+</tr>
+<tr>
+<td><code>idivl %edi</code></td>
+<td><code>dividend = edx:eax</code>, <code>eax = dividend / edi</code>, <code>edx = dividend % edi</code></td>
+</tr>
+<tr>
+<td><code>movslq %edi, %rax</code></td>
+<td><code>rax = sext64(edi)</code></td>
+</tr>
+<tr>
+<td><code>sarq $0x22, %rcx</code></td>
+<td><code>rcx = rcx &gt;&gt;s 34</code></td>
+</tr>
+<tr>
+<td><code>shrq $0x3f, %rax</code></td>
+<td><code>rax = rax &gt;&gt;u 63</code></td>
+</tr>
+<tr>
+<td><code>addl (%rdi,%rdx,4), %eax</code></td>
+<td><code>flags = add(eax, load32(rdi + rdx * 4))</code> then <code>eax = eax + load32(rdi + rdx * 4)</code></td>
+</tr>
+<tr>
+<td><code>leaq (%rip), %rcx</code> with its relocation</td>
+<td><code>rcx = &amp;.rodata+0x14</code></td>
+</tr>
+<tr>
+<td><code>pushq %rbp</code>, <code>movq %rsp, %rbp</code>, <code>subq $0x10, %rsp</code>, <code>popq %rbp</code></td>
+<td>nothing, frame bookkeeping</td>
+</tr>
+<tr>
+<td><code>retq</code></td>
+<td><code>return rax</code></td>
+</tr>
+</tbody>
+</table></div>
+<h3>Flags are a variable</h3>
+<p>Every instruction that sets the condition codes writes one variable named <code>flags</code>, and every conditional jump reads it. A <code>cmp a, b</code> writes <code>cmp(a, b)</code>, a <code>test a, b</code> writes <code>test(a, b)</code>, and <code>sub</code> writes the same <code>cmp</code> shape as a side effect. A <code>jcc</code> becomes <code>Branch(Cond(cc, flags), target, fallthrough)</code>. The condition code decides the comparison operator when the two meet in stage 6:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Code</th>
+<th>After <code>cmp(a, b)</code></th>
+<th>After <code>test(a, a)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>je</code></td>
+<td><code>a == b</code></td>
+<td><code>a == 0</code></td>
+</tr>
+<tr>
+<td><code>jne</code></td>
+<td><code>a != b</code></td>
+<td><code>a != 0</code></td>
+</tr>
+<tr>
+<td><code>jl</code>, <code>jge</code>, <code>jle</code>, <code>jg</code></td>
+<td>signed <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>&gt;</code></td>
+<td>signed compare with 0</td>
+</tr>
+<tr>
+<td><code>jb</code>, <code>jae</code>, <code>jbe</code>, <code>ja</code></td>
+<td>unsigned <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>&gt;</code></td>
+<td>unsigned compare with 0</td>
+</tr>
+</tbody>
+</table></div>
+<p><code>xorl %eax, %eax</code> is lifted straight to <code>eax = 0</code>. The flags it sets are written as <code>add</code> style flags that no jump in the fixture reads. The <code>xor</code> idiom matters in <code>grade</code>, where Ghidra lost it.</p>
+<h3>cltd and idiv</h3>
+<p><code>cltd</code> fills <code>%edx</code> with the sign bit of <code>%eax</code>. <code>idivl %edi</code> divides the 64-bit pair <code>%edx:%eax</code> by <code>%edi</code>, puts the quotient in <code>%eax</code>, and the remainder in <code>%edx</code>. The lifter writes the pair into a temporary named <code>dividend</code> first. The remainder statement then reads the old <code>%eax</code> and not the fresh quotient. In SSA the high half shows up as <code>signfill</code> of the low half. The simplifier reduces the pair to the low half, and the division becomes a 32-bit <code>/</code>.</p>
+<h3>Stack slots at -O0</h3>
+<p>At <code>-O0</code> clang keeps every local in the frame. <code>percent_change</code> stores <code>%edi</code> to <code>-0x8(%rbp)</code> and <code>%esi</code> to <code>-0xc(%rbp)</code>, then reads them back for every use. The lifter watches for <code>pushq %rbp</code> followed by <code>movq %rsp, %rbp</code>. After that prologue, a memory operand with base <code>%rbp</code>, no index, and a displacement becomes a variable named <code>local_&lt;hex&gt;</code>. <code>-0x8(%rbp)</code> is <code>local_8</code>, <code>-0xc(%rbp)</code> is <code>local_c</code>.</p>
+<p>The frame instructions themselves produce no IR, and neither do <code>subq</code> and <code>addq</code> on <code>%rsp</code>. Any other memory operand stays a <code>Load</code> or <code>Store</code>.</p>
+<h3>Relocations</h3>
+<p>The <code>leaq (%rip), %rcx</code> in <code>grade</code> has displacement zero in the file. The relocation at offset <code>0x36</code> says <code>R_X86_64_PC32.rodata+0x10</code>. The linker will write <code>S + A - P</code> into the field. <code>S</code> is the address of <code>.rodata</code>, <code>A</code> is the addend <code>0x10</code>, and <code>P</code> is the address of the field. The instruction then computes <code>next_ip + disp = (P + 4) + S + A - P = S + A + 4</code>.</p>
+<p>The lifter applies the same arithmetic without a linker. The target offset is the addend plus the distance from the field to the end of the instruction, <code>0x10 + 4 = 0x14</code>. The IR says <code>rcx = &amp;.rodata+0x14</code>, and the table there holds the five <code>int</code> values <code>1, 2, 3, 4, 4</code>.</p>
+<h2>Stage 4: Parameters From the Calling Convention</h2>
+<p>The System V AMD64 psABI, section 3.2.3, passes INTEGER class arguments in <code>%rdi</code>, <code>%rsi</code>, <code>%rdx</code>, <code>%rcx</code>, <code>%r8</code>, <code>%r9</code>, in that order. The result returns in <code>%rax</code> and then <code>%rdx</code>. Section 3.2.1 says that <code>%rbp</code>, <code>%rbx</code>, and <code>%r12</code> through <code>%r15</code> belong to the caller and must be preserved. Everything else belongs to the callee.</p>
+<p><code>collect_params()</code> applies one rule: an argument register that is read before any write in the function is a parameter. The highest such register fixes the count, so a function that reads <code>%rsi</code> and never <code>%rdi</code> still has two parameters. <code>percent_change</code> reads <code>%edi</code> and <code>%esi</code>, so it has <code>param_1</code> and <code>param_2</code>. <code>grade</code> reads only <code>%edi</code>. <code>total</code> reads <code>%rdi</code> as a 64-bit base and <code>%esi</code> as a 32-bit count.</p>
+<p>Now Ghidra's <code>param_3</code> has an explanation. <code>idivl</code> writes <code>%rdx</code>, and the psABI allows a 128-bit INTEGER return in <code>%rax:%rdx</code>. In an object file there is no caller to say how wide the return value is. Ghidra kept both registers as the return value.</p>
+<p>On the zero path, <code>xorl %eax, %eax</code> writes only <code>%eax</code>. Ghidra read <code>%rdx</code> there as an input of the function, and that input became <code>param_3</code>. The instructions are right. The signature is a guess about the parts the instructions leave open.</p>
+<h2>Stage 5: SSA, One Name per Definition</h2>
+<p>After lifting, <code>grade</code> writes <code>rax</code> four times and <code>rcx</code> three times. Cytron, Ferrante, Rosen, Wegman, and Zadeck (1991) define static single assignment form. Each variable is assigned exactly once, and phi functions at join points select among the definitions that reach them. Their construction has two steps. Section 5.1 places phi functions using dominance frontiers, and section 5.2 renames every definition and use with a walk over the dominator tree. <code>insert_phis()</code> and <code>rename()</code> follow those two sections.</p>
+<p>The SSA listing of <code>total</code> shows what the construction produces:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">block 0x44 -&gt; 0x50
+  ecx_1 = esi_0
+  edx_1 = 0
+  eax_1 = 0
+block 0x50 -&gt; 0x50, 0x5b
+  eax_2 = phi(0x44: eax_1, 0x50: eax_3)
+  rdx_2 = phi(0x44: edx_1, 0x50: rdx_3)
+  flags_2 = phi(0x44: flags_1, 0x50: flags_5)
+  flags_3 = add(eax_2, load32(rdi_0 + rdx_2 * 4))
+  eax_3 = eax_2 + load32(rdi_0 + rdx_2 * 4)
+  flags_4 = inc(rdx_2, 1)
+  rdx_3 = rdx_2 + 1
+  flags_5 = cmp(zext64(ecx_1), rdx_3)
+  if jne(flags_5) goto 0x50 else goto 0x5b
+</code></pre></div>
+<p>Version 0 of a register is its value at entry. <code>esi_0</code> and <code>rdi_0</code> are the parameters. The loop header <code>0x50</code> has two predecessors, the setup block and itself, so every variable with a definition in the loop gets a phi there. The <code>flags_2</code> phi is dead on arrival. Minimal SSA places it because <code>flags</code> has definitions in both predecessors, and stage 6 removes it because nothing reads it.</p>
+<p>The renaming step also fixes widths. <code>edx_1 = 0</code> is a 32-bit definition and <code>rdx_3 = rdx_2 + 1</code> is 64-bit, so the phi <code>rdx_2</code> takes the wider width. The read of <code>%rcx</code> in <code>cmpq %rdx, %rcx</code> is 64-bit while its definition <code>ecx_1 = esi_0</code> is 32-bit, so the use becomes <code>zext64(ecx_1)</code>. Every cast in the final pseudocode comes from this one rule.</p>
+<p>The "lite" part is the way out of SSA. <code>coalesce_webs()</code> joins each phi with its arguments into one variable, called a web, and gives the web one name. This works for the shapes a compiler emits for these functions. It can break on parallel copies, where two phis at one join exchange values, and the lesson does not handle that case. Cytron's section 7 describes the general exit through coloring.</p>
+<h2>Stage 6: Simplify, Substitute, Remove Dead Code</h2>
+<p><code>optimize()</code> repeats three passes until nothing changes. The simplifier rewrites expressions bottom up with these rules:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Before</th>
+<th>After</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Cond(je, cmp(a, b))</code></td>
+<td><code>a == b</code>, and the same for the other nine codes</td>
+</tr>
+<tr>
+<td><code>Cond(jle, test(a, a))</code></td>
+<td><code>a &lt;= 0</code></td>
+</tr>
+<tr>
+<td><code>x + (-6)</code></td>
+<td><code>x - 6</code></td>
+</tr>
+<tr>
+<td><code>trunc32(zext64(x))</code> where <code>x</code> is 32-bit</td>
+<td><code>x</code></td>
+</tr>
+<tr>
+<td><code>trunc32(a + b)</code> on 64-bit operands</td>
+<td><code>trunc32(a) + trunc32(b)</code></td>
+</tr>
+<tr>
+<td><code>(signfill(x): x) / d</code></td>
+<td><code>x / d</code> at width 32</td>
+</tr>
+<tr>
+<td><code>load32(base + idx * 4)</code></td>
+<td><code>base[idx]</code></td>
+</tr>
+<tr>
+<td><code>trunc32(p &gt;&gt;s 34) + trunc32(p &gt;&gt;u 63)</code> with <code>p = sext64(x) * 0x66666667</code></td>
+<td><code>x / 10</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>Forward substitution moves a definition into its only use. The rule has three conditions. The use is in the same block. The use is a statement and not a phi. When the definition contains a load, no store or call sits between the definition and the use. A constant or a section address is substituted anywhere except into a phi, because a phi argument has to stay a variable for the web.</p>
+<p>Dead code removal deletes an assignment or a phi whose destination has no use and whose expression has no call. The order of the passes matters. In <code>percent_change</code> the remainder <code>edx_2 = dividend_1 % edi_0</code> is dead, so it goes first. That leaves <code>edx_1 = signfill(eax_1)</code> with one use, so it is substituted into <code>dividend_1 = edx_1:eax_1</code>.</p>
+<p>The pair rule then reduces <code>signfill(eax_1):eax_1</code> to <code>eax_1</code>, and the division becomes <code>eax_1 / edi_0</code>. Now <code>eax_1 = esi_1 * 100</code> has one use, and <code>esi_1 = esi_0 - edi_0</code> has one use, and both move into the return statement. The <code>flags</code> definitions have been substituted into the branch conditions and disappear. Four instructions become one line:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">return (param_2 - param_1) * 100 / param_1;
+</code></pre></div>
+<h3>The 0x66666667 multiply</h3>
+<p><code>grade</code> divides the score by 10, and clang emits no <code>idiv</code>. It emits <code>imulq $0x66666667, %rax, %rax</code>, then <code>sarq $0x22, %rcx</code> on a copy, then <code>shrq $0x3f, %rax</code>, then adds the two. Granlund and Montgomery, "Division by Invariant Integers using Multiplication" (PLDI 1994), describe the method. The compiler picks a multiplier <code>m</code> and a shift <code>s</code>. For every <code>x</code> in the range, <code>(x * m) &gt;&gt; s</code> must equal <code>x / d</code>.</p>
+<p>Here <code>m = 0x66666667 = 1717986919</code> and <code>s = 34</code>. The arithmetic checks out: <code>2^34 / 10 = 1717986918.4</code>, and the ceiling is <code>1717986919</code>. The error is <code>m * 10 - 2^34 = 6</code>. For the identity to hold on every 32-bit <code>x</code>, the error times <code>2^31</code> must stay below <code>2^34</code>, so the error must be at most 8. Six is at most eight, so <code>(x * m) &gt;&gt; 34</code> equals <code>floor(x / 10)</code> for every non-negative <code>int</code>.</p>
+<p>For negative <code>x</code> the floor rounds away from zero while C rounds toward zero. <code>shrq $0x3f</code> extracts the sign bit of the product, which is 1 exactly when <code>x</code> is negative. Adding it corrects the rounding.</p>
+<p><code>magic_divisor(m, s)</code> tests a candidate pair. It computes <code>d</code> as the integer quotient of <code>2^s</code> by <code>m</code> and tries <code>d</code> and <code>d + 1</code>. It accepts a <code>d</code> only when <code>m</code> equals the ceiling of <code>2^s / d</code> and the error bound holds. The same multiplier with <code>s = 33</code> gives <code>d = 5</code>, which is correct, because <code>0x66666667</code> is also the ceiling of <code>2^33 / 5</code>. A test checks the identity against <code>c_div(x, 10)</code> on 2,406 values including both ends of the <code>int</code> range.</p>
+<p>With recognition on, <code>grade</code> reads <code>ecx_1 = param_1 / 10 - 6;</code>. With recognition off, the demo prints the raw form:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">rax_1 = (long)param_1 * 0x66666667;
+ecx_1 = (int)(rax_1 &gt;&gt; 34) + (int)((unsigned long)rax_1 &gt;&gt; 63) - 6;
+</code></pre></div>
+<p>Both compile and both compute the same values. Keep the switch. When you read code from a compiler you have not studied, the raw form is the honest one.</p>
+<h2>Stage 7: Types From Use</h2>
+<p>Machine code has widths and no types. <code>infer_types()</code> turns three kinds of evidence into C types. A web whose definitions are 32 bits wide is <code>int</code>, and a 64-bit web is <code>long</code>. A web that is the base of an element access <code>base[idx]</code> with 4-byte elements is <code>int *</code>. The pointer type spreads along copies and phis, so <code>local_8 = param_1</code> at <code>-O0</code> makes both of them <code>int *</code>. The return type is the width of the value in the <code>return</code> statements.</p>
+<p>The result for <code>total</code> is <code>int total(int *param_1, int param_2)</code>. Ghidra wrote <code>int total(long param_1,uint param_2)</code>. Both are consistent with the instructions. The lifter used the scaled load as pointer evidence. Ghidra kept the register width and wrote the access as <code>*(int *)(param_1 + uVar2 * 4)</code>. Neither can see <code>const</code>, and neither can tell <code>int *</code> from <code>unsigned *</code>.</p>
+<p>Lee, Avgerinos, and Brumley (TIE, NDSS 2011) frame type recovery as constraint solving over a lattice. The result is an upper and a lower bound instead of one guess. Noonan, Loginov, and Cok (Retypd, PLDI 2016) add polymorphism and recursion. They report 98 percent recall on <code>const</code> pointer annotations from idioms the compiler leaves behind. This lesson uses the two cheapest rules from that line of work and names what they cannot see.</p>
+<p>Unsigned arithmetic is kept in the expressions and not in the variable types. <code>ja</code> after <code>cmpl $0x4, %ecx</code> prints as <code>(unsigned int)ecx_1 &gt; 4</code>, and <code>shrq</code> prints as <code>(unsigned long)rax_1 &gt;&gt; 63</code>. The variables stay signed so that a reader sees the register value and the one place where the instruction treats it as unsigned.</p>
+<h2>Stage 8: Structuring From the Graph</h2>
+<p>Cifuentes (1994), chapter 6, matches regions of the graph against the shapes of a high-level language. Loops come first (6.6.1), then two-way conditionals (6.6.2), then n-way conditionals (6.6.3). Yakdan, Eschweiler, Gerhards-Padilla, and Smith (NDSS 2015) take the other road. They derive the condition under which each node executes and build the structure from those conditions, with no fixed shapes. Their motivation is a measurement. Hex-Rays on one sample produced 1,571 <code>goto</code> statements in 49,514 lines, one per 32 lines, and their structuring produced none on 1,530 coreutils functions.</p>
+<p><code>structure()</code> is a small member of the first family. It needs two facts from stage 2. The immediate post-dominator of a block that ends in a <code>Branch</code> is the join of the conditional. A back edge is an edge to a block that dominates its source. The natural loop is the set of blocks that reach the back edge source without passing the header.</p>
+<p>For a <code>Branch</code> with join <code>j</code>:</p>
+<ul>
+<li>If <code>j</code> is the jump target, emit <code>if (!cond) { fallthrough region }</code> and continue at <code>j</code>.</li>
+<li>If <code>j</code> is the fallthrough, emit <code>if (cond) { target region }</code> and continue at <code>j</code>.</li>
+<li>If <code>j</code> is the function exit, both arms return. Emit the smaller arm as <code>if (cond) {... }</code> and the other arm after it, without an <code>else</code>. This is the early return in <code>percent_change</code> and <code>total</code>.</li>
+<li>Otherwise emit <code>if (cond) { target } else { fallthrough }</code> and continue at <code>j</code>. This is <code>percent_change</code> at <code>-O0</code>, where both arms store <code>local_4</code> and meet at the epilogue.</li>
+</ul>
+<p>For a loop header:</p>
+<ul>
+<li>If the header ends in a <code>Branch</code> with one successor outside the loop, emit <code>while (cond) { body }</code>. <code>total</code> at <code>-O0</code> has this shape: the header compares <code>local_14</code> with <code>local_c</code> and leaves on <code>jge</code>.</li>
+<li>If the header is also the block with the back edge, or the latch exits instead, emit <code>do { body } while (cond);</code>. <code>total</code> at <code>-O1</code> has this shape: block <code>0x50</code> adds, increments, compares, and jumps to itself.</li>
+</ul>
+<p>An <code>IndirectJump</code> ends a block with no successors. <code>grade</code> at <code>-O0</code> is a real jump table, <code>jmpq *%rax</code> through five relative offsets at <code>.rodata+0x0</code>, and lesson 33 resolves those targets. Here the lifter prints a note instead. Four blocks at <code>0x76</code>, <code>0x7f</code>, <code>0x88</code>, and <code>0x91</code> are reached only through the indirect jump and were not lifted. The practice lab adds the <code>switch</code>.</p>
+<h3>What -O1 did to the switch</h3>
+<p>At <code>-O1</code> clang did not keep a jump table for <code>grade</code>. It computed <code>score / 10 - 6</code> and compared the result with 4 as an unsigned number. Then it loaded the return value from a five-entry table of <code>int</code> at <code>.rodata+0x14</code>. The unsigned compare is one instruction that covers both <code>score / 10 &lt; 6</code> and <code>score / 10 &gt; 10</code>. A negative difference is a large unsigned value, so it fails the same check.</p>
+<p>The table holds <code>1, 2, 3, 4, 4</code> for the quotients 6 through 10. The <code>switch</code> with five <code>return</code> statements became an <code>if</code> and an array read. The lifter emits exactly that, and names the table <code>lookup_14</code> after its section offset.</p>
+<p>The length of the table is a heuristic. <code>table_values()</code> reads from the table start to the next <code>.rodata</code> offset that any <code>.text</code> relocation references, or to the end of the section. In this object the next referenced offset is <code>0x28</code>, the table of <code>grade_label</code>, so <code>lookup_14</code> has <code>(0x28 - 0x14) / 4 = 5</code> entries. The unsigned compare against 4 agrees. Ghidra does not know the length either. It wrote <code>*(uint *)(&amp;DAT_001000b4 + (ulong)uVar2 * 4)</code>, a byte address plus an offset, and left the five values for the reader to look up.</p>
+<h2>Side by Side With Ghidra</h2>
+<p>The demo prints each pair. The Ghidra text comes from <code>code/fixtures/ghidra/*.json</code>, the Evidence records that rea returned on 2026-10-14. The command was <code>npx -y rea-agents@6.5.0 decompile ledger-x86_64-O1.o &lt;function&gt; --provider ghidra --format json</code>. Each record carries <code>confidence: observed</code> and <code>authority: shipped-artifact</code>. The text is observed. The claims inside the text are derived, and the records do not say which ones.</p>
+<h3>percent_change</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">lifter                                         | ghidra
+-----------------------------------------------+-----------------------------------------------
+int percent_change(int param_1, int param_2)   | undefined1  [16] percent_change(int param_1,int param_2,ulong param_3)
+{                                              | {
+  if (param_1 == 0) {                          |   long lVar1;
+    return 0;                                  |   undefined1 auVar2 [16];
+  }                                            |   undefined1 auVar3 [16];
+  return (param_2 - param_1) * 100 / param_1;  |   if (param_1 != 0) {
+}                                              |     lVar1 = (long)((param_2 - param_1) * 100);
+                                               |     auVar3._0_8_ = lVar1 / (long)param_1 &amp; 0xffffffff;
+                                               |     auVar3._8_8_ = lVar1 % (long)param_1 &amp; 0xffffffff;
+                                               |     return auVar3;
+                                               |   }
+                                               |   auVar2._8_8_ = 0;
+                                               |   auVar2._0_8_ = param_3;
+                                               |   return auVar2 &lt;&lt; 0x40;
+                                               | }
+</code></pre></div>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Difference</th>
+<th>Instruction or guess</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Return type <code>undefined1 [16]</code> against <code>int</code></td>
+<td>Guess. <code>idivl</code> writes <code>%rax</code> and <code>%rdx</code>, and no caller fixes the return width. Both registers were kept.</td>
+</tr>
+<tr>
+<td><code>param_3</code></td>
+<td>Guess that follows from the first. On the zero path only <code>%eax</code> is written, so <code>%rdx</code> is read as an input.</td>
+</tr>
+<tr>
+<td><code>lVar1 / (long)param_1 &amp; 0xffffffff</code> against <code>/ param_1</code></td>
+<td>Instruction. <code>cltd</code> plus <code>idivl</code> is a 64-bit division of a sign-extended 32-bit value, truncated to 32 bits. Both texts describe it. Ours reduced the pair with the <code>signfill</code> rule.</td>
+</tr>
+<tr>
+<td><code>lVar1 % (long)param_1</code> kept</td>
+<td>Follows from the return type. The remainder in <code>%rdx</code> is dead in our analysis and alive in Ghidra's.</td>
+</tr>
+<tr>
+<td><code>if (param_1 != 0)</code> with the zero case after it</td>
+<td>Instruction order. <code>je 0xd</code> jumps to the zero return. Ghidra put the computed arm first, we put the smaller arm first. Both are correct.</td>
+</tr>
+<tr>
+<td><code>return auVar2 &lt;&lt; 0x40</code></td>
+<td>Guess. A 16-byte value with <code>param_3</code> in the low half, shifted into the high half, is how the decompiler expresses <code>%rax = 0</code> with <code>%rdx</code> unknown.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The repaired version in <code>code/fixtures/ghidra/ledger-x86_64-O1.ghidra-repaired.c</code> edits only this function, and the test compares it with the source over 81 input pairs.</p>
+<h3>grade</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">lifter                                         | ghidra
+-----------------------------------------------+-----------------------------------------------
+static const int lookup_14[5] = {1, 2, 3, 4, 4}; | uint grade(int param_1)
+int grade(int param_1)                         | {
+{                                              |   uint uVar1;
+  int eax_1;                                   |   uint uVar2;
+  int ecx_1;                                   |   
+                                               |   uVar2 = param_1 / 10 - 6;
+  ecx_1 = param_1 / 10 - 6;                    |   uVar1 = -(param_1 &gt;&gt; 0x1f) ^ (uint)((ulong)((long)param_1 * 0x66666667) &gt;&gt; 0x3f);
+  eax_1 = 0;                                   |   if (uVar2 &lt; 5) {
+  if ((unsigned int)ecx_1 &lt;= 4) {              |     uVar1 = *(uint *)(&amp;DAT_001000b4 + (ulong)uVar2 * 4);
+    eax_1 = lookup_14[(unsigned long)(unsigned int)ecx_1]; |   }
+  }                                            |   return uVar1;
+  return eax_1;                                | }
+}                                              |
+</code></pre></div>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Difference</th>
+<th>Instruction or guess</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>param_1 / 10 - 6</code> in both</td>
+<td>Instruction. Both recognized the <code>0x66666667</code> idiom.</td>
+</tr>
+<tr>
+<td><code>uVar1 = -(param_1 &gt;&gt; 0x1f) ^ (uint)(... &gt;&gt; 0x3f)</code> against <code>eax_1 = 0</code></td>
+<td>Instruction <code>xorl %eax, %eax</code> at <code>grade+0x1a</code>. The register is zero. Ghidra expressed the <code>xor</code> as the sign of <code>param_1</code> exclusive-or the sign bit of the product, two spellings of the same bit, and did not cancel them. The value is 0 for every <code>int</code>, and the test proves it over 141 scores. A reader who trusts the text believes the default depends on the score.</td>
+</tr>
+<tr>
+<td><code>uVar2 &lt; 5</code> against <code>(unsigned int)ecx_1 &lt;= 4</code></td>
+<td>Instruction <code>cmpl $0x4, %ecx</code> then <code>ja</code>. Same condition. Ghidra typed <code>uVar2</code> as <code>uint</code>, we cast at the use.</td>
+</tr>
+<tr>
+<td><code>*(uint *)(&amp;DAT_001000b4 + (ulong)uVar2 * 4)</code> against <code>lookup_14[...]</code></td>
+<td>Instruction plus relocation. Ghidra loaded the object with <code>.rodata</code> at <code>0x001000a0</code>, so <code>0x001000b4</code> is <code>.rodata + 0x14</code>. It applied the relocation and kept a byte address. We named the table and read its five values.</td>
+</tr>
+<tr>
+<td><code>uint</code> return against <code>int</code></td>
+<td>Guess on both sides. The instructions only say 32 bits.</td>
+</tr>
+</tbody>
+</table></div>
+<h3>total</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">lifter                                         | ghidra
+-----------------------------------------------+-----------------------------------------------
+int total(int *param_1, int param_2)           | int total(long param_1,uint param_2)
+{                                              | {
+  int eax_1;                                   |   int iVar1;
+  int ecx_1;                                   |   ulong uVar2;
+  long rdx_1;                                  |   
+                                               |   if (0 &lt; (int)param_2) {
+  if (param_2 &lt;= 0) {                          |     uVar2 = 0;
+    return 0;                                  |     iVar1 = 0;
+  }                                            |     do {
+  ecx_1 = param_2;                             |       iVar1 = iVar1 + *(int *)(param_1 + uVar2 * 4);
+  rdx_1 = 0;                                   |       uVar2 = uVar2 + 1;
+  eax_1 = 0;                                   |     } while (param_2 != uVar2);
+  do {                                         |     return iVar1;
+    eax_1 = eax_1 + param_1[rdx_1];            |   }
+    rdx_1 = rdx_1 + 1;                         |   return 0;
+  } while ((unsigned long)(unsigned int)ecx_1 != rdx_1); | }
+  return eax_1;                                |
+}                                              |
+</code></pre></div>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Difference</th>
+<th>Instruction or guess</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>int *param_1</code> against <code>long param_1</code></td>
+<td>Inference on our side from <code>addl (%rdi,%rdx,4), %eax</code>. Ghidra kept the width.</td>
+</tr>
+<tr>
+<td><code>uint param_2</code> and <code>(int)param_2</code> against <code>int param_2</code></td>
+<td>Ghidra chose unsigned because <code>cmpq %rdx, %rcx</code> compares the zero-extended count. We kept <code>int</code> and cast at the compare.</td>
+</tr>
+<tr>
+<td><code>do { } while</code> in both</td>
+<td>Instruction <code>jne 0x50</code> from the block to itself. The compiler rotated the loop. The <code>-O0</code> object keeps the <code>while</code>.</td>
+</tr>
+<tr>
+<td><code>ecx_1 = param_2</code> kept against <code>param_2 != uVar2</code></td>
+<td>Our substitution rule stays inside one block. The copy <code>movl %esi, %ecx</code> is in the setup block and the compare is in the loop, so the variable stays. Ghidra propagated it.</td>
+</tr>
+<tr>
+<td><code>(unsigned long)(unsigned int)ecx_1</code></td>
+<td>Instruction. <code>movl %esi, %ecx</code> zero-extends, and the 64-bit compare reads the full register.</td>
+</tr>
+</tbody>
+</table></div>
+<p>The behaviour test compiles the Ghidra text for <code>grade</code> and <code>total</code> unchanged. It adds two <code>typedef</code> lines and a definition of <code>DAT_001000b4</code> from the twenty bytes at <code>.rodata+0x14</code>. Both functions match the source over the grid.</p>
+<h2>What the Research Says About Reading Pseudocode</h2>
+<p>LLM4Decompile (EMNLP 2024) measured Ghidra alone at 20.12 percent re-executability on HumanEval-Decompile. About one in five functions recompiled and passed the assertions that come with the benchmark. Refining Ghidra's output with their 6.7B model raised that to 52.74 percent. DecompileBench (Findings of ACL 2025) ran six industrial decompilers and six LLM approaches on 23,400 functions from 130 programs. The LLM outputs read better and had 52.2 percent lower functionality correctness.</p>
+<p>Liu, Raff, and Micinski (arXiv 2609.05370, September 2026) explain the gap. They used 300 GitHub library functions and 287 CVE-grounded functions. The strongest refinement model raised Ghidra's build rate from 75 to 90 percent while the behavioural match rate fell from 74 to 62 percent. Candidates that passed every test in the benchmark still diverged on fuzzed inputs. That happened in 4.9 percent of cases across eight systems, and in up to 13 percent for one system. Up to one tenth of disclosed vulnerabilities disappeared from the refined code.</p>
+<p>The cause they trace is simple. Invented fields, types, callees, and guards replaced the visible unknowns that the decompiler had left in the text.</p>
+<p>This is the reason the lifter prints <code>(unsigned long)(unsigned int)ecx_1</code> instead of a prettier name. It prints a note instead of a <code>switch</code> for the unresolved jump, and <code>lookup_14</code> instead of a label a model would invent. Every line has a derivation you can read in <code>code/main.py</code>. Ghidra's <code>undefined1 [16]</code> is ugly and honest. A refinement model's clean <code>int percent_change(int, int)</code> is right for the wrong reason. The same model will produce a clean wrong signature on the next function.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>SSA.</strong> Each definition gets a fresh name; where control flow joins, a <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ϕ</span></span></span></span> function selects the value from the edge taken:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">ϕ</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord text"><span class="mord"> from </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord text"><span class="mord"> from </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div>
+<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ϕ</span></span></span></span> nodes are placed at the dominance frontier of each block that defines <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span>.</p>
+<p><strong>Division by a constant.</strong> Compilers replace <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌊</span><span class="mord mathnormal">n</span><span class="mord">/</span><span class="mord mathnormal">d</span><span class="mclose">⌋</span></span></span></span> with a multiply and shifts. For signed 32-bit <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span>, magic <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span></span></span></span> and shift <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>,
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="delimsizing size2">⌊</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">32</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight">s</span></span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">⌋</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">[</span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">0</span><span class="mclose">]</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1771em;vertical-align:-0.686em;"></span><span class="mord"><span class="delimsizing size2">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">d</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">32</span><span class="mbin mtight">+</span><span class="mord mathnormal mtight">s</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">⌉</span></span><span class="mord">.</span></span></span></span></span></div>
+For <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span></span></span></span>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6111em;"></span><span class="mord text"><span class="mord texttt">0x66666667</span></span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>, because <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">34</span></span></span></span></span></span></span></span></span><span class="mord">/10</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1717986918.4</span></span></span></span> rounds up to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1717986919</span></span></span></span>.</p>
+<p><strong>Correct pseudocode</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span></span></span></span> for machine function <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span></span></span></span> means <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">∀</span><span class="mord mathnormal">x</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">F</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span></span></span></span> under the machine's semantics, including 32-bit wrap-around. Testing samples that set; Lesson 13.36 proves it.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Undoing the magic multiply in `grade`</div><div class="co-body"><ul>
+<li>The <code>-O1</code> code computes <code>score * 0x66666667</code>, keeps the high 32 bits, shifts right by 2 more, and adds the sign bit.</li>
+<li>Take <code>score = 95</code>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">95</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1717986919</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">163208757305</span></span></span></span>; divided by <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord">2</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">34</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">17179869184</span></span></span></span> that is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9.5</span></span></span></span>, floor <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span></span></span></span>; the sign bit is 0, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">9</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">95/10</span></span></span></span>.</li>
+<li>The lifter's <code>magic_divisor(0x66666667, 34)</code> returns 10, so it prints <code>param_1 / 10</code>.</li>
+<li>Then <code>9 - 6 = 3</code>, an unsigned compare <code>3 &lt;= 4</code> passes, and <code>lookup_14[3] = 4</code>: <code>grade(95) = 4</code>.</li>
+<li>For <code>score = 110</code>: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">11</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">11</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">6</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">5</span></span></span></span>, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6835em;vertical-align:-0.0391em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span> gives 0, which is why the original returns 0 for 110, although the C source's <code>case 10:</code> might suggest 110 is an A.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Pseudocode is the original source, recovered."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It is a hypothesis built from the bytes; names, types and structure are reconstructed.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "If the pseudocode compiles, it is correct."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It must also behave the same; compile and compare on inputs, including overflow and edge cases.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "C pseudocode has the same overflow behavior as the machine code."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Signed overflow is undefined in C; compile with wrap-around semantics (<code>-fwrapv</code>) to compare.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A lifter that works on one compiler's output works on all."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> New instructions and idioms stop it at the first stage.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The lesson's lifter was built and tested on clang's <code>-O1</code> object. What will happen when it is given the same source compiled by GCC 13 on Ubuntu, first with default flags and then with <code>-fcf-protection=none</code>? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lifter on code from another compiler</div><div class="co-body"><p><code>lift_function</code> from <code>code/main.py</code> on the clang fixture and on two fresh GCC <code>-O1</code> builds of <code>ledger.c</code>. Each function either produces pseudocode (shown on one line) or stops with the decoder's error. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Off the fixture: the lesson's eight-stage lifter (code/main.py) on objects built by this machine's GCC,
+# with and without Intel CET, next to its output for the clang fixture it was written for.
+import subprocess, tempfile, pathlib
+from main import read_object, lift_function, FIXTURES, DecodeError
+tmp = pathlib.Path(tempfile.mkdtemp())
+builds = {&quot;clang -O1 (fixture)&quot;: FIXTURES / &quot;ledger-x86_64-O1.o&quot;}
+for label, flags in ((&quot;gcc -O1&quot;, []), (&quot;gcc -O1 -fcf-protection=none&quot;, [&quot;-fcf-protection=none&quot;])):
+    out = tmp / (label.replace(&quot; &quot;, &quot;_&quot;).replace(&quot;=&quot;, &quot;&quot;) + &quot;.o&quot;)
+    subprocess.run([&quot;gcc&quot;, &quot;-O1&quot;, &quot;-c&quot;, &quot;-fno-asynchronous-unwind-tables&quot;, *flags, str(FIXTURES / &quot;ledger.c&quot;), &quot;-o&quot;, str(out)], check=True)
+    builds[label] = out
+for label, path in builds.items():
+    obj = read_object(path)
+    print(f&quot;== {label}&quot;)
+    for name in (&quot;percent_change&quot;, &quot;grade&quot;, &quot;total&quot;):
+        try:
+            lifted = lift_function(obj, name)
+            body = &quot; &quot;.join(l.strip() for l in lifted.pseudocode.splitlines()[2:-1] if l.strip())
+            print(f&quot;   {name:&lt;15} lifted: {body[:110]}{'...' if len(body) &gt; 110 else ''}&quot;)
+        except DecodeError as e:
+            print(f&quot;   {name:&lt;15} stopped at stage 1: {e}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">== clang -O1 (fixture)
+   percent_change  lifted: if (param_1 == 0) { return 0; } return (param_2 - param_1) * 100 / param_1;
+   grade           lifted: int eax_1; int ecx_1; ecx_1 = param_1 / 10 - 6; eax_1 = 0; if ((unsigned int)ecx_1 &lt;= 4) { eax_1 = lookup_14[(...
+   total           lifted: int eax_1; int ecx_1; long rdx_1; if (param_2 &lt;= 0) { return 0; } ecx_1 = param_2; rdx_1 = 0; eax_1 = 0; do { ...
+== gcc -O1
+   percent_change  stopped at stage 1: 0x0: opcode f3 is outside the fixture subset
+   grade           stopped at stage 1: 0x13: opcode f3 is outside the fixture subset
+   total           stopped at stage 1: 0x66: opcode f3 is outside the fixture subset
+== gcc -O1 -fcf-protection=none
+   percent_change  lifted: int eax_1; eax_1 = param_1; if (param_1 != 0) { eax_1 = (param_2 - param_1) * 100 / param_1; } return eax_1;
+   grade           stopped at stage 1: 0x2e: opcode ba is outside the fixture subset
+   total           stopped at stage 1: 0x6c: opcode ba is outside the fixture subset</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>On its own fixture the lifter is fluent.</strong> For the clang object it produces the three readable functions shown in the lesson, including <code>param_1 / 10</code> recovered from the magic multiply.</p>
+<p><strong>Default GCC stops it immediately.</strong> Every function begins with <code>endbr64</code> (<code>f3 0f 1e fa</code>), which is outside the decoder's fixture subset, so stage 1 fails at the first byte of each function and no later stage runs.</p>
+<p><strong>Without CET, one function gets through.</strong> With <code>-fcf-protection=none</code>, <code>percent_change</code> lifts, and the pseudocode is shaped differently from clang's (GCC computes into <code>eax</code> and returns once), although it means the same. <code>grade</code> and <code>total</code> stop at opcode <code>ba</code> (<code>mov $imm32, %edx</code>), an instruction clang did not use here.</p>
+<p>This is the normal life of a lifter: correctness on its fixtures, gaps on new code. Each gap is a fixture to add.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Pseudocode on trial: lesson, Ghidra and the original</div><div class="co-body"><p>This block continues from the one above. The lesson's pseudocode and Ghidra 12.1.4's text (with the lesson's minimal repairs so it compiles) are compiled with <code>-fwrapv</code> into shared libraries; the original clang object is linked into a third. <code>ctypes</code> calls all three on edge inputs and on 2,000 random arrays for <code>total</code>. About a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above. Is the pseudocode right? Compile the lesson's output and Ghidra's
+# (minimally repaired) text, load both next to the original clang object, and run all three on edge inputs.
+import ctypes, random
+obj = read_object(FIXTURES / &quot;ledger-x86_64-O1.o&quot;)
+lesson_c = &quot;static const int lookup_14[5] = {1, 2, 3, 4, 4};\n&quot; + &quot;\n&quot;.join(
+    lift_function(obj, n).pseudocode.replace(f&quot;{n}(&quot;, f&quot;lesson_{n}(&quot;, 1) for n in (&quot;percent_change&quot;, &quot;grade&quot;, &quot;total&quot;))
+(tmp / &quot;lesson.c&quot;).write_text(lesson_c)
+(tmp / &quot;ghidra.c&quot;).write_text(&quot;#define percent_change ghidra_percent_change\n#define grade ghidra_grade\n#define total ghidra_total\n&quot;
+                              + (FIXTURES / &quot;ghidra&quot; / &quot;ledger-x86_64-O1.ghidra-repaired.c&quot;).read_text())
+libs = {}
+for name, srcs in ((&quot;original&quot;, [str(FIXTURES / &quot;ledger-x86_64-O1.o&quot;)]), (&quot;lesson&quot;, [str(tmp / &quot;lesson.c&quot;)]), (&quot;ghidra&quot;, [str(tmp / &quot;ghidra.c&quot;)])):
+    so = tmp / f&quot;{name}.so&quot;
+    subprocess.run([&quot;gcc&quot;, &quot;-O0&quot;, &quot;-shared&quot;, &quot;-fPIC&quot;, &quot;-fwrapv&quot;, *srcs, &quot;-o&quot;, str(so)], check=True)
+    libs[name] = ctypes.CDLL(str(so))
+def fn(lib, base):
+    f = getattr(libs[lib], base if lib == &quot;original&quot; else f&quot;{lib}_{base}&quot;); f.restype = ctypes.c_int; return f
+
+cases = {&quot;percent_change&quot;: [(100, 150), (200, 100), (0, 5), (1, 30_000_000), (-7, 2_000_000_000), (3, -3)],
+         &quot;grade&quot;: [(s,) for s in (-25, 0, 59, 60, 95, 100, 109, 110, 115, -2_147_483_648)]}
+for base, args in cases.items():
+    print(base)
+    for a in args:
+        vals = [fn(lib, base)(*map(ctypes.c_int, a)) for lib in (&quot;original&quot;, &quot;lesson&quot;, &quot;ghidra&quot;)]
+        print(f&quot;   {str(a):&lt;22} original {vals[0]:&gt;11}  lesson {vals[1]:&gt;11}  ghidra {vals[2]:&gt;11}  {'' if len(set(vals)) == 1 else '&lt;- differs'}&quot;)
+random.seed(0); bad = {&quot;lesson&quot;: 0, &quot;ghidra&quot;: 0}
+for _ in range(2000):
+    n = random.randint(0, 20); arr = (ctypes.c_int * max(n, 1))(*[random.randint(-10**9, 10**9) for _ in range(max(n, 1))])
+    ref = fn(&quot;original&quot;, &quot;total&quot;)(arr, n)
+    for lib in bad: bad[lib] += fn(lib, &quot;total&quot;)(arr, n) != ref
+print(&quot;total, 2000 random arrays (with overflow):&quot;, {k: f&quot;{2000 - v}/2000 equal&quot; for k, v in bad.items()})
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">percent_change
+   (100, 150)             original          50  lesson          50  ghidra          50  
+   (200, 100)             original         -50  lesson         -50  ghidra         -50  
+   (0, 5)                 original           0  lesson           0  ghidra           0  
+   (1, 30000000)          original -1294967396  lesson -1294967396  ghidra -1294967396  
+   (-7, 2000000000)       original   266208887  lesson   266208887  ghidra   266208887  
+   (3, -3)                original        -200  lesson        -200  ghidra        -200  
+grade
+   (-25,)                 original           0  lesson           0  ghidra           0  
+   (0,)                   original           0  lesson           0  ghidra           0  
+   (59,)                  original           0  lesson           0  ghidra           0  
+   (60,)                  original           1  lesson           1  ghidra           1  
+   (95,)                  original           4  lesson           4  ghidra           4  
+   (100,)                 original           4  lesson           4  ghidra           4  
+   (109,)                 original           4  lesson           4  ghidra           4  
+   (110,)                 original           0  lesson           0  ghidra           0  
+   (115,)                 original           0  lesson           0  ghidra           0  
+   (-2147483648,)         original           0  lesson           0  ghidra           0  
+total, 2000 random arrays (with overflow): {&#x27;lesson&#x27;: &#x27;2000/2000 equal&#x27;, &#x27;ghidra&#x27;: &#x27;2000/2000 equal&#x27;}</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>All three agree on every case.</strong> On ordinary inputs and on the awkward ones (a product that overflows 32 bits, a score of 110, the most negative <code>int</code>), the lesson's pseudocode and Ghidra's repaired text return exactly what the original machine code returns, and <code>total</code> matches on 2,000 random arrays whose sums overflow.</p>
+<p><strong>The awkward cases are the point.</strong> <code>percent_change(1, 30000000)</code> is -1294967396 because <code>(after - before) * 100</code> wraps at 32 bits; a "cleaner" rewrite using a 64-bit product would return 2999999900 and silently differ. <code>grade(110)</code> is 0, not 4.</p>
+<p><strong><code>-fwrapv</code> matters.</strong> In C, signed overflow is undefined, so a compiler may assume it never happens and generate code that differs from the original's wrap-around. Compiling the pseudocode with <code>-fwrapv</code> gives it the machine's two's-complement semantics, so the comparison is fair. Ghidra's unrepaired text (<code>undefined1 [16]</code> returns) does not compile at all, which is why the lesson ships the minimal repair.</p></div></aside>
+<h2>Build it</h2>
+<p>Run the demo:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/34-lifting-to-pseudocode
+python3 code/main.py
+</code></pre></div>
+<p>The demo decodes all four functions of the <code>-O1</code> object and compares every instruction with the committed <code>llvm-objdump</code> text. For <code>percent_change</code>, <code>grade</code>, and <code>total</code> it prints the IR before SSA, the SSA listing with phi functions, and the pseudocode next to the Ghidra text. Then it prints <code>grade</code> with division recognition switched off, the <code>-O0</code> versions of <code>percent_change</code>, <code>total</code>, and <code>grade_label</code>, and a summary:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;functions&quot;: [&quot;grade&quot;, &quot;grade_label&quot;, &quot;percent_change&quot;, &quot;total&quot;],
+  &quot;instructions&quot;: 56,
+  &quot;blocks&quot;: {&quot;percent_change&quot;: 3, &quot;grade&quot;: 3, &quot;total&quot;: 5, &quot;grade_label&quot;: 4},
+  &quot;phis&quot;: {&quot;percent_change&quot;: 0, &quot;grade&quot;: 1, &quot;total&quot;: 2, &quot;grade_label&quot;: 1},
+  &quot;objdumpDifferences&quot;: 0
+}
+</code></pre></div>
+<p>Read <code>code/main.py</code> in this order:</p>
+<ol>
+<li><code>read_object()</code> reads section headers, the symbol table, and the <code>.rela</code> sections of an ELF64 relocatable object.</li>
+<li><code>decode_one()</code> and <code>render_att()</code> decode one instruction and print it the way <code>llvm-objdump</code> does.</li>
+<li><code>build_blocks()</code>, <code>immediate_dominators()</code>, and <code>dominance_frontiers()</code> build the graph facts.</li>
+<li><code>lift_insn()</code> turns one instruction into IR statements and resolves relocations.</li>
+<li><code>insert_phis()</code> and <code>rename()</code> build SSA and insert width casts.</li>
+<li><code>make_simplifier()</code>, <code>substitute_once()</code>, and <code>remove_dead_code()</code> run inside <code>optimize()</code>.</li>
+<li><code>collect_params()</code>, <code>coalesce_webs()</code>, and <code>infer_types()</code> name and type the webs.</li>
+<li><code>structure()</code> with <code>post_dominators()</code> and <code>natural_loops()</code> emits the C body.</li>
+<li><code>lift_function()</code> ties the stages together and <code>lift_all()</code> lifts a whole object with callee signatures.</li>
+</ol>
+<h2>Use it: the same idea with real libraries</h2>
+<p>To lift a function from your own object, build it with <code>clang -target x86_64-unknown-linux-gnu -c</code> and call <code>lift_all(read_object(path))</code>. When the decoder raises <code>DecodeError</code>, read the opcode byte from the message and find it in the SDM opcode map. Then add one entry to the tables at the top of the file. When the lifter raises on a mnemonic, add one rule to <code>lift_insn()</code>. When the structurer emits a <code>goto</code>, print the graph with <code>IrPrinter</code> and decide which shape rule is missing. Each addition is small and each one is checked against <code>llvm-objdump</code> or clang by the existing tests.</p>
+<p>When Ghidra is installed, run rea on the same function and place the two texts side by side. Fill the difference table before you believe either text. A difference with an instruction behind it is a presentation choice. A difference with no instruction behind it is a guess, and the guess can be on either side.</p>
+<h2>Interactive Lab</h2>
+<h3>Lab A: one function through five stages</h3>
+<p>From the <code>code</code> directory, open Python:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/34-lifting-to-pseudocode/code
+python3 -q
+</code></pre></div>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from main import *
+obj = read_object(FIXTURES / &quot;ledger-x86_64-O1.o&quot;)
+lifted = lift_function(obj, &quot;percent_change&quot;)
+for insn in lifted.decoded: print(f&quot;0x{insn.address:x}: {insn.raw.hex(' ')}  {insn.att()}&quot;)
+print(lifted.ir_text)
+print(lifted.ssa_text)
+print(lifted.pseudocode)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">0x0: 85 ff  testl	%edi, %edi
+0x2: 74 09  je	0xd
+0x4: 29 fe  subl	%edi, %esi
+0x6: 6b c6 64  imull	$0x64, %esi, %eax
+0x9: 99  cltd
+0xa: f7 ff  idivl	%edi
+0xc: c3  retq
+0xd: 31 c0  xorl	%eax, %eax
+0xf: c3  retq
+block 0x0 -&gt; 0xd, 0x4
+  flags = test(edi, edi)
+  if je(flags) goto 0xd else goto 0x4
+block 0x4 -&gt; exit
+  flags = cmp(esi, edi)
+  esi = esi - edi
+  eax = esi * 100
+  edx = signfill(eax)
+  dividend = edx:eax
+  eax = dividend / edi
+  edx = dividend % edi
+  return rax
+block 0xd -&gt; exit
+  eax = 0
+  return rax
+block 0x0 -&gt; 0xd, 0x4
+  flags_1 = test(edi_0, edi_0)
+  if je(flags_1) goto 0xd else goto 0x4
+block 0x4 -&gt; exit
+  flags_2 = cmp(esi_0, edi_0)
+  esi_1 = esi_0 - edi_0
+  eax_1 = esi_1 * 100
+  edx_1 = signfill(eax_1)
+  dividend_1 = edx_1:eax_1
+  eax_2 = dividend_1 / edi_0
+  edx_2 = dividend_1 % edi_0
+  return eax_2
+…
+(10 more lines)</code></pre></div></div></aside>
+<p>Follow <code>%esi</code> from <code>subl %edi, %esi</code> to <code>esi_1 = esi_0 - edi_0</code> to <code>(param_2 - param_1)</code>. The byte <code>fe</code> is the ModR/M of the <code>subl</code>, with <code>mod = 11</code>, <code>reg = edi</code>, and <code>r/m = esi</code>.</p>
+<h3>Lab B: the division idiom</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">print(lift_function(obj, &quot;grade&quot;, recognize_division=False).pseudocode)
+print(magic_divisor(0x66666667, 34), magic_divisor(0x66666667, 33), magic_divisor(0x66666667, 31))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">int grade(int param_1)
+{
+  int eax_1;
+  int ecx_1;
+  long rax_1;
+
+  rax_1 = (long)param_1 * 0x66666667;
+  ecx_1 = (int)(rax_1 &gt;&gt; 34) + (int)((unsigned long)rax_1 &gt;&gt; 63) - 6;
+  eax_1 = 0;
+  if ((unsigned int)ecx_1 &lt;= 4) {
+    eax_1 = lookup_14[(unsigned long)(unsigned int)ecx_1];
+  }
+  return eax_1;
+}
+10 5 None</code></pre></div></div></aside>
+<p>The first line prints the raw multiply and shifts. The second prints <code>10 5 None</code>. Work out why the same multiplier divides by 5 with one shift less, and why shift 31 fails the error bound.</p>
+<h3>Lab C: a new object stops the decoder</h3>
+<p>Build the fixture at <code>-O2</code> and lift it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">clang -target x86_64-unknown-linux-gnu -O2 -fno-asynchronous-unwind-tables -c fixtures/ledger.c -o &quot;$TMPDIR/ledger-O2.o&quot;
+python3 -c 'from main import *; from pathlib import Path; import os; lift_all(read_object(Path(os.environ[&quot;TMPDIR&quot;]) / &quot;ledger-O2.o&quot;))'
+</code></pre></div>
+<p>The decoder stops at <code>0x56</code> with <code>opcode 81 is outside the fixture subset</code>. Opcode <code>81</code> is the group 1 form with a 32-bit immediate. The instruction is <code>andl $0x7ffffff8, %edx</code>, and clang used it in the vectorized loop of <code>total</code>. Add it beside <code>0x83</code> in <code>decode_one()</code>, rerun, and note which opcode stops you next. The subset grows one entry at a time, and each entry is checked against <code>llvm-objdump</code>.</p>
+<h3>Lab D: Ghidra's default value in grade</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">print(ghidra_pseudocode(&quot;grade&quot;))
+for score in (-25, 0, 59, 60, 100, 115):
+    sign = -(score &gt;&gt; 31)
+    product_sign = ((score * 0x66666667) &amp; ((1 &lt;&lt; 64) - 1)) &gt;&gt; 63
+    print(score, sign ^ product_sign)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">uint grade(int param_1)
+
+{
+  uint uVar1;
+  uint uVar2;
+  
+  uVar2 = param_1 / 10 - 6;
+  uVar1 = -(param_1 &gt;&gt; 0x1f) ^ (uint)((ulong)((long)param_1 * 0x66666667) &gt;&gt; 0x3f);
+  if (uVar2 &lt; 5) {
+    uVar1 = *(uint *)(&amp;DAT_001000b4 + (ulong)uVar2 * 4);
+  }
+  return uVar1;
+}
+-25 0
+0 0
+59 0
+60 0
+100 0
+115 0</code></pre></div></div></aside>
+<p>Every row prints 0. Ghidra's <code>uVar1</code> expression is correct and unreadable, and the instruction <code>xorl %eax, %eax</code> says it in two bytes.</p>
+<h2>Practice Lab</h2>
+<p>Add <code>switch</code> recovery for <code>grade</code> at <code>-O0</code>.</p>
+<p>Requirements:</p>
+<ul>
+<li>Read the five relocations in <code>.rela.rodata</code> of <code>ledger-x86_64-O0.o</code>, each <code>R_X86_64_PC32.text+offset</code>, and compute the five case targets from the table at <code>.rodata+0x0</code>.</li>
+<li>Add a <code>Switch</code> terminator to the IR with the index expression, the target list, and the default from the <code>ja</code> before the table load.</li>
+<li>Give the switch block one successor per target so that dominators, post-dominators, and SSA keep working.</li>
+<li>Emit <code>switch (local_10) { case 0:... }</code> with one <code>case</code> per target and the shared epilogue after the join.</li>
+<li>Keep the note for any indirect jump whose table you cannot bound.</li>
+<li>Compile the result with clang and compare it with the source over the score grid in the tests.</li>
+</ul>
+<p>Success means <code>grade</code> at <code>-O0</code> and <code>grade</code> at <code>-O1</code> produce the same output over the grid, with one <code>switch</code> and no <code>goto</code>.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1334-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · It stops at stage 1, twice</span></summary><div class="qa-a"><p>With default flags it stops at stage 1 for every function: Ubuntu's GCC puts <code>endbr64</code> at each function entry, and the decoder only knows the instructions in its clang fixtures, so it raises <code>DecodeError</code> on the first byte. With <code>-fcf-protection=none</code> there is no <code>endbr64</code>; <code>percent_change</code> then lifts correctly, but <code>grade</code> and <code>total</code> stop at a <code>mov $imm32, %edx</code> (opcode <code>ba</code>) that clang never emitted in the fixture. Nothing is wrong with the lifter's logic; its stage 1 simply has not seen these encodings.</p></div></details>
+<details class="qa" id="a1334-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Readable is not equivalent</span></summary><div class="qa-a"><p>That the rewrite has the same behaviour on all inputs, not just two. The original, compiled from <code>switch (score / 10)</code> with <code>case 10: case 9:</code>, returns 4 for 90 to 109, 0 for 110 and above, and 0 for every negative score (where C's division truncates toward zero). A model that "simplifies" to <code>if (score &gt;= 90) return 4;</code> returns 4 for 110 and for 1000; one that writes <code>score / 10</code> with unsigned types changes negative scores. Two hand-picked tests miss all of these.</p>
+<p>Check by compiling the rewrite and running it against the original (or the lifted code) on a grid of edge values (negatives, 0, each band boundary, 100, 109, 110, <code>INT_MIN</code>, <code>INT_MAX</code>) with <code>-fwrapv</code>, and, when it matters, prove equivalence with a solver, as Lesson 13.36 does. Readability is welcome only after equivalence.</p></div></details>
+<h2>Graded Lab</h2>
+<p>Five questions about the fixtures of this lesson. Find each answer with the code you built, then write it into <code>code/lab_answers.json</code>. Write numbers as numbers or as hex strings such as <code>"0x40"</code>, and lists as JSON lists.</p>
+<ol>
+<li><code>t1</code>: parameters that the calling convention gives percent_change at -O1.</li>
+<li><code>t2</code>: phi functions in the SSA form of total at -O1.</li>
+<li><code>t3</code>: the divisor that magic_divisor finds for 0x66666667 with shift 34.</li>
+<li><code>t4</code>: the last statement of the percent_change pseudocode at -O1, as one line of text.</li>
+<li><code>t5</code>: the recovered C type of param_1 of total at -O1.</li>
+</ol>
+<p>Check your answers:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/34-lifting-to-pseudocode
+python3 code/lab.py
+</code></pre></div>
+<p>The checker computes each expected value from <code>code/main.py</code> on the committed fixtures. It prints <code>PASS</code>, <code>FAIL</code> or <code>TODO</code> for each task and a score, and it exits 0 only when all five pass. <code>python3 code/lab.py my-answers.json</code> checks another file. <code>code/tests/test_lab.py</code> proves that the checker accepts the right answers and rejects a wrong one.</p>
+<h3>See it run</h3>
+<p>The <a href="https://aiengineeringfromscratch.com/inside-a-decompiler?opt=O0">Inside a Decompiler</a> machine runs this lesson as its lift press, type pins, structuring jig and printer, with the IR, SSA and pseudocode that <code>code/main.py</code> prints. This link opens the <code>-O0</code> object: three stack slots become locals and the jig closes both jaws for the if/else.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An LLM is asked to "clean up" the lifter's <code>grade</code> pseudocode. It returns a readable <code>switch (score / 10) { case 10: case 9: return 4; ... }</code> and says the function is now "equivalent and clearer". The tests <code>grade(95) == 4</code> and <code>grade(55) == 0</code> pass. What should you check before accepting it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Decompilers in production</strong>: Ghidra (free, NSA; version 12.x in 2026), IDA Pro with Hex-Rays, Binary Ninja, angr's decompiler and RetDec. They share the pipeline shown here: lifting to an IR (P-code, Microcode, BNIL, VEX), SSA, simplification, type recovery and structuring.</li>
+<li><strong>LLM refinement</strong>: LLM4Decompile and similar models rewrite decompiler output into more readable C; studies in 2024-2026 found higher compile rates but behaviour mismatches hidden by small test suites, which is why execution and proof checks matter.</li>
+<li><strong>Checking pseudocode</strong>: recompile and differential-test against the original (this lesson), then prove equivalence where possible (Lesson 13.36).</li>
+<li><strong>On your laptop</strong>: Ghidra runs on the CPU with 16 GB RAM; a 6.7B refinement model needs 4-bit quantization to fit the RTX 4060's 8 GB.</li>
+</ul>
+<p>Sources: <a href="https://github.com/NationalSecurityAgency/ghidra">Ghidra</a>, <a href="https://arxiv.org/abs/2403.05286">LLM4Decompile (EMNLP 2024)</a>, <a href="https://en.wikipedia.org/wiki/Hacker%27s_Delight">Hacker's Delight, ch. 10 (division by constants)</a>, <a href="https://gcc.gnu.org/onlinedocs/gcc/Code-Gen-Options.html">GCC <code>-fwrapv</code></a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Eight stages: decode, blocks, lift, parameters, SSA, simplify, types, structure.</li>
+<li>Every stage can lose or invent facts; keep visible unknowns instead of guesses.</li>
+<li>Recognize compiler idioms such as magic-number division.</li>
+<li>Check pseudocode by running it against the original, with wrap-around semantics and edge inputs.</li>
+<li>A lifter tested on one compiler fails early on another; widen the fixtures.</li>
+</ul></div></aside>
+<h2>Artifact</h2>
+<p>This lesson produces <code>outputs/skill-lifting-to-pseudocode.md</code>. Use it to lift one function with a derivation for every line and to fill the difference table against a decompiler's text. The artifact requires the reference disassembly, the relocations, the calling convention, the compile check, the behaviour comparison, and a verdict for every differing line.</p>
+<h2>Verify It</h2>
+<p>Run the demo and the deterministic suite:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/34-lifting-to-pseudocode
+python3 code/main.py
+python3 -m unittest discover -s code/tests -v
+</code></pre></div>
+<p>The suite has 25 tests. Verification proves:</p>
+<ul>
+<li>the decoder agrees with the committed <code>llvm-objdump</code> text on every instruction of both objects, and with a live <code>llvm-objdump</code> when it is installed</li>
+<li>REX, ModR/M, SIB, and the displacement field offset of <code>leaq (%rip), %rcx</code> are decoded as the SDM describes</li>
+<li>an opcode outside the subset raises <code>DecodeError</code> instead of guessing</li>
+<li>the ELF reader lists the four functions and the three <code>.text</code> relocations</li>
+<li><code>total</code> has five blocks, <code>0x44</code> dominates <code>0x50</code>, and <code>0x50</code> is a loop header with itself as the body</li>
+<li><code>%rdi</code> and <code>%rsi</code> become <code>param_1</code> and <code>param_2</code>, and <code>param_1</code> in <code>total</code> is <code>int *</code></li>
+<li><code>test</code> and <code>cmp</code> with <code>je</code>, <code>jle</code>, <code>ja</code>, and <code>jge</code> become <code>==</code>, <code>&lt;=</code>, unsigned <code>&gt;</code>, and <code>&lt;</code></li>
+<li>SSA places two live phi functions at the loop header of <code>total</code> and none in <code>percent_change</code></li>
+<li>the pseudocode of <code>percent_change</code>, <code>grade</code>, and <code>total</code> equals the expected text</li>
+<li><code>grade</code> reads <code>param_1 / 10 - 6</code> with recognition on and the raw multiply with recognition off</li>
+<li><code>0x66666667</code> with shift 34 divides by 10, with shift 33 divides by 5, and the identity holds on the grid</li>
+<li>stack slots at <code>-O0</code> become <code>local_4</code>, <code>local_8</code>, <code>local_c</code>, and the frame pointer never appears</li>
+<li>the table at <code>.rodata+0x14</code> reads <code>1, 2, 3, 4, 4</code> through the relocation</li>
+<li>the indirect jump in <code>grade</code> at <code>-O0</code> is reported with its four unlifted blocks</li>
+<li>the Ghidra fixtures contain the 16-byte return, the <code>param_3</code>, the unsimplified <code>xor</code>, and the <code>long param_1</code></li>
+<li>the six emitted units compile with <code>clang -std=c11 -Wall -Werror</code> for <code>x86_64-unknown-linux-gnu</code></li>
+<li>the lifted functions, the repaired Ghidra text, and the source print the same 232 lines over the input grid</li>
+</ul>
+<h2>Production Failure Modes</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>What the weak reading reports</th>
+<th>What the derivation must show</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Decompiler widens the return value</td>
+<td>"returns a 16-byte struct"</td>
+<td><code>idivl</code> writes <code>%rdx</code>, and no caller fixes the width</td>
+</tr>
+<tr>
+<td>Decompiler adds a parameter</td>
+<td>"takes three arguments"</td>
+<td>The register is read on one path only because the return width was guessed</td>
+</tr>
+<tr>
+<td>Idiom goes unrecognized</td>
+<td>"multiplies by a magic constant"</td>
+<td>The multiplier is the ceiling of <code>2^s / d</code> and the error bound holds</td>
+</tr>
+<tr>
+<td>Idiom is recognized and a <code>xor</code> is lost</td>
+<td>"default depends on the input"</td>
+<td><code>xorl %eax, %eax</code> writes zero, two spellings of one bit cancel</td>
+</tr>
+<tr>
+<td>Pointer typed as integer</td>
+<td>"takes a long"</td>
+<td>A scaled 4-byte load from the register is pointer evidence</td>
+</tr>
+<tr>
+<td>Table length unknown</td>
+<td>"reads past the table"</td>
+<td>The next referenced offset or the section end bounds it, and the range check agrees</td>
+</tr>
+<tr>
+<td>Loop shape misread</td>
+<td>"while loop"</td>
+<td>The header has no exit, the latch jumps back, so it is <code>do while</code></td>
+</tr>
+<tr>
+<td>Indirect jump guessed</td>
+<td>"switch with five cases"</td>
+<td>The targets come from <code>.rela.rodata</code>, or the jump is reported as unresolved</td>
+</tr>
+<tr>
+<td>Substitution across a store</td>
+<td>"one expression"</td>
+<td>A loaded value moved past a store or a call changes meaning</td>
+</tr>
+<tr>
+<td>Refinement model edits the text</td>
+<td>"compiles and looks right"</td>
+<td>Build rate up, behaviour match down, invented guards replaced visible unknowns</td>
+</tr>
+<tr>
+<td>Decoder guesses an unknown opcode</td>
+<td>"disassembly looks fine"</td>
+<td><code>DecodeError</code> with the address and the byte, then one table entry checked against <code>llvm-objdump</code></td>
+</tr>
+</tbody>
+</table></div>
+<h2>Operational Rule</h2>
+<p>Treat pseudocode as a derivation you have not seen. Reproduce it from the instructions with a lifter you can read. Place the two texts side by side, and write the instruction or the guess behind every line that differs. Compile both and run both against the source when you have it. A line without an instruction behind it stays a guess no matter how clean it reads.</p>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-re-from-scratch-tools"><span class="t" style="--cs-hue:28">BA</span>Cheat sheet · Binary Analysis Tools from Scratch</a><a href="#cs-reverse-engineering"><span class="t" style="--cs-hue:200">RE</span>Cheat sheet · Reverse Engineering with rea</a></div>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1334-qa3"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">From the decompiler's pseudocode, an agent rebuilds <code>percent_change</code>. The pseudocode reads <code>undefined1 [16] percent_change(int param_1, int param_2, ulong param_3)</code> with <code>lVar1 = (long)((param_2 - param_1) * 100)</code>. The rebuild is <code>(int)(((long)after - before) * 100 / before)</code>, and four hand-written tests pass. The listing of the same record reads <code>IMUL EAX, ESI, 0x64</code>, <code>CDQ</code>, <code>IDIV EDI</code>. What went wrong, and what is the rule?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The 16-byte return and the third parameter are the decompiler's inference, not the program: <code>idiv</code> writes the pair <code>EDX:EAX</code>, the zero path leaves <code>EDX</code> untouched, so the decompiler modelled a 16-byte result and read <code>%rdx</code> as an input. The listing says every operation is 32 bits wide, so the honest rebuild is <code>100 * (after - before) / before</code> in <code>int</code>; the <code>long</code> version divides the unwrapped product and fails 26 of the overflow cells while compiling to 26 bytes where the original has 16. The rule is to read the listing before the pseudocode, write the rebuild from the operation widths, and cite the record id it came from.</p>
+<p><strong>Instruction or guess, line by line.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Difference</th>
+<th>Verdict</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>return type <code>undefined1 [16]</code> against <code>int</code></td>
+<td>guess; <code>idivl</code> writes two registers and no caller fixes the width</td>
+</tr>
+<tr>
+<td><code>param_3</code></td>
+<td>guess that follows from the first; <code>%rdx</code> is read on the zero path only because the return width was guessed</td>
+</tr>
+<tr>
+<td><code>lVar1 / (long)param_1 &amp; 0xffffffff</code> against <code>/ param_1</code></td>
+<td>instruction; <code>cltd</code> plus <code>idivl</code> is a sign-extended 32-bit division, and both texts describe it</td>
+</tr>
+<tr>
+<td><code>if (param_1 != 0)</code> first</td>
+<td>instruction order; the branch jumps to the zero return, and either arm may be printed first</td>
+</tr>
+</tbody>
+</table></div>
+<p>A difference with an instruction behind it is a presentation choice. A difference with no instruction behind it is a guess, and the guess can be on either side.</p>
+<p><strong>Why four tests passed.</strong></p>
+<p>The naive cases avoid every hard class. The wrapped and unwrapped products agree whenever <code>(after - before) * 100</code> fits in 32 bits, so a test that never crosses that line sees two equal functions. On a grid with overflow cells, the <code>long</code> rebuild fails 26 cells, every one with <code>|before| &gt; 1</code>; for <code>before</code> equal to 1 or -1 the 64-bit quotient truncates back to the wrapped value and the two agree by accident.</p>
+<p><strong>The size told you first.</strong></p>
+<p>Compiled with the original flags, the <code>long</code> rebuild is 26 bytes: <code>movslq</code>, <code>imulq</code>, <code>cqto</code> and <code>idivq</code> replaced the 32-bit forms. Size is a diagnostic and never an acceptance, and the listing had shown the widths before any compile.</p>
+<p><strong>What the research says about this pattern.</strong></p>
+<p>A 2026 study of decompilation systems found candidates that passed every test in a benchmark and still diverged on fuzzed inputs. The strongest refinement model raised the build rate from 75 to 90 percent while the behavioural match rate fell from 74 to 62 percent, and the cause was invented fields, types, callees and guards that replaced the visible unknowns a decompiler leaves in its text. The <code>long</code> rebuild is an invented type.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"The decompiler is broken; ignore its output." Its instructions were right; only the parts the instructions leave open were guessed, and the listing in the same record is the correction.</li>
+<li>"The <code>&amp; 0xffffffff</code> is a decompiler bug." It describes the truncation of a sign-extended division correctly.</li>
+<li>"Ten tests pass, ship it." A grid with overflow, negative, rounding and trap cells is the test; the ten cases avoided every hazard.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why did the four tests not catch it? Expected: none of them made the product exceed 32 bits, and the two versions agree everywhere the product fits.</li>
+<li><em>(level 3)</em> Which inputs expose the difference, and which hide it by accident? Expected: overflow cells with <code>|before| &gt; 1</code> fail; <code>before</code> of 1 or -1 agree because the wide quotient truncates to the wrapped value.</li>
+<li><em>(level 3)</em> What did the 26-byte size tell you before any run? Expected: wider instruction forms replaced the 32-bit ones, so the candidate computes in a different width than the listing.</li>
+<li><em>(level 4)</em> How does the refinement-model finding change how you read clean pseudocode? Expected: a clean signature is right for the wrong reason when it fills an unknown; keep the ugly honest form and record what no instruction supports.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The <a href="#a1334">lifting lesson</a> fills the difference table, the <a href="#a1336">rebuild lesson</a> runs the grid, and the proof harness section records the 26 failing cells and the 26-byte candidate.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel SDM Volume 2, chapter 2, Instruction Format</a></li>
+<li><a href="https://gitlab.com/x86-psABIs/x86-64-ABI">System V AMD64 psABI, section 3.2, Function Calling Sequence</a></li>
+<li><a href="https://doi.org/10.1145/115372.115320">Cytron et al., Efficiently Computing Static Single Assignment Form and the Control Dependence Graph, TOPLAS 1991</a></li>
+<li><a href="https://www.cs.tufts.edu/~nr/cs257/archive/keith-cooper/dom14.pdf">Cooper, Harvey, Kennedy, A Simple, Fast Dominance Algorithm, 2001</a></li>
+<li><a href="https://eprints.qut.edu.au/36820/">Cifuentes, Reverse Compilation Techniques, PhD thesis, QUT 1994</a></li>
+<li><a href="https://www.ndss-symposium.org/ndss2015/ndss-2015-programme/no-more-gotos-decompilation-using-pattern-independent-control-flow-structuring-and-semantics/">Yakdan et al., No More Gotos, NDSS 2015</a></li>
+<li><a href="https://doi.org/10.1145/178243.178249">Granlund, Montgomery, Division by Invariant Integers using Multiplication, PLDI 1994</a></li>
+<li><a href="https://www.ndss-symposium.org/ndss2011/tie-principled-reverse-engineering-of-types-in-binary-programs/">Lee, Avgerinos, Brumley, TIE, NDSS 2011</a></li>
+<li><a href="https://arxiv.org/abs/1603.05495">Noonan, Loginov, Cok, Polymorphic Type Inference for Machine Code, PLDI 2016</a></li>
+<li><a href="https://arxiv.org/abs/2403.05286">LLM4Decompile, EMNLP 2024</a></li>
+<li><a href="https://aclanthology.org/2025.findings-acl.1194/">DecompileBench, Findings of ACL 2025</a></li>
+<li><a href="https://arxiv.org/abs/2609.05370">Liu, Raff, Micinski, When LLM Decompilers Recompile More and Preserve Less, 2026</a></li>
+<li><a href="https://github.com/morluto/rea/blob/rea-agents-6.5.0/docs/ghidra-provider.md">rea 6.5.0 Ghidra provider notes</a></li>
+<li>rea 6.5.0 source at tag <code>3b79af2</code> that this lesson describes: <code>src/domain/functionComparisonDimensions.ts</code>, <code>website/evidence/dx-ball-sound-pan.md</code>.</li>
+</ul></div></aside></div><p class="src-credit">Adapted from <a href="https://github.com/rohitg00/ai-engineering-from-scratch/tree/main/phases/13-tools-and-protocols/34-lifting-to-pseudocode" target="_blank" rel="noopener">AI Engineering from Scratch</a> by Rohit Ghumare (MIT licence), with worked examples, exercises and takeaways added for this course.</p><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1334" id="done-a1334">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1334" id="undo-a1334" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1333"><span class="pn-dir">Previous</span><span class="pn-t">13.33 · Disassembly and Control Flow: From Bytes to a Graph You Can Check</span></a><a class="pn next" href="#a1335"><span class="pn-dir">Next</span><span class="pn-t">13.35 · Evidence, Confidence, and Unknowns in Binary Analysis</span></a></div></footer>
