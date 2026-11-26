@@ -31,6 +31,7 @@ Each phase has up to three sections: its own lessons, **Cheat sheets** (one-page
 lessons/<id>.html     each lesson (edit these)
 data/course.json      parts, phases and the lesson list: order, numbers, titles, minutes (edit this)
 data/zxt.json         the one-line summaries the lesson player shows per section
+data/diagrams/<id>.mmd  the step-through diagram of a lesson, as Mermaid source (edit these)
 engine/               the app: page shell, styles and scripts
 img/ figs/ repo-assets/ src/   images and data used by lessons
 shared/               Python runtime (Pyodide 0.26.4) and maths fonts
@@ -44,6 +45,7 @@ After changing a lesson or `data/course.json`, run
 
 ```bash
 python3 tools/renumber.py   # only if lesson numbers changed: updates every "Lesson N" reference
+python3 tools/diagrams.py   # only if a diagram source changed: re-renders it into its lesson (needs mmdc)
 python3 tools/build.py
 ```
 
