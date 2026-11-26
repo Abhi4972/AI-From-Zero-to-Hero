@@ -12,6 +12,7 @@
 </ul></div></aside>
 <aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Reward models and PPO are the classical RLHF stack. DPO collapses that stack into a single supervised loss that fits a policy directly against preference pairs. This lesson derives the DPO loss from the reward-difference identity, ships a working reference model plus policy model, computes per-token log-probabilities, and trains a tiny transformer on a preference fixture of chosen and rejected completions. Tests pin the loss math and the gradient direction so you know the implementation matches the paper.</p></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p><strong>Direct Preference Optimization (DPO)</strong> trains a model from pairs of answers to the same prompt where a person preferred one (<strong>chosen</strong>) over the other (<strong>rejected</strong>). Classic RLHF first trains a reward model and then optimizes against it with reinforcement learning; DPO skips both and uses one ordinary loss. It compares how much more likely the model makes the chosen answer than a frozen <strong>reference</strong> model does, against the same ratio for the rejected answer, and pushes the difference (the <strong>margin</strong>) up. The strength <strong>β</strong> controls how far the model may move from the reference. The model in this lesson is tiny and trains in seconds.</p></div></aside>
 <p>You have an SFT model. It follows instructions, but its outputs are uneven; some completions are clear, some are wordy or wrong. You also have a small dataset of preference pairs: for the same prompt, a human marked one completion as chosen and the other as rejected.</p>
 <p>The classical RLHF answer is a two-stage pipeline. Train a reward model on the preferences. Optimise the policy against the reward with PPO. This works but is expensive: two models in memory during PPO, KL control to keep the policy near the reference, reward hacking when the reward model is brittle.</p>
 <p>DPO replaces both stages with a single supervised loss. The reward model never exists explicitly. The policy is trained directly on the preference pairs, with an explicit KL penalty toward the SFT reference. Same optimal solution under the Bradley-Terry preference model, far less code.</p>
@@ -66,8 +67,622 @@
 <li><code>evaluate_margins</code>: returns the mean chosen-rejected log-probability margin under the policy at any point.</li>
 <li><code>run_demo</code>: builds reference and policy from a small warm-up pretrain, copies weights, trains for thirty steps, prints the per-step loss and margin, and exits zero on success.</li>
 </ol>
+<p>Here is <code>code/main.py</code>, in 9 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 9 · <code>InstructionTokenizer</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;
+Direct Preference Optimization (DPO) from scratch.
+
+See: phases/19-capstone-projects/40-dpo-from-scratch/docs/en.md
+
+Builds:
+  - InstructionTokenizer with INST / RESP specials (byte-level)
+  - TinyGPT (causal decoder-only transformer)
+  - preference fixture of (prompt, chosen, rejected) triples
+  - sequence_log_prob that sums next-token log probabilities over the
+    completion, masking the prompt
+  - dpo_loss that implements:
+       L = -log sigmoid( beta * ( (logp_w_pol - logp_w_ref)
+                                - (logp_l_pol - logp_l_ref) ) )
+  - train_dpo loop with a frozen reference and a trainable policy
+  - run_demo that prints loss and chosen-rejected margins per epoch.
+
+Exits 0 when the chosen-rejected log-prob margin increases under training.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser
+# ---------------------------------------------------------------------------
+
+
+class InstructionTokenizer:
+    INST_ID = 256
+    RESP_ID = 257
+    PAD_ID = 258
+    VOCAB = 260
+
+    def encode_prompt(self, prompt: str) -&gt; List[int]:
+        ids = [self.INST_ID]
+        ids.extend(prompt.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))
+        ids.append(self.RESP_ID)
+        return ids
+
+    def encode_completion(self, completion: str) -&gt; List[int]:
+        return list(completion.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))
+
+
+# ---------------------------------------------------------------------------
+# TinyGPT
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 2 of 9 · <code>CausalSelfAttention</code>, <code>Block</code>, <code>TinyGPT</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class CausalSelfAttention(nn.Module):
+    def __init__(self, hidden: int, heads: int, max_len: int):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(&quot;hidden must divide heads&quot;)
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+        self.out = nn.Linear(hidden, hidden, bias=False)
+        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
+        self.register_buffer(&quot;causal_mask&quot;, mask, persistent=False)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        causal = self.causal_mask[:T, :T].view(1, 1, T, T)
+        att = att.masked_fill(~causal, float(&quot;-inf&quot;))
+        weights = F.softmax(att, dim=-1)
+        ctx = (weights @ v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.out(ctx)
+
+
+class Block(nn.Module):
+    def __init__(self, hidden: int, heads: int, max_len: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden)
+        self.attn = CausalSelfAttention(hidden, heads, max_len)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.fc1 = nn.Linear(hidden, hidden * 4)
+        self.fc2 = nn.Linear(hidden * 4, hidden)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        h = self.ln2(x)
+        return x + self.fc2(F.gelu(self.fc1(h)))
+
+
+class TinyGPT(nn.Module):
+    def __init__(self, vocab: int, hidden: int, heads: int, depth: int, max_len: int):
+        super().__init__()
+        self.tok = nn.Embedding(vocab, hidden)
+        self.pos = nn.Embedding(max_len, hidden)
+        self.blocks = nn.ModuleList([Block(hidden, heads, max_len) for _ in range(depth)])
+        self.ln_f = nn.LayerNorm(hidden)
+        self.head = nn.Linear(hidden, vocab, bias=False)
+        self.max_len = max_len
+
+    def forward(self, ids: torch.Tensor) -&gt; torch.Tensor:
+        B, T = ids.shape
+        positions = torch.arange(T, device=ids.device).unsqueeze(0).expand(B, T)
+        x = self.tok(ids) + self.pos(positions)
+        for blk in self.blocks:
+            x = blk(x)
+        return self.head(self.ln_f(x))
+
+
+# ---------------------------------------------------------------------------
+# Preference fixture
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 3 of 9 · <code>make_preferences</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def make_preferences() -&gt; List[Dict[str, str]]:
+    &quot;&quot;&quot;Twelve preference triples covering simple task types.&quot;&quot;&quot;
+    return [
+        {
+            &quot;prompt&quot;: &quot;What is the capital of France?&quot;,
+            &quot;chosen&quot;: &quot;Paris.&quot;,
+            &quot;rejected&quot;: &quot;France is in Europe and has many beautiful cities including Paris.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;What is the capital of Japan?&quot;,
+            &quot;chosen&quot;: &quot;Tokyo.&quot;,
+            &quot;rejected&quot;: &quot;Japan is an island nation. Its government sits in Tokyo.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;What is the capital of Spain?&quot;,
+            &quot;chosen&quot;: &quot;Madrid.&quot;,
+            &quot;rejected&quot;: &quot;Spain has many cities. Madrid is the largest of them.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Compute 2 + 3.&quot;,
+            &quot;chosen&quot;: &quot;5.&quot;,
+            &quot;rejected&quot;: &quot;Let me think. 2 plus 3 is something close to 5 I believe.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Compute 7 * 6.&quot;,
+            &quot;chosen&quot;: &quot;42.&quot;,
+            &quot;rejected&quot;: &quot;7 multiplied by 6 gives a number around the forties.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Compute 12 / 4.&quot;,
+            &quot;chosen&quot;: &quot;3.&quot;,
+            &quot;rejected&quot;: &quot;Twelve divided by four is roughly three or so.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;List three colors.&quot;,
+            &quot;chosen&quot;: &quot;red, green, blue.&quot;,
+            &quot;rejected&quot;: &quot;Colors are everywhere. Some of them are red, green, and there is blue too.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;List three vowels.&quot;,
+            &quot;chosen&quot;: &quot;a, e, i.&quot;,
+            &quot;rejected&quot;: &quot;Vowels are letters that produce open mouth sounds, like a and e and also i.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Define variable.&quot;,
+            &quot;chosen&quot;: &quot;a name bound to a value.&quot;,
+            &quot;rejected&quot;: &quot;A variable is a thing that you can use in programming to store stuff.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Define function.&quot;,
+            &quot;chosen&quot;: &quot;a reusable block of code that returns an output.&quot;,
+            &quot;rejected&quot;: &quot;A function is basically something that does things when you call it on inputs.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Python: print 42.&quot;,
+            &quot;chosen&quot;: &quot;print(42)&quot;,
+            &quot;rejected&quot;: &quot;You can print numbers in python. For 42 you would call print on it.&quot;,
+        },
+        {
+            &quot;prompt&quot;: &quot;Python: sort items.&quot;,
+            &quot;chosen&quot;: &quot;items.sort()&quot;,
+            &quot;rejected&quot;: &quot;Sorting a list in python is easy, just call sort on the items list.&quot;,
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Log-probability machinery
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 4 of 9 · <code>sequence_log_prob</code>, <code>dpo_loss</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def sequence_log_prob(
+    model: TinyGPT,
+    prompt_ids: Sequence[int],
+    completion_ids: Sequence[int],
+) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Sum of log-probabilities of the completion tokens conditioned on prompt.
+
+    Returns a 0-dim tensor on the same device as the model.
+
+    Implementation:
+      - Concatenate prompt + completion.
+      - Forward through the model.
+      - Take log-softmax of the logits.
+      - For each completion position i (counted in the full sequence), gather
+        log p(completion[i] | tokens[&lt;i]) and sum.
+    &quot;&quot;&quot;
+    if len(completion_ids) == 0:
+        return torch.zeros((), device=next(model.parameters()).device)
+    full = list(prompt_ids) + list(completion_ids)
+    if len(full) &gt; model.max_len:
+        # Truncate from the left to keep the most recent context.
+        full = full[-model.max_len :]
+        prompt_len = max(0, len(full) - len(completion_ids))
+    else:
+        prompt_len = len(prompt_ids)
+    ids = torch.tensor([full], dtype=torch.long, device=next(model.parameters()).device)
+    logits = model(ids)
+    log_probs = F.log_softmax(logits, dim=-1)
+    # Position i predicts token i+1. The completion lives at indices [prompt_len, len(full)).
+    # We need log p(token at index k | tokens up to k-1), for k in that range.
+    # That probability is log_probs[0, k-1, token_k].
+    completion_targets = torch.tensor(full[prompt_len:], dtype=torch.long, device=ids.device)
+    pred_positions = torch.arange(prompt_len - 1, len(full) - 1, device=ids.device)
+    # Guard against the (degenerate) case where prompt_len == 0.
+    if prompt_len == 0:
+        pred_positions = torch.arange(0, len(full) - 1, device=ids.device)
+        completion_targets = torch.tensor(full[1:], dtype=torch.long, device=ids.device)
+    gathered = log_probs[0, pred_positions, completion_targets]
+    return gathered.sum()
+
+
+def dpo_loss(
+    logp_w_pol: torch.Tensor,
+    logp_l_pol: torch.Tensor,
+    logp_w_ref: torch.Tensor,
+    logp_l_ref: torch.Tensor,
+    beta: float,
+) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+    &quot;&quot;&quot;Per-example DPO loss and the implicit reward margin.
+
+    L = -log sigmoid( beta * ( (logp_w_pol - logp_w_ref) - (logp_l_pol - logp_l_ref) ) )
+
+    Returns (loss_scalar, reward_margin) where reward_margin is the argument
+    of the sigmoid divided by beta (i.e. the implicit reward difference).
+    &quot;&quot;&quot;
+    diff_w = logp_w_pol - logp_w_ref
+    diff_l = logp_l_pol - logp_l_ref
+    margin = diff_w - diff_l
+    z = beta * margin
+    # logsigmoid is numerically stable; loss is per-example, scalar.
+    loss = -F.logsigmoid(z)
+    return loss, margin
+</code></pre></div>
+
+<p><strong>Part 5 of 9 · <code>ipo_loss</code>, <code>length_normalised_log_prob</code>, <code>MarginRow</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def ipo_loss(
+    logp_w_pol: torch.Tensor,
+    logp_l_pol: torch.Tensor,
+    logp_w_ref: torch.Tensor,
+    logp_l_ref: torch.Tensor,
+    beta: float,
+) -&gt; Tuple[torch.Tensor, torch.Tensor]:
+    &quot;&quot;&quot;The IPO variant: a squared loss that does not saturate.
+
+    L_IPO = ( ( (logp_w_pol - logp_w_ref) - (logp_l_pol - logp_l_ref) ) - 1 / (2 * beta) ) ** 2
+
+    The 1 / (2 * beta) offset is the standard IPO target margin. The lesson
+    ships this variant for the stretch comparison; the demo and DPO tests do
+    not use it.
+    &quot;&quot;&quot;
+    diff_w = logp_w_pol - logp_w_ref
+    diff_l = logp_l_pol - logp_l_ref
+    margin = diff_w - diff_l
+    target = 1.0 / (2.0 * beta) if beta &gt; 0 else 0.0
+    loss = (margin - target) ** 2
+    return loss, margin
+
+
+def length_normalised_log_prob(
+    model: TinyGPT,
+    prompt_ids: Sequence[int],
+    completion_ids: Sequence[int],
+) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Sequence log-prob divided by completion length.
+
+    Useful for diagnosing length bias: if length-normalised margins are
+    positive but raw margins are negative (or vice versa) the model is
+    showing length-sensitive preferences.
+    &quot;&quot;&quot;
+    if len(completion_ids) == 0:
+        return torch.zeros((), device=next(model.parameters()).device)
+    raw = sequence_log_prob(model, prompt_ids, completion_ids)
+    return raw / float(len(completion_ids))
+
+
+@dataclass(frozen=True)
+class MarginRow:
+    prompt: str
+    chosen: str
+    rejected: str
+    margin: float
+    chosen_logprob: float
+    rejected_logprob: float
+</code></pre></div>
+
+<p><strong>Part 6 of 9 · <code>margin_table</code>, <code>print_margin_table</code>, <code>DPOConfig</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def margin_table(
+    policy: TinyGPT,
+    tok: InstructionTokenizer,
+    triples: Sequence[Dict[str, str]],
+) -&gt; List[MarginRow]:
+    &quot;&quot;&quot;Per-triple margin report under the policy. Useful for debugging.&quot;&quot;&quot;
+    rows: List[MarginRow] = []
+    with torch.no_grad():
+        for tri in triples:
+            prompt = tok.encode_prompt(tri[&quot;prompt&quot;])
+            chosen = tok.encode_completion(tri[&quot;chosen&quot;])
+            rejected = tok.encode_completion(tri[&quot;rejected&quot;])
+            lp_w = sequence_log_prob(policy, prompt, chosen).item()
+            lp_l = sequence_log_prob(policy, prompt, rejected).item()
+            rows.append(
+                MarginRow(
+                    prompt=tri[&quot;prompt&quot;],
+                    chosen=tri[&quot;chosen&quot;],
+                    rejected=tri[&quot;rejected&quot;],
+                    margin=lp_w - lp_l,
+                    chosen_logprob=lp_w,
+                    rejected_logprob=lp_l,
+                )
+            )
+    return rows
+
+
+def print_margin_table(rows: Sequence[MarginRow], log: Callable[[str], None] = print) -&gt; None:
+    log(&quot;  margin   chosen_lp   rejected_lp   prompt&quot;)
+    log(&quot;  -------  ----------  ------------  -------------------------&quot;)
+    for row in rows:
+        log(
+            f&quot;  {row.margin:+.4f}   {row.chosen_logprob:+.4f}    {row.rejected_logprob:+.4f}     {row.prompt[:35]}&quot;
+        )
+
+
+# ---------------------------------------------------------------------------
+# Reference / policy management
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DPOConfig:
+    vocab: int = InstructionTokenizer.VOCAB
+    hidden: int = 64
+    heads: int = 4
+    depth: int = 2
+    max_len: int = 96
+    beta: float = 0.2
+    lr: float = 1e-3
+    epochs: int = 30
+    seed: int = 0
+    warmup_epochs: int = 8  # brief reference pretrain so log-probs are non-trivial
+</code></pre></div>
+
+<p><strong>Part 7 of 9 · <code>build_models</code>, <code>warmup_pretrain</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def build_models(cfg: DPOConfig) -&gt; Tuple[TinyGPT, TinyGPT]:
+    &quot;&quot;&quot;Build a reference and a policy. The policy is initialised from the
+    reference's state dict so they start in the same place, then the policy
+    diverges under DPO training while the reference stays frozen.&quot;&quot;&quot;
+    torch.manual_seed(cfg.seed)
+    reference = TinyGPT(cfg.vocab, cfg.hidden, cfg.heads, cfg.depth, cfg.max_len)
+    torch.manual_seed(cfg.seed)  # reseed so the policy weights match before any training
+    policy = TinyGPT(cfg.vocab, cfg.hidden, cfg.heads, cfg.depth, cfg.max_len)
+    policy.load_state_dict(reference.state_dict())
+    # Freeze the reference.
+    for p in reference.parameters():
+        p.requires_grad = False
+    reference.eval()
+    return reference, policy
+
+
+def warmup_pretrain(
+    model: TinyGPT,
+    tok: InstructionTokenizer,
+    triples: Sequence[Dict[str, str]],
+    epochs: int = 8,
+    lr: float = 3e-3,
+    seed: int = 0,
+) -&gt; List[float]:
+    &quot;&quot;&quot;A short next-token pretraining pass on the chosen completions so the
+    reference has non-trivial probabilities on the fixture's task structure.&quot;&quot;&quot;
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    losses: List[float] = []
+    model.train()
+    sequences: List[List[int]] = []
+    for tri in triples:
+        prompt = tok.encode_prompt(tri[&quot;prompt&quot;])
+        chosen = tok.encode_completion(tri[&quot;chosen&quot;])
+        sequences.append(prompt + chosen)
+    for _ in range(epochs):
+        ep_loss = 0.0
+        for seq in sequences:
+            if len(seq) &gt; model.max_len:
+                seq = seq[: model.max_len]
+            ids = torch.tensor([seq], dtype=torch.long)
+            logits = model(ids)
+            pred = logits[:, :-1, :].contiguous()
+            target = ids[:, 1:].contiguous()
+            loss = F.cross_entropy(pred.view(-1, pred.size(-1)), target.view(-1))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            ep_loss += float(loss.item())
+        losses.append(ep_loss / max(len(sequences), 1))
+    return losses
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 8 of 9 · <code>DPOReport</code>, <code>evaluate_margins</code>, <code>train_dpo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class DPOReport:
+    losses: List[float] = field(default_factory=list)
+    margins: List[float] = field(default_factory=list)
+    initial_margin: float = 0.0
+    final_margin: float = 0.0
+
+
+def evaluate_margins(
+    policy: TinyGPT,
+    reference: TinyGPT,
+    tok: InstructionTokenizer,
+    triples: Sequence[Dict[str, str]],
+) -&gt; float:
+    &quot;&quot;&quot;Mean (chosen - rejected) log-prob difference under the policy.
+
+    Without DPO this can be anything; DPO training drives it positive.
+    &quot;&quot;&quot;
+    margins: List[float] = []
+    with torch.no_grad():
+        for tri in triples:
+            prompt = tok.encode_prompt(tri[&quot;prompt&quot;])
+            chosen = tok.encode_completion(tri[&quot;chosen&quot;])
+            rejected = tok.encode_completion(tri[&quot;rejected&quot;])
+            lp_w = sequence_log_prob(policy, prompt, chosen).item()
+            lp_l = sequence_log_prob(policy, prompt, rejected).item()
+            margins.append(lp_w - lp_l)
+    return float(np.mean(margins)) if margins else 0.0
+
+
+def train_dpo(
+    policy: TinyGPT,
+    reference: TinyGPT,
+    tok: InstructionTokenizer,
+    triples: Sequence[Dict[str, str]],
+    cfg: DPOConfig,
+    log: Callable[[str], None] = print,
+) -&gt; DPOReport:
+    report = DPOReport()
+    opt = torch.optim.Adam(policy.parameters(), lr=cfg.lr)
+    # Snapshot reference log-probs up front; they never change.
+    ref_logps: List[Tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.no_grad():
+        for tri in triples:
+            prompt = tok.encode_prompt(tri[&quot;prompt&quot;])
+            chosen = tok.encode_completion(tri[&quot;chosen&quot;])
+            rejected = tok.encode_completion(tri[&quot;rejected&quot;])
+            lp_w_ref = sequence_log_prob(reference, prompt, chosen).detach()
+            lp_l_ref = sequence_log_prob(reference, prompt, rejected).detach()
+            ref_logps.append((lp_w_ref, lp_l_ref))
+    report.initial_margin = evaluate_margins(policy, reference, tok, triples)
+    for ep in range(1, cfg.epochs + 1):
+        policy.train()
+        total_loss = 0.0
+        total_margin = 0.0
+        for tri, (lp_w_ref, lp_l_ref) in zip(triples, ref_logps):
+            prompt = tok.encode_prompt(tri[&quot;prompt&quot;])
+            chosen = tok.encode_completion(tri[&quot;chosen&quot;])
+            rejected = tok.encode_completion(tri[&quot;rejected&quot;])
+            lp_w_pol = sequence_log_prob(policy, prompt, chosen)
+            lp_l_pol = sequence_log_prob(policy, prompt, rejected)
+            loss, margin = dpo_loss(lp_w_pol, lp_l_pol, lp_w_ref, lp_l_ref, beta=cfg.beta)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total_loss += float(loss.item())
+            total_margin += float(margin.item())
+        report.losses.append(total_loss / max(len(triples), 1))
+        report.margins.append(total_margin / max(len(triples), 1))
+        log(f&quot;  epoch {ep:&gt;3d}: loss={report.losses[-1]:.4f}  margin={report.margins[-1]:+.4f}&quot;)
+    report.final_margin = evaluate_margins(policy, reference, tok, triples)
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 9 of 9 · <code>run_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_demo(cfg: Optional[DPOConfig] = None) -&gt; int:
+    cfg = cfg or DPOConfig()
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+
+    tok = InstructionTokenizer()
+    triples = make_preferences()
+
+    print(&quot;DPO FROM SCRATCH DEMO&quot;)
+    print(f&quot;triples={len(triples)} beta={cfg.beta} lr={cfg.lr} epochs={cfg.epochs}&quot;)
+    print(&quot;&quot;)
+
+    reference, policy = build_models(cfg)
+
+    print(f&quot;[warmup] short pretrain on chosen completions ({cfg.warmup_epochs} epochs)...&quot;)
+    # build_models() freezes the reference so the DPO loop cannot accidentally
+    # update it. Unfreeze it just for warmup, then re-freeze before training.
+    for p in reference.parameters():
+        p.requires_grad = True
+    reference.train()
+    warm_losses = warmup_pretrain(
+        reference,
+        tok,
+        triples,
+        epochs=cfg.warmup_epochs,
+        seed=cfg.seed,
+    )
+    # Copy warmed-up weights into the policy and re-freeze the reference.
+    policy.load_state_dict(reference.state_dict())
+    for p in reference.parameters():
+        p.requires_grad = False
+    reference.eval()
+    print(f&quot;         warmup final loss = {warm_losses[-1]:.4f}&quot;)
+
+    initial = evaluate_margins(policy, reference, tok, triples)
+    print(f&quot;         initial chosen-rejected margin = {initial:+.4f}&quot;)
+    print(&quot;&quot;)
+
+    print(&quot;[dpo training]&quot;)
+    report = train_dpo(policy, reference, tok, triples, cfg)
+
+    print(&quot;&quot;)
+    print(&quot;[per-triple margins after training]&quot;)
+    print_margin_table(margin_table(policy, tok, triples))
+
+    print(&quot;&quot;)
+    print(f&quot;FINAL margin = {report.final_margin:+.4f}  (initial was {report.initial_margin:+.4f})&quot;)
+    print(f&quot;FINAL loss   = {report.losses[-1]:.4f}  (epoch-1 loss was {report.losses[0]:.4f})&quot;)
+
+    # Sanity: training should push the margin up.
+    if report.final_margin &lt;= report.initial_margin:
+        print(&quot;ERROR: training did not increase the chosen-rejected margin&quot;, file=sys.stderr)
+        return 1
+    # And loss should drop.
+    if report.losses[-1] &gt;= report.losses[0]:
+        print(&quot;ERROR: training did not reduce loss across epochs&quot;, file=sys.stderr)
+        return 1
+    return 0
+</code></pre></div>
+
 <h2>Why DPO works</h2>
 <p>DPO is mathematically equivalent to RLHF under the Bradley-Terry preference model, up to the parameterisation of the reward. The implicit reward <code>r(x, y) = beta * (log pi(y|x) - log pi_ref(y|x))</code> is identifiable from preferences up to a function of <code>x</code>, which cancels in the difference. The closed-form policy lets you skip the explicit reward model. The KL constraint is enforced structurally: any deviation of <code>pi</code> from <code>pi_ref</code> makes the log-ratio larger, and the sigmoid saturates, which damps the gradient when the policy moves too far. The reference is your safety net.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-title">The DPO loss</div><div class="co-body"><p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord">−</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord mathnormal" style="margin-right:0.05278em;">β</span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ref</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ref</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mord mathnormal">x</span><span class="mclose">))</span><span class="mord"><span class="delimsizing size1">]</span></span><span class="mord"><span class="delimsizing size2">)</span></span></span></span></span></span></div></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02691em;">w</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> is the chosen answer, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> the rejected one, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span></span></span></span> the model being trained and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ref</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> the frozen reference. The bracket is the margin; <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">σ</span></span></span></span> is the logistic function.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">One pair by hand</div><div class="co-body"><p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05278em;">β</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span>. Log-probabilities of the chosen answer: policy −12, reference −14. Rejected answer: policy −15, reference −13.</p>
+<ol>
+<li>Chosen improvement over the reference: −12 − (−14) = +2.</li>
+<li>Rejected improvement: −15 − (−13) = −2.</li>
+<li>Margin = 2 − (−2) = 4; times β = 0.8. Loss = −log σ(0.8) ≈ 0.37.</li>
+<li>When the margin is large (say β × margin = 10), the loss is about 0.00005 and its gradient almost vanishes: the pair is already learned and stops contributing.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> DPO needs a frozen reference model but no separate reward model.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> DPO maximizes the chosen answer's probability regardless of the reference.
+  It rewards improvement relative to the reference, for chosen against rejected.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Larger β makes the loss more sensitive to the margin.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A loss of zero means the model has become better overall.
+  It means these pairs are separated; check held-out quality and drift from the reference.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with β = 0.2, how large must the margin be for the loss to fall below 0.01?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">How the DPO loss saturates</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+def dpo_loss(margin, beta=0.2):
+    return -math.log(1 / (1 + math.exp(-beta * margin)))
+
+for margin in (-5, 0, 4, 10, 23, 50, 98):
+    print(f&quot;margin {margin:4d}: loss {dpo_loss(margin):.5f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">margin   -5: loss 1.31326
+margin    0: loss 0.69315
+margin    4: loss 0.37110
+margin   10: loss 0.12693
+margin   23: loss 0.01000
+margin   50: loss 0.00005
+margin   98: loss 0.00000</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>At margin 0 the loss is ln 2 ≈ 0.69; it falls below 0.01 at a margin of about 23 and is essentially zero by 50. Pairs separated that far stop producing gradient. Keep that in mind when reading the lesson's run: its margin starts at +257, so the loss is already near zero before preference training begins.</p></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Look at the first lines: after a short warm-up on the <em>chosen</em> completions, the initial chosen-minus-rejected margin is already +257, because the warm-up itself taught the model the chosen answers. DPO's loss is 0.07 in the first epoch and 0.0000 from the second on, and the margin settles near +98 (it moves down from the warm-up value as the reference comparison kicks in). The mechanics work, but the experiment has almost nothing left for DPO to learn. Warming up on both answers, or on separate data, would make the preference step visible.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team runs DPO with the reference model <em>updated</em> alongside the policy at every step (they share weights by accident). The margin never grows and the loss stays at ln 2. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>DPO turns preference pairs into one supervised loss.</li>
+<li>The margin compares policy against reference for chosen and rejected answers.</li>
+<li>β controls how sharply the margin matters and how far the model moves.</li>
+<li>Large margins saturate the loss; those pairs stop teaching.</li>
+<li>Check held-out behaviour, not only the training loss.</li>
+</ul></div></aside>
 <h2>Stretch goals</h2>
 <ul>
 <li>Add a length normalisation to the log-probability sum: divide by completion length. Length bias is a known DPO failure mode where the model preferentially chooses shorter completions because their log-probabilities are larger in absolute terms.</li>
@@ -76,5 +691,7 @@
 <li>Replace the reference with a smaller cheaper model (knowledge distillation flavour).</li>
 </ul>
 <p>The implementation gives you the loss, the reference invariance, and the training loop. The math is the lesson. The code makes the math concrete.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1940-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A moving reference</span></summary><div class="qa-a"><p>If the reference shares weights with the policy, the policy-over-reference ratios are always 1 (log difference 0) for every answer, so the margin is always 0 and the loss stays at ln 2 with no useful gradient. Make the reference a separate, frozen copy (or precompute its log-probabilities once) before training.</p></div></details>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-llm-pipeline-capstone"><span class="t" style="--cs-hue:215">EE</span>Cheat sheet · End-to-End LLM and Fine-Tuning Pipeline</a><a href="#cs-rlhf-dpo"><span class="t" style="--cs-hue:20">RD</span>Cheat sheet · RLHF, DPO and Preference Tuning</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1940" id="done-a1940">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1940" id="undo-a1940" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1939"><span class="pn-dir">Previous</span><span class="pn-t">19.39 · Capstone Lesson 39: Instruction Tuning by Supervised Fine-Tuning</span></a><a class="pn next" href="#a1941"><span class="pn-dir">Next</span><span class="pn-t">19.41 · Capstone Lesson 41: Full Evaluation Pipeline</span></a></div></footer>

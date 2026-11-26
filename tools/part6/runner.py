@@ -22,7 +22,10 @@ signal.signal(signal.SIGALRM, alarm)
 IN, OUT = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.getcwd())
 blocks = json.load(open(IN))
-ns = {"__name__": "__main__", "__file__": os.path.join(os.getcwd(), "main.py")}
+import types
+_main = types.ModuleType("__main__"); _main.__file__ = os.path.join(os.getcwd(), "main.py")
+sys.modules["__main__"] = _main          # so pickling (multiprocessing spawn) finds functions defined on the page
+ns = _main.__dict__
 def scrub(t):   # keep this machine's folders out of the published output
     t = re.sub(r"(/home/claude/upstream/phases|/home/claude/aifs/run|/tmp/claude-0/z2/aiefs/repo/phases)/[^/\s]+/[^/\s\"']+", ".", t)
     return re.sub(r"/(home/claude|tmp/claude-0)(/[^\s\"']*)?", "/path/to/project", t)

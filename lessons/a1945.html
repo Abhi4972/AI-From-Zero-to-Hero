@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Gradients are not always well behaved. One bad batch can produce a gradient thousands of times larger than usual, and a single update that size can wreck a model. <strong>Gradient clipping</strong> limits the damage: compute the <strong>global L2 norm</strong> of all gradients together, and if it exceeds a threshold, scale every gradient down by the same factor. <strong>Mixed precision</strong> adds another hazard: computing in 16-bit floats is faster, but FP16 overflows easily, producing <strong>Inf</strong> or <strong>NaN</strong>. A <strong>GradScaler</strong> multiplies the loss by a large factor so small gradients do not vanish, divides it back out (<strong>unscales</strong>) before clipping, <strong>skips</strong> the update if any gradient is not finite, and lowers the factor when that happens. The order of these steps matters.</p></div></aside>
 <p>A training run that ran clean yesterday produces a loss curve that goes vertical at step 8,217. The culprit is a single batch whose gradient norm is 4,200, twenty times the previous peak. Without clipping the optimizer applies a step that resets every learning the model had done in the previous hour. With a global L2 clip at norm 1.0, the same batch contributes a unit-norm update; the loss stays on its trend line; the run survives.</p>
 <p>Mixed-precision training pushes throughput by 2-3x by computing the forward pass and most of the backward pass in FP16. The cost is that FP16 has a narrow exponent range. A typical gradient that overflows in FP16 evaluates to Inf, which propagates through subsequent layers as NaN, which sets every weight to NaN at the next optimizer step. PyTorch's GradScaler solves this by multiplying the loss by a large scaling factor before the backward pass and dividing the gradients by the same factor before the optimizer step. If any gradient is Inf or NaN at unscale time, the scaler skips the step and halves the scaling factor; if the previous N steps were clean, the scaler doubles the factor. Over the course of training the factor finds the highest value the FP16 range allows.</p>
 <p>The build problem is wiring the two correctly. Clip before unscale and the threshold is on scaled gradients; clip after unscale and the order of operations on the GradScaler matters. The right order is: <code>scaler.scale(loss).backward()</code>, then <code>scaler.unscale_(optimizer)</code>, then <code>clip_grad_norm_</code>, then <code>scaler.step(optimizer)</code>, then <code>scaler.update()</code>. Any other order produces a silently broken loop.</p>
@@ -61,6 +62,39 @@
 <h2>Idea 4 · Scaling factor diagnostics</h2>
 <p>The scaling factor is the GradScaler's internal state. Every step the lesson reads <code>scaler.get_scale()</code> and logs it next to the learning rate and gradient norm. A healthy run shows the scaling factor climbing in powers of two until it saturates near <code>2^17</code> or <code>2^18</code>. A misbehaving run shows the factor oscillating between high and low values, which is the signal that the model's gradients are sometimes in range and sometimes not. The diagnostic is invisible without logging.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="grad-clip-monitor"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Clipping one update</div><div class="co-body"><p>Three parameter tensors have gradient norms 3, 4 and 12. Threshold 1.0.</p>
+<ol>
+<li>Global norm: √(3² + 4² + 12²) = √169 = 13.</li>
+<li>13 &gt; 1, so the clip factor is 1 / 13 ≈ 0.077.</li>
+<li>Every gradient is multiplied by 0.077, so the new global norm is exactly 1, and the <em>direction</em> of the update is unchanged.</li>
+<li>Clipping each tensor separately to norm 1 would instead give norms 1, 1, 1 (global √3 ≈ 1.73) and change the direction, over-weighting the small tensors. That is why clipping uses the global norm.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Global-norm clipping scales all gradients by the same factor.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Gradients should be clipped before unscaling in mixed precision.
+  Unscale first, or the threshold applies to artificially inflated values.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A step with any non-finite gradient is skipped, and the scale is reduced.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Clipping changes the direction of the update.
+  Global clipping changes only its length.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: gradients with norms 0.3, 0.4 and 0 and a threshold of 1. Is anything clipped? What if one gradient is infinite?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Global clipping and the skip rule</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+def clip(grads, max_norm=1.0):
+    norm = math.sqrt(sum(g * g for vec in grads for g in vec))
+    if not math.isfinite(norm): return None, norm, &quot;skip: non-finite gradient&quot;
+    factor = min(1.0, max_norm / (norm + 1e-6))
+    return [[g * factor for g in vec] for vec in grads], norm, f&quot;factor {factor:.3f}&quot;
+
+for grads in ([[3.0], [4.0], [12.0]], [[0.3], [0.4], [0.0]], [[1.0], [math.inf], [2.0]]):
+    new, norm, note = clip(grads)
+    after = None if new is None else math.sqrt(sum(g * g for v in new for g in v))
+    print(f&quot;global norm {norm:7.3f} -&gt; {note}&quot; + (&quot;&quot; if after is None else f&quot;, norm after {after:.3f}&quot;))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">global norm  13.000 -&gt; factor 0.077, norm after 1.000
+global norm   0.500 -&gt; factor 1.000, norm after 0.500
+global norm     inf -&gt; skip: non-finite gradient</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The first set is scaled by 1/13 to a norm of exactly 1. The second is below the threshold and passes untouched (factor 1). The third has an infinite component, so its norm is infinite and the update is skipped rather than clipped, because scaling infinity gives infinity or NaN, not a usable step.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -87,6 +121,416 @@
 <li><strong>Loss check before backward.</strong> <code>torch.isfinite(loss).all()</code> is one tensor reduction; the cost is negligible and the savings on a NaN loss are an entire training step. Always run it.</li>
 <li><strong><code>set_to_none=True</code> in <code>zero_grad</code>.</strong> Sets gradients to <code>None</code> instead of zero, which lets the optimizer skip computation for unaffected parameter groups. The setting is a free throughput improvement and a slight bug-surface reduction.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 5 · <code>StepLog</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Gradient clipping and mixed-precision training step.
+
+Implements:
+- clip_global_l2_norm, a wrapper around torch.nn.utils.clip_grad_norm_ that
+  returns both the pre-clip norm and an explicit post-clip norm.
+- has_non_finite_grad, a helper that scans gradients for NaN and Inf.
+- AmpTrainState, a training-step orchestrator that wires an AdamW optimizer,
+  autocast, and GradScaler into one safe step.
+- StepLog and SkipLog, structured per-step records.
+
+The demo at the bottom trains a small torch.nn.Linear model for 20 steps and
+injects a non-finite gradient on a specific step to exercise the skip path.
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import csv
+import math
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable
+
+try:
+    import torch
+    from torch import nn
+except ImportError as exc:
+    raise SystemExit(
+        &quot;torch is required for this lesson. Install with: pip install torch&quot;
+    ) from exc
+
+
+DEFAULT_MAX_NORM = 1.0
+DEFAULT_DEVICE = &quot;cpu&quot;
+NORM_TYPE = 2.0
+
+
+@dataclass
+class StepLog:
+    &quot;&quot;&quot;One row of the per-step training log.&quot;&quot;&quot;
+
+    step: int
+    lr: float
+    grad_l2_pre_clip: float
+    grad_l2_post_clip: float
+    loss: float
+    skipped: bool
+    skip_reason: str
+    scaler_scale: float
+
+    def to_csv_row(self) -&gt; list[str]:
+        return [
+            str(self.step),
+            f&quot;{self.lr:.10f}&quot;,
+            f&quot;{self.grad_l2_pre_clip:.10f}&quot;,
+            f&quot;{self.grad_l2_post_clip:.10f}&quot;,
+            f&quot;{self.loss:.10f}&quot;,
+            &quot;1&quot; if self.skipped else &quot;0&quot;,
+            self.skip_reason,
+            f&quot;{self.scaler_scale:.6f}&quot;,
+        ]
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>SkipLog</code>, <code>has_non_finite_grad</code>, <code>compute_global_l2_norm</code>, <code>clip_global_l2_norm</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class SkipLog:
+    &quot;&quot;&quot;Standalone record of a skipped step, for alerting and forensics.&quot;&quot;&quot;
+
+    step: int
+    reason: str
+    pre_clip_norm: float
+    loss: float
+    scaler_scale: float
+
+
+def has_non_finite_grad(parameters: Iterable[torch.nn.Parameter]) -&gt; bool:
+    &quot;&quot;&quot;Return True if any gradient contains a NaN or Inf.&quot;&quot;&quot;
+
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        if not torch.isfinite(grad).all().item():
+            return True
+    return False
+
+
+def compute_global_l2_norm(parameters: Iterable[torch.nn.Parameter]) -&gt; float:
+    &quot;&quot;&quot;Compute the Euclidean norm over all gradients without clipping.&quot;&quot;&quot;
+
+    squared_sum = 0.0
+    for param in parameters:
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        squared_sum += float(grad.pow(2).sum().item())
+    return math.sqrt(squared_sum)
+
+
+def clip_global_l2_norm(
+    parameters: list[torch.nn.Parameter],
+    max_norm: float,
+) -&gt; tuple[float, float]:
+    &quot;&quot;&quot;Clip gradients in place to max_norm and return (pre_clip, post_clip).
+
+    Returns (pre_clip, post_clip). When pre_clip &lt;= max_norm the gradients are
+    untouched and post_clip == pre_clip. When pre_clip &gt; max_norm the gradients
+    are scaled by max_norm / pre_clip and post_clip == max_norm.
+    &quot;&quot;&quot;
+
+    if max_norm &lt;= 0:
+        raise ValueError(&quot;max_norm must be positive&quot;)
+    pre_clip = compute_global_l2_norm(parameters)
+    if not math.isfinite(pre_clip):
+        return pre_clip, pre_clip
+    if pre_clip &lt;= max_norm:
+        return pre_clip, pre_clip
+    scale = max_norm / (pre_clip + 1e-12)
+    for param in parameters:
+        if param.grad is not None:
+            param.grad.detach().mul_(scale)
+    return pre_clip, max_norm
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>AmpTrainState</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class AmpTrainState:
+    &quot;&quot;&quot;Training step with mixed precision and gradient clipping.
+
+    Wires together a model, an AdamW optimizer, a GradScaler, and an autocast
+    device. Exposes step(inputs, targets) which:
+
+      1. Forward pass under autocast.
+      2. Loss finiteness check; non-finite loss skips backward.
+      3. Backward through scaler.scale(loss).
+      4. scaler.unscale_(optimizer).
+      5. Gradient finiteness check; non-finite grad skips optimizer step.
+      6. Clip to max_norm.
+      7. scaler.step(optimizer); scaler.update().
+    &quot;&quot;&quot;
+
+    def __init__(
+        self,
+        model: nn.Module,
+        lr: float = 1e-2,
+        max_norm: float = DEFAULT_MAX_NORM,
+        device_type: str = DEFAULT_DEVICE,
+        weight_decay: float = 0.01,
+        amp_dtype: torch.dtype | None = None,
+    ) -&gt; None:
+        if max_norm &lt;= 0:
+            raise ValueError(&quot;max_norm must be positive&quot;)
+        if device_type not in (&quot;cpu&quot;, &quot;cuda&quot;, &quot;mps&quot;):
+            raise ValueError(f&quot;device_type must be 'cpu', 'cuda', or 'mps', got {device_type}&quot;)
+        self.model = model
+        self.max_norm = max_norm
+        self.device_type = device_type
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        scaler_enabled = device_type == &quot;cuda&quot;
+        self.scaler = torch.amp.GradScaler(device_type, enabled=scaler_enabled)
+        if amp_dtype is None:
+            amp_dtype = torch.bfloat16 if device_type == &quot;cpu&quot; else torch.float16
+        self.amp_dtype = amp_dtype
+        self.global_step = 0
+        self._log: list[StepLog] = []
+        self._skip_log: list[SkipLog] = []
+        self._loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = nn.functional.mse_loss
+
+    @property
+    def log(self) -&gt; list[StepLog]:
+        return list(self._log)
+
+    @property
+    def skip_log(self) -&gt; list[SkipLog]:
+        return list(self._skip_log)
+
+    @property
+    def skip_count(self) -&gt; int:
+        return len(self._skip_log)
+
+    def set_loss_fn(self, fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor]) -&gt; None:
+        self._loss_fn = fn
+
+    def set_lr(self, lr: float) -&gt; None:
+        for group in self.optimizer.param_groups:
+            group[&quot;lr&quot;] = lr
+
+    def _current_lr(self) -&gt; float:
+        return float(self.optimizer.param_groups[0][&quot;lr&quot;])
+
+    def step(
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        gradient_corruptor: Callable[[nn.Module], None] | None = None,
+    ) -&gt; StepLog:
+        &quot;&quot;&quot;Run one training step with optional gradient corruption for testing.
+
+        `gradient_corruptor` lets the demo inject a non-finite gradient after
+        backward and before the unscale step. Production callers leave it as
+        None; tests pass a closure that writes Inf into one parameter's grad.
+        &quot;&quot;&quot;
+
+        self.model.train()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        with torch.amp.autocast(device_type=self.device_type, dtype=self.amp_dtype):
+            predictions = self.model(inputs)
+            loss = self._loss_fn(predictions, targets)
+
+        if not torch.isfinite(loss).all().item():
+            # Skip without touching scaler.update(): we never called
+            # scaler.scale(loss).backward() for this step, so calling update()
+            # here would violate GradScaler's required call ordering.
+            return self._record_skip(
+                loss_value=float(loss.detach().cpu().item()),
+                reason=&quot;non_finite_loss&quot;,
+                pre_clip=0.0,
+                update_scaler=False,
+            )
+
+        self.scaler.scale(loss).backward()
+        if gradient_corruptor is not None:
+            gradient_corruptor(self.model)
+        self.scaler.unscale_(self.optimizer)
+
+        if has_non_finite_grad(self.model.parameters()):
+            scale_before = float(self.scaler.get_scale())
+            self.scaler.update()
+            record = StepLog(
+                step=self.global_step,
+                lr=self._current_lr(),
+                grad_l2_pre_clip=float(&quot;inf&quot;),
+                grad_l2_post_clip=float(&quot;inf&quot;),
+                loss=float(loss.detach().item()),
+                skipped=True,
+                skip_reason=&quot;non_finite_grad&quot;,
+                scaler_scale=scale_before,
+            )
+            self._log.append(record)
+            self._skip_log.append(
+                SkipLog(
+                    step=self.global_step,
+                    reason=&quot;non_finite_grad&quot;,
+                    pre_clip_norm=float(&quot;inf&quot;),
+                    loss=float(loss.detach().item()),
+                    scaler_scale=scale_before,
+                )
+            )
+            self.global_step += 1
+            return record
+
+        pre_clip, post_clip = clip_global_l2_norm(list(self.model.parameters()), self.max_norm)
+
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        record = StepLog(
+            step=self.global_step,
+            lr=self._current_lr(),
+            grad_l2_pre_clip=pre_clip,
+            grad_l2_post_clip=post_clip,
+            loss=float(loss.detach().item()),
+            skipped=False,
+            skip_reason=&quot;&quot;,
+            scaler_scale=float(self.scaler.get_scale()),
+        )
+        self._log.append(record)
+        self.global_step += 1
+        return record
+
+    def _record_skip(
+        self,
+        loss_value: float,
+        reason: str,
+        pre_clip: float,
+        update_scaler: bool = True,
+    ) -&gt; StepLog:
+        record = StepLog(
+            step=self.global_step,
+            lr=self._current_lr(),
+            grad_l2_pre_clip=pre_clip,
+            grad_l2_post_clip=pre_clip,
+            loss=loss_value,
+            skipped=True,
+            skip_reason=reason,
+            scaler_scale=float(self.scaler.get_scale()),
+        )
+        self._log.append(record)
+        self._skip_log.append(
+            SkipLog(
+                step=self.global_step,
+                reason=reason,
+                pre_clip_norm=pre_clip,
+                loss=loss_value,
+                scaler_scale=float(self.scaler.get_scale()),
+            )
+        )
+        self.global_step += 1
+        if update_scaler:
+            self.scaler.update()
+        return record
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>rolling_skip_rate</code>, <code>write_step_log_csv</code>, <code>build_toy_model</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def rolling_skip_rate(log: Iterable[StepLog], window: int = 1000) -&gt; list[float]:
+    &quot;&quot;&quot;Return the rolling skip rate over the last `window` steps for each step.&quot;&quot;&quot;
+
+    if window &lt;= 0:
+        raise ValueError(&quot;window must be positive&quot;)
+    rows = list(log)
+    rates: list[float] = []
+    skipped: list[int] = []
+    for row in rows:
+        skipped.append(1 if row.skipped else 0)
+        if len(skipped) &gt; window:
+            skipped = skipped[-window:]
+        rates.append(sum(skipped) / len(skipped))
+    return rates
+
+
+def write_step_log_csv(log: Iterable[StepLog], path: Path) -&gt; None:
+    &quot;&quot;&quot;Write the canonical training-step CSV.
+
+    Columns: step, lr, grad_l2_pre_clip, grad_l2_post_clip, loss, skipped,
+    skip_reason, scaler_scale.
+    &quot;&quot;&quot;
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open(&quot;w&quot;, encoding=&quot;utf-8&quot;, newline=&quot;&quot;) as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                &quot;step&quot;,
+                &quot;lr&quot;,
+                &quot;grad_l2_pre_clip&quot;,
+                &quot;grad_l2_post_clip&quot;,
+                &quot;loss&quot;,
+                &quot;skipped&quot;,
+                &quot;skip_reason&quot;,
+                &quot;scaler_scale&quot;,
+            ]
+        )
+        for row in log:
+            writer.writerow(row.to_csv_row())
+
+
+def build_toy_model(
+    in_dim: int = 16,
+    out_dim: int = 4,
+    seed: int = 7,
+) -&gt; tuple[nn.Module, torch.Tensor, torch.Tensor]:
+    torch.manual_seed(seed)
+    model = nn.Sequential(nn.Linear(in_dim, 32), nn.GELU(), nn.Linear(32, out_dim))
+    inputs = torch.randn(8, in_dim)
+    targets = torch.randn(8, out_dim)
+    return model, inputs, targets
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · <code>inject_inf_into_first_grad</code>, <code>run_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def inject_inf_into_first_grad(model: nn.Module) -&gt; None:
+    &quot;&quot;&quot;Test-only: write +Inf into the first parameter's gradient.&quot;&quot;&quot;
+
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.data[...] = float(&quot;inf&quot;)
+            return
+
+
+def run_demo() -&gt; int:
+    &quot;&quot;&quot;Train for 20 steps and inject a non-finite gradient on a known step.&quot;&quot;&quot;
+
+    model, inputs, targets = build_toy_model()
+    state = AmpTrainState(model=model, lr=1e-2, max_norm=1.0, device_type=&quot;cpu&quot;)
+    for index in range(20):
+        corruptor: Callable[[nn.Module], None] | None = None
+        if index == 5:
+            corruptor = inject_inf_into_first_grad
+        record = state.step(inputs, targets, gradient_corruptor=corruptor)
+        marker = &quot;SKIP&quot; if record.skipped else &quot;STEP&quot;
+        print(
+            f&quot;{marker} step={record.step:&gt;3} lr={record.lr:.6f} &quot;
+            f&quot;pre_clip={record.grad_l2_pre_clip:&gt;10.6f} &quot;
+            f&quot;post_clip={record.grad_l2_post_clip:&gt;10.6f} &quot;
+            f&quot;loss={record.loss:.6f} scale={record.scaler_scale:.1f} &quot;
+            f&quot;reason={record.skip_reason or '-'}&quot;
+        )
+    print()
+    print(
+        f&quot;skip_count={state.skip_count} &quot;
+        f&quot;final_skip_rate={rolling_skip_rate(state.log, window=10)[-1]:.4f}&quot;
+    )
+    return 0
+</code></pre></div>
+
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Twenty steps run; at step 0 the gradient norm (1.008) is just above the threshold and gets clipped to 1.0, and afterwards it stays below. At step 5 the demo injects an infinite gradient: the step is marked SKIP with reason <code>non_finite_grad</code>, the loss is unchanged at the next step, and training continues. Two details to read carefully: the scale stays at 1.0 throughout because this CPU run does not use FP16, so the scaler is inactive; and the summary reports <code>skip_count=1</code> but <code>final_skip_rate=0.0000</code>, which is a rate over a recent window that no longer contains step 5, not over the whole run.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A training script calls <code>torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)</code> right after <code>scaler.scale(loss).backward()</code>, then <code>scaler.step(optimizer)</code>. Clipping never seems to do anything. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Clip by the global L2 norm; direction stays the same.</li>
+<li>In mixed precision: scale, backward, unscale, clip, step, update the scale.</li>
+<li>Skip steps with non-finite gradients and lower the scale.</li>
+<li>Log pre-clip norm, post-clip norm, scale and skips.</li>
+<li>BF16's wider range rarely needs loss scaling.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-nn-debugging"><span class="t" style="--cs-hue:12">DN</span>Cheat sheet · Debugging Neural Network Training</a><a href="#cs-optimizers-schedules"><span class="t" style="--cs-hue:28">OL</span>Cheat sheet · Optimizers and Learning Rate Schedules</a><a href="#cs-training-memory-checkpoints"><span class="t" style="--cs-hue:20">TM</span>Cheat sheet · Training Memory, Accumulation and Checkpoints</a></div>
 <h2>Ship it</h2>
@@ -99,6 +543,9 @@
 <li>Add a rolling-window skip-rate computation and a CLI flag that fails the run if the rate exceeds a configured threshold for 100 consecutive steps.</li>
 <li>Wire the loop to write the canonical CSV (<code>step, lr, grad_l2_pre_clip, grad_l2_post_clip, loss, skipped, skip_reason, scaler_scale</code>) and confirm the file survives a Ctrl-C by flushing after every row.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1945-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · BF16 instead of FP16</span></summary><div class="qa-a"><p>BF16 keeps FP32's exponent range with fewer mantissa bits, so values that overflow FP16 do not overflow BF16. Switch autocast to <code>dtype=torch.bfloat16</code> and disable the scaler; on the same demo, non-finite gradients from overflow disappear (an injected Inf will still be skipped, since that is not an overflow).</p></div></details>
+<details class="qa" id="a1945-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Clipping scaled gradients</span></summary><div class="qa-a"><p>After <code>scaler.scale(loss).backward()</code> the gradients are multiplied by the scale factor (often 65,536), so their norm is huge and clipping to 1.0 squashes them, then the scaler divides again, and the real update is tiny or erratic. Call <code>scaler.unscale_(optimizer)</code> before clipping, then <code>scaler.step(optimizer)</code> and <code>scaler.update()</code>.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://arxiv.org/abs/1710.03740">Micikevicius et al., Mixed Precision Training (arXiv 1710.03740)</a> - the original loss-scaling proposal</li>
 <li><a href="https://arxiv.org/abs/1211.5063">Pascanu, Mikolov, Bengio, On the difficulty of training recurrent neural networks (arXiv 1211.5063)</a> - the gradient-clipping reference paper</li>

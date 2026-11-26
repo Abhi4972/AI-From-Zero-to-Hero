@@ -12,6 +12,7 @@
 </ul></div></aside>
 <aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>The loop is only as honest as its measurements. Build the runner that takes a spec, executes it in a sandboxed subprocess, and emits a json metrics blob the evaluator can trust.</p></div></aside>
 <h2>Why a subprocess</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>The research agent's experiments must be measured honestly and must not be able to damage the agent itself. So each experiment runs in a separate <strong>subprocess</strong> from an <strong>ExperimentSpec</strong>: the script, its parameters, a seed, a wall-clock limit and a memory cap. The runner captures <strong>stdout and stderr</strong>, reads metrics the script prints as JSON lines (intermediate ones while it runs, a final one at the end), records exit status, wall time and peak memory, and returns a structured result. Running the same spec with different settings produces an <strong>ablation table</strong>; running it twice with the same seed must produce identical metrics (<strong>determinism</strong>). The experiment here is a tiny mock training script.</p></div></aside>
 <p>A research loop runs untrusted code. The hypothesis came from a sampler, the experiment script came from the same path; treating either as safe in-process is asking for a crash that takes the orchestrator down. Subprocesses are the simplest isolation the language ships: a separate process, an independent address space, a signal handle on the parent side.</p>
 <p>The runner here does not implement full sandboxing. There is no cgroup, no seccomp filter, no namespace remapping. What it does have is a wall clock timeout, a polling loop for memory growth, and a kill path that terminates the process on either limit. That is the runtime contract every more elaborate sandbox extends. The lesson keeps the contract small enough to read in one sitting.</p>
 <h2>The ExperimentSpec shape</h2>
@@ -62,11 +63,395 @@
   stderr_tail          : str
 </code></pre></div>
 <p>The evaluator reads <code>metrics</code> and <code>terminal</code> first. If terminal is anything other than <code>"ok"</code> the experiment counts as a failed run and the evaluator's verdict is automatic. Otherwise the metrics are passed through the significance test.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Classifying how a run ended</div><div class="co-body"><p>Four runs of the same spec.</p>
+<ol>
+<li>Exit code 0, final metrics line present: <code>ok</code>.</li>
+<li>Killed at the 30-second limit: <code>timeout</code>. Its last intermediate metrics are kept but not treated as final.</li>
+<li>Exit code 1 with a traceback on stderr: <code>error</code>. The stderr tail goes into the result for debugging.</li>
+<li>Exit code 0 but no final metrics line: also an error, because "it finished" is not "it measured something". Distinguishing these cases is what lets the evaluator trust every <code>ok</code>.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A subprocess crash cannot take the agent process down with it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A zero exit code means the experiment produced valid metrics.
+  The final metrics line must also be present and parse.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> The same spec and seed must give identical metrics.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A soft memory cap guarantees the process cannot use more memory.
+  It is a check on measured usage; hard limits need OS controls.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a script prints two JSON lines, then a non-JSON log line, then a final JSON line, and exits 0. Which lines does the parser treat as metrics, and which as final?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Parsing metrics from a subprocess</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, subprocess, sys
+script = r'''
+import json, sys
+print(json.dumps({&quot;step&quot;: 0, &quot;loss&quot;: 4.9}))
+print(json.dumps({&quot;step&quot;: 1, &quot;loss&quot;: 4.4}))
+print(&quot;warning: something harmless&quot;)
+print(json.dumps({&quot;final_loss&quot;: 4.0, &quot;perplexity&quot;: 54.6}))
+print(&quot;progress chatter&quot;, file=sys.stderr)
+'''
+proc = subprocess.run([sys.executable, &quot;-c&quot;, script], capture_output=True, text=True, timeout=10)
+records = []
+for line in proc.stdout.splitlines():
+    try: records.append(json.loads(line))
+    except json.JSONDecodeError: pass
+final = records[-1] if records and &quot;final_loss&quot; in records[-1] else None
+print(&quot;exit code   :&quot;, proc.returncode)
+print(&quot;intermediate:&quot;, [r for r in records if r is not final])
+print(&quot;final       :&quot;, final)
+print(&quot;stderr tail :&quot;, proc.stderr.strip())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">exit code   : 0
+intermediate: [{&#x27;step&#x27;: 0, &#x27;loss&#x27;: 4.9}, {&#x27;step&#x27;: 1, &#x27;loss&#x27;: 4.4}]
+final       : {&#x27;final_loss&#x27;: 4.0, &#x27;perplexity&#x27;: 54.6}
+stderr tail : progress chatter</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The two step lines are intermediate metrics; the last JSON line, which carries <code>final_loss</code>, is the final record; the warning line is skipped because it is not JSON; and stderr is kept separately. This is the runner's contract in miniature: structured lines are data, everything else is log. (The lesson's runner launches script files rather than <code>-c</code> strings, which the sandbox from Lesson 19.26 would refuse.)</p></div></aside>
 <h2>How to read the code</h2>
 <p><code>code/main.py</code> defines <code>ExperimentSpec</code>, <code>ExperimentResult</code>, <code>ExperimentRunner</code>, <code>AblationRunner</code>, and a deterministic demo. The subprocess management is one class. The memory poller is a small thread. The ablation helper is a single function.</p>
 <p><code>code/experiments/sparsity_experiment.py</code> is the mock experiment used in tests. It reads its config file path from argv and writes a single json metrics line on completion.</p>
 <p><code>code/tests/test_runner.py</code> covers the success path, the timeout path, the crash path, the ablation table, and the determinism check across two runs.</p>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 5 · <code>ExperimentSpec</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Experiment runner: subprocess sandbox with timeout, memory poller, ablation table.
+
+Conceptual references:
+- ./docs/en.md (this lesson)
+- Phase 19 Track A lessons 20-29 (agent harness primitives)
+
+Stdlib only. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Iterable
+
+
+_LOGGER = logging.getLogger(__name__)
+_MEMORY_POLLER_UNSUPPORTED_WARNED = False
+
+
+@dataclass
+class ExperimentSpec:
+    spec_id: str
+    hypothesis_id: int
+    script_path: str
+    config: dict
+    seed: int = 0
+    wall_timeout_s: float = 30.0
+    memory_cap_mb: int = 512
+    metric_keys: list[str] = field(default_factory=list)
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;spec_id&quot;: self.spec_id,
+            &quot;hypothesis_id&quot;: self.hypothesis_id,
+            &quot;script_path&quot;: self.script_path,
+            &quot;config&quot;: dict(self.config),
+            &quot;seed&quot;: self.seed,
+            &quot;wall_timeout_s&quot;: self.wall_timeout_s,
+            &quot;memory_cap_mb&quot;: self.memory_cap_mb,
+            &quot;metric_keys&quot;: list(self.metric_keys),
+        }
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>ExperimentResult</code>, <code>_rss_mb</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class ExperimentResult:
+    spec_id: str
+    hypothesis_id: int
+    exit_code: int
+    terminal: str
+    wall_time_s: float
+    peak_rss_mb: float | None
+    metrics: dict
+    intermediate_metrics: list[dict]
+    stdout_tail: str
+    stderr_tail: str
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;spec_id&quot;: self.spec_id,
+            &quot;hypothesis_id&quot;: self.hypothesis_id,
+            &quot;exit_code&quot;: self.exit_code,
+            &quot;terminal&quot;: self.terminal,
+            &quot;wall_time_s&quot;: round(self.wall_time_s, 4),
+            &quot;peak_rss_mb&quot;: None if self.peak_rss_mb is None else round(self.peak_rss_mb, 2),
+            &quot;metrics&quot;: dict(self.metrics),
+            &quot;intermediate_metrics&quot;: [dict(m) for m in self.intermediate_metrics],
+            &quot;stdout_tail&quot;: self.stdout_tail[-400:],
+            &quot;stderr_tail&quot;: self.stderr_tail[-400:],
+        }
+
+
+def _rss_mb(pid: int) -&gt; float | None:
+    &quot;&quot;&quot;Best effort RSS read in MB. Returns None on unsupported platforms.&quot;&quot;&quot;
+    proc_status = f&quot;/proc/{pid}/status&quot;
+    if os.path.exists(proc_status):
+        try:
+            with open(proc_status, &quot;rt&quot;, encoding=&quot;utf-8&quot;) as fh:
+                for line in fh:
+                    if line.startswith(&quot;VmRSS:&quot;):
+                        parts = line.split()
+                        if len(parts) &gt;= 2:
+                            return float(parts[1]) / 1024.0
+        except OSError:
+            return None
+        return 0.0
+    if shutil.which(&quot;ps&quot;):
+        try:
+            out = subprocess.run(
+                [&quot;ps&quot;, &quot;-o&quot;, &quot;rss=&quot;, &quot;-p&quot;, str(pid)],
+                capture_output=True, text=True, timeout=2.0,
+            )
+            value = out.stdout.strip()
+            if value:
+                return float(value) / 1024.0
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+    return None
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>_MemoryPoller</code>, <code>_scan_intermediates</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class _MemoryPoller(threading.Thread):
+    &quot;&quot;&quot;Polls subprocess RSS in MB; kills the process if it crosses the cap.&quot;&quot;&quot;
+
+    def __init__(self, proc: subprocess.Popen, cap_mb: int, interval_s: float = 0.05) -&gt; None:
+        super().__init__(daemon=True)
+        self._proc = proc
+        self._cap = cap_mb
+        self._interval = interval_s
+        self._stop_event = threading.Event()
+        self.peak_rss_mb: float | None = None
+        self.killed_for_oom = False
+        self.unsupported = False
+
+    def stop(self) -&gt; None:
+        self._stop_event.set()
+
+    def run(self) -&gt; None:
+        global _MEMORY_POLLER_UNSUPPORTED_WARNED
+        while not self._stop_event.is_set() and self._proc.poll() is None:
+            rss = _rss_mb(self._proc.pid)
+            if rss is None:
+                self.unsupported = True
+                if not _MEMORY_POLLER_UNSUPPORTED_WARNED:
+                    _MEMORY_POLLER_UNSUPPORTED_WARNED = True
+                    _LOGGER.warning(
+                        &quot;memory poller disabled: platform does not expose RSS via /proc or ps; wall clock timeout still applies&quot;,
+                    )
+                return
+            self.peak_rss_mb = rss if self.peak_rss_mb is None else max(self.peak_rss_mb, rss)
+            if rss &gt; self._cap:
+                self.killed_for_oom = True
+                try:
+                    self._proc.kill()
+                except OSError:
+                    pass
+                return
+            self._stop_event.wait(self._interval)
+
+
+def _scan_intermediates(stdout: str, metric_keys: list[str]) -&gt; tuple[dict, list[dict]]:
+    &quot;&quot;&quot;Walk stdout lines and pull every json line whose keys cover metric_keys.
+
+    The last covering line is treated as the final metrics. Earlier lines are
+    returned as intermediates so the evaluator can plot learning curves.
+    &quot;&quot;&quot;
+    intermediates: list[dict] = []
+    final: dict = {}
+    required = set(metric_keys)
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith(&quot;{&quot;):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        if required and not required.issubset(parsed.keys()):
+            continue
+        if final:
+            intermediates.append(final)
+        final = parsed
+    return final, intermediates
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>ExperimentRunner</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ExperimentRunner:
+    &quot;&quot;&quot;Spawn a subprocess, enforce timeout and memory cap, return an ExperimentResult.&quot;&quot;&quot;
+
+    def __init__(self, python_path: str | None = None, poll_interval_s: float = 0.05) -&gt; None:
+        self._python = python_path or sys.executable
+        self._poll_interval = poll_interval_s
+
+    def run(self, spec: ExperimentSpec) -&gt; ExperimentResult:
+        with tempfile.TemporaryDirectory(prefix=&quot;exp_&quot;) as workdir:
+            config_path = os.path.join(workdir, &quot;config.json&quot;)
+            merged_config = dict(spec.config)
+            merged_config[&quot;__seed&quot;] = spec.seed
+            with open(config_path, &quot;w&quot;, encoding=&quot;utf-8&quot;) as fh:
+                json.dump(merged_config, fh)
+            return self._run_subprocess(spec, config_path)
+
+    def _run_subprocess(self, spec: ExperimentSpec, config_path: str) -&gt; ExperimentResult:
+        start = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                [self._python, spec.script_path, config_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except OSError as exc:
+            wall = time.perf_counter() - start
+            return ExperimentResult(
+                spec_id=spec.spec_id,
+                hypothesis_id=spec.hypothesis_id,
+                exit_code=-1,
+                terminal=&quot;crash&quot;,
+                wall_time_s=wall,
+                peak_rss_mb=None,
+                metrics={},
+                intermediate_metrics=[],
+                stdout_tail=&quot;&quot;,
+                stderr_tail=str(exc),
+            )
+        poller = _MemoryPoller(proc, spec.memory_cap_mb, self._poll_interval)
+        poller.start()
+        killed_for_timeout = False
+        try:
+            stdout, stderr = proc.communicate(timeout=spec.wall_timeout_s)
+        except subprocess.TimeoutExpired:
+            killed_for_timeout = True
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                stdout, stderr = proc.communicate(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = &quot;&quot;, &quot;&quot;
+        finally:
+            poller.stop()
+            poller.join(timeout=1.0)
+        wall = time.perf_counter() - start
+        metrics, intermediates = _scan_intermediates(stdout, spec.metric_keys)
+        terminal = self._terminal_label(proc.returncode, killed_for_timeout, poller.killed_for_oom, bool(metrics))
+        return ExperimentResult(
+            spec_id=spec.spec_id,
+            hypothesis_id=spec.hypothesis_id,
+            exit_code=proc.returncode if proc.returncode is not None else -1,
+            terminal=terminal,
+            wall_time_s=wall,
+            peak_rss_mb=poller.peak_rss_mb,
+            metrics=metrics,
+            intermediate_metrics=intermediates,
+            stdout_tail=stdout,
+            stderr_tail=stderr,
+        )
+
+    @staticmethod
+    def _terminal_label(exit_code: int | None, timed_out: bool, oomed: bool, have_metrics: bool) -&gt; str:
+        if oomed:
+            return &quot;oom&quot;
+        if timed_out:
+            return &quot;timeout&quot;
+        if exit_code == 0 and have_metrics:
+            return &quot;ok&quot;
+        if exit_code == 0 and not have_metrics:
+            return &quot;crash&quot;
+        return &quot;crash&quot;
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · <code>ablate</code>, <code>AblationTable</code>, <code>AblationRunner</code>, <code>_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def ablate(base: ExperimentSpec, knob: str, values: Iterable[Any]) -&gt; list[ExperimentSpec]:
+    specs: list[ExperimentSpec] = []
+    for value in values:
+        derived_config = dict(base.config)
+        derived_config[knob] = value
+        specs.append(ExperimentSpec(
+            spec_id=f&quot;{base.spec_id}_{knob}_{value}&quot;,
+            hypothesis_id=base.hypothesis_id,
+            script_path=base.script_path,
+            config=derived_config,
+            seed=base.seed,
+            wall_timeout_s=base.wall_timeout_s,
+            memory_cap_mb=base.memory_cap_mb,
+            metric_keys=list(base.metric_keys),
+        ))
+    return specs
+
+
+@dataclass
+class AblationTable:
+    knob: str
+    rows: list[tuple[Any, ExperimentResult]]
+
+    def to_dict(self) -&gt; dict:
+        return {
+            &quot;knob&quot;: self.knob,
+            &quot;rows&quot;: [{&quot;value&quot;: v, &quot;result&quot;: r.to_dict()} for v, r in self.rows],
+        }
+
+
+class AblationRunner:
+    def __init__(self, runner: ExperimentRunner) -&gt; None:
+        self._runner = runner
+
+    def sweep(self, base: ExperimentSpec, knob: str, values: Iterable[Any]) -&gt; AblationTable:
+        value_list = list(values)
+        rows: list[tuple[Any, ExperimentResult]] = []
+        for value, spec in zip(value_list, ablate(base, knob, value_list)):
+            result = self._runner.run(spec)
+            rows.append((value, result))
+        return AblationTable(knob=knob, rows=rows)
+
+
+def _demo() -&gt; None:
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(here, &quot;experiments&quot;, &quot;sparsity_experiment.py&quot;)
+    base = ExperimentSpec(
+        spec_id=&quot;demo_base&quot;,
+        hypothesis_id=1,
+        script_path=script,
+        config={&quot;k&quot;: 16, &quot;steps&quot;: 4, &quot;sleep_s&quot;: 0.0},
+        seed=7,
+        wall_timeout_s=15.0,
+        memory_cap_mb=256,
+        metric_keys=[&quot;perplexity&quot;, &quot;final_loss&quot;],
+    )
+    runner = ExperimentRunner()
+    base_result = runner.run(base)
+    sweep = AblationRunner(runner).sweep(base, &quot;k&quot;, [4, 8, 16, 32])
+    print(json.dumps({
+        &quot;base&quot;: base_result.to_dict(),
+        &quot;ablation&quot;: sweep.to_dict(),
+    }, indent=2))
+</code></pre></div>
+
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The base run exits 0 in about 0.1 seconds, peaks near 21 MB of memory, and reports four intermediate steps with loss falling from 4.98 to 3.60 and a final perplexity of 36.7; the stdout tail shows the raw JSON lines the metrics were parsed from. The rest of the output (an ablation over the spec's parameters) follows the same structure, so the evaluator in the next lesson can compare runs field by field.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An experiment runner calls the experiment function directly in the agent's process "to save the subprocess overhead". One generated experiment calls <code>os._exit(0)</code> and another leaks memory until the machine swaps. What is lost? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>One subprocess per experiment, from a written spec.</li>
+<li>Enforce wall-clock limits; check memory.</li>
+<li>Metrics are JSON lines; the last one carrying final fields is the result.</li>
+<li>Classify ok, timeout and error, and keep stderr tails.</li>
+<li>Same spec and seed, same metrics.</li>
+</ul></div></aside>
 <h2>Where this slots in</h2>
 <p>Lesson fifty generates the hypothesis. Lesson fifty-one filters out anything the literature already settled. Lesson fifty-two runs the experiment for what is left. Lesson fifty-three reads the result, runs the significance test, and writes the verdict the orchestrator stores against the hypothesis id.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1952-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · No process boundary</span></summary><div class="qa-a"><p><code>os._exit(0)</code> ends the whole agent, not just the experiment, and a memory leak in the same process degrades the agent and every later experiment. A separate process gives isolation, a clean way to kill on timeout, and accurate per-experiment memory and time measurements; the overhead is small next to any real experiment.</p></div></details>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-research-agent-pipeline"><span class="t" style="--cs-hue:165">RP</span>Cheat sheet · Research Agent Pipeline from Scratch</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1952" id="done-a1952">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1952" id="undo-a1952" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1951"><span class="pn-dir">Previous</span><span class="pn-t">19.51 · Literature Retrieval</span></a><a class="pn next" href="#a1953"><span class="pn-dir">Next</span><span class="pn-t">19.53 · Result Evaluator</span></a></div></footer>

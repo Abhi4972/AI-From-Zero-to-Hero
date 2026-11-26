@@ -12,6 +12,7 @@
 </ul></div></aside>
 <aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Track B's first capstone. A pretrained language model is a stack of self-attention blocks ending in a token-prediction head. When you want spam vs ham, the head is wrong but the body is mostly right. This lesson rips the head off, glues a two-class linear layer onto the pooled representation, and trains the classifier two different ways: final-layer only, and full fine-tuning. The eval is precision, recall, and F1 on a held-out split. You learn what each strategy buys you and what it costs.</p></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A pretrained language model ends in a <strong>head</strong> that predicts the next token. To turn it into a <strong>classifier</strong> (spam or not spam), keep the <strong>body</strong>, which already encodes useful structure, and swap the head for a small linear layer that outputs one score per class. The body produces one vector per token, so first <strong>pool</strong> them into one vector per message: take the last real token's vector, or the mean over real tokens (ignoring padding). Then choose how much to train. <strong>Head-only</strong> training freezes the body and learns just the new layer: tiny, fast, and hard to overfit. <strong>Full fine-tuning</strong> updates everything: more capacity, more risk with little data. This lesson builds both on the same small dataset (training here is seconds on a tiny model).</p></div></aside>
 <p>You pre-trained a small transformer on a generic corpus. The output head projects the last hidden state to a 1000-token vocabulary. You now have 800 SMS messages labelled spam or ham and you want a binary classifier. Three options exist.</p>
 <p>The wrong option is to train a fresh classifier from scratch on 800 examples. The body of the pretrained model already encodes useful structure: word identity, position, simple co-occurrence. Throwing it away wastes the compute that built it.</p>
 <p>The two right options are head swap with the body frozen, and head swap with the body trainable. Head-only training is fast, almost free in memory, and rarely overfits with this little data. Full fine-tuning is slower, can overfit on small data, but reaches higher accuracy when the downstream domain drifts from the pretraining corpus.</p>
@@ -70,9 +71,674 @@
 <li><code>evaluate</code>: runs the test set and returns <code>Metrics(precision, recall, f1, confusion)</code>.</li>
 <li><code>run_demo</code>: pretrains the body briefly, then trains and evaluates head-only, then full, prints both reports, and exits zero.</li>
 </ol>
+<p>Here is <code>code/main.py</code>, in 10 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 10 · <code>ByteTokenizer</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;
+Classifier fine-tuning by head swap.
+
+See: phases/19-capstone-projects/38-classifier-finetuning/docs/en.md
+
+Compares two strategies on a synthetic spam/ham fixture:
+  - Head-only: body frozen, only the linear classification head trains.
+  - Full FT:   body and head both train.
+
+The demo at the bottom pretrains a tiny transformer body briefly, then
+fine-tunes under both regimes and prints precision, recall, F1, and the
+confusion matrix for each. Exits 0 on success.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+from dataclasses import dataclass
+from typing import Iterable, List, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser
+# ---------------------------------------------------------------------------
+
+
+class ByteTokenizer:
+    &quot;&quot;&quot;Maps printable bytes to ids 0..255. Reserves PAD as id 256.&quot;&quot;&quot;
+
+    PAD_ID = 256
+    VOCAB = 260  # leave headroom for future specials
+
+    def encode(self, text: str, max_len: int) -&gt; Tuple[List[int], List[int]]:
+        &quot;&quot;&quot;Return (ids, attention_mask). Pads to max_len.&quot;&quot;&quot;
+        raw = list(text.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))[:max_len]
+        attn = [1] * len(raw)
+        while len(raw) &lt; max_len:
+            raw.append(self.PAD_ID)
+            attn.append(0)
+        return raw, attn
+
+    def decode(self, ids: Sequence[int]) -&gt; str:
+        return bytes(i for i in ids if i &lt; 256).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+
+# ---------------------------------------------------------------------------
+# Tiny transformer body
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 2 of 10 · <code>MultiHeadAttention</code>, <code>FeedForward</code>, <code>Block</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden: int, heads: int):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(&quot;hidden must divide by heads&quot;)
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+        self.out = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # mask: B x T, 1 for real, 0 for pad. broadcast to B x 1 x 1 x T.
+        m = mask.view(B, 1, 1, T).to(att.dtype)
+        att = att.masked_fill(m == 0, float(&quot;-inf&quot;))
+        weights = F.softmax(att, dim=-1)
+        # Replace nan rows (all-pad keys, never happens for valid input) with zeros.
+        weights = torch.nan_to_num(weights, nan=0.0)
+        ctx = (weights @ v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.out(ctx)
+
+
+class FeedForward(nn.Module):
+    def __init__(self, hidden: int, mlp_ratio: int = 4):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, hidden * mlp_ratio)
+        self.fc2 = nn.Linear(hidden * mlp_ratio, hidden)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.fc2(F.gelu(self.fc1(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, hidden: int, heads: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden)
+        self.attn = MultiHeadAttention(hidden, heads)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.ff = FeedForward(hidden)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x), mask)
+        x = x + self.ff(self.ln2(x))
+        return x
+</code></pre></div>
+
+<p><strong>Part 3 of 10 · <code>LMBody</code>, <code>mean_pool</code>, <code>Classifier</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class LMBody(nn.Module):
+    &quot;&quot;&quot;Embedding + position + N transformer blocks. Returns hidden states.&quot;&quot;&quot;
+
+    def __init__(self, vocab: int, hidden: int, heads: int, depth: int, max_len: int):
+        super().__init__()
+        self.tok = nn.Embedding(vocab, hidden)
+        self.pos = nn.Embedding(max_len, hidden)
+        self.blocks = nn.ModuleList([Block(hidden, heads) for _ in range(depth)])
+        self.ln_f = nn.LayerNorm(hidden)
+        self.max_len = max_len
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        B, T = ids.shape
+        positions = torch.arange(T, device=ids.device).unsqueeze(0).expand(B, T)
+        x = self.tok(ids) + self.pos(positions)
+        for block in self.blocks:
+            x = block(x, mask)
+        return self.ln_f(x)
+
+
+# ---------------------------------------------------------------------------
+# Pooling and classifier head
+# ---------------------------------------------------------------------------
+
+
+def mean_pool(hidden: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Mask-weighted mean across the sequence dimension.&quot;&quot;&quot;
+    m = mask.unsqueeze(-1).to(hidden.dtype)
+    summed = (hidden * m).sum(dim=1)
+    counts = m.sum(dim=1).clamp(min=1.0)
+    return summed / counts
+
+
+class Classifier(nn.Module):
+    def __init__(self, body: LMBody, num_classes: int = 2):
+        super().__init__()
+        self.body = body
+        hidden = body.ln_f.normalized_shape[0]
+        self.head = nn.Linear(hidden, num_classes)
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        h = self.body(ids, mask)
+        pooled = mean_pool(h, mask)
+        return self.head(pooled)
+</code></pre></div>
+
+<p><strong>Part 4 of 10 · <code>LMHead</code>, <code>freeze_body</code>, <code>unfreeze_body</code>, <code>trainable_params</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class LMHead(nn.Module):
+    &quot;&quot;&quot;Token-prediction head, used during the brief pretraining pass.&quot;&quot;&quot;
+
+    def __init__(self, body: LMBody, vocab: int):
+        super().__init__()
+        self.body = body
+        hidden = body.ln_f.normalized_shape[0]
+        self.proj = nn.Linear(hidden, vocab, bias=False)
+
+    def forward(self, ids: torch.Tensor, mask: torch.Tensor) -&gt; torch.Tensor:
+        h = self.body(ids, mask)
+        return self.proj(h)
+
+
+# ---------------------------------------------------------------------------
+# Freeze toggles
+# ---------------------------------------------------------------------------
+
+
+def freeze_body(model: Classifier) -&gt; int:
+    &quot;&quot;&quot;Set requires_grad=False on every body parameter. Returns count frozen.&quot;&quot;&quot;
+    n = 0
+    for p in model.body.parameters():
+        p.requires_grad = False
+        n += 1
+    return n
+
+
+def unfreeze_body(model: Classifier) -&gt; int:
+    n = 0
+    for p in model.body.parameters():
+        p.requires_grad = True
+        n += 1
+    return n
+
+
+def trainable_params(model: nn.Module) -&gt; int:
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic spam/ham fixture
+# ---------------------------------------------------------------------------
+
+
+SPAM_TEMPLATES = [
+    &quot;FREE entry in {n}wkly comp to win FA Cup&quot;,
+    &quot;URGENT call {phone} to claim your prize&quot;,
+    &quot;WINNER claim your {amount} pound award now&quot;,
+    &quot;Congrats you won {prize} reply YES&quot;,
+    &quot;Click {url} for {discount} percent off&quot;,
+    &quot;Cheap loans available call {phone}&quot;,
+    &quot;Hot singles in {city} text NOW&quot;,
+    &quot;Earn money working from home click {url}&quot;,
+    &quot;You have been selected for a {amount} pound voucher&quot;,
+    &quot;Limited offer reply STOP to opt out&quot;,
+]
+
+HAM_TEMPLATES = [
+    &quot;are you home for dinner tonight&quot;,
+    &quot;see you at {time} tomorrow&quot;,
+    &quot;can you pick up {item} on the way&quot;,
+    &quot;the meeting moved to {time}&quot;,
+    &quot;thanks for the {item} yesterday&quot;,
+    &quot;let me know when you are free&quot;,
+    &quot;running late by {n} minutes sorry&quot;,
+    &quot;have a good day at work&quot;,
+    &quot;did you watch the match last night&quot;,
+    &quot;happy birthday hope you have fun&quot;,
+]
+
+SLOTS = {
+    &quot;n&quot;: [&quot;1&quot;, &quot;2&quot;, &quot;3&quot;, &quot;5&quot;, &quot;10&quot;],
+    &quot;phone&quot;: [&quot;09061701461&quot;, &quot;08000839402&quot;, &quot;09058091870&quot;],
+    &quot;amount&quot;: [&quot;100&quot;, &quot;250&quot;, &quot;500&quot;, &quot;1000&quot;, &quot;5000&quot;],
+    &quot;prize&quot;: [&quot;a holiday&quot;, &quot;an iPhone&quot;, &quot;a laptop&quot;, &quot;cash&quot;],
+    &quot;url&quot;: [&quot;http://bit.ly/free&quot;, &quot;http://win.now/cash&quot;, &quot;http://promo.io&quot;],
+    &quot;discount&quot;: [&quot;20&quot;, &quot;30&quot;, &quot;50&quot;, &quot;70&quot;],
+    &quot;city&quot;: [&quot;London&quot;, &quot;Manchester&quot;, &quot;Leeds&quot;, &quot;Bristol&quot;],
+    &quot;time&quot;: [&quot;6pm&quot;, &quot;7pm&quot;, &quot;noon&quot;, &quot;9am&quot;],
+    &quot;item&quot;: [&quot;milk&quot;, &quot;bread&quot;, &quot;the kids&quot;, &quot;the dog&quot;, &quot;groceries&quot;],
+}
+</code></pre></div>
+
+<p><strong>Part 5 of 10 · <code>fill</code>, <code>make_dataset</code>, <code>stratified_split</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def fill(template: str, rng: random.Random) -&gt; str:
+    out = template
+    for key, options in SLOTS.items():
+        marker = &quot;{&quot; + key + &quot;}&quot;
+        if marker in out:
+            out = out.replace(marker, rng.choice(options))
+    return out
+
+
+def make_dataset(n_per_class: int = 400, seed: int = 0) -&gt; Tuple[List[str], List[int]]:
+    rng = random.Random(seed)
+    texts: List[str] = []
+    labels: List[int] = []
+    for _ in range(n_per_class):
+        texts.append(fill(rng.choice(SPAM_TEMPLATES), rng))
+        labels.append(1)
+        texts.append(fill(rng.choice(HAM_TEMPLATES), rng))
+        labels.append(0)
+    # Shuffle deterministically.
+    order = list(range(len(texts)))
+    rng.shuffle(order)
+    return [texts[i] for i in order], [labels[i] for i in order]
+
+
+def stratified_split(
+    texts: Sequence[str], labels: Sequence[int], test_frac: float, seed: int
+) -&gt; Tuple[List[str], List[int], List[str], List[int]]:
+    rng = random.Random(seed)
+    by_label: dict[int, List[int]] = {}
+    for idx, y in enumerate(labels):
+        by_label.setdefault(y, []).append(idx)
+    train_idx: List[int] = []
+    test_idx: List[int] = []
+    for y, idxs in by_label.items():
+        idxs_copy = list(idxs)
+        rng.shuffle(idxs_copy)
+        cut = int(len(idxs_copy) * (1.0 - test_frac))
+        train_idx.extend(idxs_copy[:cut])
+        test_idx.extend(idxs_copy[cut:])
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    return (
+        [texts[i] for i in train_idx],
+        [labels[i] for i in train_idx],
+        [texts[i] for i in test_idx],
+        [labels[i] for i in test_idx],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 6 of 10 · <code>ClassificationDataset</code>, <code>LMDataset</code>, <code>pretrain_quick</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ClassificationDataset(Dataset):
+    def __init__(self, texts: Sequence[str], labels: Sequence[int], tok: ByteTokenizer, max_len: int):
+        self.texts = list(texts)
+        self.labels = list(labels)
+        self.tok = tok
+        self.max_len = max_len
+
+    def __len__(self) -&gt; int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int):
+        ids, mask = self.tok.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(mask, dtype=torch.long),
+            torch.tensor(self.labels[idx], dtype=torch.long),
+        )
+
+
+class LMDataset(Dataset):
+    &quot;&quot;&quot;Causal LM dataset over the spam/ham strings. Used for the warm-up pretraining.&quot;&quot;&quot;
+
+    def __init__(self, texts: Sequence[str], tok: ByteTokenizer, max_len: int):
+        self.texts = list(texts)
+        self.tok = tok
+        self.max_len = max_len
+
+    def __len__(self) -&gt; int:
+        return len(self.texts)
+
+    def __getitem__(self, idx: int):
+        ids, mask = self.tok.encode(self.texts[idx], self.max_len)
+        return (
+            torch.tensor(ids, dtype=torch.long),
+            torch.tensor(mask, dtype=torch.long),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Training loops
+# ---------------------------------------------------------------------------
+
+
+def pretrain_quick(
+    body: LMBody,
+    tok: ByteTokenizer,
+    texts: Sequence[str],
+    max_len: int,
+    epochs: int = 5,
+    batch_size: int = 32,
+    lr: float = 3e-3,
+    seed: int = 0,
+) -&gt; List[float]:
+    &quot;&quot;&quot;A short LM pretraining pass to give the body non-trivial weights.&quot;&quot;&quot;
+    torch.manual_seed(seed)
+    head = LMHead(body, vocab=tok.VOCAB)
+    ds = LMDataset(texts, tok, max_len)
+    dl = DataLoader(ds, batch_size=batch_size, shuffle=True)
+    opt = torch.optim.Adam(head.parameters(), lr=lr)
+    losses: List[float] = []
+    head.train()
+    for _ in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        for ids, mask in dl:
+            logits = head(ids, mask)
+            # Shift one for next-token prediction.
+            target = ids[:, 1:].contiguous()
+            tgt_mask = mask[:, 1:].contiguous()
+            logits = logits[:, :-1, :].contiguous()
+            loss_full = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                target.view(-1),
+                reduction=&quot;none&quot;,
+            )
+            loss_full = loss_full.view(target.shape) * tgt_mask
+            denom = tgt_mask.sum().clamp(min=1.0)
+            loss = loss_full.sum() / denom
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        losses.append(epoch_loss / max(n_batches, 1))
+    return losses
+</code></pre></div>
+
+<p><strong>Part 7 of 10 · <code>TrainReport</code>, <code>train_classifier</code>, <code>Metrics</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class TrainReport:
+    losses: List[float]
+    final_loss: float
+    trainable: int
+
+
+def train_classifier(
+    model: Classifier,
+    train_loader: DataLoader,
+    epochs: int,
+    lr: float,
+    seed: int,
+) -&gt; TrainReport:
+    torch.manual_seed(seed)
+    params = [p for p in model.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError(&quot;No trainable parameters. Did you freeze the head as well?&quot;)
+    opt = torch.optim.Adam(params, lr=lr)
+    losses: List[float] = []
+    model.train()
+    for _ in range(epochs):
+        epoch_loss = 0.0
+        n_batches = 0
+        for ids, mask, y in train_loader:
+            logits = model(ids, mask)
+            loss = F.cross_entropy(logits, y)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            epoch_loss += float(loss.item())
+            n_batches += 1
+        losses.append(epoch_loss / max(n_batches, 1))
+    return TrainReport(losses=losses, final_loss=losses[-1], trainable=trainable_params(model))
+
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Metrics:
+    precision: float
+    recall: float
+    f1: float
+    tp: int
+    fp: int
+    fn: int
+    tn: int
+
+    def confusion(self) -&gt; str:
+        return (
+            &quot;                pred ham   pred spam\n&quot;
+            f&quot;  actual ham    {self.tn:&gt;8d}   {self.fp:&gt;8d}\n&quot;
+            f&quot;  actual spam   {self.fn:&gt;8d}   {self.tp:&gt;8d}&quot;
+        )
+</code></pre></div>
+
+<p><strong>Part 8 of 10 · <code>precision_recall_f1</code>, <code>evaluate</code>, <code>Config</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def precision_recall_f1(tp: int, fp: int, fn: int) -&gt; Tuple[float, float, float]:
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (2 * p * r) / (p + r) if (p + r) else 0.0
+    return p, r, f1
+
+
+@torch.no_grad()
+def evaluate(model: Classifier, loader: DataLoader, positive: int = 1) -&gt; Metrics:
+    model.eval()
+    tp = fp = fn = tn = 0
+    for ids, mask, y in loader:
+        logits = model(ids, mask)
+        pred = logits.argmax(dim=-1)
+        for p_i, y_i in zip(pred.tolist(), y.tolist()):
+            if p_i == positive and y_i == positive:
+                tp += 1
+            elif p_i == positive and y_i != positive:
+                fp += 1
+            elif p_i != positive and y_i == positive:
+                fn += 1
+            else:
+                tn += 1
+    p, r, f1 = precision_recall_f1(tp, fp, fn)
+    return Metrics(precision=p, recall=r, f1=f1, tp=tp, fp=fp, fn=fn, tn=tn)
+
+
+# ---------------------------------------------------------------------------
+# Configuration and demo
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    vocab: int = ByteTokenizer.VOCAB
+    hidden: int = 64
+    heads: int = 4
+    depth: int = 2
+    max_len: int = 32
+    batch_size: int = 32
+    head_only_epochs: int = 20
+    full_ft_epochs: int = 20
+    head_lr: float = 5e-3
+    full_lr: float = 1e-3
+    pretrain_epochs: int = 5
+    seed: int = 0
+</code></pre></div>
+
+<p><strong>Part 9 of 10 · <code>build_model</code>, <code>DemoReport</code>, <code>run_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def build_model(cfg: Config) -&gt; Classifier:
+    torch.manual_seed(cfg.seed)
+    body = LMBody(
+        vocab=cfg.vocab,
+        hidden=cfg.hidden,
+        heads=cfg.heads,
+        depth=cfg.depth,
+        max_len=cfg.max_len,
+    )
+    return Classifier(body, num_classes=2)
+
+
+@dataclass
+class DemoReport:
+    head_only: Metrics
+    full_ft: Metrics
+    head_only_loss: float
+    full_ft_loss: float
+    head_only_trainable: int
+    full_ft_trainable: int
+
+    def passed(self) -&gt; bool:
+        # Both regimes should beat random (F1 &gt; 0.5) on this fixture.
+        return self.head_only.f1 &gt; 0.5 and self.full_ft.f1 &gt; 0.5
+
+
+def run_demo(cfg: Config | None = None) -&gt; int:
+    cfg = cfg or Config()
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+
+    tok = ByteTokenizer()
+    texts, labels = make_dataset(n_per_class=400, seed=cfg.seed)
+    tr_t, tr_y, te_t, te_y = stratified_split(texts, labels, test_frac=0.2, seed=cfg.seed)
+
+    train_ds = ClassificationDataset(tr_t, tr_y, tok, cfg.max_len)
+    test_ds = ClassificationDataset(te_t, te_y, tok, cfg.max_len)
+    train_dl = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    test_dl = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
+
+    print(&quot;CLASSIFIER FINE-TUNING DEMO&quot;)
+    print(f&quot;train={len(train_ds)} test={len(test_ds)} max_len={cfg.max_len}&quot;)
+    print(&quot;&quot;)
+    print(&quot;[1/3] pretraining body briefly on the corpus text...&quot;)
+    body_for_pretrain = LMBody(
+        vocab=cfg.vocab,
+        hidden=cfg.hidden,
+        heads=cfg.heads,
+        depth=cfg.depth,
+        max_len=cfg.max_len,
+    )
+    pre_losses = pretrain_quick(
+        body_for_pretrain,
+        tok,
+        tr_t,
+        cfg.max_len,
+        epochs=cfg.pretrain_epochs,
+        batch_size=cfg.batch_size,
+        seed=cfg.seed,
+    )
+    print(f&quot;      pretrain final loss = {pre_losses[-1]:.4f}&quot;)
+
+    # Two classifiers share the same pretrained body weights (copied to keep regimes independent).
+    head_only_model = Classifier(_clone_body(body_for_pretrain), num_classes=2)
+    full_ft_model = Classifier(_clone_body(body_for_pretrain), num_classes=2)
+
+    print(&quot;&quot;)
+    print(&quot;[2/3] training head-only (body frozen)...&quot;)
+    freeze_body(head_only_model)
+    head_report = train_classifier(
+        head_only_model,
+        train_dl,
+        epochs=cfg.head_only_epochs,
+        lr=cfg.head_lr,
+        seed=cfg.seed,
+    )
+    head_metrics = evaluate(head_only_model, test_dl)
+    print(f&quot;      trainable params = {head_report.trainable}&quot;)
+    print(f&quot;      final train loss = {head_report.final_loss:.4f}&quot;)
+    print(f&quot;      P={head_metrics.precision:.3f} R={head_metrics.recall:.3f} F1={head_metrics.f1:.3f}&quot;)
+    print(head_metrics.confusion())
+
+    print(&quot;&quot;)
+    print(&quot;[3/3] training full fine-tuning (body unfrozen)...&quot;)
+    unfreeze_body(full_ft_model)
+    full_report = train_classifier(
+        full_ft_model,
+        train_dl,
+        epochs=cfg.full_ft_epochs,
+        lr=cfg.full_lr,
+        seed=cfg.seed,
+    )
+    full_metrics = evaluate(full_ft_model, test_dl)
+    print(f&quot;      trainable params = {full_report.trainable}&quot;)
+    print(f&quot;      final train loss = {full_report.final_loss:.4f}&quot;)
+    print(f&quot;      P={full_metrics.precision:.3f} R={full_metrics.recall:.3f} F1={full_metrics.f1:.3f}&quot;)
+    print(full_metrics.confusion())
+
+    report = DemoReport(
+        head_only=head_metrics,
+        full_ft=full_metrics,
+        head_only_loss=head_report.final_loss,
+        full_ft_loss=full_report.final_loss,
+        head_only_trainable=head_report.trainable,
+        full_ft_trainable=full_report.trainable,
+    )
+
+    print(&quot;&quot;)
+    print(&quot;SUMMARY&quot;)
+    print(f&quot;  head-only:  trainable={report.head_only_trainable:&gt;6d} F1={report.head_only.f1:.3f}&quot;)
+    print(f&quot;  full-FT:    trainable={report.full_ft_trainable:&gt;6d} F1={report.full_ft.f1:.3f}&quot;)
+    if not report.passed():
+        print(&quot;ERROR: at least one regime did not beat random F1=0.5&quot;, file=sys.stderr)
+        return 1
+    return 0
+</code></pre></div>
+
+<p><strong>Part 10 of 10 · <code>_clone_body</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _clone_body(body: LMBody) -&gt; LMBody:
+    &quot;&quot;&quot;Deep-copy a body so two regimes start from the same pretrained weights.&quot;&quot;&quot;
+    clone = LMBody(
+        vocab=body.tok.num_embeddings,
+        hidden=body.ln_f.normalized_shape[0],
+        heads=body.blocks[0].attn.heads,
+        depth=len(body.blocks),
+        max_len=body.max_len,
+    )
+    clone.load_state_dict(body.state_dict())
+    return clone
+</code></pre></div>
+
 <h2>Why the comparison matters</h2>
 <p>The head-only regime usually trains faster and underfits more gracefully. On this fixture you typically see precision near 0.9 and recall near 0.85 after twenty epochs of head-only training. Full fine-tuning takes about three times longer and lands within a couple of points either way, depending on the random seed.</p>
 <p>The lesson does not pick a winner. It teaches you to read the numbers and the cost. On 800 examples and a tiny body, head-only is the right call. On 80,000 examples and a bigger body, full fine-tuning starts to pay off. The contract you take from this lesson is the API: the same <code>train_classifier</code> function handles both, and the toggle is one call.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Counting what you train</div><div class="co-body"><p>Body width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">D</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>, two classes.</p>
+<ol>
+<li>Head-only: a linear layer from 64 to 2 has <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">130</span></span></span></span> parameters. That is the entire trainable set.</li>
+<li>Full fine-tuning: the same 130 plus every body parameter, about 118,000 in this lesson's model.</li>
+<li>With 640 training messages, 130 parameters cannot memorize much; 118,000 can, so full fine-tuning needs a validation set and early stopping to be trusted.</li>
+<li>If both reach the same test score, the head-only result is the more informative: it shows the body's features already separate the classes.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Head-only training freezes the body and trains only the new layer.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Mean pooling should include padding positions to keep shapes simple.
+  Padding vectors carry no content; mask them out of the mean.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> The new head outputs one logit per class.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Full fine-tuning always beats head-only training.
+  With little data it can overfit; it wins only when the body's features are not enough.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a message has 3 real tokens and 2 padding positions. What is the difference between a mean over all 5 positions and a mean over the real tokens only?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Masked mean pooling</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">vectors = [[1.0, 2.0], [3.0, 0.0], [2.0, 4.0], [0.0, 0.0], [0.0, 0.0]]   # last two are padding
+mask = [1, 1, 1, 0, 0]
+naive = [sum(v[d] for v in vectors) / len(vectors) for d in range(2)]
+masked = [sum(v[d] * m for v, m in zip(vectors, mask)) / sum(mask) for d in range(2)]
+last_real = vectors[max(i for i, m in enumerate(mask) if m)]
+print(&quot;mean over all positions :&quot;, naive)
+print(&quot;mean over real tokens   :&quot;, masked)
+print(&quot;last real token         :&quot;, last_real)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">mean over all positions : [1.2, 1.2]
+mean over real tokens   : [2.0, 2.0]
+last real token         : [2.0, 4.0]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Including padding shrinks the pooled vector toward zero (here by 40%), and by an amount that depends on how much padding each message has, so short and long messages land in different regions for no reason related to their content. The masked mean and the last-real-token vector both ignore padding; which works better is the "pooling question" the lesson leaves you to test.</p></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Both approaches reach a perfect score on the 160 test messages: precision, recall and F1 all 1.0, with no errors in either confusion matrix. Head-only training gets there with 130 trainable parameters, full fine-tuning with 118,402. When the cheapest method is already perfect, the test set is too easy to tell the methods apart; that is the useful conclusion here, and a reason to build harder test cases before choosing.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team fine-tunes the full model on 800 messages for 50 epochs, reports 100% training accuracy and ships. In production, accuracy is 71%. What did their process leave out? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Keep the pretrained body; replace the head with a small class layer.</li>
+<li>Pool token vectors into one, masking padding.</li>
+<li>Head-only: few parameters, fast, little overfitting.</li>
+<li>Full fine-tuning: more capacity, more need for validation.</li>
+<li>If the cheap method is perfect, the test set is too easy.</li>
+</ul></div></aside>
 <h2>Stretch goals</h2>
 <ul>
 <li>Add a third regime that unfreezes only the last block. This is sometimes called partial fine-tuning. It costs less than full FT and learns more than head-only.</li>
@@ -80,12 +746,14 @@
 <li>Replace mean pooling with a learned attention pool: a small attention layer with one learned query. This often beats mean pool on longer sequences.</li>
 </ul>
 <p>The implementation gives you the hooks. The tests pin the contract. The numbers are yours to push.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1938-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Training accuracy is not evidence</span></summary><div class="qa-a"><p>They measured only on the data they trained on, so 100% says the model memorized 800 messages, not that it generalizes. Hold out a validation set from the start, stop training when validation performance stops improving, compare against the head-only baseline, and test on messages from a different time or source to catch drift.</p></div></details>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-llm-pipeline-capstone"><span class="t" style="--cs-hue:215">EE</span>Cheat sheet · End-to-End LLM and Fine-Tuning Pipeline</a><a href="#cs-lora-fine-tuning"><span class="t" style="--cs-hue:310">FT</span>Cheat sheet · Fine-Tuning with LoRA</a></div>
 <h2>Interview questions</h2>
 <p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
 <p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
-<details class="qa" id="a1938-qa1"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You have a small pretrained transformer and 800 labelled text messages, half of them spam. You need a binary classifier by tomorrow. Do you train only a new classification head, or do you update every weight? Defend the choice.</span></summary><div class="qa-a"><p><em>Level 1 of 4 · about 8 minutes to answer well.</em></p>
+<details class="qa" id="a1938-qa2"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You have a small pretrained transformer and 800 labelled text messages, half of them spam. You need a binary classifier by tomorrow. Do you train only a new classification head, or do you update every weight? Defend the choice.</span></summary><div class="qa-a"><p><em>Level 1 of 4 · about 8 minutes to answer well.</em></p>
 <p><strong>Short answer.</strong> Swap the language-model head for a two-class linear layer and start with the body frozen. Head-only training is fast, costs almost no memory, and rarely overfits on this little data. Unfreeze the body only when the frozen run leaves accuracy on the table and the domain is far from the pretraining text.</p>
 <p><strong>Two regimes, one loop.</strong></p>
 <p>The body maps tokens to hidden states and stays as it is. The head maps a pooled hidden state to two logits and is new. Head-only training sets <code>requires_grad=False</code> on the body, so the optimizer sees only the head. Full fine-tuning lets the gradient flow through the whole stack, and the body drifts toward the classification objective.</p>
@@ -111,7 +779,7 @@
 <li><em>(level 3)</em> The full update scores lower than the frozen run on this data. What happened? Expected: the body overfit the small set and lost pretrained structure; lower the body learning rate, unfreeze fewer blocks, or stay with the head.</li>
 </ul>
 <p><strong>Where it is taught.</strong> The <a href="#a1938">classifier fine-tuning capstone</a> builds both regimes on one training loop and reads precision, recall and F1 for each.</p></div></details>
-<details class="qa" id="a1938-qa2"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You have a small pretrained language model and 800 labeled text messages, half spam and half not. Design the classifier: what you keep, what you replace, which of two training regimes you choose, how you split and evaluate, and when the other regime would win.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 12 minutes to answer well.</em></p>
+<details class="qa" id="a1938-qa3"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You have a small pretrained language model and 800 labeled text messages, half spam and half not. Design the classifier: what you keep, what you replace, which of two training regimes you choose, how you split and evaluate, and when the other regime would win.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 12 minutes to answer well.</em></p>
 <p><strong>Short answer.</strong> Keep the pretrained body and replace the vocabulary head with a linear layer to two classes over a mean-pooled, mask-weighted sequence vector. With 800 examples, train the head only with the body frozen: it is fast, light on memory and rarely overfits, and on this fixture it reaches about 0.9 precision and 0.85 recall after twenty epochs. Full fine-tuning takes about three times longer and lands within a couple of points either way; it starts to pay off at the scale of 80,000 examples or when the domain drifts far from the pretraining text.</p>
 <p><strong>What to keep and replace.</strong></p>
 <p>The body already encodes word identity, position and co-occurrence. Training a fresh classifier from scratch on 800 examples throws that away. The head is the wrong part: it projects to the vocabulary. Replace it with one linear layer from the hidden width to two logits over a pooled vector, and train with cross-entropy against the label.</p>

@@ -12,6 +12,7 @@
 </ul></div></aside>
 <aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A pretrained base model can extend a sequence but cannot follow an instruction. Supervised fine-tuning is the smallest change that fixes this: feed the model paired examples of an instruction and a desired response, and train the body to predict the response tokens. The trick is that you only want the loss to count the response, not the instruction. This lesson builds an Alpaca-style SFT loop with a custom collate function that masks instruction tokens with <code>ignore_index=-100</code>, trains on 200 instruction-response pairs, and evaluates on a held-out split using exact-match.</p></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A base model continues text; it does not know that a question expects an answer. <strong>Supervised fine-tuning (SFT)</strong> teaches that format by training on examples written as one sequence: an instruction marker, the instruction, a response marker, the response. The key detail is the <strong>loss mask</strong>: the model should learn to produce the <em>response</em>, so positions inside the instruction get the label −100, which PyTorch's cross-entropy ignores. Without the mask, much of the training signal goes into predicting instructions the user will always supply. Answers are then <strong>generated</strong> after the response marker and scored by <strong>exact match</strong> against the reference. This lesson runs the whole loop on a deliberately tiny model, which, as the output shows, is not enough to learn the task.</p></div></aside>
 <p>A base model trained on next-token prediction has no idea what an instruction is. Show it the string <code>"What is the capital of France?"</code> and it will continue the question or invent a new sentence. The model has the language but not the format contract.</p>
 <p>The SFT contract is a string template. Every training example becomes a single sequence with three regions:</p>
 <div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">&lt;INST&gt; What is the capital of France? &lt;RESP&gt; The capital of France is Paris.
@@ -80,8 +81,734 @@
 <li><code>exact_match</code>: normalised string comparison, returns float in <code>[0, 1]</code>.</li>
 <li><code>run_demo</code>: builds the data, trains for twenty epochs, evaluates, prints a per-category breakdown, exits zero on success.</li>
 </ol>
+<p>Here is <code>code/main.py</code>, in 10 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 10 · <code>InstructionTokenizer</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;
+Instruction tuning by supervised fine-tuning (SFT).
+
+See: phases/19-capstone-projects/39-instruction-tuning-sft/docs/en.md
+
+Builds:
+  - byte-level tokenizer with INST / RESP / PAD specials
+  - SFT dataset over 200 instruction-response pairs
+  - collate function that masks instruction + pad tokens with -100
+  - TinyGPT (decoder-only transformer) body and LM head
+  - SFT loop, greedy generator, exact-match metric
+  - run_demo that trains for 20 epochs and prints per-category exact-match.
+
+Exits 0 when the trained model beats the random baseline of 0.0 on the held-out set.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+
+# ---------------------------------------------------------------------------
+# Tokeniser
+# ---------------------------------------------------------------------------
+
+
+class InstructionTokenizer:
+    &quot;&quot;&quot;Byte-level tokenizer with INST, RESP, PAD specials.&quot;&quot;&quot;
+
+    INST_ID = 256
+    RESP_ID = 257
+    PAD_ID = 258
+    VOCAB = 260
+    IGNORE_INDEX = -100
+
+    def encode_pair(self, instruction: str, response: str, max_len: int) -&gt; Tuple[List[int], int]:
+        &quot;&quot;&quot;Return (token_ids, response_start_index). Truncates to max_len if
+        needed but always keeps the RESP marker plus at least one response
+        token so SFT collation never produces fully-masked labels.&quot;&quot;&quot;
+        if max_len &lt; 3:
+            raise ValueError(&quot;max_len must be &gt;= 3 to fit INST, RESP, and one response token&quot;)
+        inst_bytes = list(instruction.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))
+        resp_bytes = list(response.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))
+        # Reserve 2 control tokens + at least 1 response byte.
+        max_inst = max_len - 3
+        inst_bytes = inst_bytes[:max_inst]
+        ids = [self.INST_ID] + inst_bytes + [self.RESP_ID]
+        resp_start = len(ids)
+        ids.extend(resp_bytes[: max_len - len(ids)])
+        return ids, resp_start
+
+    def encode_prefix(self, instruction: str, max_len: int) -&gt; List[int]:
+        &quot;&quot;&quot;Encode just the instruction prefix for generation. Always keeps the
+        RESP marker so the model sees the same boundary as during training.&quot;&quot;&quot;
+        if max_len &lt; 2:
+            raise ValueError(&quot;max_len must be &gt;= 2 to fit INST and RESP&quot;)
+        inst_bytes = list(instruction.encode(&quot;utf-8&quot;, errors=&quot;ignore&quot;))[: max_len - 2]
+        ids = [self.INST_ID] + inst_bytes + [self.RESP_ID]
+        return ids
+
+    def decode_response(self, ids: Sequence[int]) -&gt; str:
+        &quot;&quot;&quot;Decode a generated response, dropping specials.&quot;&quot;&quot;
+        chunk = bytes(i for i in ids if i &lt; 256)
+        return chunk.decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+
+# ---------------------------------------------------------------------------
+# Tiny GPT
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 2 of 10 · <code>CausalSelfAttention</code>, <code>Block</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class CausalSelfAttention(nn.Module):
+    def __init__(self, hidden: int, heads: int, max_len: int):
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError(&quot;hidden must divide by heads&quot;)
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.qkv = nn.Linear(hidden, hidden * 3, bias=False)
+        self.out = nn.Linear(hidden, hidden, bias=False)
+        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
+        self.register_buffer(&quot;causal_mask&quot;, mask, persistent=False)
+
+    def forward(self, x: torch.Tensor, key_pad_mask: Optional[torch.Tensor] = None) -&gt; torch.Tensor:
+        B, T, D = x.shape
+        qkv = self.qkv(x).view(B, T, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        causal = self.causal_mask[:T, :T].view(1, 1, T, T)
+        att = att.masked_fill(~causal, float(&quot;-inf&quot;))
+        if key_pad_mask is not None:
+            # key_pad_mask: B x T, 1 for real, 0 for pad.
+            km = key_pad_mask.view(B, 1, 1, T).to(torch.bool)
+            att = att.masked_fill(~km, float(&quot;-inf&quot;))
+        weights = F.softmax(att, dim=-1)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        ctx = (weights @ v).transpose(1, 2).contiguous().view(B, T, D)
+        return self.out(ctx)
+
+
+class Block(nn.Module):
+    def __init__(self, hidden: int, heads: int, max_len: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden)
+        self.attn = CausalSelfAttention(hidden, heads, max_len)
+        self.ln2 = nn.LayerNorm(hidden)
+        self.fc1 = nn.Linear(hidden, hidden * 4)
+        self.fc2 = nn.Linear(hidden * 4, hidden)
+
+    def forward(self, x: torch.Tensor, key_pad_mask: Optional[torch.Tensor] = None) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x), key_pad_mask)
+        h = self.ln2(x)
+        h = self.fc2(F.gelu(self.fc1(h)))
+        return x + h
+</code></pre></div>
+
+<p><strong>Part 3 of 10 · <code>TinyGPT</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class TinyGPT(nn.Module):
+    def __init__(self, vocab: int, hidden: int, heads: int, depth: int, max_len: int):
+        super().__init__()
+        self.tok = nn.Embedding(vocab, hidden)
+        self.pos = nn.Embedding(max_len, hidden)
+        self.blocks = nn.ModuleList([Block(hidden, heads, max_len) for _ in range(depth)])
+        self.ln_f = nn.LayerNorm(hidden)
+        self.head = nn.Linear(hidden, vocab, bias=False)
+        self.max_len = max_len
+
+    def forward(self, ids: torch.Tensor, key_pad_mask: Optional[torch.Tensor] = None) -&gt; torch.Tensor:
+        B, T = ids.shape
+        positions = torch.arange(T, device=ids.device).unsqueeze(0).expand(B, T)
+        x = self.tok(ids) + self.pos(positions)
+        for blk in self.blocks:
+            x = blk(x, key_pad_mask)
+        return self.head(self.ln_f(x))
+
+
+# ---------------------------------------------------------------------------
+# Instruction fixture
+# ---------------------------------------------------------------------------
+
+
+CAPITALS = [
+    (&quot;France&quot;, &quot;Paris&quot;),
+    (&quot;Spain&quot;, &quot;Madrid&quot;),
+    (&quot;Italy&quot;, &quot;Rome&quot;),
+    (&quot;Japan&quot;, &quot;Tokyo&quot;),
+    (&quot;Egypt&quot;, &quot;Cairo&quot;),
+    (&quot;Brazil&quot;, &quot;Brasilia&quot;),
+    (&quot;Canada&quot;, &quot;Ottawa&quot;),
+    (&quot;Australia&quot;, &quot;Canberra&quot;),
+    (&quot;Kenya&quot;, &quot;Nairobi&quot;),
+    (&quot;Sweden&quot;, &quot;Stockholm&quot;),
+]
+
+ARITHMETIC = [
+    (2, 3, &quot;+&quot;),
+    (5, 4, &quot;*&quot;),
+    (9, 7, &quot;-&quot;),
+    (12, 4, &quot;/&quot;),
+    (7, 6, &quot;+&quot;),
+    (11, 3, &quot;-&quot;),
+    (8, 8, &quot;+&quot;),
+    (15, 5, &quot;/&quot;),
+    (6, 9, &quot;*&quot;),
+    (20, 4, &quot;/&quot;),
+]
+
+LIST_NAMES = [
+    (&quot;colors&quot;, [&quot;red&quot;, &quot;green&quot;, &quot;blue&quot;]),
+    (&quot;planets&quot;, [&quot;mercury&quot;, &quot;venus&quot;, &quot;earth&quot;]),
+    (&quot;vowels&quot;, [&quot;a&quot;, &quot;e&quot;, &quot;i&quot;]),
+    (&quot;seasons&quot;, [&quot;spring&quot;, &quot;summer&quot;, &quot;autumn&quot;]),
+    (&quot;metals&quot;, [&quot;iron&quot;, &quot;gold&quot;, &quot;silver&quot;]),
+    (&quot;primes&quot;, [&quot;2&quot;, &quot;3&quot;, &quot;5&quot;]),
+    (&quot;oceans&quot;, [&quot;pacific&quot;, &quot;atlantic&quot;, &quot;indian&quot;]),
+    (&quot;languages&quot;, [&quot;python&quot;, &quot;rust&quot;, &quot;go&quot;]),
+    (&quot;instruments&quot;, [&quot;guitar&quot;, &quot;piano&quot;, &quot;drums&quot;]),
+    (&quot;fruits&quot;, [&quot;apple&quot;, &quot;banana&quot;, &quot;cherry&quot;]),
+]
+
+SUMMARIES = [
+    (&quot;the sun rises in the east and sets in the west.&quot;, &quot;the sun moves east to west.&quot;),
+    (&quot;water boils at one hundred degrees celsius at sea level.&quot;, &quot;water boils at 100c.&quot;),
+    (&quot;the moon orbits the earth roughly every 27 days.&quot;, &quot;the moon orbits earth in 27 days.&quot;),
+    (&quot;light travels at about 300000 km per second.&quot;, &quot;light moves at 300000 km/s.&quot;),
+    (&quot;the human body has 206 bones in adulthood.&quot;, &quot;adults have 206 bones.&quot;),
+    (&quot;plants make food using sunlight, water, and co2.&quot;, &quot;plants use sun, water, and co2.&quot;),
+    (&quot;dna stores genetic information in cells.&quot;, &quot;dna stores genes.&quot;),
+    (&quot;the heart pumps blood through the body.&quot;, &quot;the heart pumps blood.&quot;),
+    (&quot;electricity flows through conductors easily.&quot;, &quot;current flows in conductors.&quot;),
+    (&quot;bees pollinate flowers as they collect nectar.&quot;, &quot;bees pollinate flowers.&quot;),
+]
+
+CODE = [
+    (&quot;print hello world&quot;, &quot;print('hello world')&quot;),
+    (&quot;print the number 42&quot;, &quot;print(42)&quot;),
+    (&quot;sort a list named items ascending&quot;, &quot;items.sort()&quot;),
+    (&quot;reverse a list named items&quot;, &quot;items.reverse()&quot;),
+    (&quot;get the length of items&quot;, &quot;len(items)&quot;),
+    (&quot;open a file in read mode&quot;, &quot;open('f.txt', 'r')&quot;),
+    (&quot;get the keys of a dict d&quot;, &quot;d.keys()&quot;),
+    (&quot;return the absolute value of x&quot;, &quot;abs(x)&quot;),
+    (&quot;round x to two decimals&quot;, &quot;round(x, 2)&quot;),
+    (&quot;convert x to a string&quot;, &quot;str(x)&quot;),
+]
+
+DEFINITIONS = [
+    (&quot;variable&quot;, &quot;a name bound to a value in memory.&quot;),
+    (&quot;function&quot;, &quot;a reusable block of code that takes inputs and returns an output.&quot;),
+    (&quot;loop&quot;, &quot;a control structure that repeats a block of code.&quot;),
+    (&quot;class&quot;, &quot;a template for creating objects with shared structure.&quot;),
+    (&quot;list&quot;, &quot;an ordered, mutable sequence of values.&quot;),
+    (&quot;dict&quot;, &quot;a mapping from keys to values.&quot;),
+    (&quot;string&quot;, &quot;a sequence of characters.&quot;),
+    (&quot;integer&quot;, &quot;a whole number without a fractional part.&quot;),
+    (&quot;float&quot;, &quot;a number with a fractional part stored in binary.&quot;),
+    (&quot;module&quot;, &quot;a file of python code that can be imported.&quot;),
+]
+</code></pre></div>
+
+<p><strong>Part 4 of 10 · <code>_arithmetic_response</code>, <code>make_dataset</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _arithmetic_response(a: int, b: int, op: str) -&gt; str:
+    if op == &quot;+&quot;:
+        return f&quot;{a} + {b} = {a + b}&quot;
+    if op == &quot;-&quot;:
+        return f&quot;{a} - {b} = {a - b}&quot;
+    if op == &quot;*&quot;:
+        return f&quot;{a} * {b} = {a * b}&quot;
+    if op == &quot;/&quot;:
+        return f&quot;{a} / {b} = {a // b}&quot;
+    raise ValueError(f&quot;unknown op {op}&quot;)
+
+
+def make_dataset(seed: int = 0) -&gt; Tuple[List[Dict[str, str]], List[str]]:
+    &quot;&quot;&quot;Returns (pairs, categories). Each pair has instruction, response.&quot;&quot;&quot;
+    rng = random.Random(seed)
+    pairs: List[Dict[str, str]] = []
+    categories: List[str] = []
+
+    # Capitals (40 pairs: 10 base x 4 templates)
+    cap_templates = [
+        &quot;What is the capital of {country}?&quot;,
+        &quot;Name the capital city of {country}.&quot;,
+        &quot;Capital of {country}?&quot;,
+        &quot;Tell me the capital of {country}.&quot;,
+    ]
+    cap_resp_templates = [
+        &quot;the capital of {country} is {city}.&quot;,
+        &quot;{city} is the capital of {country}.&quot;,
+        &quot;{city}.&quot;,
+        &quot;the answer is {city}.&quot;,
+    ]
+    for country, city in CAPITALS:
+        for i, t in enumerate(cap_templates):
+            pairs.append(
+                {
+                    &quot;instruction&quot;: t.format(country=country),
+                    &quot;response&quot;: cap_resp_templates[i].format(country=country, city=city),
+                }
+            )
+            categories.append(&quot;capitals&quot;)
+
+    # Arithmetic (30 pairs: 10 base x 3 templates)
+    arith_templates = [
+        &quot;Compute {a} {op} {b}.&quot;,
+        &quot;What is {a} {op} {b}?&quot;,
+        &quot;{a} {op} {b}?&quot;,
+    ]
+    for a, b, op in ARITHMETIC:
+        for t in arith_templates:
+            pairs.append(
+                {
+                    &quot;instruction&quot;: t.format(a=a, b=b, op=op),
+                    &quot;response&quot;: _arithmetic_response(a, b, op),
+                }
+            )
+            categories.append(&quot;arithmetic&quot;)
+
+    # Lists (30 pairs: 10 base x 3 templates)
+    list_templates = [
+        &quot;List three {name}.&quot;,
+        &quot;Give me three {name}.&quot;,
+        &quot;Name three {name}.&quot;,
+    ]
+    for name, items in LIST_NAMES:
+        for t in list_templates:
+            pairs.append(
+                {
+                    &quot;instruction&quot;: t.format(name=name),
+                    &quot;response&quot;: &quot;, &quot;.join(items) + &quot;.&quot;,
+                }
+            )
+            categories.append(&quot;lists&quot;)
+
+    # Summaries (30 pairs: 10 base x 3 templates)
+    sum_templates = [
+        &quot;Summarise: {text}&quot;,
+        &quot;One-sentence summary of: {text}&quot;,
+        &quot;TLDR: {text}&quot;,
+    ]
+    for text, summary in SUMMARIES:
+        for t in sum_templates:
+            pairs.append({&quot;instruction&quot;: t.format(text=text), &quot;response&quot;: summary})
+            categories.append(&quot;summaries&quot;)
+
+    # Code (30 pairs: 10 base x 3 templates)
+    code_templates = [
+        &quot;Write python code to {task}.&quot;,
+        &quot;Python: {task}.&quot;,
+        &quot;Code that will {task}.&quot;,
+    ]
+    for task, code in CODE:
+        for t in code_templates:
+            pairs.append({&quot;instruction&quot;: t.format(task=task), &quot;response&quot;: code})
+            categories.append(&quot;code&quot;)
+
+    # Definitions (40 pairs: 10 base x 4 templates)
+    def_templates = [
+        &quot;Define {term}.&quot;,
+        &quot;What is a {term}?&quot;,
+        &quot;Explain the term {term}.&quot;,
+        &quot;{term}: what is it?&quot;,
+    ]
+    for term, defn in DEFINITIONS:
+        for t in def_templates:
+            pairs.append({&quot;instruction&quot;: t.format(term=term), &quot;response&quot;: defn})
+            categories.append(&quot;definitions&quot;)
+
+    # Total = 40 + 30 + 30 + 30 + 30 + 40 = 200. Shuffle and return.
+    order = list(range(len(pairs)))
+    rng.shuffle(order)
+    return [pairs[i] for i in order], [categories[i] for i in order]
+</code></pre></div>
+
+<p><strong>Part 5 of 10 · <code>split_dataset</code>, <code>SFTDataset</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def split_dataset(
+    pairs: Sequence[Dict[str, str]],
+    cats: Sequence[str],
+    test_frac: float = 0.2,
+    seed: int = 0,
+) -&gt; Tuple[List[Dict[str, str]], List[str], List[Dict[str, str]], List[str]]:
+    &quot;&quot;&quot;Stratified split by category.&quot;&quot;&quot;
+    rng = random.Random(seed)
+    by_cat: Dict[str, List[int]] = {}
+    for i, c in enumerate(cats):
+        by_cat.setdefault(c, []).append(i)
+    train_idx: List[int] = []
+    test_idx: List[int] = []
+    for c, idxs in by_cat.items():
+        idxs_copy = list(idxs)
+        rng.shuffle(idxs_copy)
+        cut = max(1, int(len(idxs_copy) * (1.0 - test_frac)))
+        train_idx.extend(idxs_copy[:cut])
+        test_idx.extend(idxs_copy[cut:])
+    rng.shuffle(train_idx)
+    rng.shuffle(test_idx)
+    return (
+        [pairs[i] for i in train_idx],
+        [cats[i] for i in train_idx],
+        [pairs[i] for i in test_idx],
+        [cats[i] for i in test_idx],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dataset and collate
+# ---------------------------------------------------------------------------
+
+
+class SFTDataset(Dataset):
+    def __init__(
+        self,
+        pairs: Sequence[Dict[str, str]],
+        tok: InstructionTokenizer,
+        max_len: int,
+    ):
+        self.pairs = list(pairs)
+        self.tok = tok
+        self.max_len = max_len
+
+    def __len__(self) -&gt; int:
+        return len(self.pairs)
+
+    def __getitem__(self, idx: int) -&gt; Tuple[List[int], int]:
+        pair = self.pairs[idx]
+        ids, resp_start = self.tok.encode_pair(pair[&quot;instruction&quot;], pair[&quot;response&quot;], self.max_len)
+        return ids, resp_start
+</code></pre></div>
+
+<p><strong>Part 6 of 10 · <code>sft_collate</code>, <code>shifted_loss</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def sft_collate(
+    batch: Sequence[Tuple[List[int], int]],
+    pad_id: int = InstructionTokenizer.PAD_ID,
+    ignore_index: int = InstructionTokenizer.IGNORE_INDEX,
+) -&gt; Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    &quot;&quot;&quot;Pad to longest in batch and build labels with -100 mask on instruction + pad.&quot;&quot;&quot;
+    max_t = max(len(x[0]) for x in batch)
+    input_ids: List[List[int]] = []
+    labels: List[List[int]] = []
+    attn_mask: List[List[int]] = []
+    for ids, resp_start in batch:
+        seq_len = len(ids)
+        pad = [pad_id] * (max_t - seq_len)
+        padded = list(ids) + pad
+        # The label at position i is what input_ids[i+1] should be; we then
+        # mask out positions corresponding to instruction and to padding.
+        lbl: List[int] = list(padded)
+        for i in range(len(lbl)):
+            if i &lt; resp_start:
+                # Instruction or boundary token: do not train on predicting these.
+                lbl[i] = ignore_index
+            elif i &gt;= seq_len:
+                # Padding region.
+                lbl[i] = ignore_index
+        am = [1] * seq_len + [0] * (max_t - seq_len)
+        input_ids.append(padded)
+        labels.append(lbl)
+        attn_mask.append(am)
+    return (
+        torch.tensor(input_ids, dtype=torch.long),
+        torch.tensor(labels, dtype=torch.long),
+        torch.tensor(attn_mask, dtype=torch.long),
+    )
+
+
+def shifted_loss(
+    logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = InstructionTokenizer.IGNORE_INDEX
+) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Standard causal LM loss: predict next token, ignore the masked positions.&quot;&quot;&quot;
+    # Position i predicts position i+1 in labels.
+    pred = logits[:, :-1, :].contiguous()
+    target = labels[:, 1:].contiguous()
+    return F.cross_entropy(
+        pred.view(-1, pred.size(-1)),
+        target.view(-1),
+        ignore_index=ignore_index,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Training and generation
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 7 of 10 · <code>SFTConfig</code>, <code>build_model</code>, <code>SFTReport</code>, <code>train_sft</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class SFTConfig:
+    vocab: int = InstructionTokenizer.VOCAB
+    hidden: int = 96
+    heads: int = 4
+    depth: int = 2
+    max_len: int = 96
+    batch_size: int = 16
+    epochs: int = 20
+    lr: float = 5e-4
+    seed: int = 0
+
+
+def build_model(cfg: SFTConfig) -&gt; TinyGPT:
+    torch.manual_seed(cfg.seed)
+    return TinyGPT(cfg.vocab, cfg.hidden, cfg.heads, cfg.depth, cfg.max_len)
+
+
+@dataclass
+class SFTReport:
+    losses: List[float] = field(default_factory=list)
+    eval_em: List[float] = field(default_factory=list)
+    final_em: float = 0.0
+
+
+def train_sft(
+    model: TinyGPT,
+    train_loader: DataLoader,
+    cfg: SFTConfig,
+    eval_pairs: Optional[Sequence[Dict[str, str]]] = None,
+    tok: Optional[InstructionTokenizer] = None,
+    eval_every: int = 5,
+    log: Callable[[str], None] = print,
+) -&gt; SFTReport:
+    torch.manual_seed(cfg.seed)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    report = SFTReport()
+    for ep in range(1, cfg.epochs + 1):
+        model.train()
+        ep_loss = 0.0
+        n_batches = 0
+        for input_ids, labels, attn_mask in train_loader:
+            logits = model(input_ids, key_pad_mask=attn_mask)
+            loss = shifted_loss(logits, labels)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            ep_loss += float(loss.item())
+            n_batches += 1
+        avg = ep_loss / max(n_batches, 1)
+        report.losses.append(avg)
+        if eval_pairs is not None and tok is not None and ep % eval_every == 0:
+            em = exact_match_set(model, tok, eval_pairs, cfg.max_len)
+            report.eval_em.append(em)
+            log(f&quot;  epoch {ep:&gt;3d}: loss={avg:.4f}  EM={em:.3f}&quot;)
+        elif ep % eval_every == 0:
+            log(f&quot;  epoch {ep:&gt;3d}: loss={avg:.4f}&quot;)
+    if eval_pairs is not None and tok is not None:
+        report.final_em = exact_match_set(model, tok, eval_pairs, cfg.max_len)
+    return report
+</code></pre></div>
+
+<p><strong>Part 8 of 10 · <code>generate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@torch.no_grad()
+def generate(
+    model: TinyGPT,
+    tok: InstructionTokenizer,
+    instruction: str,
+    max_len: int,
+    temperature: float = 0.0,
+    max_new_tokens: int = 64,
+    seed: int = 0,
+) -&gt; str:
+    &quot;&quot;&quot;Greedy (temperature=0) or sampled generation. Stops on two consecutive sentence-ends.&quot;&quot;&quot;
+    model.eval()
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+    ids = tok.encode_prefix(instruction, max_len=max_len)
+    sentence_ends = {ord(&quot;.&quot;), ord(&quot;!&quot;), ord(&quot;?&quot;)}
+    out_chars: List[int] = []
+    for _ in range(max_new_tokens):
+        if len(ids) &gt;= max_len:
+            break
+        x = torch.tensor([ids], dtype=torch.long)
+        attn_mask = torch.ones_like(x)
+        logits = model(x, key_pad_mask=attn_mask)
+        next_logits = logits[0, -1, :]
+        if temperature &lt;= 0.0:
+            next_id = int(next_logits.argmax().item())
+        else:
+            probs = F.softmax(next_logits / temperature, dim=-1)
+            next_id = int(torch.multinomial(probs, num_samples=1, generator=rng).item())
+        if next_id == tok.PAD_ID:
+            break
+        if next_id == tok.INST_ID or next_id == tok.RESP_ID:
+            # Model produced a control token. Stop.
+            break
+        ids.append(next_id)
+        out_chars.append(next_id)
+        if (
+            len(out_chars) &gt;= 2
+            and out_chars[-1] in sentence_ends
+            and out_chars[-2] in sentence_ends
+        ):
+            break
+    return tok.decode_response(out_chars)
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 9 of 10 · <code>normalise</code>, <code>exact_match</code>, <code>exact_match_set</code>, <code>per_category_em</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def normalise(text: str) -&gt; str:
+    s = text.lower().strip()
+    while &quot;  &quot; in s:
+        s = s.replace(&quot;  &quot;, &quot; &quot;)
+    return s
+
+
+def exact_match(pred: str, gold: str) -&gt; int:
+    return 1 if normalise(pred) == normalise(gold) else 0
+
+
+@torch.no_grad()
+def exact_match_set(
+    model: TinyGPT,
+    tok: InstructionTokenizer,
+    pairs: Sequence[Dict[str, str]],
+    max_len: int,
+) -&gt; float:
+    if not pairs:
+        return 0.0
+    hits = 0
+    for pair in pairs:
+        pred = generate(model, tok, pair[&quot;instruction&quot;], max_len=max_len)
+        hits += exact_match(pred, pair[&quot;response&quot;])
+    return hits / len(pairs)
+
+
+def per_category_em(
+    model: TinyGPT,
+    tok: InstructionTokenizer,
+    pairs: Sequence[Dict[str, str]],
+    cats: Sequence[str],
+    max_len: int,
+) -&gt; Dict[str, float]:
+    by_cat: Dict[str, List[int]] = {}
+    for p, c in zip(pairs, cats):
+        pred = generate(model, tok, p[&quot;instruction&quot;], max_len=max_len)
+        by_cat.setdefault(c, []).append(exact_match(pred, p[&quot;response&quot;]))
+    return {c: sum(vs) / max(len(vs), 1) for c, vs in by_cat.items()}
+
+
+# ---------------------------------------------------------------------------
+# Demo
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 10 of 10 · <code>run_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_demo(cfg: Optional[SFTConfig] = None) -&gt; int:
+    cfg = cfg or SFTConfig()
+    torch.manual_seed(cfg.seed)
+    np.random.seed(cfg.seed)
+    random.seed(cfg.seed)
+
+    tok = InstructionTokenizer()
+    pairs, cats = make_dataset(seed=cfg.seed)
+    tr_pairs, tr_cats, te_pairs, te_cats = split_dataset(pairs, cats, test_frac=0.2, seed=cfg.seed)
+
+    train_ds = SFTDataset(tr_pairs, tok, cfg.max_len)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: sft_collate(b),
+    )
+
+    print(&quot;INSTRUCTION TUNING (SFT) DEMO&quot;)
+    print(f&quot;train={len(tr_pairs)} test={len(te_pairs)} max_len={cfg.max_len}&quot;)
+    print(f&quot;categories: {sorted(set(cats))}&quot;)
+    print(&quot;&quot;)
+
+    model = build_model(cfg)
+    initial_em = exact_match_set(model, tok, te_pairs, cfg.max_len)
+    print(f&quot;baseline (untrained) EM = {initial_em:.3f}&quot;)
+    print(&quot;&quot;)
+
+    print(&quot;[training]&quot;)
+    report = train_sft(
+        model,
+        train_dl,
+        cfg,
+        eval_pairs=te_pairs,
+        tok=tok,
+        eval_every=5,
+    )
+
+    print(&quot;&quot;)
+    print(&quot;[per-category exact-match on held-out]&quot;)
+    cat_em = per_category_em(model, tok, te_pairs, te_cats, cfg.max_len)
+    for cat in sorted(cat_em):
+        print(f&quot;  {cat:&gt;12s}: {cat_em[cat]:.3f}&quot;)
+
+    print(&quot;&quot;)
+    print(&quot;[sample generations]&quot;)
+    for pair in te_pairs[:3]:
+        pred = generate(model, tok, pair[&quot;instruction&quot;], max_len=cfg.max_len)
+        match = &quot;MATCH&quot; if exact_match(pred, pair[&quot;response&quot;]) else &quot;MISS &quot;
+        print(f&quot;  [{match}] inst: {pair['instruction']}&quot;)
+        print(f&quot;          gold: {pair['response']}&quot;)
+        print(f&quot;          pred: {pred}&quot;)
+
+    print(&quot;&quot;)
+    print(f&quot;FINAL EXACT MATCH = {report.final_em:.3f}  (baseline was {initial_em:.3f})&quot;)
+
+    if (
+        len(report.losses) &lt; 2
+        or not math.isfinite(report.losses[-1])
+        or report.losses[-1] &gt;= report.losses[0]
+    ):
+        print(&quot;ERROR: training loss did not decrease over the run&quot;, file=sys.stderr)
+        return 1
+    return 0
+</code></pre></div>
+
 <h2>Why the mask matters</h2>
 <p>Without the mask, the loss treats instruction tokens as targets. The model learns to predict the instruction. This is a different objective and produces a worse model in two ways. First, model capacity is wasted reconstructing inputs the user always provides. Second, the response loss is smaller in the gradient sum because instruction tokens outnumber response tokens in most batches; the optimiser's effective learning rate on the part you care about is lower than you intended. The mask is not a polish; it is the objective.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Where the gradient goes</div><div class="co-body"><p>An example has an 18-token instruction (with markers) and a 6-token response.</p>
+<ol>
+<li>Without a mask, the loss averages over all 23 predictions (24 tokens, each predicting the next): 17 of them are instruction tokens.</li>
+<li>About three quarters of the gradient teaches the model to predict instructions, which it will never have to write.</li>
+<li>With the mask, only the 6 positions predicting response tokens count, so every update is about answering.</li>
+<li>With short responses and long instructions, unmasked training can look like a falling loss while answer quality barely moves.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Labels of −100 are ignored by PyTorch's cross-entropy.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> The mask removes instruction tokens from the model's input.
+  The model still reads them; they just do not contribute to the loss.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> The marker tokens tell the model where the response begins.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A falling training loss guarantees better answers.
+  Exact match on held-out instructions is the real check.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: three examples have (instruction, response) lengths of (18, 6), (10, 20) and (30, 3) tokens. What share of predicted positions count toward the loss with the mask?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">How much of each example is trained</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">IGNORE = -100
+def labels(n_inst, n_resp):
+    ids = list(range(n_inst + n_resp))
+    targets = ids[1:] + [IGNORE]                      # next-token targets
+    return [IGNORE if i &lt; n_inst - 1 else t for i, t in enumerate(targets)]   # mask predictions made inside the instruction
+
+for n_inst, n_resp in ((18, 6), (10, 20), (30, 3)):
+    lab = labels(n_inst, n_resp)
+    counted = sum(1 for x in lab if x != IGNORE)
+    print(f&quot;instruction {n_inst:2d}, response {n_resp:2d}: {counted:2d} of {len(lab)} positions trained ({counted / len(lab):.0%})&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">instruction 18, response  6:  6 of 24 positions trained (25%)
+instruction 10, response 20: 20 of 30 positions trained (67%)
+instruction 30, response  3:  3 of 33 positions trained (9%)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With the mask, the trained share follows the response length: a quarter of the first example, two thirds of the second, a tenth of the third. Each counted position predicts one response token (the last one predicts the end of the sequence). Unmasked, all positions would count equally, and the long-instruction example would spend 90% of its signal on text the model is never asked to write.</p></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>This run is an honest failure. Training loss falls steadily, from 3.30 to 1.99 over 20 epochs, but exact match on held-out instructions stays at 0.000 in every category, and the sample answers are fragments of characters. A tiny model trained for seconds learns some letter statistics, not the task. The lesson's mechanics (template, mask, generation, scoring) are all working; the model is simply far too small and briefly trained for SFT to show results, which is also why the loss alone would have been misleading.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team masks the instruction correctly but forgets to put an end-of-response token in the training data. After SFT, the model answers correctly and then keeps writing new questions and answers until it hits the length limit. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>SFT trains on instruction–response pairs in a fixed template.</li>
+<li>Mask instruction positions with −100 so only responses are trained.</li>
+<li>Markers separate instruction from response.</li>
+<li>Score held-out generations with exact match, not training loss.</li>
+<li>Teach the model where a response ends.</li>
+</ul></div></aside>
 <h2>Stretch goals</h2>
 <ul>
 <li>Add a learning-rate warmup followed by cosine decay. SFT is more sensitive to LR than pretraining.</li>
@@ -90,5 +817,7 @@
 <li>Add a chat template with multi-turn formatting and train on a fixture that includes follow-ups.</li>
 </ul>
 <p>The implementation gives you the format contract, the mask, and the loop. The objective change from base model to instruction follower is one collate function.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1939-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · No end token</span></summary><div class="qa-a"><p>The model learns to continue the pattern it saw: after a response comes another instruction marker and another pair, because nothing marked the response as finished. Append an end-of-sequence token to each response, include it in the trained (unmasked) labels, and stop generation when it is produced.</p></div></details>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-llm-pipeline-capstone"><span class="t" style="--cs-hue:215">EE</span>Cheat sheet · End-to-End LLM and Fine-Tuning Pipeline</a><a href="#cs-lora-fine-tuning"><span class="t" style="--cs-hue:310">FT</span>Cheat sheet · Fine-Tuning with LoRA</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1939" id="done-a1939">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1939" id="undo-a1939" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1938"><span class="pn-dir">Previous</span><span class="pn-t">19.38 · Capstone Lesson 38: Classifier Fine-Tuning by Head Swap</span></a><a class="pn next" href="#a1940"><span class="pn-dir">Next</span><span class="pn-t">19.40 · Capstone Lesson 40: Direct Preference Optimization from Scratch</span></a></div></footer>

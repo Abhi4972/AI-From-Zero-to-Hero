@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Long training runs get interrupted, so they <strong>checkpoint</strong>: save enough state to continue exactly where they left off. "Enough" is more than the model weights. It is five things: model weights, optimizer state (AdamW's running averages), the learning-rate scheduler's position, the data loader's position within the epoch, and the <strong>random number generator</strong> states, so shuffling and dropout repeat identically. The save must be <strong>atomic</strong>: write to a temporary file, then rename it into place, so a crash mid-write never leaves a corrupt checkpoint where a good one was. Large models write <strong>sharded</strong> checkpoints, one file per part. The test of correctness is strict: a resumed run must produce exactly the same losses as an uninterrupted one.</p></div></aside>
 <p>You set a training job for 18 hours. The scheduler caps each allocation at 4 hours, so the run is already a chain of resumed jobs. Then the cluster reboots at hour 11 of the run because someone above your pay grade approved a kernel upgrade. Without checkpoints you start over. Without resume you also lose the optimizer state that took the first 11 hours to learn, so even if the model weights survived, the AdamW moments are gone and the next step lurches in a direction the training trajectory had already moved past.</p>
 <p>The right artifact is a single file that holds everything needed to continue: model parameters, optimizer state, scheduler state, the loss history for plots, the current step and epoch and batch-in-epoch counters, and the RNG state for every source of randomness. Without the RNG state the resumed loss curve is a different curve. Same model, same data, different shuffle, different dropout mask, different number on the dashboard.</p>
 <p>Atomic save is the other half of the contract. Writing into the final filename means a crash mid-write leaves a corrupt file; the resume reads garbage. Writing into a temporary file in the same directory and then renaming means a crash mid-write leaves the previous good file untouched. The rename is atomic on POSIX file systems.</p>
@@ -92,6 +93,49 @@
 <h2>Idea 4 · Resume continues mid epoch</h2>
 <p>A resume that snaps to the start of the next epoch wastes anywhere from minutes to a day. The fix is <code>(epoch, batch_in_epoch)</code> plus the RNG state. After load, the training loop fast-forwards the random number generator past the batches already consumed in the current epoch and continues from <code>batch_in_epoch</code>. The lesson code does this exactly; the assertion is that the loss trajectory after resume matches the uninterrupted baseline within 1e-4.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="cc-atomic-checkpoint"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">What goes wrong if one bucket is missing</div><div class="co-body"><p>A run is interrupted at step 10 of 24 and resumed.</p>
+<ol>
+<li><strong>No optimizer state:</strong> AdamW restarts its running averages at zero, so the first steps after resume are much larger than they should be: a loss spike.</li>
+<li><strong>No scheduler state:</strong> the learning rate restarts at warmup.</li>
+<li><strong>No data position:</strong> the epoch restarts, so the model sees the first examples twice and the last ones never.</li>
+<li><strong>No RNG state:</strong> shuffling and dropout differ, so losses after resume diverge from an uninterrupted run, which makes the bug hard to see. With all five saved, the resumed losses match the uninterrupted ones exactly.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> An atomic save writes a temporary file and then renames it into place.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Saving the model weights is enough to resume training.
+  Optimizer, scheduler, data position and RNG states are needed too.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Restoring RNG state makes shuffling and dropout repeat exactly.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Writing directly to <code>checkpoint.pt</code> is safe if the disk is reliable.
+  A crash mid-write leaves a truncated file in place of the last good one.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a random generator is saved after drawing three numbers, then draws three more. If the saved state is restored, do the next three numbers match the second three?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">RNG state and atomic writes</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import os, pickle, random, tempfile
+rng = random.Random(42)
+first = [rng.random() for _ in range(3)]
+saved = rng.getstate()
+second = [rng.random() for _ in range(3)]
+rng.setstate(saved)
+replayed = [rng.random() for _ in range(3)]
+print(&quot;restored stream matches:&quot;, replayed == second)
+
+def atomic_save(obj, path):
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, suffix=&quot;.tmp&quot;)
+    with os.fdopen(fd, &quot;wb&quot;) as f:
+        pickle.dump(obj, f); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)                 # atomic on the same filesystem
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, &quot;ckpt.pkl&quot;)
+    atomic_save({&quot;step&quot;: 10, &quot;rng&quot;: saved}, path)
+    print(&quot;files after save:&quot;, os.listdir(d))
+    print(&quot;loaded step:&quot;, pickle.load(open(path, &quot;rb&quot;))[&quot;step&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">restored stream matches: True
+files after save: [&#x27;ckpt.pkl&#x27;]
+loaded step: 10</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Restoring the saved state replays exactly the same numbers, which is what makes a resumed run identical to an uninterrupted one. The save leaves only the final file: the temporary file was renamed over it in one step (<code>os.replace</code> is atomic within one filesystem), so a reader ever sees either the old checkpoint or the complete new one, never half of one.</p></div></aside>
 <h2>Step 1 · capture and restore RNG state</h2>
 <p><code>code/main.py</code> provides four primitives and a demo driver.</p>
 <p><code>capture_rng_state</code> returns a dict with Python's <code>random.getstate</code>, NumPy's <code>np.random.get_state</code>, and PyTorch CPU and CUDA RNG bytes. Every piece is stored as plain Python numbers, tuples, and lists (NumPy's key array goes through <code>tolist()</code>), so the loader in Step 3 can read it back without unpickling arbitrary objects. <code>restore_rng_state</code> reverses it. The CPU tensor is a uint8 byte buffer that PyTorch's RNG knows how to consume.</p>
@@ -117,6 +161,546 @@
 <li><strong>Sha256 every shard.</strong> A silently truncated download is the worst kind of bug; the loader fails fast or it fails late.</li>
 <li><strong>Keep checkpoint cadence honest.</strong> Save every N steps and every wallclock-minute, whichever is shorter. Otherwise the long step that crashes wastes a full window of work.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 9 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 9 · <code>TrainState</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Checkpoint save and resume from scratch.
+
+Full checkpoint dict: model state, optimizer state, scheduler state,
+loss history, current step, RNG state (python random, numpy, torch CPU,
+torch CUDA if present). Atomic save by writing to a temp file and then
+renaming. Sharded save splits the model state by parameter group so a
+single shard is small enough to load on demand. Resume continues mid
+epoch with deterministic loss within tolerance.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import torch
+from torch import nn
+
+
+HERE = Path(__file__).parent
+OUT_DIR = HERE.parent / &quot;outputs&quot;
+
+CHECKPOINT_SCHEMA = &quot;ckpt.v1&quot;
+SHARD_SCHEMA = &quot;ckpt-shard.v1&quot;
+
+
+@dataclass
+class TrainState:
+    step: int
+    epoch: int
+    batch_in_epoch: int
+    losses: List[float] = field(default_factory=list)
+</code></pre></div>
+
+<p><strong>Part 2 of 9 · <code>seed_everything</code>, <code>make_model</code>, <code>make_optimizer_and_scheduler</code>, <code>synthetic_loader</code>, <code>capture_rng_state</code>, <code>restore_rng_state</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def seed_everything(seed: int) -&gt; None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_model(in_dim: int, hidden: int, out_dim: int) -&gt; nn.Module:
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden),
+        nn.GELU(),
+        nn.Linear(hidden, hidden),
+        nn.GELU(),
+        nn.Linear(hidden, out_dim),
+    )
+
+
+def make_optimizer_and_scheduler(model: nn.Module, lr: float, total_steps: int):
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=total_steps)
+    return opt, sched
+
+
+def synthetic_loader(batch_size: int, num_batches: int, in_dim: int, out_dim: int, gen: torch.Generator):
+    for _ in range(num_batches):
+        x = torch.randn(batch_size, in_dim, generator=gen)
+        y = torch.randint(low=0, high=out_dim, size=(batch_size,), generator=gen)
+        yield x, y
+
+
+def capture_rng_state() -&gt; Dict[str, Any]:
+    name, keys, pos, has_gauss, cached_gaussian = np.random.get_state()
+    state: Dict[str, Any] = {
+        &quot;python&quot;: random.getstate(),
+        &quot;numpy&quot;: (name, keys.tolist(), int(pos), int(has_gauss), float(cached_gaussian)),
+        &quot;torch_cpu&quot;: torch.get_rng_state().tolist(),
+    }
+    if torch.cuda.is_available():
+        state[&quot;torch_cuda&quot;] = [s.tolist() for s in torch.cuda.get_rng_state_all()]
+    return state
+
+
+def restore_rng_state(state: Dict[str, Any]) -&gt; None:
+    py = state.get(&quot;python&quot;)
+    if py is not None:
+        random.setstate(tuple_from_nested(py))
+    np_state = state.get(&quot;numpy&quot;)
+    if np_state is not None:
+        np.random.set_state(tuple_from_nested(np_state))
+    cpu = state.get(&quot;torch_cpu&quot;)
+    if cpu is not None:
+        torch.set_rng_state(torch.tensor(cpu, dtype=torch.uint8))
+    cuda = state.get(&quot;torch_cuda&quot;)
+    if cuda is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([torch.tensor(s, dtype=torch.uint8) for s in cuda])
+</code></pre></div>
+
+<p><strong>Part 3 of 9 · <code>tuple_from_nested</code>, <code>atomic_save</code>, <code>atomic_write_json</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tuple_from_nested(obj):
+    if isinstance(obj, list):
+        return tuple(tuple_from_nested(x) for x in obj)
+    return obj
+
+
+def atomic_save(payload: Dict[str, Any], path: Path) -&gt; Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=str(path.parent),
+        prefix=path.name + &quot;.&quot;,
+        suffix=&quot;.tmp&quot;,
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+    return path
+
+
+def atomic_write_json(payload: Dict[str, Any], path: Path) -&gt; Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        mode=&quot;w&quot;,
+        delete=False,
+        dir=str(path.parent),
+        prefix=path.name + &quot;.&quot;,
+        suffix=&quot;.tmp&quot;,
+        encoding=&quot;utf-8&quot;,
+    )
+    tmp_path = Path(tmp.name)
+    try:
+        json.dump(payload, tmp, indent=2)
+        tmp.write(&quot;\n&quot;)
+        tmp.close()
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+    return path
+</code></pre></div>
+
+<p><strong>Part 4 of 9 · <code>file_sha256</code>, <code>save_checkpoint</code>, <code>load_checkpoint</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def file_sha256(path: Path) -&gt; str:
+    h = hashlib.sha256()
+    with path.open(&quot;rb&quot;) as f:
+        for chunk in iter(lambda: f.read(1 &lt;&lt; 16), b&quot;&quot;):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    state: TrainState,
+    out_path: Path,
+    *,
+    schema: str = CHECKPOINT_SCHEMA,
+    extras: Optional[Dict[str, Any]] = None,
+) -&gt; Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        &quot;schema&quot;: schema,
+        &quot;model&quot;: model.state_dict(),
+        &quot;optimizer&quot;: optimizer.state_dict(),
+        &quot;scheduler&quot;: scheduler.state_dict(),
+        &quot;state&quot;: {
+            &quot;step&quot;: state.step,
+            &quot;epoch&quot;: state.epoch,
+            &quot;batch_in_epoch&quot;: state.batch_in_epoch,
+            &quot;losses&quot;: list(state.losses),
+        },
+        &quot;rng&quot;: capture_rng_state(),
+        &quot;wall_saved_at&quot;: time.time(),
+    }
+    if extras:
+        payload[&quot;extras&quot;] = extras
+    atomic_save(payload, out_path)
+    return payload
+
+
+def load_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+) -&gt; TrainState:
+    payload = torch.load(path, map_location=&quot;cpu&quot;, weights_only=True)
+    if not str(payload.get(&quot;schema&quot;, &quot;&quot;)).startswith(&quot;ckpt&quot;):
+        raise ValueError(f&quot;unknown schema {payload.get('schema')}&quot;)
+    model.load_state_dict(payload[&quot;model&quot;])
+    optimizer.load_state_dict(payload[&quot;optimizer&quot;])
+    scheduler.load_state_dict(payload[&quot;scheduler&quot;])
+    restore_rng_state(payload[&quot;rng&quot;])
+    s = payload[&quot;state&quot;]
+    return TrainState(
+        step=int(s[&quot;step&quot;]),
+        epoch=int(s[&quot;epoch&quot;]),
+        batch_in_epoch=int(s[&quot;batch_in_epoch&quot;]),
+        losses=list(s[&quot;losses&quot;]),
+    )
+</code></pre></div>
+
+<p><strong>Part 5 of 9 · <code>shard_keys_by_prefix</code>, <code>save_sharded_checkpoint</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def shard_keys_by_prefix(state_dict: Dict[str, torch.Tensor], num_shards: int) -&gt; Dict[int, List[str]]:
+    &quot;&quot;&quot;Round-robin allocate parameter keys across shards.
+
+    Production sharding usually goes by parameter group or by layer. The
+    round robin keeps the shards roughly the same size for the demo and
+    keeps the index easy to read.
+    &quot;&quot;&quot;
+    if num_shards &lt; 1:
+        raise ValueError(&quot;num_shards must be &gt;= 1&quot;)
+    keys = sorted(state_dict.keys())
+    shards: Dict[int, List[str]] = {i: [] for i in range(num_shards)}
+    for i, k in enumerate(keys):
+        shards[i % num_shards].append(k)
+    return shards
+
+
+def save_sharded_checkpoint(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    state: TrainState,
+    out_dir: Path,
+    *,
+    num_shards: int,
+    extras: Optional[Dict[str, Any]] = None,
+) -&gt; Dict[str, Any]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_sd = model.state_dict()
+    layout = shard_keys_by_prefix(model_sd, num_shards)
+    shard_files: List[Dict[str, Any]] = []
+    for shard_idx in range(num_shards):
+        keys = layout[shard_idx]
+        tensors = {k: model_sd[k] for k in keys}
+        shard_path = out_dir / f&quot;model.shard-{shard_idx:03d}.pt&quot;
+        atomic_save({&quot;schema&quot;: SHARD_SCHEMA, &quot;tensors&quot;: tensors, &quot;keys&quot;: keys}, shard_path)
+        shard_files.append({
+            &quot;shard&quot;: shard_idx,
+            &quot;path&quot;: shard_path.name,
+            &quot;num_params&quot;: len(keys),
+            &quot;sha256&quot;: file_sha256(shard_path),
+        })
+    meta_path = out_dir / &quot;meta.pt&quot;
+    meta_payload = {
+        &quot;schema&quot;: CHECKPOINT_SCHEMA + &quot;-sharded&quot;,
+        &quot;optimizer&quot;: optimizer.state_dict(),
+        &quot;scheduler&quot;: scheduler.state_dict(),
+        &quot;state&quot;: {
+            &quot;step&quot;: state.step,
+            &quot;epoch&quot;: state.epoch,
+            &quot;batch_in_epoch&quot;: state.batch_in_epoch,
+            &quot;losses&quot;: list(state.losses),
+        },
+        &quot;rng&quot;: capture_rng_state(),
+        &quot;wall_saved_at&quot;: time.time(),
+        &quot;shards&quot;: shard_files,
+        &quot;extras&quot;: extras or {},
+    }
+    atomic_save(meta_payload, meta_path)
+    index_payload = {
+        &quot;schema&quot;: CHECKPOINT_SCHEMA + &quot;-index&quot;,
+        &quot;num_shards&quot;: num_shards,
+        &quot;shards&quot;: shard_files,
+        &quot;meta_sha256&quot;: file_sha256(meta_path),
+        &quot;saved_at&quot;: meta_payload[&quot;wall_saved_at&quot;],
+        &quot;step&quot;: state.step,
+    }
+    atomic_write_json(index_payload, out_dir / &quot;index.json&quot;)
+    return meta_payload
+</code></pre></div>
+
+<p><strong>Part 6 of 9 · <code>load_sharded_checkpoint</code>, <code>step_one</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def load_sharded_checkpoint(
+    ckpt_dir: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+) -&gt; TrainState:
+    index = json.loads((ckpt_dir / &quot;index.json&quot;).read_text())
+    expected_sha = index[&quot;meta_sha256&quot;]
+    meta_path = ckpt_dir / &quot;meta.pt&quot;
+    actual_sha = file_sha256(meta_path)
+    if actual_sha != expected_sha:
+        raise ValueError(f&quot;meta sha mismatch: {actual_sha} != {expected_sha}&quot;)
+    meta = torch.load(meta_path, map_location=&quot;cpu&quot;, weights_only=True)
+    root = ckpt_dir.resolve()
+    merged: Dict[str, torch.Tensor] = {}
+    for shard in meta[&quot;shards&quot;]:
+        shard_path = (ckpt_dir / shard[&quot;path&quot;]).resolve()
+        if not shard_path.is_relative_to(root):
+            raise ValueError(f&quot;shard path escapes the checkpoint directory: {shard['path']}&quot;)
+        actual = file_sha256(shard_path)
+        if actual != shard[&quot;sha256&quot;]:
+            raise ValueError(f&quot;shard sha mismatch: {shard['path']}&quot;)
+        body = torch.load(shard_path, map_location=&quot;cpu&quot;, weights_only=True)
+        if body[&quot;schema&quot;] != SHARD_SCHEMA:
+            raise ValueError(f&quot;unknown shard schema {body['schema']}&quot;)
+        merged.update(body[&quot;tensors&quot;])
+    model.load_state_dict(merged)
+    optimizer.load_state_dict(meta[&quot;optimizer&quot;])
+    scheduler.load_state_dict(meta[&quot;scheduler&quot;])
+    restore_rng_state(meta[&quot;rng&quot;])
+    s = meta[&quot;state&quot;]
+    return TrainState(
+        step=int(s[&quot;step&quot;]),
+        epoch=int(s[&quot;epoch&quot;]),
+        batch_in_epoch=int(s[&quot;batch_in_epoch&quot;]),
+        losses=list(s[&quot;losses&quot;]),
+    )
+
+
+def step_one(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    loss_fn,
+) -&gt; float:
+    optimizer.zero_grad()
+    loss = loss_fn(model(x), y)
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+    return float(loss.detach().item())
+</code></pre></div>
+
+<p><strong>Part 7 of 9 · <code>train_until</code>, <code>run_resume_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def train_until(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    loss_fn,
+    state: TrainState,
+    *,
+    stop_step: int,
+    batches_per_epoch: int,
+    batch_size: int,
+    in_dim: int,
+    out_dim: int,
+) -&gt; TrainState:
+    while state.step &lt; stop_step:
+        gen = torch.Generator()
+        gen.manual_seed(12345 + state.epoch)
+        for _ in range(state.batch_in_epoch):
+            torch.randn(batch_size, in_dim, generator=gen)
+            torch.randint(low=0, high=out_dim, size=(batch_size,), generator=gen)
+        while state.batch_in_epoch &lt; batches_per_epoch and state.step &lt; stop_step:
+            x = torch.randn(batch_size, in_dim, generator=gen)
+            y = torch.randint(low=0, high=out_dim, size=(batch_size,), generator=gen)
+            loss = step_one(model, optimizer, scheduler, x, y, loss_fn)
+            state.losses.append(loss)
+            state.step += 1
+            state.batch_in_epoch += 1
+        if state.batch_in_epoch &gt;= batches_per_epoch:
+            state.epoch += 1
+            state.batch_in_epoch = 0
+    return state
+
+
+def run_resume_demo(
+    *,
+    total_steps: int = 30,
+    interrupt_at: int = 12,
+    in_dim: int = 16,
+    hidden: int = 24,
+    out_dim: int = 4,
+    batch_size: int = 4,
+    batches_per_epoch: int = 5,
+    seed: int = 11,
+    ckpt_dir: Path,
+    sharded: bool = False,
+    num_shards: int = 3,
+) -&gt; Dict[str, Any]:
+    loss_fn = nn.CrossEntropyLoss()
+
+    seed_everything(seed)
+    m1 = make_model(in_dim, hidden, out_dim)
+    o1, s1 = make_optimizer_and_scheduler(m1, lr=0.01, total_steps=total_steps)
+    state_1 = TrainState(step=0, epoch=0, batch_in_epoch=0)
+    train_until(
+        m1, o1, s1, loss_fn, state_1,
+        stop_step=interrupt_at,
+        batches_per_epoch=batches_per_epoch,
+        batch_size=batch_size,
+        in_dim=in_dim,
+        out_dim=out_dim,
+    )
+    if sharded:
+        save_sharded_checkpoint(m1, o1, s1, state_1, ckpt_dir, num_shards=num_shards)
+    else:
+        save_checkpoint(m1, o1, s1, state_1, ckpt_dir / &quot;ckpt.pt&quot;)
+    train_until(
+        m1, o1, s1, loss_fn, state_1,
+        stop_step=total_steps,
+        batches_per_epoch=batches_per_epoch,
+        batch_size=batch_size,
+        in_dim=in_dim,
+        out_dim=out_dim,
+    )
+    full_losses = list(state_1.losses)
+
+    seed_everything(seed)
+    m2 = make_model(in_dim, hidden, out_dim)
+    o2, s2 = make_optimizer_and_scheduler(m2, lr=0.01, total_steps=total_steps)
+    if sharded:
+        loaded = load_sharded_checkpoint(ckpt_dir, m2, o2, s2)
+    else:
+        loaded = load_checkpoint(ckpt_dir / &quot;ckpt.pt&quot;, m2, o2, s2)
+    train_until(
+        m2, o2, s2, loss_fn, loaded,
+        stop_step=total_steps,
+        batches_per_epoch=batches_per_epoch,
+        batch_size=batch_size,
+        in_dim=in_dim,
+        out_dim=out_dim,
+    )
+    resumed_losses = list(loaded.losses)
+
+    suffix_full = full_losses[interrupt_at:]
+    suffix_resumed = resumed_losses[interrupt_at:]
+    if not suffix_full:
+        max_diff = 0.0
+    else:
+        max_diff = max(abs(a - b) for a, b in zip(suffix_full, suffix_resumed, strict=True))
+    return {
+        &quot;interrupt_at&quot;: interrupt_at,
+        &quot;total_steps&quot;: total_steps,
+        &quot;max_loss_diff_after_resume&quot;: max_diff,
+        &quot;full_losses&quot;: full_losses,
+        &quot;resumed_losses&quot;: resumed_losses,
+        &quot;sharded&quot;: sharded,
+    }
+</code></pre></div>
+
+<p><strong>Part 8 of 9 · <code>parse_args</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def parse_args() -&gt; argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument(&quot;--total-steps&quot;, type=int, default=24)
+    p.add_argument(&quot;--interrupt-at&quot;, type=int, default=10)
+    p.add_argument(&quot;--sharded&quot;, action=&quot;store_true&quot;)
+    p.add_argument(&quot;--num-shards&quot;, type=int, default=3)
+    p.add_argument(&quot;--seed&quot;, type=int, default=11)
+    return p.parse_args()
+
+
+def main() -&gt; int:
+    args = parse_args()
+    with tempfile.TemporaryDirectory(prefix=&quot;ckpt-demo-&quot;) as scratch:
+        scratch_dir = Path(scratch)
+        print(&quot;running resume demo (single file checkpoint)&quot;)
+        single = run_resume_demo(
+            total_steps=args.total_steps,
+            interrupt_at=args.interrupt_at,
+            ckpt_dir=scratch_dir / &quot;single&quot;,
+            sharded=False,
+            seed=args.seed,
+        )
+        print(json.dumps({k: v for k, v in single.items() if k not in (&quot;full_losses&quot;, &quot;resumed_losses&quot;)}, indent=2))
+        assert single[&quot;max_loss_diff_after_resume&quot;] &lt; 1e-4, &quot;loss drifted after single-file resume&quot;
+
+        print(&quot;running resume demo (sharded checkpoint)&quot;)
+        sharded = run_resume_demo(
+            total_steps=args.total_steps,
+            interrupt_at=args.interrupt_at,
+            ckpt_dir=scratch_dir / &quot;sharded&quot;,
+            sharded=True,
+            num_shards=args.num_shards,
+            seed=args.seed,
+        )
+        print(json.dumps({k: v for k, v in sharded.items() if k not in (&quot;full_losses&quot;, &quot;resumed_losses&quot;)}, indent=2))
+        assert sharded[&quot;max_loss_diff_after_resume&quot;] &lt; 1e-4, &quot;loss drifted after sharded resume&quot;
+
+    summary = {
+        &quot;schema&quot;: &quot;resume-demo.v1&quot;,
+        &quot;single&quot;: {
+            &quot;max_loss_diff_after_resume&quot;: single[&quot;max_loss_diff_after_resume&quot;],
+            &quot;interrupt_at&quot;: single[&quot;interrupt_at&quot;],
+            &quot;total_steps&quot;: single[&quot;total_steps&quot;],
+        },
+        &quot;sharded&quot;: {
+            &quot;max_loss_diff_after_resume&quot;: sharded[&quot;max_loss_diff_after_resume&quot;],
+            &quot;interrupt_at&quot;: sharded[&quot;interrupt_at&quot;],
+            &quot;total_steps&quot;: sharded[&quot;total_steps&quot;],
+            &quot;num_shards&quot;: args.num_shards,
+        },
+    }
+    atomic_write_json(summary, OUT_DIR / &quot;resume-demo.json&quot;)
+    print(f&quot;wrote {OUT_DIR / 'resume-demo.json'}&quot;)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 9 of 9 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">running resume demo (single file checkpoint)
+{
+  &quot;interrupt_at&quot;: 10,
+  &quot;total_steps&quot;: 24,
+  &quot;max_loss_diff_after_resume&quot;: 0.0,
+  &quot;sharded&quot;: false
+}
+running resume demo (sharded checkpoint)
+{
+  &quot;interrupt_at&quot;: 10,
+  &quot;total_steps&quot;: 24,
+  &quot;max_loss_diff_after_resume&quot;: 0.0,
+  &quot;sharded&quot;: true
+}
+wrote ./outputs/resume-demo.json</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Both resume demos interrupt a 24-step run at step 10, reload, and continue; the maximum loss difference against an uninterrupted run is exactly 0.0, for the single-file checkpoint and for the sharded one. Exact equality, not "close", is the right bar: any difference means some piece of state was not saved or restored.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team keeps only the latest checkpoint and overwrites it in place every 1,000 steps. A node fails during a save at step 41,000. What have they lost, and what two practices prevent it? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Save five buckets: model, optimizer, scheduler, data position, RNG.</li>
+<li>Write to a temporary file, fsync, then rename into place.</li>
+<li>Shard large checkpoints, with a manifest of the pieces.</li>
+<li>Test that a resumed run matches an uninterrupted one exactly.</li>
+<li>Keep more than one checkpoint.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-training-memory-checkpoints"><span class="t" style="--cs-hue:20">TM</span>Cheat sheet · Training Memory, Accumulation and Checkpoints</a></div>
 <h2>Ship it</h2>
@@ -185,6 +769,9 @@ Any training run longer than the wallclock cap of the cluster, any run that must
 <li>Add a checksum verification path that runs at startup, scans every checkpoint in the directory, and reports which ones are corrupt.</li>
 <li>Implement a <code>migrate_v1_to_v2</code> function that adds a new field to the payload and bumps the schema string. Make load tolerate both versions.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1947-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · Keeping the last K</span></summary><div class="qa-a"><p>After each successful save, list checkpoints by step and delete all but the newest K. K = 2 is the minimum (the latest might be corrupt or have been saved just before a bad divergence); 3 to 5 is common when space allows. Verify a checkpoint's checksum before deleting the older ones.</p></div></details>
+<details class="qa" id="a1947-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · One file, overwritten</span></summary><div class="qa-a"><p>The in-place write was interrupted, so the only checkpoint is now truncated, and up to 41,000 steps of progress are gone. Use atomic saves (temporary file plus rename) so a failed write never replaces a good checkpoint, and keep several recent checkpoints, verified by checksum at startup.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li>POSIX <code>rename</code> semantics for the atomicity claim that <code>os.replace</code> relies on.</li>
 <li>PyTorch documentation on <code>torch.save</code> and <code>torch.load</code>, including <code>map_location</code> for cross-device restores and <code>weights_only</code> for loading untrusted files.</li>
