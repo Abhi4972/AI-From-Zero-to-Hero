@@ -70,7 +70,12 @@ def mainpy_md(c, intro):
     code = f.read_text().rstrip() + "\n"
     code = re.sub(r'\nif __name__ == ["\']__main__["\']:\n(?:[ \t]+.*\n?|\n)+$', "\n", code)
     lines = code.splitlines(keepends=True)
-    starts = [i for i, l in enumerate(lines) if re.match(r"(async def |def |class |@)", l) and not (i and lines[i - 1].startswith("@"))]
+    try:                                  # cut only at real top-level definitions (never inside a string)
+        import ast as _ast
+        starts = sorted({min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])]) - 1
+                         for n in _ast.parse(code).body if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))})
+    except SyntaxError:
+        starts = [i for i, l in enumerate(lines) if re.match(r"(async def |def |class |@)", l) and not (i and lines[i - 1].startswith("@"))]
     cuts, last = [0], 0
     for s in starts:
         if s - last >= 45: cuts.append(s); last = s
@@ -228,7 +233,8 @@ def run_lesson(c):
     (wd / "blocks.json").write_text(json.dumps(blocks))
     try:
         subprocess.run([PY, "/home/claude/aifs/runner.py", "blocks.json", "res.json"], cwd=wd, timeout=600, capture_output=True,
-                       env={**os.environ, "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "2"})
+                       env={**os.environ, "HF_HUB_OFFLINE": "1", "OMP_NUM_THREADS": "2",
+                            **({"PYTHONPATH": "/home/claude/aifs/sitefix"} if "multiprocessing" in "".join(c["blocks"]) else {})})
         res = json.loads((wd / "res.json").read_text())
     except Exception as e:
         res = [{"status": "error", "err": str(e)}] * len(c["blocks"])

@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p><strong>Pipeline parallelism</strong> splits a model by layers: rank 0 holds the first block of layers, rank 1 the next, and so on, each a <strong>stage</strong>. A batch is cut into <strong>micro-batches</strong> that flow through the stages like an assembly line. At the start and end of each step some stages sit idle waiting for work; that idle time is the <strong>bubble</strong>. <strong>GPipe</strong> runs all forward passes, then all backward passes; <strong>1F1B</strong> interleaves one forward with one backward once the pipeline is full, which keeps the same bubble but limits how many micro-batches' activations each stage must hold. More micro-batches shrink the bubble, and stages should do equal work, since the slowest stage sets the pace.</p></div></aside>
 <p>A 70B-parameter model in fp16 needs 140 GB of parameters alone. No consumer GPU holds it. ZeRO-3 shards parameters across ranks but still needs every rank to allgather the full layer for each forward step, paying <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mclose">)</span></span></span></span> hops per layer. Pipeline parallel takes a different route: cut the model into N stages and put one stage on each rank. Forward of layer 1 finishes on rank 0 and hands the activation tensor to rank 1; rank 1 runs layer 2 and hands to rank 2; and so on. Backward flows in reverse. Memory drops linearly because each rank only holds one stage; compute is sequential, which is the bubble problem.</p>
 <p>The bubble is the idle time at the start of the pipeline (waiting for the first microbatch to reach the last stage) and at the end (waiting for the last microbatch to drain back through). With M microbatches and N stages the per-stage bubble fraction is (N-1)/(M+N-1). At M=8, N=4 that is 27%. At M=64, N=4 it is 4.5%. The bubble shrinks when you have many microbatches per step, which means small per-microbatch batch sizes, which is the constraint that drives microbatch design.</p>
 <h2>The idea</h2>
@@ -59,6 +60,33 @@
 <h2>Idea 4 · Microbatch versus batch</h2>
 <p>A pipeline runs M microbatches of size B each. The effective batch size is M<em>B. The gradient at the end of a pipeline step is the gradient on the combined M</em>B examples. Bubble fraction depends on M; the optimiser sees M*B. Tuning M means trading bubble (lower with high M) against per-microbatch memory (higher activation memory with high M for GPipe).</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="cd-pipeline-bubble"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-title">The bubble fraction</div><div class="co-body"><p>With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span></span></span></span> stages and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">M</span></span></span></span> micro-batches, GPipe and 1F1B both leave idle a fraction</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">bubble</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1297em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>of each stage's time: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> slots to fill the pipeline at the start and to drain it at the end.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Four stages, eight micro-batches</div><div class="co-body"><ol>
+<li>Forward phase: stage 0 starts micro-batch 0 at time 0; stage 3 cannot start until time 3. Stage 3 idles for 3 slots at the start.</li>
+<li>Backward phase, in reverse: stage 0 waits for the gradients to come back, idling for 3 slots at the end.</li>
+<li>Each stage does 2 × 8 = 16 slots of work in a schedule 2 × (8 + 3) = 22 slots long: idle 6 of 22, or 27.3%, matching (4 − 1)/(8 + 4 − 1) = 3/11.</li>
+<li>With 32 micro-batches the bubble falls to 3/35 ≈ 8.6%. Smaller micro-batches are less efficient on the GPU, so M is a balance.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> The bubble shrinks as the number of micro-batches grows.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> 1F1B removes the pipeline bubble.
+  It keeps the same bubble but bounds activation memory.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> The slowest stage sets the pace of the whole pipeline.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Pipeline parallelism splits each matrix multiply across ranks.
+  That is tensor parallelism; pipelines split the layers.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with 4 stages, what bubble fraction do 1, 4, 16 and 64 micro-batches give? And with 8 stages and 16 micro-batches?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Bubble fraction by stages and micro-batches</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def bubble(S, M): return (S - 1) / (M + S - 1)
+for S in (2, 4, 8):
+    print(f&quot;S={S}: &quot; + &quot;  &quot;.join(f&quot;M={M:2d}:{bubble(S, M):6.1%}&quot; for M in (1, 4, 16, 64)))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">S=2: M= 1: 50.0%  M= 4: 20.0%  M=16:  5.9%  M=64:  1.5%
+S=4: M= 1: 75.0%  M= 4: 42.9%  M=16: 15.8%  M=64:  4.5%
+S=8: M= 1: 87.5%  M= 4: 63.6%  M=16: 30.4%  M=64:  9.9%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With one micro-batch, a 4-stage pipeline is idle 75% of the time; with 16 it is 16%, and with 64 under 5%. Doubling the stages to 8 doubles the fill and drain cost, so 16 micro-batches now leave 30% idle. Deeper pipelines need proportionally more micro-batches, which means larger global batches, one reason pipeline depth is usually kept modest.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -83,6 +111,264 @@
 <li><strong>DeepSpeed Pipeline.</strong> Integrates with ZeRO; ZeRO-1 + pipeline is a common combo for the largest open models.</li>
 <li><strong>PyTorch Pipe.</strong> The PyTorch-native pipeline wrapper, built on <code>torch.distributed.pipeline.sync.Pipe</code>.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>_loopback_iface</code>, <code>bubble_fraction</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Pipeline parallel with GPipe schedule and bubble analysis.
+
+Splits a sequential MLP into N stages. The schedule simulates wall-clock for
+each stage's forward and backward, then prints a Gantt chart and computes the
+bubble fraction against the closed-form (N-1)/(M+N-1) prediction.
+
+A second demo wires a 2-stage real pipeline over torch.distributed gloo:
+rank 0 owns stage 0, rank 1 owns stage 1, activations flow over send/recv,
+and the schedule trains a small MLP for a few steps to prove the wire works.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import sys
+import tempfile
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+
+SEED = 23
+NUM_STAGES = 4
+NUM_MICROBATCHES = 8
+FORWARD_UNITS = 1
+BACKWARD_UNITS = 2
+
+
+def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+def bubble_fraction(num_stages: int, num_microbatches: int) -&gt; float:
+    &quot;&quot;&quot;Closed-form bubble fraction per stage for GPipe.
+
+    Forward takes M + N - 1 cycles per stage (M useful + N - 1 idle warmup).
+    Backward takes M + N - 1 cycles per stage (M useful + N - 1 idle drain).
+    Total cycles = 2(M + N - 1); useful per stage = 2M.
+    Bubble fraction = 2(N - 1) / 2(M + N - 1) = (N - 1) / (M + N - 1).
+    &quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    return (n - 1) / (m + n - 1)
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>gpipe_schedule</code>, <code>render_gantt</code>, <code>measure_bubble</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def gpipe_schedule(num_stages: int, num_microbatches: int) -&gt; list:
+    &quot;&quot;&quot;Return the GPipe schedule as a list of (cycle, stage, microbatch, phase).
+
+    Phase is 'F' for forward, 'B' for backward, '.' for idle. Cycle is the
+    integer time slot. Microbatch is the microbatch index.
+    &quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    schedule = []
+    # forward pass: microbatch i enters stage 0 at cycle i, stage k at cycle i+k
+    for mb in range(m):
+        for stage in range(n):
+            cycle = mb + stage
+            schedule.append((cycle, stage, mb, &quot;F&quot;))
+    # backward pass: microbatch i finishes forward at stage n-1 cycle i+n-1
+    # then backward starts at stage n-1 at cycle m+n-1+i and rolls to stage 0
+    forward_end = m + n - 1
+    for mb in range(m):
+        for stage in reversed(range(n)):
+            cycle = forward_end + (m - 1 - mb) + (n - 1 - stage)
+            schedule.append((cycle, stage, mb, &quot;B&quot;))
+    return schedule
+
+
+def render_gantt(schedule: list, num_stages: int, num_microbatches: int) -&gt; str:
+    &quot;&quot;&quot;Render the schedule as a stage-by-cycle text Gantt chart.&quot;&quot;&quot;
+    n = num_stages
+    m = num_microbatches
+    max_cycle = max(c for c, _, _, _ in schedule)
+    grid = [[&quot;.&quot; for _ in range(max_cycle + 1)] for _ in range(n)]
+    for cycle, stage, mb, phase in schedule:
+        grid[stage][cycle] = f&quot;{phase}{mb}&quot; if phase != &quot;.&quot; else &quot;.&quot;
+    lines = []
+    header = &quot;stage \\ cycle  &quot; + &quot; &quot;.join(f&quot;{c:&gt;2}&quot; for c in range(max_cycle + 1))
+    lines.append(header)
+    for s, row in enumerate(grid):
+        lines.append(f&quot;stage {s}         &quot; + &quot; &quot;.join(f&quot;{cell:&gt;2}&quot; for cell in row))
+    return &quot;\n&quot;.join(lines)
+
+
+def measure_bubble(num_stages: int, num_microbatches: int) -&gt; float:
+    &quot;&quot;&quot;Empirical bubble: count idle slots in the rendered schedule.&quot;&quot;&quot;
+    schedule = gpipe_schedule(num_stages, num_microbatches)
+    max_cycle = max(c for c, _, _, _ in schedule)
+    total_slots = num_stages * (max_cycle + 1)
+    used = len(schedule)
+    return (total_slots - used) / total_slots
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>StageMLP</code>, <code>_pipe_worker</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class StageMLP(nn.Module):
+    &quot;&quot;&quot;One stage of a sequential MLP.&quot;&quot;&quot;
+
+    def __init__(self, in_dim: int, hid_dim: int, out_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hid_dim)
+        self.fc2 = nn.Linear(hid_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return torch.relu(self.fc2(torch.relu(self.fc1(x))))
+
+
+def _pipe_worker(rank: int, world_size: int, init_file: str, iface: str,
+                 steps: int, batch: int, microbatches: int, out_queue) -&gt; None:
+    &quot;&quot;&quot;Two-rank pipeline: rank 0 owns stage 0, rank 1 owns stage 1.
+
+    Forward: rank 0 runs stage 0 on microbatch, sends activation to rank 1.
+    Rank 1 runs stage 1, computes loss, runs backward, sends grad back to rank 0.
+    Rank 0 finishes backward on stage 0. Repeats per microbatch.
+    &quot;&quot;&quot;
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;, init_method=f&quot;file://{init_file}&quot;,
+        rank=rank, world_size=world_size,
+    )
+    torch.manual_seed(SEED + rank)
+    in_dim, hid_dim, mid_dim, out_dim = 16, 32, 16, 4
+    if rank == 0:
+        stage = StageMLP(in_dim, hid_dim, mid_dim)
+    else:
+        stage = StageMLP(mid_dim, hid_dim, out_dim)
+    optim = torch.optim.SGD(stage.parameters(), lr=0.05)
+    loss_fn = nn.MSELoss()
+    g = torch.Generator().manual_seed(SEED + 99)
+    losses = []
+    for step in range(steps):
+        optim.zero_grad(set_to_none=True)
+        for _ in range(microbatches):
+            if rank == 0:
+                x = torch.randn(batch, in_dim, generator=g)
+                act = stage(x)
+                dist.send(act.detach(), dst=1)
+                grad = torch.zeros_like(act)
+                dist.recv(grad, src=1)
+                act.backward(grad)
+            else:
+                act = torch.zeros(batch, mid_dim, requires_grad=True)
+                buf = torch.zeros(batch, mid_dim)
+                dist.recv(buf, src=0)
+                act = buf.detach().requires_grad_(True)
+                pred = stage(act)
+                y = torch.zeros(batch, out_dim)
+                loss = loss_fn(pred, y)
+                loss.backward()
+                dist.send(act.grad.detach(), dst=0)
+                losses.append(loss.item())
+        optim.step()
+    norm = sum(p.detach().pow(2).sum().item() for p in stage.parameters()) ** 0.5
+    out_queue.put((rank, losses, norm))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>run_pipeline</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_pipeline(steps: int = 5, batch: int = 8, microbatches: int = 4) -&gt; dict:
+    &quot;&quot;&quot;Spawn a 2-rank pipeline; return per-rank losses (only rank 1 reports) and norms.&quot;&quot;&quot;
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_pipe_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    world_size = 2
+    procs = []
+    try:
+        for r in range(world_size):
+            p = ctx.Process(
+                target=_pipe_worker,
+                args=(r, world_size, init_file, iface, steps, batch, microbatches, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, losses, norm = out_queue.get(timeout=120)
+            results[rank] = (losses, norm)
+        return results
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+
+
+def main() -&gt; int:
+    print(f&quot;GPipe schedule analysis: stages={NUM_STAGES}, microbatches={NUM_MICROBATCHES}&quot;)
+    schedule = gpipe_schedule(NUM_STAGES, NUM_MICROBATCHES)
+    print(render_gantt(schedule, NUM_STAGES, NUM_MICROBATCHES))
+    closed = bubble_fraction(NUM_STAGES, NUM_MICROBATCHES)
+    measured = measure_bubble(NUM_STAGES, NUM_MICROBATCHES)
+    print(f&quot;\nclosed-form bubble fraction: {closed * 100:.2f}%&quot;)
+    print(f&quot;measured bubble fraction:    {measured * 100:.2f}%&quot;)
+    print(&quot;\nbubble vs microbatch count (N=4):&quot;)
+    print(f&quot;{'M':&lt;6}{'bubble %':&lt;10}&quot;)
+    for m in (1, 2, 4, 8, 16, 32, 64):
+        print(f&quot;{m:&lt;6}{bubble_fraction(4, m)*100:&lt;10.2f}&quot;)
+    print(&quot;\nrunning 2-stage real pipeline over gloo...&quot;)
+    results = run_pipeline(steps=3, batch=8, microbatches=4)
+    rank1_losses = results[1][0]
+    print(f&quot;rank 1 saw {len(rank1_losses)} microbatch losses; final norm rank 0 = {results[0][1]:.4f}, rank 1 = {results[1][1]:.4f}&quot;)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">GPipe schedule analysis: stages=4, microbatches=8
+stage \ cycle   0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21
+stage 0         F0 F1 F2 F3 F4 F5 F6 F7  .  .  .  .  .  . B7 B6 B5 B4 B3 B2 B1 B0
+stage 1          . F0 F1 F2 F3 F4 F5 F6 F7  .  .  .  . B7 B6 B5 B4 B3 B2 B1 B0  .
+stage 2          .  . F0 F1 F2 F3 F4 F5 F6 F7  .  . B7 B6 B5 B4 B3 B2 B1 B0  .  .
+stage 3          .  .  . F0 F1 F2 F3 F4 F5 F6 F7 B7 B6 B5 B4 B3 B2 B1 B0  .  .  .
+
+closed-form bubble fraction: 27.27%
+measured bubble fraction:    27.27%
+
+bubble vs microbatch count (N=4):
+M     bubble %  
+1     75.00     
+2     60.00     
+4     42.86     
+8     27.27     
+16    15.79     
+32    8.57      
+64    4.48      
+
+running 2-stage real pipeline over gloo...
+rank 1 saw 12 microbatch losses; final norm rank 0 = 4.0857, rank 1 = 3.5662</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The schedule grid shows GPipe's shape for 4 stages and 8 micro-batches: a staircase of forwards, a gap, then backwards in reverse order. The measured bubble (27.27%) matches the formula exactly, and the table of micro-batch counts reproduces the visual. A real two-stage pipeline over gloo then runs 12 micro-batches. Its two final norms differ (4.09 against 3.57), which is expected, because each rank holds <em>different</em> layers, unlike data parallelism, where all copies must match.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A pipeline puts the embedding layer and the first 2 transformer blocks on stage 0, and 10 blocks plus the output head on stage 1. GPU utilization is poor. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Split the model by layers into stages; feed micro-batches through.</li>
+<li>Bubble = (S − 1)/(M + S − 1); more micro-batches, smaller bubble.</li>
+<li>1F1B keeps the bubble but bounds activation memory.</li>
+<li>Balance compute across stages.</li>
+<li>Ranks hold different layers, so their parameters differ.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-distributed-training"><span class="t" style="--cs-hue:280">DF</span>Cheat sheet · DDP, FSDP, ZeRO and Pipeline Parallel</a></div>
 <h2>Ship it</h2>
@@ -95,6 +381,9 @@
 <li>Pair the pipeline with activation checkpointing and measure the memory drop versus compute cost.</li>
 <li>Combine pipeline with DDP (each pipeline rank is replicated across a data-parallel group) and reason through the 2D schedule.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1979-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 1F1B</span></summary><div class="qa-a"><p>After a warm-up of S − 1 forwards, each stage alternates one forward and one backward, so at most S micro-batches' activations are alive on a stage instead of M. The schedule's length and bubble match GPipe's (S − 1)/(M + S − 1); measure peak activation memory per stage to see the difference.</p></div></details>
+<details class="qa" id="a1979-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Unbalanced stages</span></summary><div class="qa-a"><p>Stage 1 does about five times the work of stage 0, so stage 0 waits idle most of the time and the pipeline runs at stage 1's pace. Balance by measured time per layer, for example 6 blocks per stage, putting the cheap embedding with the first blocks and the output head with the last.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://arxiv.org/abs/1811.06965">Huang et al, GPipe: Efficient Training of Giant Neural Networks</a></li>
 <li><a href="https://arxiv.org/abs/1806.03377">Narayanan et al, PipeDream: Generalized Pipeline Parallelism for DNN Training</a></li>

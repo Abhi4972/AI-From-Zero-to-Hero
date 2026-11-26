@@ -6,7 +6,9 @@ Voice overlays: /home/claude/aifs/voice/<id>.md. Directives: @@top <h2>, @@end <
 Overlay pattern per lesson: plain (top The problem), math?, worked, check, predict, visual + python run, read (end last Idea); mainpy Use it; read of main.py output + broken + recap (before Ship it); Solutions (end Exercises); takeaways for every h2 + Solutions.
 Rules: money in prose not inside $math$; use u^{*} not u^\*; runner skips code containing openai/anthropic/requests./while True etc. (mainpy parts are forced with #!run).
 Helpers: rd.py <ppNN> prints a source lesson compactly; heads.txt lists converted h2 headings per lesson.
-Done: phase 17 and phase 18 overlays (a1701-a1830) and their diagrams. Next: phase 19 (85 capstone lessons).
+Done: all of Part 6. Phase 17, 18 and 19 overlays (144 lessons, a1701-a1987) and step-through diagrams (data/diagrams/a17*, a18*, a19*; lessons with upstream Mermaid use that instead).
+Runner: lessons are run as a real __main__ module (multiprocessing pickling works), a full main() gets 150 s, local paths are scrubbed from output; lessons that import multiprocessing run with PYTHONPATH=sitefix (torch file_system sharing).
+build_p6 splits main.py for @@mainpy at AST top-level definitions, never inside a string.
 IMPORTANT: build_p6.py rewrites lesson HTML, which removes the step-through diagrams; always run tools/diagrams.py (all ids) afterwards.
 conv.py now keeps the whole first block quote as the one-line idea (it used to cut at 600 characters).
 Note: many toy main.py outputs contradict their own captions; read boxes say so honestly.

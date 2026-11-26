@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A large training job runs on many ranks, and each holds a different shard of the model and optimizer, so its checkpoint is <strong>sharded</strong>: every rank writes its own file in parallel, and a <strong>manifest</strong> records the world size, the step, and each shard's file name, size and <strong>sha256</strong> hash. The manifest is written last, <strong>atomically</strong>, so it only exists once every shard is safely on disk. On resume, the loader checks the manifest against reality: same world size, every file present, every hash matching. It also <strong>rotates</strong> checkpoints, keeping the most recent few and deleting older ones. The lesson tests the three failure modes the schema must catch: a different world size, a corrupted shard, and a missing shard.</p></div></aside>
 <p>A vanilla checkpoint reads all parameters and optimiser state into rank 0, gathers, and writes a single file. For a 70B model that is 1.1 TB of state through one rank's network port. The write blocks every other rank because they idle waiting for the gather. The IO bandwidth is the slowest single GPU's network link, not the aggregate. On a real cluster the gather-then-write step can take longer than the previous training hour, which means the job ships less than one checkpoint per training day.</p>
 <p>Sharded checkpoints flip the pattern: every rank writes its own shard to its own file in parallel. The manifest records which rank owned which shard so resume can put each shard back where it came from. The aggregate write bandwidth scales with the cluster. A 1 TB checkpoint that took 4 hours through one rank takes 4 minutes through 64 ranks. Plus the manifest gives you a contract for incompatible resumes: world-size change is detectable, partial writes are detectable, and the load path can fail loudly rather than silently using stale data.</p>
 <h2>The idea</h2>
@@ -96,6 +97,33 @@
 <h2>Idea 4 · Why per-rank files, not one big file</h2>
 <p>Concurrent write to one file via <code>O_APPEND</code> works on POSIX for byte-aligned writes, but in practice the offsets within one shard span MB-sized regions and the locking dominates. Per-rank files have no contention and benefit from striping when the underlying filesystem is parallel (Lustre, GPFS). Production stacks (DeepSpeed, FSDP, NeMo) all use per-rank files for that reason.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="ci-sharded-checkpoint"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Why the manifest goes last</div><div class="co-body"><p>Four ranks write shards for step 1,200; rank 2's node dies halfway through its write.</p>
+<ol>
+<li><strong>Manifest first:</strong> a manifest for step 1,200 exists, listing four shards, but rank 2's file is truncated. A resume would load it (or fail confusingly) unless every hash is checked.</li>
+<li><strong>Manifest last:</strong> ranks 0, 1 and 3 finish; rank 2 never does; the coordinator never writes the manifest. Resume looks for the newest <em>complete</em> checkpoint and loads step 1,100.</li>
+<li>With manifest-last plus hash checks, a half-written checkpoint is invisible, and a corrupted one is rejected loudly.</li>
+<li>The cost: at most one checkpoint interval of lost work.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Each rank writes its own shard file, in parallel.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> The manifest should be written first so resume knows what to expect.
+  Written last, its existence proves the checkpoint is complete.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Loading checks world size and every shard's hash.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Rotation can safely sort checkpoints by file modification time.
+  Sort by step number; times can mislead when checkpoints are copied or restored.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a directory holds checkpoints for steps 100, 0, 1, 2, 3, 4, 5, 6, 7, written in that order. Keeping 5, which are deleted if rotation sorts by write time? By step number?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Rotation by time or by step</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">written = [&quot;step_0100&quot;, &quot;step_0000&quot;, &quot;step_0001&quot;, &quot;step_0002&quot;, &quot;step_0003&quot;, &quot;step_0004&quot;, &quot;step_0005&quot;, &quot;step_0006&quot;, &quot;step_0007&quot;]
+keep = 5
+by_time = written[:-keep]                                        # oldest writes first
+by_step = sorted(written, key=lambda s: int(s.split(&quot;_&quot;)[1]))[:-keep]
+print(&quot;delete by write time :&quot;, by_time)
+print(&quot;delete by step number:&quot;, by_step)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">delete by write time : [&#x27;step_0100&#x27;, &#x27;step_0000&#x27;, &#x27;step_0001&#x27;, &#x27;step_0002&#x27;]
+delete by step number: [&#x27;step_0000&#x27;, &#x27;step_0001&#x27;, &#x27;step_0002&#x27;, &#x27;step_0003&#x27;]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Sorting by write time deletes <code>step_0100</code>, the most advanced checkpoint in the directory, because it happened to be written first; sorting by step number keeps it and deletes steps 0–3. The lesson's own rotation test shows exactly the first behaviour, which is a real bug to fix: rotation should order by the step recorded in each manifest.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -120,6 +148,332 @@
 <li><strong>PyTorch FSDP checkpointing.</strong> <code>torch.distributed.checkpoint</code> saves sharded state with a <code>Planner</code> that decides per-rank layout.</li>
 <li><strong>NeMo.</strong> Wraps DeepSpeed and FSDP with a uniform <code>save_to_checkpoint</code> API that adds metadata.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>ShardEntry</code>, <code>ShardManifest</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Sharded checkpoint with atomic write and verified resume.
+
+Saves a multi-rank training state as per-rank binary files plus a JSON
+manifest. The write is atomic: every file lands at &lt;name&gt;.tmp first, the
+manifest writes last, then a single rename moves everything to the final
+names. A crash mid-write leaves the previous checkpoint intact.
+
+Resume verifies the manifest schema (world_size, shard count, sha256 per
+shard) and reconstructs per-rank state byte-equal to what was saved.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+import torch
+
+
+SCHEMA_VERSION = 1
+MANIFEST_NAME = &quot;manifest.json&quot;
+
+
+@dataclass
+class ShardEntry:
+    rank: int
+    path: str
+    sha256: str
+    param_shard_offset: int
+    param_shard_numel: int
+
+
+@dataclass
+class ShardManifest:
+    world_size: int
+    step: int
+    wall_clock_seconds: float
+    shards: list
+    schema_version: int = SCHEMA_VERSION
+
+    def to_json(self) -&gt; str:
+        return json.dumps({
+            &quot;world_size&quot;: self.world_size,
+            &quot;step&quot;: self.step,
+            &quot;wall_clock_seconds&quot;: self.wall_clock_seconds,
+            &quot;schema_version&quot;: self.schema_version,
+            &quot;shards&quot;: [asdict(s) for s in self.shards],
+        }, indent=2, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, text: str) -&gt; &quot;ShardManifest&quot;:
+        data = json.loads(text)
+        return cls(
+            world_size=int(data[&quot;world_size&quot;]),
+            step=int(data[&quot;step&quot;]),
+            wall_clock_seconds=float(data[&quot;wall_clock_seconds&quot;]),
+            schema_version=int(data[&quot;schema_version&quot;]),
+            shards=[ShardEntry(**s) for s in data[&quot;shards&quot;]],
+        )
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>CheckpointError</code>, <code>_sha256_bytes</code>, <code>_fsync_dir</code>, <code>_serialize_state</code>, <code>_deserialize_state</code>, <code>save_sharded</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class CheckpointError(Exception):
+    &quot;&quot;&quot;Raised when manifest validation or shard verification fails.&quot;&quot;&quot;
+
+
+def _sha256_bytes(data: bytes) -&gt; str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fsync_dir(path: Path) -&gt; None:
+    &quot;&quot;&quot;Fsync a directory so rename metadata reaches disk; no-op where unsupported.&quot;&quot;&quot;
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _serialize_state(state: dict) -&gt; bytes:
+    &quot;&quot;&quot;Serialize a state dict deterministically using torch.save with pickle 4.&quot;&quot;&quot;
+    import io
+    buf = io.BytesIO()
+    torch.save(state, buf, pickle_protocol=4)
+    return buf.getvalue()
+
+
+def _deserialize_state(data: bytes) -&gt; dict:
+    import io
+    buf = io.BytesIO(data)
+    return torch.load(buf, weights_only=False)
+
+
+def save_sharded(per_rank_state: list, dest_dir: str, step: int,
+                 wall_clock_seconds: float = 0.0) -&gt; ShardManifest:
+    &quot;&quot;&quot;Write per-rank state files atomically; return the manifest written.
+
+    per_rank_state is a list indexed by rank. Each entry is a state dict that
+    will be torch.save'd into rankN.bin. The function uses the .tmp + rename
+    pattern so a partial write never corrupts an existing checkpoint.
+    &quot;&quot;&quot;
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    world_size = len(per_rank_state)
+    shards = []
+    tmp_paths = []
+    offset = 0
+    for rank, state in enumerate(per_rank_state):
+        payload = _serialize_state(state)
+        sha = _sha256_bytes(payload)
+        final_name = f&quot;rank{rank}.bin&quot;
+        tmp_name = f&quot;rank{rank}.bin.tmp&quot;
+        tmp_path = dest / tmp_name
+        with open(tmp_path, &quot;wb&quot;) as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp_paths.append((tmp_path, dest / final_name))
+        param_shard = state.get(&quot;param_shard&quot;)
+        numel = param_shard.numel() if isinstance(param_shard, torch.Tensor) else 0
+        shards.append(ShardEntry(
+            rank=rank,
+            path=final_name,
+            sha256=sha,
+            param_shard_offset=offset,
+            param_shard_numel=numel,
+        ))
+        offset += numel
+    manifest = ShardManifest(
+        world_size=world_size,
+        step=step,
+        wall_clock_seconds=wall_clock_seconds,
+        shards=shards,
+    )
+    manifest_tmp = dest / (MANIFEST_NAME + &quot;.tmp&quot;)
+    manifest_final = dest / MANIFEST_NAME
+    with open(manifest_tmp, &quot;w&quot;) as f:
+        f.write(manifest.to_json())
+        f.flush()
+        os.fsync(f.fileno())
+    for tmp, final in tmp_paths:
+        os.replace(tmp, final)
+    os.replace(manifest_tmp, manifest_final)
+    _fsync_dir(dest)
+    return manifest
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>load_sharded</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def load_sharded(src_dir: str, expected_world_size: int) -&gt; tuple:
+    &quot;&quot;&quot;Read the manifest, verify every shard, return (manifest, per-rank state list).&quot;&quot;&quot;
+    src = Path(src_dir)
+    manifest_path = src / MANIFEST_NAME
+    if not manifest_path.exists():
+        raise CheckpointError(f&quot;manifest missing at {manifest_path}&quot;)
+    manifest = ShardManifest.from_json(manifest_path.read_text())
+    if manifest.world_size != expected_world_size:
+        raise CheckpointError(
+            f&quot;world_size mismatch: manifest={manifest.world_size}, expected={expected_world_size}&quot;
+        )
+    if manifest.schema_version != SCHEMA_VERSION:
+        raise CheckpointError(
+            f&quot;schema_version mismatch: manifest={manifest.schema_version}, expected={SCHEMA_VERSION}&quot;
+        )
+    if len(manifest.shards) != manifest.world_size:
+        raise CheckpointError(
+            f&quot;shard count != world_size: {len(manifest.shards)} vs {manifest.world_size}&quot;
+        )
+    per_rank = [None] * manifest.world_size
+    seen_ranks = set()
+    src_resolved = src.resolve()
+    for shard in manifest.shards:
+        if not (0 &lt;= shard.rank &lt; manifest.world_size):
+            raise CheckpointError(
+                f&quot;shard rank {shard.rank} out of range [0,{manifest.world_size})&quot;
+            )
+        if shard.rank in seen_ranks:
+            raise CheckpointError(f&quot;duplicate shard for rank {shard.rank}&quot;)
+        seen_ranks.add(shard.rank)
+        if os.path.isabs(shard.path) or os.sep in shard.path or &quot;/&quot; in shard.path or shard.path in (&quot;&quot;, &quot;.&quot;, &quot;..&quot;):
+            raise CheckpointError(f&quot;unsafe shard path: {shard.path!r}&quot;)
+        shard_path = (src / shard.path).resolve()
+        try:
+            shard_path.relative_to(src_resolved)
+        except ValueError as exc:
+            raise CheckpointError(f&quot;shard path escapes checkpoint dir: {shard.path!r}&quot;) from exc
+        if not shard_path.exists():
+            raise CheckpointError(f&quot;shard file missing: {shard_path}&quot;)
+        payload = shard_path.read_bytes()
+        actual = _sha256_bytes(payload)
+        if actual != shard.sha256:
+            raise CheckpointError(
+                f&quot;sha256 mismatch on rank {shard.rank}: &quot;
+                f&quot;recorded={shard.sha256[:12]}..., actual={actual[:12]}...&quot;
+            )
+        per_rank[shard.rank] = _deserialize_state(payload)
+    if len(seen_ranks) != manifest.world_size:
+        missing = sorted(set(range(manifest.world_size)) - seen_ranks)
+        raise CheckpointError(f&quot;manifest missing ranks: {missing}&quot;)
+    return manifest, per_rank
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>rotate_checkpoints</code>, <code>make_demo_state</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def rotate_checkpoints(parent_dir: str, keep_last: int = 5) -&gt; list:
+    &quot;&quot;&quot;Delete oldest checkpoint directories so only the most recent keep_last remain.&quot;&quot;&quot;
+    if keep_last &lt; 0:
+        raise ValueError(f&quot;keep_last must be &gt;= 0, got {keep_last}&quot;)
+    parent = Path(parent_dir)
+    if not parent.exists():
+        return []
+    children = sorted(
+        [c for c in parent.iterdir() if c.is_dir() and c.name.startswith(&quot;step_&quot;)],
+        key=lambda c: (c.stat().st_mtime, c.name),
+    )
+    if keep_last == 0:
+        to_delete = children
+    elif len(children) &gt; keep_last:
+        to_delete = children[:-keep_last]
+    else:
+        to_delete = []
+    deleted = []
+    for c in to_delete:
+        shutil.rmtree(c, ignore_errors=True)
+        deleted.append(c.name)
+    return deleted
+
+
+def make_demo_state(rank: int, world_size: int) -&gt; dict:
+    &quot;&quot;&quot;Construct a representative per-rank state for the demo.&quot;&quot;&quot;
+    torch.manual_seed(31 + rank)
+    return {
+        &quot;rank&quot;: rank,
+        &quot;world_size&quot;: world_size,
+        &quot;param_shard&quot;: torch.randn(1024) + rank,
+        &quot;m_shard&quot;: torch.zeros(1024),
+        &quot;v_shard&quot;: torch.ones(1024) * 1e-6,
+        &quot;step&quot;: 100,
+    }
+
+
+def main() -&gt; int:
+    world_size = 4
+    workdir = tempfile.mkdtemp(prefix=&quot;aie_ckpt_&quot;)
+    print(f&quot;workdir: {workdir}&quot;)
+    states = [make_demo_state(r, world_size) for r in range(world_size)]
+    step_dir = os.path.join(workdir, &quot;step_0100&quot;)
+    print(&quot;saving sharded checkpoint...&quot;)
+    manifest = save_sharded(states, step_dir, step=100, wall_clock_seconds=42.0)
+    print(f&quot;manifest: world_size={manifest.world_size}, step={manifest.step}, shards={len(manifest.shards)}&quot;)
+    for entry in manifest.shards:
+        print(f&quot;  rank {entry.rank}: {entry.path} sha256={entry.sha256[:12]}... numel={entry.param_shard_numel}&quot;)
+    print(&quot;\nresuming...&quot;)
+    loaded_manifest, loaded_states = load_sharded(step_dir, expected_world_size=world_size)
+    for r in range(world_size):
+        before = states[r][&quot;param_shard&quot;]
+        after = loaded_states[r][&quot;param_shard&quot;]
+        assert torch.equal(before, after), f&quot;rank {r} param shard differs after resume&quot;
+    print(&quot;byte-equal round-trip verified for every rank&quot;)
+    print(&quot;\ntesting failure mode: wrong world size...&quot;)
+    try:
+        load_sharded(step_dir, expected_world_size=8)
+    except CheckpointError as e:
+        print(f&quot;  rejected as expected: {e}&quot;)
+    print(&quot;\ntesting failure mode: tampered shard...&quot;)
+    shard0 = Path(step_dir) / &quot;rank0.bin&quot;
+    backup = shard0.read_bytes()
+    shard0.write_bytes(backup + b&quot;corruption&quot;)
+    try:
+        load_sharded(step_dir, expected_world_size=world_size)
+    except CheckpointError as e:
+        print(f&quot;  rejected as expected: {e}&quot;)
+    shard0.write_bytes(backup)
+    print(&quot;\ntesting rotation: write 8 checkpoints, keep 5...&quot;)
+    for s in range(8):
+        sd = os.path.join(workdir, f&quot;step_{s:04d}&quot;)
+        save_sharded(states, sd, step=s)
+    deleted = rotate_checkpoints(workdir, keep_last=5)
+    print(f&quot;  rotated {len(deleted)} oldest: {deleted}&quot;)
+    shutil.rmtree(workdir, ignore_errors=True)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">workdir: /tmp/aie_ckpt_oploz5u4
+saving sharded checkpoint...
+manifest: world_size=4, step=100, shards=4
+  rank 0: rank0.bin sha256=194bfd3c6653... numel=1024
+  rank 1: rank1.bin sha256=0dd605637003... numel=1024
+  rank 2: rank2.bin sha256=106f0b7741a2... numel=1024
+  rank 3: rank3.bin sha256=ae92515ac857... numel=1024
+
+resuming...
+byte-equal round-trip verified for every rank
+
+testing failure mode: wrong world size...
+  rejected as expected: world_size mismatch: manifest=4, expected=8
+
+testing failure mode: tampered shard...
+  rejected as expected: sha256 mismatch on rank 0: recorded=194bfd3c6653..., actual=712d93275d12...
+
+testing rotation: write 8 checkpoints, keep 5...
+  rotated 4 oldest: [&#x27;step_0100&#x27;, &#x27;step_0000&#x27;, &#x27;step_0001&#x27;, &#x27;step_0002&#x27;]</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The sharded checkpoint for step 100 is written with four shards and their hashes, and a resume verifies a byte-for-byte round trip on every rank. Both failure tests are rejected as intended: a manifest for 4 ranks refused by an 8-rank job, and a tampered shard caught by its hash. The rotation test then writes 8 more checkpoints and keeps 5, deleting <code>step_0100</code> along with steps 0–2: the time-ordered rotation the visual warns about, which throws away the furthest-trained checkpoint.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A resume script loads whichever shard files exist and skips hash checks "because the disk is reliable". After a crash, one shard is from step 900 and the other three from step 1,000. What happens? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>One shard per rank, written in parallel.</li>
+<li>The manifest (world size, step, hashes) is written last and atomically.</li>
+<li>On load, check world size, presence and every hash.</li>
+<li>Rotate by step number, keeping several recent checkpoints.</li>
+<li>Test the failure paths, not just the happy path.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-training-memory-checkpoints"><span class="t" style="--cs-hue:20">TM</span>Cheat sheet · Training Memory, Accumulation and Checkpoints</a></div>
 <h2>Ship it</h2>
@@ -132,6 +486,9 @@
 <li>Add a cross-world-size load: shard rebalance from N=4 to N=8 by reading the manifest, concatenating, and re-sharding.</li>
 <li>Add an upload to a fake S3 (a second directory) and write the upload manifest. Defend the two-tier storage policy.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1980-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · Keep the last five</span></summary><div class="qa-a"><p>Parse each checkpoint's step from its manifest, sort by step, and delete all but the five highest, but only after the new checkpoint's manifest has been written and verified, so a failed save never leaves fewer than five good checkpoints.</p></div></details>
+<details class="qa" id="a1980-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Mixed steps</span></summary><div class="qa-a"><p>The model is assembled from shards trained to different steps, so layers and optimizer states disagree; training continues from an inconsistent state, often with a loss spike or silent damage. Only load shards listed in one manifest, and verify every hash against it.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://deepspeed.readthedocs.io/en/latest/model-checkpointing.html">DeepSpeed checkpointing</a></li>
 <li><a href="https://pytorch.org/docs/stable/distributed.checkpoint.html">PyTorch torch.distributed.checkpoint</a></li>

@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A <strong>bi-encoder</strong> embeds the query and each document separately, which makes search fast because documents are embedded once in advance. A <strong>cross-encoder</strong> reads the query and one document <em>together</em> and outputs a relevance score, so it can notice how they relate word by word: more accurate, but far too slow to run over a whole corpus. The standard answer is two stages: the fast retriever picks the top N candidates, and the cross-encoder <strong>re-ranks</strong> only those, keeping the top K. This lesson trains a tiny cross-encoder on a few labelled pairs (seconds of training) to show the shape, including its main failure: a reranker trained on too little data can make the ranking worse.</p></div></aside>
 <p>A bi-encoder maps query and document into the same vector space and ranks by cosine. The two encodings never see each other. The model has to compress everything useful about a document into a single vector, blind to the query. This is fast - one embedding per document at index time and one per query at query time - and it is the only way to rank at corpus scale.</p>
 <p>The cost is precision. Two documents that have the same overall topic can have nearly identical embeddings even when one of them answers the query and the other does not. The bi-encoder cannot tell them apart.</p>
 <p>A cross-encoder solves this by reading the query and the document together. The model receives <code>[query] [SEP] [document]</code> as a single sequence, runs full attention across the join, and produces one relevance scalar. Every token of the document can attend to every token of the query. The model decides the score with full context.</p>
@@ -100,6 +101,32 @@
 <p>The numbers above are illustrative of the shape, not measurements from this fixture. The shape is real. There is always a knee around 20 to 50 candidates where the rerank lift saturates. Past the knee you are paying for nothing.</p>
 <p>Pick N from the eval curve plus the latency budget. The cross-encoder cannot raise recall above the bi-encoder's recall at N, so a low N caps quality, not just latency.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="rerank-funnel"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The latency budget</div><div class="co-body"><p>A corpus of 1,000,000 chunks; one cross-encoder pass takes 5 ms on a GPU; the retriever takes 20 ms total.</p>
+<ol>
+<li>Cross-encoding everything: 1,000,000 × 5 ms ≈ 83 minutes per query. Impossible.</li>
+<li>Retrieve top 50, then cross-encode 50: 20 ms + 50 × 5 ms = 270 ms, or less with batching.</li>
+<li>Retrieve top 10: 70 ms, but if the right chunk was ranked 25th by the retriever, the reranker never sees it.</li>
+<li>N trades latency against the chance that the answer is in the candidate set at all; measure the retriever's recall@N before choosing it.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A cross-encoder reads query and document together.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A reranker can recover documents the retriever did not return.
+  It only reorders the candidates it is given.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Re-ranking only the top N keeps latency bounded.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A reranker trained to near-zero loss will improve rankings.
+  On a tiny training set it can overfit and make rankings worse.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: the retriever's recall@N on a query set is 0.70 at N = 10, 0.88 at N = 50 and 0.93 at N = 200. If the reranker always puts the right chunk first when it is present, what is the end-to-end recall@1 for each N?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Candidate depth sets the ceiling</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">recall_at_n = {10: 0.70, 50: 0.88, 200: 0.93}
+ms_per_pair, retrieve_ms = 5, 20
+for n, r in recall_at_n.items():
+    print(f&quot;N={n:3d}: best possible recall@1 after re-ranking {r:.2f}, latency about {retrieve_ms + n * ms_per_pair} ms unbatched&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">N= 10: best possible recall@1 after re-ranking 0.70, latency about 70 ms unbatched
+N= 50: best possible recall@1 after re-ranking 0.88, latency about 270 ms unbatched
+N=200: best possible recall@1 after re-ranking 0.93, latency about 1020 ms unbatched</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>A perfect reranker can only reach the retriever's recall@N: 0.70 with 10 candidates, 0.93 with 200, at 40 times the reranking cost. In practice the curve flattens (here from 50 to 200 buys 5 points for 750 ms more), so N is usually set where the retriever's recall stops climbing quickly.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -127,6 +154,387 @@
 <li>Cache the reranker's output by (query, document_id) hash. The same query against a stable corpus reranks to the same order; cache hits buy you a free latency cut.</li>
 <li>Log the rank-1 cross-encoder score. A query whose top-1 score is below a corpus-specific threshold is an out-of-domain hit; surface it to the LLM as "I am not confident".</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 7 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 7 · <code>_set_seed</code>, <code>_token_to_id</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Cross-encoder reranker on top of a bi-encoder retriever.
+
+A tiny torch module shows the architectural shape. The two-stage pipeline
+demonstrates the latency-vs-quality trade-off on a fixture corpus.
+
+References:
+- ./docs/en.md
+- Phase 19 lesson 65 (bi-encoder hybrid retriever)
+- Phase 19 lesson 68 (eval harness measuring the rerank lift)
+- Phase 19 lesson 69 (end-to-end system that uses this reranker)
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import math
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+VOCAB_SIZE = 8192
+PAD_ID = 0
+SEP_ID = 1
+CLS_ID = 2
+SEED = 19660101
+
+
+def _set_seed(seed: int = SEED) -&gt; None:
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+
+def _token_to_id(token: str) -&gt; int:
+    h = 0
+    for ch in token:
+        h = (h * 1315423911) ^ ord(ch)
+        h &amp;= 0xFFFFFFFF
+    return 3 + (h % (VOCAB_SIZE - 3))
+
+
+_WORD = re.compile(r&quot;[a-z0-9]+&quot;)
+</code></pre></div>
+
+<p><strong>Part 2 of 7 · <code>tokenize_pair</code>, <code>CrossEncoder</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tokenize_pair(query: str, document: str, max_len: int = 96) -&gt; tuple[list[int], list[int]]:
+    q_tokens = [_token_to_id(t) for t in _WORD.findall(query.lower())]
+    d_tokens = [_token_to_id(t) for t in _WORD.findall(document.lower())]
+    ids = [CLS_ID] + q_tokens + [SEP_ID] + d_tokens + [SEP_ID]
+    type_ids = ([0] * (len(q_tokens) + 2)) + ([1] * (len(d_tokens) + 1))
+    if len(ids) &gt; max_len:
+        ids = ids[:max_len]
+        type_ids = type_ids[:max_len]
+    else:
+        pad = max_len - len(ids)
+        ids = ids + [PAD_ID] * pad
+        type_ids = type_ids + [0] * pad
+    return ids, type_ids
+
+
+# ---------------------------------------------------------------------------
+# the cross-encoder model
+# ---------------------------------------------------------------------------
+
+class CrossEncoder(nn.Module):
+    def __init__(self, d_model: int = 64, n_heads: int = 4, ff_hidden: int = 128,
+                 max_len: int = 96) -&gt; None:
+        super().__init__()
+        _set_seed()
+        self.token_emb = nn.Embedding(VOCAB_SIZE, d_model, padding_idx=PAD_ID)
+        self.type_emb = nn.Embedding(2, d_model)
+        self.pos_emb = nn.Embedding(max_len, d_model)
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ff_hidden),
+            nn.GELU(),
+            nn.Linear(ff_hidden, d_model),
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, 1)
+        self.max_len = max_len
+
+    def forward(self, input_ids: torch.Tensor, type_ids: torch.Tensor) -&gt; torch.Tensor:
+        batch, seq = input_ids.shape
+        pos = torch.arange(seq, device=input_ids.device).unsqueeze(0).expand(batch, seq)
+        x = self.token_emb(input_ids) + self.type_emb(type_ids) + self.pos_emb(pos)
+        mask = (input_ids == PAD_ID)
+        attn_out, _ = self.attn(x, x, x, key_padding_mask=mask)
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        # mean-pool over non-pad positions
+        keep = (~mask).unsqueeze(-1).float()
+        pooled = (x * keep).sum(dim=1) / keep.sum(dim=1).clamp(min=1.0)
+        return self.head(pooled).squeeze(-1)
+
+
+# ---------------------------------------------------------------------------
+# training - one supervised pass with hand-labeled triples
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 3 of 7 · <code>Triple</code>, <code>_batch_encode</code>, <code>train_tiny</code>, <code>Candidate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class Triple:
+    query: str
+    document: str
+    label: float  # 1.0 relevant, 0.0 irrelevant
+
+
+def _batch_encode(pairs: list[Triple], max_len: int = 96) -&gt; tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    id_lists = []
+    type_lists = []
+    labels = []
+    for p in pairs:
+        ids, tids = tokenize_pair(p.query, p.document, max_len)
+        id_lists.append(ids)
+        type_lists.append(tids)
+        labels.append(p.label)
+    return (
+        torch.tensor(id_lists, dtype=torch.long),
+        torch.tensor(type_lists, dtype=torch.long),
+        torch.tensor(labels, dtype=torch.float),
+    )
+
+
+def train_tiny(model: CrossEncoder, triples: list[Triple], epochs: int = 60, lr: float = 5e-3) -&gt; list[float]:
+    &quot;&quot;&quot;Returns per-epoch loss.&quot;&quot;&quot;
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    losses: list[float] = []
+    ids, tids, labels = _batch_encode(triples, max_len=model.max_len)
+    for _ in range(epochs):
+        opt.zero_grad()
+        pred = model(ids, tids)
+        loss = loss_fn(pred, labels)
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    return losses
+
+
+# ---------------------------------------------------------------------------
+# reranking interface
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Candidate:
+    doc_id: str
+    text: str
+    retriever_score: float = 0.0
+</code></pre></div>
+
+<p><strong>Part 4 of 7 · <code>rerank</code>, <code>mock_embed</code>, <code>cosine</code>, <code>BiEncoder</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def rerank(
+    model: CrossEncoder,
+    query: str,
+    candidates: list[Candidate],
+    top_k: int = 5,
+) -&gt; list[tuple[Candidate, float]]:
+    if not candidates:
+        return []
+    model.eval()
+    triples = [Triple(query, c.text, 0.0) for c in candidates]
+    ids, tids, _ = _batch_encode(triples, max_len=model.max_len)
+    with torch.no_grad():
+        scores = model(ids, tids).tolist()
+    out = sorted(zip(candidates, scores), key=lambda x: -x[1])
+    return out[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# bi-encoder retriever (deterministic mock embedding)
+# ---------------------------------------------------------------------------
+
+def mock_embed(text: str, dim: int = 96) -&gt; list[float]:
+    vec = [0.0] * dim
+    for tok in _WORD.findall(text.lower()):
+        h = 0
+        for ch in tok:
+            h = (h * 1315423911) ^ ord(ch)
+            h &amp;= 0xFFFFFFFF
+        vec[h % dim] += 1.0
+        vec[(h &gt;&gt; 7) % dim] += 0.5
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+def cosine(a: list[float], b: list[float]) -&gt; float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+@dataclass
+class BiEncoder:
+    docs: list[Candidate] = field(default_factory=list)
+    vectors: list[list[float]] = field(default_factory=list)
+
+    def add(self, c: Candidate) -&gt; None:
+        self.docs.append(c)
+        self.vectors.append(mock_embed(c.text))
+
+    def search(self, query: str, top_n: int) -&gt; list[Candidate]:
+        qv = mock_embed(query)
+        scored = [(d, cosine(qv, v)) for d, v in zip(self.docs, self.vectors)]
+        scored.sort(key=lambda x: -x[1])
+        return [Candidate(d.doc_id, d.text, retriever_score=s) for d, s in scored[:top_n]]
+
+
+# ---------------------------------------------------------------------------
+# the full two-stage pipeline
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 5 of 7 · <code>pipeline</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def pipeline(
+    query: str,
+    retriever: BiEncoder,
+    reranker: CrossEncoder,
+    top_n: int = 10,
+    top_k: int = 5,
+) -&gt; dict[str, object]:
+    t0 = time.perf_counter()
+    n_candidates = retriever.search(query, top_n)
+    t1 = time.perf_counter()
+    reranked = rerank(reranker, query, n_candidates, top_k)
+    t2 = time.perf_counter()
+    return {
+        &quot;retrieve_top_n&quot;: n_candidates,
+        &quot;reranked_top_k&quot;: reranked,
+        &quot;latency_retrieve_ms&quot;: (t1 - t0) * 1000,
+        &quot;latency_rerank_ms&quot;: (t2 - t1) * 1000,
+    }
+
+
+# ---------------------------------------------------------------------------
+# fixture corpus and training pairs
+# ---------------------------------------------------------------------------
+
+CORPUS = [
+    Candidate(&quot;d1&quot;, &quot;AbortMultipartOnFail aborts an in-flight S3 multipart upload and &quot;
+                    &quot;decrements the per-bucket retry budget when the upload fails.&quot;),
+    Candidate(&quot;d2&quot;, &quot;Uploading large files: the storage service splits a file into parts. &quot;
+                    &quot;The client tracks parts. Cancelled uploads release reserved keys.&quot;),
+    Candidate(&quot;d3&quot;, &quot;Per-bucket budgets: each bucket carries a retry budget that limits &quot;
+                    &quot;how often a failed operation can be retried within a window.&quot;),
+    Candidate(&quot;d4&quot;, &quot;check_permission: authorization is centralized in check_permission &quot;
+                    &quot;which evaluates a policy against principal, resource, and action.&quot;),
+    Candidate(&quot;d5&quot;, &quot;Policy engine: wraps an Open Policy Agent runtime and exposes evaluate. &quot;
+                    &quot;Cached for a configured TTL.&quot;),
+    Candidate(&quot;d6&quot;, &quot;Search ranking: production search combines lexical and semantic &quot;
+                    &quot;retrieval through a rank fusion step.&quot;),
+    Candidate(&quot;d7&quot;, &quot;Index sizing: the vector index sits in memory; plan for 1 KB per &quot;
+                    &quot;vector at 256 dimensions in float32.&quot;),
+    Candidate(&quot;d8&quot;, &quot;Cancelling jobs: long-running jobs accept a cancellation signal that &quot;
+                    &quot;stops the worker and releases the queue slot.&quot;),
+]
+
+
+TRAIN_TRIPLES = [
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[0].text, 1.0),
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[1].text, 0.3),
+    Triple(&quot;how do we abort a multipart upload&quot;, CORPUS[3].text, 0.0),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[2].text, 1.0),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[0].text, 0.5),
+    Triple(&quot;retry budget per bucket configuration&quot;, CORPUS[4].text, 0.0),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[3].text, 1.0),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[4].text, 0.5),
+    Triple(&quot;centralized authorization check function&quot;, CORPUS[6].text, 0.0),
+    Triple(&quot;how does rank fusion work&quot;, CORPUS[5].text, 1.0),
+    Triple(&quot;how does rank fusion work&quot;, CORPUS[2].text, 0.0),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[7].text, 1.0),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[1].text, 0.3),
+    Triple(&quot;how do we cancel a job&quot;, CORPUS[0].text, 0.2),
+]
+
+
+# ---------------------------------------------------------------------------
+# demo
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 6 of 7 · <code>print_list</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def print_list(label: str, items, fmt) -&gt; None:
+    print(f&quot;  {label}:&quot;)
+    for i, item in enumerate(items[:5]):
+        print(f&quot;    {i + 1}. {fmt(item)}&quot;)
+
+
+def main() -&gt; None:
+    _set_seed()
+    retriever = BiEncoder()
+    for c in CORPUS:
+        retriever.add(c)
+
+    reranker = CrossEncoder()
+    losses = train_tiny(reranker, TRAIN_TRIPLES, epochs=60)
+    print(f&quot;trained tiny cross-encoder, loss {losses[0]:.4f} -&gt; {losses[-1]:.4f}\n&quot;)
+
+    queries = [
+        &quot;how do we abort a multipart upload&quot;,
+        &quot;centralized authorization check function&quot;,
+        &quot;how do we cancel a job&quot;,
+    ]
+
+    for q in queries:
+        print(f&quot;query: {q}&quot;)
+        result = pipeline(q, retriever, reranker, top_n=8, top_k=3)
+        print_list(
+            &quot;retrieve top-N&quot;,
+            result[&quot;retrieve_top_n&quot;],
+            lambda c: f&quot;{c.doc_id}  retriever_score={c.retriever_score:.4f}&quot;,
+        )
+        print_list(
+            &quot;reranked top-K&quot;,
+            result[&quot;reranked_top_k&quot;],
+            lambda x: f&quot;{x[0].doc_id}  cross_score={x[1]:.4f}&quot;,
+        )
+        print(f&quot;  latency: retrieve {result['latency_retrieve_ms']:.2f}ms, &quot;
+              f&quot;rerank {result['latency_rerank_ms']:.2f}ms\n&quot;)
+</code></pre></div>
+
+<p><strong>Part 7 of 7 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">trained tiny cross-encoder, loss 0.5356 -&gt; 0.0003
+
+query: how do we abort a multipart upload
+  retrieve top-N:
+    1. d1  retriever_score=0.4255
+    2. d3  retriever_score=0.3660
+    3. d4  retriever_score=0.2131
+    4. d8  retriever_score=0.1735
+    5. d2  retriever_score=0.1579
+  reranked top-K:
+    1. d1  cross_score=0.9780
+    2. d8  cross_score=0.8024
+    3. d6  cross_score=0.6686
+  latency: retrieve 0.11ms, rerank 3.32ms
+
+query: centralized authorization check function
+  retrieve top-N:
+    1. d4  retriever_score=0.5159
+    2. d7  retriever_score=0.2911
+    3. d2  retriever_score=0.1470
+    4. d6  retriever_score=0.1118
+    5. d3  retriever_score=0.0958
+  reranked top-K:
+    1. d8  cross_score=1.1841
+    2. d4  cross_score=0.9991
+    3. d2  cross_score=0.8358
+  latency: retrieve 0.08ms, rerank 2.00ms
+
+query: how do we cancel a job
+  retrieve top-N:
+    1. d3  retriever_score=0.4304
+    2. d4  retriever_score=0.2916
+    3. d8  retriever_score=0.2586
+    4. d1  retriever_score=0.2578
+    5. d2  retriever_score=0.2551
+  reranked top-K:
+    1. d8  cross_score=1.0152
+    2. d3  cross_score=0.9986
+    3. d6  cross_score=0.7758
+  latency: retrieve 0.08ms, rerank 2.55ms</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The tiny cross-encoder's training loss falls to almost zero (0.54 to 0.0003), which already suggests memorization. The results confirm it. For "how do we abort a multipart upload", it keeps the right document first. For "centralized authorization check function", the retriever had the right document (<code>check_permission</code>, d4) first, and the reranker moved a document about <em>cancelling jobs</em> (d8) above it. It also favours d8 for the job-cancelling query, so it has learned a bias toward that document. Its scores also exceed 1, so they are not probabilities. A reranker must be evaluated against the retriever's ranking before it ships.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team adds a cross-encoder reranker and sees average latency rise from 40 ms to 900 ms, with no gain in answer quality. Name two things to check. (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Bi-encoders retrieve fast; cross-encoders re-rank accurately.</li>
+<li>Re-rank only the top N candidates.</li>
+<li>The retriever's recall@N caps what re-ranking can achieve.</li>
+<li>Small rerankers overfit; compare against the retriever's own order.</li>
+<li>Measure latency and quality together.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-rag"><span class="t" style="--cs-hue:100">RA</span>Cheat sheet · Retrieval-Augmented Generation (RAG)</a></div>
 <h2>Ship it</h2>
@@ -139,10 +547,12 @@
 <li>Add a second cross-encoder head that predicts a binary "is this answer in the document" label. Use both heads at inference; one to rank, one to threshold.</li>
 <li>Replace the deterministic mock bi-encoder with the one from lesson 65 and chain the two stages. Measure the change in top-K versus bi-encoder alone.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1966-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Slow and useless reranking</span></summary><div class="qa-a"><p>Check N: re-ranking hundreds of candidates unbatched explains the latency, so batch the pairs and lower N to where the retriever's recall levels off. Check quality on a labelled set: if the reranker does not beat the retriever's order (or a general-purpose pretrained reranker), it is not worth its cost; it may be undertrained or mismatched to the domain.</p></div></details>
 <h2>Interview questions</h2>
 <p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
 <p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
-<details class="qa" id="a1966-qa1"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You add a cross-encoder behind a hybrid retriever. The prompt receives K chunks. The team wants a rule for N, the number of candidates the reranker scores, and one engineer proposes a small N to protect the latency budget. How do you choose N, and what do you refuse?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
+<details class="qa" id="a1966-qa2"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You add a cross-encoder behind a hybrid retriever. The prompt receives K chunks. The team wants a rule for N, the number of candidates the reranker scores, and one engineer proposes a small N to protect the latency budget. How do you choose N, and what do you refuse?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 10 minutes to answer well.</em></p>
 <p><strong>Short answer.</strong> Choose N from the recall curve of the reranked output and the latency budget together. Sweep N on a held-out query set; the lift saturates at a knee somewhere around 20 to 50 candidates, and past it every extra candidate costs a forward pass for nothing. Keep N at least three times K, because the reranker can only promote a chunk that the retriever put in the pool.</p>
 <p><strong>The one tunable.</strong></p>
 <p>The two-stage pipeline has one knob. The bi-encoder returns N candidates, the cross-encoder scores each pair and keeps K. The lesson shows the shape of the curve with illustrative values: recall at 1 rises from N of 5 to N of 20, rises less to N of 50, and does not change at N of 100. The values are not measurements from the fixture; the knee is real.</p>
@@ -170,7 +580,7 @@
 <li><em>(level 4)</em> How do you get the latency back without a smaller N? Expected: one batched forward pass for the N pairs, and a cache keyed on the query and the document id.</li>
 </ul>
 <p><strong>Where it is taught.</strong> The lesson <a href="#a1966">cross-encoder</a> gives the latency against quality curve, the three times K rule and the batching and memory notes.</p></div></details>
-<details class="qa" id="a1966-qa2"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">A new cross-encoder reranker lifts MRR on the offline fixture to a near-perfect value. In production the same reranker makes the top result worse than the retriever alone. List the causes you check, in order, and say how each one shows up.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<details class="qa" id="a1966-qa3"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">A new cross-encoder reranker lifts MRR on the offline fixture to a near-perfect value. In production the same reranker makes the top result worse than the retriever alone. List the causes you check, in order, and say how each one shows up.</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
 <p><strong>Short answer.</strong> Check the training data first: if the hand-labeled training pairs include the eval queries, the eval is a memory test and the lift is fake. Then check the pair order in production, because a cross-encoder is not symmetric and a swapped query and document collapses recall. Then check the candidate pool, because production candidates come from the real bi-encoder, and its recall at N caps what the reranker can see.</p>
 <p><strong>Cause 1: the eval leaked into training.</strong></p>
 <p>The reranker lesson warns that if the hand-labeled training pairs include the eval queries, the rerank looks magical. The end-to-end lesson makes the point concrete: its 14 training triples resemble the eval queries, so the demo keeps the eval queries disjoint on purpose. A leak shows as a near-perfect fixture and a production result that looks like a different model.</p>

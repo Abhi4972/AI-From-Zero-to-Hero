@@ -34,7 +34,7 @@ for code in blocks:
     if SKIP.search(code) and not code.startswith("#!run\n"):
         res.append({"status": "skipped"}); continue
     buf = io.StringIO()
-    signal.alarm(25)
+    signal.alarm(150 if code.startswith("#!run\nimport sys as _s") else 25)   # a lesson's full main() gets longer
     try:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             exec(compile(code, "<lesson>", "exec"), ns)

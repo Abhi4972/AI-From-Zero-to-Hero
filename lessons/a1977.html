@@ -46,6 +46,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p><strong>DistributedDataParallel (DDP)</strong> is the standard way to train one model on several processes, and it needs only three operations: <strong>broadcast</strong> the initial weights from rank 0 so every copy starts identical; after each backward pass, <strong>all-reduce</strong> the gradients and divide by the number of ranks to get their <strong>mean</strong>; and let every rank take the same optimizer step. Real DDP groups gradients into <strong>buckets</strong> so it can start communicating while backward is still running, and the data and initialization are <strong>seeded</strong> so runs are reproducible. This lesson builds DDP on the hand-made collectives and checks that it produces exactly the same parameters as single-process training on the full batch.</p></div></aside>
 <p>A 1-billion-parameter model with 12 GB of activations does not fit on one consumer GPU. Even when it fits, training takes weeks. Data parallel splits the batch across N ranks, each rank computes the forward and backward on its shard, and at every step every rank's gradients are summed so all N copies stay identical. The summed gradient is what the optimiser steps on.</p>
 <p>Without gradient sync, the N replicas diverge by step 2. The model is not "one model trained on more data" anymore, it is N separate models that happen to share initial weights. With gradient sync done badly (one allreduce per parameter, no overlap, no bucketing) the network is the bottleneck and the GPUs idle waiting for the wire. The craft of DDP is making the gradient sync nearly free relative to compute. The canonical PyTorch DDP achieves that by bucketing gradients, overlapping allreduce with the next layer's backward, and using NCCL on NVLink. We can do all three on CPU with gloo and learn the same lessons.</p>
 <h2>The idea</h2>
@@ -84,6 +85,33 @@
 <h2>Idea 4 · Why pin the seed</h2>
 <p>Every rank must call <code>torch.manual_seed(seed + rank)</code> for shuffling but <code>torch.manual_seed(seed)</code> for parameter init. A single shared seed for shuffling means every rank sees the same batch order (defeating data parallel). For parameters, the rank 0 broadcast at construction is what makes the replicas identical, and it overwrites whatever each rank initialised. The shared init seed is the backup: if the broadcast is skipped or broken, rank-specific init gives every replica different starting weights, and gradient sync alone never pulls them back together. Get the seed pattern right or the test for parameter equivalence fails on step 1.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="ci-ddp-grad-sync"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Why the mean and not the sum</div><div class="co-body"><p>Four ranks each compute a gradient on their quarter of a 64-example batch; single-process training would average over all 64.</p>
+<ol>
+<li>Summing the four gradients gives four times the full-batch average gradient.</li>
+<li>With the sum, every step is four times too large, as if the learning rate were multiplied by the number of ranks; scaling to 64 ranks would multiply it by 64.</li>
+<li>Dividing by the world size gives exactly the full-batch average (with equal shard sizes), so the same learning rate works at any scale.</li>
+<li>That equivalence is what the lesson's test checks: DDP's parameters after each step equal the single-process reference.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Initial weights are broadcast so every rank starts identical.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Gradients should be summed across ranks to speed up learning.
+  The sum scales the step with the number of ranks; use the mean.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Buckets let communication start before backward finishes.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Different seeds per rank are fine for model initialization.
+  They make the copies different; broadcast or share the seed.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: per-rank gradients 0.8, 1.2, 1.0 and 1.0. What step does each rank take with learning rate 0.1, using the mean? Using the sum?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Mean against sum</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">grads = [0.8, 1.2, 1.0, 1.0]
+lr, w = 0.1, 5.0
+mean_step = lr * sum(grads) / len(grads)
+sum_step = lr * sum(grads)
+print(f&quot;mean: every rank moves w from {w} to {w - mean_step:.3f} (same as single-process on the full batch)&quot;)
+print(f&quot;sum : every rank moves w from {w} to {w - sum_step:.3f} (a step {sum_step / mean_step:.0f}x too large)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">mean: every rank moves w from 5.0 to 4.900 (same as single-process on the full batch)
+sum : every rank moves w from 5.0 to 4.600 (a step 4x too large)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With the mean, every rank takes a 0.1 step, exactly what one process on the whole batch would take. With the sum, the step is four times larger. Both keep the ranks identical (they all apply the same number), which is why the bug is easy to miss: the copies agree with each other, but not with the training you meant to run.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -108,6 +136,270 @@
 <li><strong>HuggingFace Accelerate.</strong> Adds a launcher that handles <code>torchrun</code> env vars and the model wrap. Same DDP under the hood.</li>
 <li><strong>Megatron-LM data parallel.</strong> Combines DDP with tensor parallel for large models; the data-parallel piece is the same allreduce-after-backward pattern.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>_loopback_iface</code>, <code>MiniMLP</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;DistributedDataParallel from scratch on the gloo backend.
+
+Wraps an nn.Module so that:
+  * at construct time every rank's parameters are broadcast from rank 0 and so
+    every rank starts with identical weights,
+  * after backward each parameter's gradient is allreduced (sum) and divided
+    by world_size, producing the mean gradient every rank steps on.
+
+The demo trains a 3-layer MLP for 20 steps on synthetic data across 4 ranks
+and compares the resulting per-step loss against a single-process reference
+that walks the same batches in rank order. The two paths produce identical
+loss curves to float epsilon, which is the load-bearing correctness test.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import sys
+import tempfile
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+
+
+SEED = 7
+WORLD_SIZE = 4
+STEPS = 20
+BATCH = 8
+IN_DIM = 16
+HID_DIM = 32
+OUT_DIM = 4
+
+
+def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+class MiniMLP(nn.Module):
+    &quot;&quot;&quot;Small enough to converge in seconds, big enough to expose DDP wiring.&quot;&quot;&quot;
+
+    def __init__(self, in_dim: int = IN_DIM, hid_dim: int = HID_DIM, out_dim: int = OUT_DIM):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, hid_dim),
+            nn.ReLU(),
+            nn.Linear(hid_dim, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.net(x)
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>DistributedDataParallel</code>, <code>make_dataset</code>, <code>_ddp_worker</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class DistributedDataParallel:
+    &quot;&quot;&quot;Broadcast params at init, allreduce-and-mean grads after backward.
+
+    Not a full nn.Module wrapper; the API exposes the two methods the training
+    loop needs (sync_init, sync_grads). The wrap is intentionally thin so the
+    cost of each operation is visible in the loop.
+    &quot;&quot;&quot;
+
+    def __init__(self, module: nn.Module, world_size: int):
+        self.module = module
+        self.world_size = world_size
+        self._broadcast_params()
+
+    def _broadcast_params(self) -&gt; None:
+        for p in self.module.parameters():
+            dist.broadcast(p.data, src=0)
+
+    def sync_grads(self) -&gt; None:
+        for p in self.module.parameters():
+            if p.grad is None:
+                continue
+            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM)
+            p.grad.data.div_(self.world_size)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        return self.module(x)
+
+    def parameters(self):
+        return self.module.parameters()
+
+
+def make_dataset(seed: int, n_total: int) -&gt; tuple:
+    &quot;&quot;&quot;Synthetic regression dataset shared by every rank's reference loop.&quot;&quot;&quot;
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n_total, IN_DIM, generator=g)
+    w = torch.randn(IN_DIM, OUT_DIM, generator=g)
+    y = x @ w + 0.1 * torch.randn(n_total, OUT_DIM, generator=g)
+    return x, y
+
+
+def _ddp_worker(rank: int, world_size: int, init_file: str, iface: str,
+                steps: int, batch: int, lr: float, out_queue) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;,
+        init_method=f&quot;file://{init_file}&quot;,
+        rank=rank,
+        world_size=world_size,
+    )
+    torch.manual_seed(SEED)
+    model = MiniMLP()
+    ddp = DistributedDataParallel(model, world_size=world_size)
+    optim = torch.optim.SGD(ddp.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    x_all, y_all = make_dataset(SEED + 1000, n_total=world_size * batch * steps)
+    losses = []
+    for step in range(steps):
+        offset = step * world_size * batch + rank * batch
+        x = x_all[offset:offset + batch]
+        y = y_all[offset:offset + batch]
+        optim.zero_grad(set_to_none=True)
+        pred = ddp.forward(x)
+        loss = loss_fn(pred, y)
+        loss.backward()
+        ddp.sync_grads()
+        optim.step()
+        losses.append(loss.item())
+
+    final_norm = sum(p.detach().pow(2).sum().item() for p in ddp.parameters()) ** 0.5
+    out_queue.put((rank, losses, final_norm))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>run_ddp</code>, <code>reference_single_process</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_ddp(world_size: int = WORLD_SIZE, steps: int = STEPS,
+            batch: int = BATCH, lr: float = 0.05) -&gt; tuple:
+    &quot;&quot;&quot;Spawn world_size ranks, return per-rank loss history and param norm.&quot;&quot;&quot;
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_ddp_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    procs = []
+    try:
+        for r in range(world_size):
+            p = ctx.Process(
+                target=_ddp_worker,
+                args=(r, world_size, init_file, iface, steps, batch, lr, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, losses, norm = out_queue.get(timeout=120)
+            results[rank] = (losses, norm)
+        return results
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+
+
+def reference_single_process(world_size: int = WORLD_SIZE, steps: int = STEPS,
+                             batch: int = BATCH, lr: float = 0.05) -&gt; tuple:
+    &quot;&quot;&quot;Train the same model on the same per-step concatenated batch sequentially.
+
+    A 'no-DDP' rank that walks every rank's micro-batch in rank order each step
+    produces the same gradient as DDP's allreduce-mean, so the two paths must
+    yield byte-equal per-step losses to float epsilon.
+    &quot;&quot;&quot;
+    torch.manual_seed(SEED)
+    model = MiniMLP()
+    optim = torch.optim.SGD(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    x_all, y_all = make_dataset(SEED + 1000, n_total=world_size * batch * steps)
+    losses = []
+    for step in range(steps):
+        optim.zero_grad(set_to_none=True)
+        rank0_loss = None
+        for r in range(world_size):
+            offset = step * world_size * batch + r * batch
+            x = x_all[offset:offset + batch]
+            y = y_all[offset:offset + batch]
+            pred = model(x)
+            loss = loss_fn(pred, y) / world_size
+            loss.backward()
+            if r == 0:
+                rank0_loss = loss.item() * world_size
+        optim.step()
+        losses.append(rank0_loss)
+    final_norm = sum(p.detach().pow(2).sum().item() for p in model.parameters()) ** 0.5
+    return losses, final_norm
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; int:
+    print(f&quot;world_size={WORLD_SIZE}, steps={STEPS}, batch={BATCH}, model=MiniMLP&quot;)
+    print(&quot;running DDP across ranks...&quot;)
+    ddp_results = run_ddp()
+    print(&quot;running single-process reference...&quot;)
+    ref_losses, ref_norm = reference_single_process()
+    print(f&quot;\n{'step':&lt;6}{'ref_loss':&lt;14}{'ddp_rank0':&lt;14}{'ddp_rank3':&lt;14}{'rank_drift':&lt;14}&quot;)
+    rank0_losses, rank0_norm = ddp_results[0]
+    rank3_losses, _ = ddp_results[WORLD_SIZE - 1]
+    for s in range(STEPS):
+        drift = abs(rank0_losses[s] - rank3_losses[s])
+        print(f&quot;{s:&lt;6}{ref_losses[s]:&lt;14.6f}{rank0_losses[s]:&lt;14.6f}{rank3_losses[s]:&lt;14.6f}{drift:&lt;14.2e}&quot;)
+    print(f&quot;\nfinal param norm: ref={ref_norm:.6f}, ddp_rank0={rank0_norm:.6f}&quot;)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">world_size=4, steps=20, batch=8, model=MiniMLP
+running DDP across ranks...
+running single-process reference...
+
+step  ref_loss      ddp_rank0     ddp_rank3     rank_drift    
+0     9.972533      9.972533      10.594129     6.22e-01      
+1     10.442020     10.442020     10.310112     1.32e-01      
+2     14.129453     14.129453     11.502509     2.63e+00      
+3     12.108944     12.108944     10.971149     1.14e+00      
+4     11.531786     11.531786     9.954807      1.58e+00      
+5     9.026390      9.026390      4.984780      4.04e+00      
+6     7.327267      7.327267      11.965755     4.64e+00      
+7     9.944302      9.944302      13.479290     3.53e+00      
+8     12.161362     12.161362     9.608809      2.55e+00      
+9     12.334517     12.334517     10.409409     1.93e+00      
+10    8.306699      8.306699      9.764732      1.46e+00      
+11    10.440281     10.440281     8.922322      1.52e+00      
+12    8.226559      8.226559      7.471594      7.55e-01      
+13    10.046166     10.046166     7.320679      2.73e+00      
+14    11.308887     11.308887     14.362629     3.05e+00      
+15    14.030174     14.030174     15.171868     1.14e+00      
+16    6.292726      6.292726      8.843662      2.55e+00      
+17    8.970582      8.970582      7.135619      1.83e+00      
+18    12.417347     12.417347     7.035938      5.38e+00      
+19    8.561934      8.561934      12.318209     3.76e+00      
+
+final param norm: ref=5.148460, ddp_rank0=5.148460</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>For 20 steps, the single-process reference loss and rank 0's DDP loss are identical to every printed digit, and the final parameter norms match exactly (5.148460). The third column is another rank's local loss, which differs because each rank sees a different shard of the data; what must agree is the parameters, not the per-rank losses.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In a DDP model, one MLP layer is skipped on some forward passes. With default settings, training hangs after a few steps. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Broadcast initial weights; all-reduce and average gradients; step identically.</li>
+<li>Use the mean so the learning rate does not depend on world size.</li>
+<li>Buckets overlap communication with the backward pass.</li>
+<li>Seed data and initialization for reproducibility.</li>
+<li>Check: parameters match a single-process reference exactly.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-distributed-training"><span class="t" style="--cs-hue:280">DF</span>Cheat sheet · DDP, FSDP, ZeRO and Pipeline Parallel</a></div>
 <h2>Ship it</h2>
@@ -120,6 +412,9 @@
 <li>Replace gloo with <code>torch.distributed.barrier()</code>-only synchronisation to feel the difference between allreduce-based and barrier-based sync.</li>
 <li>Measure the gradient-sync overhead as a fraction of step time for batch sizes 1, 16, 256 and explain the scaling.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1977-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · <code>no_sync()</code> for accumulation</span></summary><div class="qa-a"><p>Inside <code>no_sync()</code>, backward hooks skip the all-reduce, so gradients accumulate locally over K micro-batches; on the last micro-batch, outside the context, one all-reduce averages the accumulated gradients. Compare with a single process on K × the batch: parameters should match to rounding error (Lesson 19.46).</p></div></details>
+<details class="qa" id="a1977-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A parameter that never reports</span></summary><div class="qa-a"><p>DDP waits until every parameter's gradient is ready before all-reducing a bucket. If a layer is skipped, its gradient never arrives on that rank, the bucket never completes, and the ranks wait on each other forever. Enable <code>find_unused_parameters=True</code> (at some cost), or structure the model so every parameter is used every step.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html">PyTorch DistributedDataParallel docs</a></li>
 <li><a href="https://pytorch.org/tutorials/intermediate/ddp_tutorial.html">PyTorch DDP internals tutorial</a></li>

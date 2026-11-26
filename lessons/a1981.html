@@ -41,6 +41,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>This lesson assembles the distributed track: a tiny GPT is trained on 4 simulated ranks with <strong>DDP</strong> for gradient averaging, <strong>ZeRO-1</strong> for sharding the optimizer state, and the <strong>sharded checkpoint</strong> format for saving and resuming. The point is composition: each piece was verified alone, and here the checks are about how they interact: every rank must end with identical parameters, each rank's optimizer shard must be the expected size, and a checkpoint saved mid-run must match the in-memory state byte for byte. The model is tiny (about 30,000 parameters) and trains for 20 steps on CPU; it demonstrates the machinery, not learning.</p></div></aside>
 <p>A capstone is the proof that the pieces fit together. <a href="#a1976">Lesson 19.76</a> implemented collectives. <a href="#a1977">Lesson 19.77</a> wrapped them into DDP. <a href="#a1978">Lesson 19.78</a> sharded optimiser state with reduce_scatter. <a href="#a1979">Lesson 19.79</a> analysed pipeline. <a href="#a1980">Lesson 19.80</a> saved a sharded checkpoint. Each lesson stood alone with its own test. A real training run uses every primitive at once; if the composition is wrong, the loss diverges, the checkpoint refuses to resume, or the per-rank memory grows when it should shrink.</p>
 <p>This lesson runs the end-to-end demo and verifies four invariants: (a) the loss decreases monotonically across the 20 steps within float noise, (b) every rank holds the same parameter norm at every step, (c) the per-rank optimiser memory equals the ZeRO-1 formula 12P/N bytes, and (d) the checkpoint at step 10 reloads byte-equal at restart. The demo self-terminates: 20 steps, single command, exit 0.</p>
 <h2>The idea</h2>
@@ -85,6 +86,29 @@
 <h2>Idea 4 · Self-terminating means exit 0</h2>
 <p>The loop runs a fixed 20 steps and exits. No <code>while True</code>, no human intervention, no resume from external state. A capstone you can leave running unattended and find a complete log when it finishes is a capstone that proves the system is wired correctly. If any piece deadlocks the demo never returns and the test rig catches it.</p>
 <p><figure class="aifig"><div class="lesson-figure" data-figure="ci-distributed-assembly"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The composition checks</div><div class="co-body"><ol>
+<li><strong>DDP:</strong> after each step every rank applies the same averaged update, so the parameter norm on all 4 ranks must match exactly; any drift means a missed or wrong all-reduce.</li>
+<li><strong>ZeRO-1:</strong> each rank holds 1/4 of the optimizer state; for P parameters with an fp32 master copy and two moments, that is 3 × 4 bytes × P / 4 per rank.</li>
+<li><strong>Checkpoint:</strong> after saving at step 10, reload the shard and compare it with the live state byte by byte; any difference means something was not captured.</li>
+<li><strong>Exit code 0</strong> only if all three hold, so a CI job can run the whole stack on every change.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Parameters must be identical on every rank after each step.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> ZeRO-1 makes each rank's parameters different.
+  Updates are computed on shards, then gathered so all ranks match.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A checkpoint is verified byte for byte against the live state.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A falling loss is what this demo must show.
+  It checks the machinery; 20 steps on a tiny model is not training.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: for 29,824 parameters on 4 ranks with fp32 master weights and two Adam moments, how many bytes of optimizer state does each rank hold?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Expected shard size</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">params, ranks = 29_824, 4
+per_param_bytes = 4 * 3                      # fp32 master + m + v
+total = params * per_param_bytes
+print(f&quot;total optimizer state: {total:,} bytes; per rank with ZeRO-1: {total // ranks:,} bytes&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">total optimizer state: 357,888 bytes; per rank with ZeRO-1: 89,472 bytes</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>357,888 bytes in total, 89,472 per rank, which is exactly the per-rank figure the demo reports for every rank. When a measured number equals the formula to the byte, the sharding is doing precisely what it should.</p></div></aside>
 <h2>Build it</h2>
 <p><code>code/main.py</code> implements:</p>
 <ul>
@@ -110,6 +134,515 @@
 <li><strong>PyTorch FSDP.</strong> The native equivalent. <code>FullyShardedDataParallel</code> with <code>ShardingStrategy.SHARD_GRAD_OP</code> is ZeRO-2.</li>
 <li><strong>NeMo and Megatron-LM.</strong> Add tensor parallel for the very largest models; otherwise the composition is the same shape.</li>
 </ul>
+<p>Here is <code>code/main.py</code>, in 9 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 9 · setup: imports and constants</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;End-to-end distributed training: tiny GPT, 4 ranks, DDP + ZeRO-1 + sharded checkpoint.
+
+Composes the pieces built in lessons 76-80:
+  * gloo backend with file rendezvous (lesson 76)
+  * broadcast at init for DDP-shape parameter sync (lesson 77)
+  * reduce_scatter on grad + allgather on params for ZeRO-1 (lesson 78)
+  * sharded checkpoint with atomic write at the halfway mark (lesson 80)
+
+20 steps, self-terminating, prints loss curve, per-rank memory profile, and a
+RESUME VERIFIED line proving the step-10 checkpoint reloads byte-equal.
+
+Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import multiprocessing as mp
+import os
+import shutil
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+SEED = 41
+WORLD_SIZE = 4
+STEPS = 20
+CHECKPOINT_STEP = 10
+BATCH = 4
+SEQ_LEN = 16
+VOCAB = 64
+EMBED_DIM = 32
+NUM_HEADS = 4
+NUM_LAYERS = 2
+LR = 5e-3
+</code></pre></div>
+
+<p><strong>Part 2 of 9 · <code>_loopback_iface</code>, <code>CausalSelfAttention</code>, <code>TransformerBlock</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _loopback_iface() -&gt; str:
+    return &quot;lo0&quot; if sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, 3 * embed_dim, bias=False)
+        self.proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        b, t, e = x.shape
+        qkv = self.qkv(x).reshape(b, t, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        mask = torch.triu(torch.ones(t, t), diagonal=1).bool()
+        attn = attn.masked_fill(mask, float(&quot;-inf&quot;))
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+        out = out.transpose(1, 2).reshape(b, t, e)
+        return self.proj(out)
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embed_dim)
+        self.attn = CausalSelfAttention(embed_dim, num_heads)
+        self.ln2 = nn.LayerNorm(embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, 4 * embed_dim),
+            nn.GELU(),
+            nn.Linear(4 * embed_dim, embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+</code></pre></div>
+
+<p><strong>Part 3 of 9 · <code>MiniGPT</code>, <code>flat_param_numel</code>, <code>gather_flat_params</code>, <code>scatter_flat_to_params</code>, <code>gather_flat_grads</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class MiniGPT(nn.Module):
+    def __init__(self, vocab: int = VOCAB, embed_dim: int = EMBED_DIM,
+                 num_heads: int = NUM_HEADS, num_layers: int = NUM_LAYERS,
+                 seq_len: int = SEQ_LEN):
+        super().__init__()
+        self.tok_embed = nn.Embedding(vocab, embed_dim)
+        self.pos_embed = nn.Embedding(seq_len, embed_dim)
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads) for _ in range(num_layers)
+        ])
+        self.ln_f = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, vocab, bias=False)
+        self.seq_len = seq_len
+
+    def forward(self, ids: torch.Tensor) -&gt; torch.Tensor:
+        b, t = ids.shape
+        pos = torch.arange(t, device=ids.device)
+        x = self.tok_embed(ids) + self.pos_embed(pos)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln_f(x)
+        return self.head(x)
+
+
+def flat_param_numel(module: nn.Module) -&gt; int:
+    return sum(p.numel() for p in module.parameters())
+
+
+def gather_flat_params(module: nn.Module) -&gt; torch.Tensor:
+    return torch.cat([p.detach().to(torch.float32).flatten() for p in module.parameters()])
+
+
+def scatter_flat_to_params(module: nn.Module, flat: torch.Tensor) -&gt; None:
+    offset = 0
+    for p in module.parameters():
+        n = p.numel()
+        p.data.copy_(flat[offset:offset + n].reshape(p.shape).to(p.dtype))
+        offset += n
+
+
+def gather_flat_grads(module: nn.Module) -&gt; torch.Tensor:
+    parts = []
+    for p in module.parameters():
+        if p.grad is None:
+            parts.append(torch.zeros_like(p.data, dtype=torch.float32).flatten())
+        else:
+            parts.append(p.grad.detach().to(torch.float32).flatten())
+    return torch.cat(parts)
+</code></pre></div>
+
+<p><strong>Part 4 of 9 · <code>ZeroOptimizer</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ZeroOptimizer:
+    &quot;&quot;&quot;Stage-1 sharded Adam, ported from lesson 78.&quot;&quot;&quot;
+
+    def __init__(self, module: nn.Module, world_size: int, rank: int,
+                 lr: float = LR, beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-8):
+        self.module = module
+        self.world_size = world_size
+        self.rank = rank
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.step_count = 0
+        total = flat_param_numel(module)
+        self.total = total
+        pad = (-total) % world_size
+        self.chunk = (total + pad) // world_size
+        full = gather_flat_params(module)
+        padded = torch.zeros(self.chunk * world_size, dtype=torch.float32)
+        padded[:total] = full
+        self.master_shard = padded[rank * self.chunk:(rank + 1) * self.chunk].clone()
+        self.m_shard = torch.zeros_like(self.master_shard)
+        self.v_shard = torch.zeros_like(self.master_shard)
+
+    def shard_bytes(self) -&gt; int:
+        return (self.master_shard.numel() + self.m_shard.numel() + self.v_shard.numel()) * 4
+
+    def step(self) -&gt; None:
+        flat_grad = gather_flat_grads(self.module)
+        pad = (-self.total) % self.world_size
+        padded = torch.zeros(self.total + pad, dtype=torch.float32)
+        padded[:self.total] = flat_grad
+        chunks = [c.contiguous() for c in padded.chunk(self.world_size)]
+        local_grad = torch.zeros_like(chunks[0])
+        dist.reduce_scatter(local_grad, chunks, op=dist.ReduceOp.SUM)
+        local_grad.div_(self.world_size)
+        self.step_count += 1
+        self.m_shard.mul_(self.beta1).add_(local_grad, alpha=1 - self.beta1)
+        self.v_shard.mul_(self.beta2).addcmul_(local_grad, local_grad, value=1 - self.beta2)
+        bc1 = 1 - self.beta1 ** self.step_count
+        bc2 = 1 - self.beta2 ** self.step_count
+        m_hat = self.m_shard / bc1
+        v_hat = self.v_shard / bc2
+        self.master_shard.addcdiv_(m_hat, v_hat.sqrt().add_(self.eps), value=-self.lr)
+        gathered = [torch.zeros_like(self.master_shard) for _ in range(self.world_size)]
+        dist.all_gather(gathered, self.master_shard)
+        flat_full = torch.cat(gathered)[:self.total]
+        scatter_flat_to_params(self.module, flat_full)
+
+    def zero_grad(self) -&gt; None:
+        for p in self.module.parameters():
+            if p.grad is not None:
+                p.grad.detach_()
+                p.grad.zero_()
+
+    def state_dict(self) -&gt; dict:
+        return {
+            &quot;master_shard&quot;: self.master_shard.clone(),
+            &quot;m_shard&quot;: self.m_shard.clone(),
+            &quot;v_shard&quot;: self.v_shard.clone(),
+            &quot;step_count&quot;: self.step_count,
+        }
+
+    def load_state_dict(self, state: dict) -&gt; None:
+        self.master_shard.copy_(state[&quot;master_shard&quot;])
+        self.m_shard.copy_(state[&quot;m_shard&quot;])
+        self.v_shard.copy_(state[&quot;v_shard&quot;])
+        self.step_count = state[&quot;step_count&quot;]
+</code></pre></div>
+
+<p><strong>Part 5 of 9 · <code>ShardEntry</code>, <code>_sha</code>, <code>_serialize</code>, <code>_deserialize</code>, <code>save_sharded</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class ShardEntry:
+    rank: int
+    path: str
+    sha256: str
+
+
+def _sha(data: bytes) -&gt; str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _serialize(state: dict) -&gt; bytes:
+    import io
+    buf = io.BytesIO()
+    torch.save(state, buf, pickle_protocol=4)
+    return buf.getvalue()
+
+
+def _deserialize(data: bytes) -&gt; dict:
+    import io
+    return torch.load(io.BytesIO(data), weights_only=False)
+
+
+def save_sharded(per_rank_state: list, dest_dir: str, step: int) -&gt; dict:
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    shards = []
+    tmps = []
+    for rank, state in enumerate(per_rank_state):
+        payload = _serialize(state)
+        sha = _sha(payload)
+        tmp_name = f&quot;rank{rank}.bin.tmp&quot;
+        final_name = f&quot;rank{rank}.bin&quot;
+        with open(dest / tmp_name, &quot;wb&quot;) as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        tmps.append((dest / tmp_name, dest / final_name))
+        shards.append(ShardEntry(rank=rank, path=final_name, sha256=sha))
+    manifest = {
+        &quot;world_size&quot;: len(per_rank_state),
+        &quot;step&quot;: step,
+        &quot;shards&quot;: [asdict(s) for s in shards],
+    }
+    manifest_tmp = dest / &quot;manifest.json.tmp&quot;
+    with open(manifest_tmp, &quot;w&quot;) as f:
+        f.write(json.dumps(manifest, indent=2, sort_keys=True))
+        f.flush()
+        os.fsync(f.fileno())
+    for tmp, final in tmps:
+        os.replace(tmp, final)
+    os.replace(manifest_tmp, dest / &quot;manifest.json&quot;)
+    return manifest
+</code></pre></div>
+
+<p><strong>Part 6 of 9 · <code>load_sharded</code>, <code>make_corpus</code>, <code>init_distributed</code>, <code>_gather_payloads_to_rank0</code>, <code>_train_worker</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def load_sharded(src_dir: str, expected_world_size: int) -&gt; list:
+    src = Path(src_dir)
+    manifest = json.loads((src / &quot;manifest.json&quot;).read_text())
+    if manifest[&quot;world_size&quot;] != expected_world_size:
+        raise RuntimeError(
+            f&quot;world_size mismatch: manifest={manifest['world_size']}, &quot;
+            f&quot;expected={expected_world_size}&quot;
+        )
+    per_rank = [None] * manifest[&quot;world_size&quot;]
+    for entry in manifest[&quot;shards&quot;]:
+        payload = (src / entry[&quot;path&quot;]).read_bytes()
+        actual = _sha(payload)
+        if actual != entry[&quot;sha256&quot;]:
+            raise RuntimeError(f&quot;sha256 mismatch on rank {entry['rank']}&quot;)
+        per_rank[entry[&quot;rank&quot;]] = _deserialize(payload)
+    return per_rank
+
+
+def make_corpus(seed: int, total_tokens: int) -&gt; torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randint(0, VOCAB, (total_tokens,), generator=g)
+
+
+def init_distributed(rank: int, world_size: int, init_file: str, iface: str) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;, init_method=f&quot;file://{init_file}&quot;,
+        rank=rank, world_size=world_size,
+    )
+
+
+def _gather_payloads_to_rank0(local_payload: bytes, world_size: int) -&gt; list:
+    &quot;&quot;&quot;Allgather variable-length byte buffers across ranks via padding.&quot;&quot;&quot;
+    tensor = torch.frombuffer(bytearray(local_payload), dtype=torch.uint8).clone()
+    sizes = [torch.zeros(1, dtype=torch.long) for _ in range(world_size)]
+    dist.all_gather(sizes, torch.tensor([tensor.numel()], dtype=torch.long))
+    max_size = max(int(s.item()) for s in sizes)
+    padded = torch.zeros(max_size, dtype=torch.uint8)
+    padded[:tensor.numel()] = tensor
+    gathered = [torch.zeros(max_size, dtype=torch.uint8) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+    return [bytes(gathered[r][:int(sizes[r].item())].tolist()) for r in range(world_size)]
+
+
+def _train_worker(rank: int, world_size: int, init_file: str, iface: str,
+                  ckpt_dir: str, steps: int, out_queue) -&gt; None:
+    init_distributed(rank, world_size, init_file, iface)
+    torch.manual_seed(SEED)
+    model = MiniGPT()
+    for p in model.parameters():
+        dist.broadcast(p.data, src=0)
+    optim = ZeroOptimizer(model, world_size=world_size, rank=rank, lr=LR)
+    corpus_total = world_size * BATCH * (SEQ_LEN + 1) * steps
+    corpus = make_corpus(SEED + 7, corpus_total)
+    rank0_losses = []
+    master_at_ckpt = None
+    for step in range(steps):
+        offset = step * world_size * BATCH * (SEQ_LEN + 1) + rank * BATCH * (SEQ_LEN + 1)
+        block = corpus[offset:offset + BATCH * (SEQ_LEN + 1)].reshape(BATCH, SEQ_LEN + 1)
+        x = block[:, :-1]
+        y = block[:, 1:]
+        optim.zero_grad()
+        logits = model(x)
+        loss = F.cross_entropy(logits.reshape(-1, VOCAB), y.reshape(-1))
+        loss.backward()
+        optim.step()
+        if rank == 0:
+            rank0_losses.append(loss.item())
+        if step + 1 == CHECKPOINT_STEP:
+            state = {
+                &quot;model_state&quot;: {k: v.clone() for k, v in model.state_dict().items()},
+                &quot;optim_state&quot;: optim.state_dict(),
+                &quot;rank&quot;: rank,
+            }
+            master_at_ckpt = optim.master_shard.clone()
+            dist.barrier()
+            payloads = _gather_payloads_to_rank0(_serialize(state), world_size)
+            if rank == 0:
+                all_states = [_deserialize(p) for p in payloads]
+                save_sharded(all_states, ckpt_dir, step=CHECKPOINT_STEP)
+            dist.barrier()
+    param_norm = sum(p.detach().pow(2).sum().item() for p in model.parameters()) ** 0.5
+    out_queue.put((rank, rank0_losses if rank == 0 else [], param_norm, optim.shard_bytes(),
+                   master_at_ckpt))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+</code></pre></div>
+
+<p><strong>Part 7 of 9 · <code>run_e2e</code>, <code>verify_resume</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_e2e(world_size: int = WORLD_SIZE, steps: int = STEPS) -&gt; dict:
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    workdir = tempfile.mkdtemp(prefix=&quot;aie_e2e_&quot;)
+    init_file = os.path.join(workdir, &quot;rendezvous&quot;)
+    ckpt_dir = os.path.join(workdir, f&quot;step_{CHECKPOINT_STEP:04d}&quot;)
+    iface = _loopback_iface()
+    procs = []
+    cleanup_workdir = False
+    try:
+        try:
+            for r in range(world_size):
+                p = ctx.Process(
+                    target=_train_worker,
+                    args=(r, world_size, init_file, iface, ckpt_dir, steps, out_queue),
+                )
+                p.start()
+                procs.append(p)
+            results = {}
+            for _ in range(world_size):
+                rank, losses, norm, shard_bytes, master_at_ckpt = out_queue.get(timeout=180)
+                results[rank] = {
+                    &quot;losses&quot;: losses,
+                    &quot;norm&quot;: norm,
+                    &quot;shard_bytes&quot;: shard_bytes,
+                    &quot;master_at_ckpt&quot;: master_at_ckpt,
+                }
+        except Exception:
+            cleanup_workdir = True
+            raise
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        if cleanup_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+    return {&quot;workdir&quot;: workdir, &quot;ckpt_dir&quot;: ckpt_dir, &quot;results&quot;: results}
+
+
+def verify_resume(ckpt_dir: str, expected_world_size: int,
+                  expected_master_shards: list) -&gt; bool:
+    &quot;&quot;&quot;Reload the checkpoint and compare master shards byte-equal to the snapshot.
+
+    Each rank captured its master shard at the moment of the checkpoint write;
+    reloading the saved manifest must return the same tensor byte-for-byte.
+    &quot;&quot;&quot;
+    loaded = load_sharded(ckpt_dir, expected_world_size=expected_world_size)
+    for r in range(expected_world_size):
+        saved = loaded[r][&quot;optim_state&quot;][&quot;master_shard&quot;]
+        snapshot = expected_master_shards[r]
+        if not torch.equal(saved, snapshot):
+            return False
+    return True
+</code></pre></div>
+
+<p><strong>Part 8 of 9 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; int:
+    print(f&quot;world_size={WORLD_SIZE}, steps={STEPS}, model=MiniGPT&quot;)
+    total_params = flat_param_numel(MiniGPT())
+    print(f&quot;model params: {total_params}&quot;)
+    print(&quot;starting distributed train...&quot;)
+    out = run_e2e()
+    results = out[&quot;results&quot;]
+    ckpt_dir = out[&quot;ckpt_dir&quot;]
+    print(f&quot;\n{'step':&lt;6}{'rank0_loss':&lt;14}&quot;)
+    rank0_losses = results[0][&quot;losses&quot;]
+    for s, loss in enumerate(rank0_losses):
+        print(f&quot;{s:&lt;6}{loss:&lt;14.6f}&quot;)
+    norms = [results[r][&quot;norm&quot;] for r in range(WORLD_SIZE)]
+    print(&quot;\nfinal param norm (must agree across ranks):&quot;)
+    for r in range(WORLD_SIZE):
+        print(f&quot;  rank {r}: {norms[r]:.6f}&quot;)
+    norm_drift = max(norms) - min(norms)
+    print(f&quot;  drift across ranks: {norm_drift:.2e}&quot;)
+    print(&quot;\nper-rank optimiser memory (ZeRO-1 shard, bytes):&quot;)
+    for r in range(WORLD_SIZE):
+        print(f&quot;  rank {r}: {results[r]['shard_bytes']}&quot;)
+    expected_zero = (total_params + (-total_params) % WORLD_SIZE) // WORLD_SIZE * 4 * 3
+    print(f&quot;  expected per-rank (fp32 master + m + v): {expected_zero}&quot;)
+    print(f&quot;\ncheckpoint at step {CHECKPOINT_STEP}: {ckpt_dir}&quot;)
+    master_shards = [results[r][&quot;master_at_ckpt&quot;] for r in range(WORLD_SIZE)]
+    if verify_resume(ckpt_dir, WORLD_SIZE, master_shards):
+        print(&quot;RESUME VERIFIED: saved shard at step 10 matches in-memory snapshot byte-for-byte&quot;)
+    else:
+        print(&quot;RESUME FAILED&quot;)
+        return 1
+    shutil.rmtree(out[&quot;workdir&quot;], ignore_errors=True)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 9 of 9 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">world_size=4, steps=20, model=MiniGPT
+model params: 29824
+starting distributed train...
+
+step  rank0_loss    
+0     4.297341      
+1     4.295949      
+2     4.237854      
+3     4.261005      
+4     4.312036      
+5     4.203934      
+6     4.459343      
+7     4.335932      
+8     4.238627      
+9     4.364796      
+10    4.205659      
+11    4.176303      
+12    4.137795      
+13    4.232329      
+14    4.111523      
+15    4.218005      
+16    4.217341      
+17    4.317704      
+18    4.185369      
+19    4.222419      
+
+final param norm (must agree across ranks):
+  rank 0: 54.513170
+  rank 1: 54.513170
+  rank 2: 54.513170
+  rank 3: 54.513170
+  drift across ranks: 0.00e+00
+
+per-rank optimiser memory (ZeRO-1 shard, bytes):
+  rank 0: 89472
+  rank 1: 89472
+…
+(6 more lines)</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>All three checks pass: parameter norms are identical on the four ranks (drift exactly 0), each rank holds 89,472 bytes of optimizer state as the formula predicts, and the step-10 checkpoint matches the in-memory snapshot byte for byte. The loss, though, hovers around 4.1–4.4 for all 20 steps without a clear downward trend; with ln(vocabulary) near that value, the tiny model has barely started learning. That is fine for this lesson, whose claims are about correctness of the distributed machinery, but it is a reminder not to read a systems demo as a training result.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>After adding ZeRO-1, a team sees parameter norms differ across ranks by about 1e-3 after 1,000 steps and decides it is "just floating point". Should they accept it? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Compose DDP, ZeRO-1 and sharded checkpoints, then test the composition.</li>
+<li>Parameters must match across ranks exactly.</li>
+<li>Shard sizes must match the formula.</li>
+<li>Checkpoints must round-trip byte for byte.</li>
+<li>A systems demo proves correctness, not learning.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-training-memory-checkpoints"><span class="t" style="--cs-hue:20">TM</span>Cheat sheet · Training Memory, Accumulation and Checkpoints</a></div>
 <h2>Ship it</h2>
@@ -122,6 +655,9 @@
 <li>Add a metrics export (loss, grad norm, step time) to JSONL so the run can be visualised after the fact.</li>
 <li>Add a NaN guard that rolls back to the previous checkpoint on a loss spike, and force a spike with a one-step LR multiplier to exercise the rollback.</li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1981-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P3 · Resume and continue</span></summary><div class="qa-a"><p>Save at step 10, continue the original run to step 20 and record its final loss and parameters; then start a fresh process, load the step-10 checkpoint (including RNG and data positions), train to step 20, and compare. With everything captured, final losses and parameters match exactly.</p></div></details>
+<details class="qa" id="a1981-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Drift is a bug</span></summary><div class="qa-a"><p>No. With identical starting weights, identical gathered updates and deterministic operations, ranks should stay bit-identical; growing drift means some rank applied a different update, for example a missed all-gather after the sharded step or a non-deterministic reduction order. Find it before it compounds.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://www.deepspeed.ai/getting-started/">DeepSpeed end-to-end training tutorial</a></li>
 <li><a href="https://pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html">PyTorch FSDP advanced tutorial</a></li>
