@@ -1,0 +1,109 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-21">Phase 21 · Interview Case Files</a></nav><h1>Health probes that add load</h1><div class="m-meta"><span class="chip chip-num">Lesson 21.10</span><span class="chip">15 min</span><span class="chip chip-core">Case file</span><span class="chip chip-done" data-done-chip="a2110" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a href="#a1723">Lesson 17.23</a></li>
+<li><strong>Type</strong>: Interview case file, incident. Level 2 (Working). <strong>Time</strong>: about 15 minutes.</li>
+<li><strong>Interview rounds</strong>: debugging, design-review. <strong>Roles</strong>: inference engineer, forward deployed AI engineer, AI evaluation reliability engineer.</li>
+<li><strong>Version</strong>: SGLang 0.5.22 against vLLM 0.31.0</li>
+<li><strong>Model</strong>: Qwen/Qwen3-8B</li>
+<li><strong>Hardware</strong>: one L4 with 24 GB of memory</li>
+</ul></div></aside>
+<h2>The situation</h2>
+<p>A platform team runs SGLang pods on Kubernetes. The liveness probe asks <code>/health</code> every few seconds with a short timeout, and a failed probe restarts the pod. During a traffic spike the busiest pods restart in a loop. A probe times out, the pod is killed in the middle of its answers, its users move to the other pods, and the next busiest pod fails its probe. The service recovers only when the spike passes.</p>
+<p>The scheduler log of a restarted pod shows the probes themselves, as prefill batches of one token between the user requests. The ticket proposes two changes: a longer probe timeout and a higher memory limit for the pod.</p>
+<h2>The evidence</h2>
+<p>Read one listing at a time, and write down what each one tells you before you open the next.</p>
+<p><strong>The health probe around the ready line of our L4 server</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">title: the health probe around the ready line of our L4 server
+source: manuals/sglang-101/capture/gpu/out-l4/server-default.log
+lines: 36-43
+lang: text
+note: Read the line before the last one, and ask what sent that batch.
+---
+[2026-10-17 14:43:37] INFO:     127.0.0.1:58250 - &quot;GET /health HTTP/1.1&quot; 503 Service Unavailable
+[2026-10-17 14:43:38] INFO:     127.0.0.1:58266 - &quot;GET /model_info HTTP/1.1&quot; 200 OK
+[2026-10-17 14:43:38] Prefill batch, #new-seq: 1, #new-token: 6, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: True, input throughput (token/s): 3.37
+[2026-10-17 14:43:38] INFO:     127.0.0.1:58272 - &quot;POST /generate HTTP/1.1&quot; 200 OK
+[2026-10-17 14:43:38] INFO:     127.0.0.1:58288 - &quot;POST /freeze_gc HTTP/1.1&quot; 200 OK
+[2026-10-17 14:43:38] The server is fired up and ready to roll!
+[2026-10-17 14:43:40] Prefill batch, #new-seq: 1, #new-token: 1, #cached-token: 0, token usage: 0.00, #running-req: 0, #queue-req: 0, #pending-token: 0, cuda graph: False, input throughput (token/s): 0.58
+[2026-10-17 14:43:40] INFO:     127.0.0.1:58298 - &quot;GET /health HTTP/1.1&quot; 200 OK
+</code></pre></div>
+<p><strong>The three health endpoints and the two settings behind them</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">title: the three health endpoints and the two settings behind them
+source: manuals/sglang-101/sections/7-1-operating-sglang.md
+lines: 86-90
+lang: text
+note: Find the endpoint that sends no request to the model, and the default of the generation setting.
+---
+- `/ready` returns 200 when the tokenizer manager is ready and 503 before that.
+- `/health` and `/health_generate` share one handler. They return 503 while the server starts and while it shuts down.
+- Otherwise the handler sends a one-token request with `max_new_tokens` 1 and waits for any output from the detokenizer.
+- `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION` defaults to true, so a plain `/health` also generates that token.
+- The wait is `SGLANG_HEALTH_CHECK_TIMEOUT`, 20 s by default. With no output in that time, the handler marks the server `UnHealthy` and returns 503.
+</code></pre></div>
+<p><strong>What the code claims and what two incidents showed</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">title: what the code claims and what two incidents showed
+source: manuals/sglang-101/sections/7-1-operating-sglang.md
+lines: 92-92
+lang: text
+note: Separate the claim about the work from the claim about the timing.
+---
+The docstring says that the probe request costs nothing when the server is busy, because any output from the scheduler counts as proof of life. That is true for the work, and false for the timing. **A real incident:** issue #22511 reports &quot;health check failed. server could not get a response from detokenizer for last 20 seconds&quot; on GLM-5 with 2 H800 GPUs under high load, on v0.5.10 {{issue #22511}}. A related issue, #35884, found that a timed-out probe left its request in the scheduler, so failed probes accumulated {{issue #35884}}.
+</code></pre></div>
+<p><strong>The routes of a vLLM server with an API key, with and without the key</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">title: the routes of a vLLM server with an API key, with and without the key
+source: manuals/vllm-101/capture/gpu/out-l4/livecheck-2026-10-22.txt
+lines: 52-62
+lang: text
+note: Find the routes that answer without a key, and think about which of them touch the model.
+---
+/v1/models       nokey=401 key=200
+/health          nokey=200 key=200
+/metrics         nokey=200 key=200
+/invocations     nokey=405 key=405
+/version         nokey=200 key=200
+/tokenize        nokey=405 key=405
+/v2/x            nokey=401 key=404
+/inference/x     nokey=401 key=404
+/cohere/x        nokey=401 key=404
+/ping            nokey=200 key=200
+/load            nokey=200 key=200
+</code></pre></div>
+<p><strong>The first health check of a vLLM server after startup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">title: the first health check of a vLLM server after startup
+source: manuals/vllm-101/sections/1-2-check-that-the-server-is-healthy.md
+lines: 23-25
+lang: text
+note: No prefill batch follows the health request on this engine.
+---
+INFO:     Application startup complete.
+INFO:     127.0.0.1:35152 - &quot;GET /health HTTP/1.1&quot; 200 OK
+INFO:     127.0.0.1:34616 - &quot;GET /v1/models HTTP/1.1&quot; 200 OK
+</code></pre></div>
+<h2>Questions to answer first</h2>
+<ol>
+<li>Read the log around the ready line. What did the server do when the probe asked for its health, and what does that cost under load?</li>
+<li>Name the three endpoints and the question that each one answers.</li>
+<li>The code says that the probe costs nothing when the server is busy. Why is that true for the work and false for the timing?</li>
+<li>Design the probes: readiness, liveness and a deep check. Give the endpoint, the setting, the timeout and what happens on a failure.</li>
+<li>The other engine answers its health route without generating. What does that change for a deep check there?</li>
+<li>A restart in the middle of answers also needs a clean stop. Which signal, to which process, and how long do you wait?</li>
+</ol>
+<h2>Walkthrough</h2>
+<details class="qa" id="a2110-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">Open the walkthrough once you have your own answers</span></summary><div class="qa-a"><p>Read the eight log lines in order. At 14:43:37 the probe asked <code>/health</code> and got a 503, because the server was still starting. The server then sent itself one request to <code>/generate</code>, froze the garbage collector, and printed the ready line. Two seconds later the scheduler logged a prefill batch of one new token, and right after it the probe got its 200. Nothing else was running. That one-token batch was the probe. By default <code>/health</code> does not only answer, it sends a request through the model and waits for the result.</p>
+<p>The second listing names the three endpoints. <code>/ready</code> returns 200 when the tokenizer manager is ready, and it sends nothing to the model. <code>/health</code> and <code>/health_generate</code> share one handler: they return 503 while the server starts or shuts down, and otherwise they send a one-token request with <code>max_new_tokens</code> of 1 and wait for any output from the detokenizer. <code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION</code> defaults to true, so a plain <code>/health</code> generates too. The wait is <code>SGLANG_HEALTH_CHECK_TIMEOUT</code>, 20 s by default, after which the handler marks the server unhealthy and returns 503.</p>
+<p>The third listing is the subtle part. The docstring is right about the work: any output from the scheduler counts as proof of life, so a busy server does not need to finish the probe's token. It is wrong about the timing. The probe request waits in the same queue as the users, and when the first token of anyone takes longer than the probe timeout, the probe fails. The two incidents show both halves. One report saw the health check fail with no response from the detokenizer for 20 seconds, on a large model under high load. A second found that a timed-out probe left its request in the scheduler, so failed probes accumulated. Under a spike, the probe is a user who gives up after 20 s and tells the orchestrator to kill the server.</p>
+<p>The last two listings are the other engine. Its <code>/health</code>, <code>/ping</code> and <code>/load</code> routes answer 200 without an API key, and its first health check after startup is followed by the model list, not by a prefill batch. The manual says why: that health route answers 200 when the engine runs and does not generate a token, so a 200 does not prove that a request completes. On that engine the health route is a liveness check by design, and a deep check means one short request.</p></div></details>
+<h2>What actually happened</h2>
+<p>The probes were the incident. The liveness probe generated a token on every call, waited in the user queue, timed out under load and killed the busiest pod, which moved its load to the next pod.</p>
+<p>Set <code>/ready</code> as the readiness probe, so a pod joins the service when it can accept requests. For liveness, set <code>SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=false</code>, after which <code>/health</code> returns 200 without a request to the scheduler, and keep that probe on the pod. Move <code>/health_generate</code> to a slower deep check that alerts a person and restarts nothing. The probe timeout then stops mattering under load, and the memory limit was never the problem. On the other engine, use <code>/health</code> for liveness as it is, and make the deep check one short request.</p>
+<p>Then fix the stop. Only a SIGTERM to the main process drains the running requests: the server returns 503 on <code>/health</code> during the drain, logs the remaining requests every 5 s, and exits when none remain. A signal to the whole process group or a forced exit stops work in progress. Set the termination grace period longer than the longest request at the output cap, and cap <code>max_tokens</code> first, or a drain can never finish in time.</p>
+<h2>Wrong turns</h2>
+<ul>
+<li>"Raise the probe timeout to a minute." The probe still waits in the user queue, and a timed-out probe left its request in the scheduler in one report. A longer timeout hides the overload for longer and then kills the pod anyway.</li>
+<li>"Raise the memory limit of the pod." The pods did not run out of memory. They were killed by the orchestrator after a probe waited too long.</li>
+<li>"Use the generating endpoint for liveness, because it proves that the model works." A deep check that restarts the busiest pod under load is the incident. A deep check should alert a person.</li>
+<li>"Kill the pod fast so the others take over." A signal to the process group killed the scheduler child first and failed every running request. Only a SIGTERM to the main process drains.</li>
+</ul>
+<h2>The lesson to carry</h2>
+<p>A probe is a client, and a client that waits in the same queue as the users will fail exactly when the users wait, which is when a restart hurts most. Separate the questions: can the process accept requests, is the process alive, and can the model produce a token. Give each question its own endpoint, its own schedule and its own consequence, and never let the slow question trigger a restart.</p>
+<aside class="co co-connect"><div class="co-label">How this connects</div><div class="co-title">Where this is taught</div><div class="co-body"><p>The SGLang manual shows the probe in the log in <a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/manuals/sglang-101/sections/1-2-check-that-the-server-is-healthy.md">the health page</a> and gives the probe settings, the incidents and the drain in <a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/manuals/sglang-101/sections/7-1-operating-sglang.md">the operating page</a>, the vLLM manual explains its health route in <a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/manuals/vllm-101/sections/1-2-check-that-the-server-is-healthy.md">its health page</a> and the production probes in <a href="https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/manuals/vllm-101/sections/7-2-run-vllm-in-production.md">the production page</a>, and <a href="#a1723">the SRE for AI lesson</a> covers runbooks for this class of loop.</p></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a2110" id="done-a2110">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a2110" id="undo-a2110" hidden>Mark as not done</button></div><div class="pn-row"></div></footer>
