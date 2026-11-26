@@ -7,6 +7,7 @@ index.html          landing page (links to all five volumes)
 vol1/ … vol5/       one volume each (index.html + figures and images)
 shared/pyodide/     Python-in-the-browser runtime, shared by all volumes
 shared/katex-fonts/ maths fonts, shared by all volumes
+thumbs/             link-preview images (1200×630) for the site and each volume
 .nojekyll           tells GitHub Pages to serve the files as they are
 ```
 
