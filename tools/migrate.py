@@ -183,6 +183,27 @@ REPORT["z2a_links"] = dict(stats); REPORT["claude_links_left"] = left
 # Each phase's own lessons keep their numbers; the Zero to Agents lessons it hosts continue that sequence
 # (Phase 0 ends at 0.13, so its companions become 0.14, 0.15 ...). Their header chip and every reference to them follow.
 ZLESSON = re.compile(r"l\d{4}(?:-v\d)?$")
+# sections inside each phase: the phase's own lessons, then "Cheat sheets", then the Zero to Agents lessons grouped by
+# their original chapter, in that course's order. The orientation lesson opens the course as 0.0. The knowledge-graph
+# self-check was only linked from the old course map, so it joins the knowledge-graph lessons.
+zseq = {l["id"]: k for k, l in enumerate(l for p in ZC for ch in p["chapters"] for l in ch["lessons"])}
+zchap = {l["id"]: (k, ch["title"]) for k, ch in enumerate(ch for p in ZC for ch in p["chapters"]) for l in ch["lessons"]}
+def move(i, to):
+    for ch in PHASES.values():
+        for l in list(ch["lessons"]):
+            if l["id"] == i: ch["lessons"].remove(l); PHASES[to]["lessons"].append(l); lesson_phase[i] = to; return
+move("l0509", "ph-14")
+for ch in PHASES.values():
+    own = [l for l in ch["lessons"] if l["id"].startswith("a")]
+    cs = [l for l in ch["lessons"] if l["id"].startswith("cs-")]
+    zl = [l for l in ch["lessons"] if ZLESSON.match(l["id"]) and l["id"] != "l0001"]
+    first = [l for l in ch["lessons"] if l["id"] == "l0001"]
+    assert len(own) + len(cs) + len(zl) + len(first) == len(ch["lessons"]), ch["id"]
+    for l in cs: l["group"] = "Cheat sheets"
+    for l in zl: l["group"] = "From Zero to Agents · " + zchap[l["id"][:5]][1]
+    zl.sort(key=lambda l: (zchap[l["id"][:5]][0], zseq[l["id"][:5]]))
+    for l in first: l["depth"] = "Start here"
+    ch["lessons"] = first + own + cs + zl
 newnum = {}
 for ch in PHASES.values():
     code = ch["code"]
@@ -190,7 +211,9 @@ for ch in PHASES.values():
            if l["id"].startswith("a") and re.fullmatch(re.escape(code) + r"\.\d+", l.get("num") or "")]
     k = max(own or [0])
     for l in ch["lessons"]:
-        if ZLESSON.match(l["id"]):
+        if l["id"] == "l0001":
+            newnum[l["id"]] = (l["num"], "0.0"); l["num"] = "0.0"
+        elif ZLESSON.match(l["id"]):
             k += 1; newnum[l["id"]] = (l["num"], f"{code}.{k}"); l["num"] = f"{code}.{k}"
 part_of = {l["id"]: pi for pi, p in enumerate(COURSE) for ch in p["chapters"] for l in ch["lessons"]}
 by_old = defaultdict(list)
@@ -209,17 +232,24 @@ def map_run(run, where):
     out = run
     for o, n in zip(nums, new): out = tok(o).sub(n, out, count=1)
     return out, len(nums)
+RAW = re.compile(r"<(script|style|pre|textarea|code)\b.*?</\1>|<[^>]+>", re.S)
+def split_html(a):
+    """Text, tags, and whole script/style/pre/textarea/code blocks (kept opaque, never rewritten; diagrams are processed so their link labels follow too)."""
+    out, pos = [], 0
+    for m in RAW.finditer(a):
+        if m.start() > pos: out.append(a[pos:m.start()])
+        out.append(m.group(0)); pos = m.end()
+    out.append(a[pos:])
+    return out
 def renumber_text(i, a):
-    parts = re.split(r"(<[^>]+>)", a)
+    parts = split_html(a)
     skip = 0; anchors = []
     for k, t in enumerate(parts):
         if t.startswith("<"):
             m = re.match(r"<(/?)([a-zA-Z0-9]+)", t)
             if m:
                 tag = m.group(2).lower(); closing = m.group(1) == "/"
-                if tag in ("pre", "code", "script", "style", "svg", "textarea"):
-                    skip += -1 if closing else (0 if t.endswith("/>") else 1)
-                elif tag == "a":
+                if tag == "a":
                     if closing: anchors and anchors.pop()
                     else:
                         h = re.search(r'href="#([^"]+)"', t); anchors.append(h.group(1) if h else None)

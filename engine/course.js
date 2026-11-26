@@ -98,6 +98,13 @@
       '<circle class="val" cx="18" cy="18" r="15" stroke-dasharray="' + c + '" stroke-dashoffset="' + off.toFixed(2) + '"/></svg>';
   }
 
+  /* ---------- sections inside a phase: its own lessons, cheat sheets, and companion lessons by topic ---------- */
+  function groupLabel(g) {
+    if (!g) return "Lessons";
+    const k = g.indexOf(" · ");
+    return k < 0 ? esc(g) : '<small>' + esc(g.slice(0, k)) + "</small>" + esc(g.slice(k + 3));
+  }
+
   /* ---------- sidebar ---------- */
   const openCh = {};
   function renderNav(currentCh, currentLesson) {
@@ -110,7 +117,10 @@
         '</span><span class="nav-ch-count">' + t.done + "/" + t.n + "</span></button>";
       if (open) {
         h += '<ol class="nav-lessons"><li><a class="nav-ch-open" href="#' + ch.id + '">Phase overview</a></li>';
+        let grp = null; const grouped = ch.lessons.some(x => x.group);
         ch.lessons.forEach(l => {
+          const lg = l.group || "";
+          if (grouped && lg !== grp) { grp = lg; h += '<li class="nav-group" aria-hidden="true">' + groupLabel(lg) + "</li>"; }
           h += '<li><a class="nav-link' + (isDone(l.id) ? " done" : "") + (l.id === currentLesson ? " active" : "") + (onPath(l) ? "" : " off") + '" href="#' + l.id + '" data-id="' + l.id + '">' +
             '<span class="nav-done" aria-hidden="true"></span><span class="nav-title"><span class="nav-num">' + esc(l.num) + "</span>" + esc(l.title) +
             '</span><span class="nav-min">' + l.min + "m</span></a></li>";
@@ -138,7 +148,7 @@
     const chWith = phases.filter(c => tally(c.lessons).n).length;
     const quizzes = Object.keys(S.q).length;
     let h = '<header class="home-hero"><div class="eyebrow"><span>A complete course</span><span class="dot">·</span><span>' + lessons.length + " lessons</span><span class=\"dot\">·</span><span>about " + hrs(lessons.reduce((a, l) => a + l.min, 0)) + " hours</span></div>" +
-      "<h1>AI from Scratch</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, in five parts. Every lesson of AI Engineering from Scratch, rebuilt in the Zero to Agents format, with its code run and its figures live, plus the Zero to Agents lessons on the same topics.</p></header>";
+      "<h1>AI from Scratch</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, in five parts. Every lesson has its code run, its figures live, and quick checks, exercises and interview questions to make it stick.</p></header>";
     h += '<section class="dash" aria-label="Your progress"><div class="dash-ring">' + ringSvg(frac) + '<div class="dash-pct"><b>' + Math.round(frac * 100) + "%</b><span>complete</span></div></div>" +
       '<div class="dash-body"><div class="dash-line">' + (all.done === 0 ? "You have not started yet." : all.done === all.n ? "You have finished this path. Well done." : all.done + " of " + all.n + " lessons finished") +
       "<small>" + (all.done ? "About " + hrs(all.min - all.doneMin) + " hours left of " + hrs(all.min) : "About " + hrs(all.min) + " hours, at your own pace") + (S.path !== "all" ? " on the “" + PATHS[S.path][0] + "” path" : "") + ".</small></div>" +
@@ -167,7 +177,7 @@
       });
       h += "</div></section>";
     });
-    h += '<div class="home-foot"><span>Tick “Mark complete” at the end of each lesson and this page keeps score.</span><span>Lessons, figures and interview questions adapted from <a href=\"https://github.com/rohitg00/ai-engineering-from-scratch\" target=\"_blank\" rel=\"noopener\">AI Engineering from Scratch</a>, © 2026 Rohit Ghumare, MIT licence.</span><button type="button" class="ghost" id="reset-btn">' + (resetArmed ? "Click again to erase all progress" : "Reset my progress") + "</button></div>";
+    h += '<div class="home-foot"><span>Tick “Mark complete” at the end of each lesson and this page keeps score.</span><button type="button" class="ghost" id="reset-btn">' + (resetArmed ? "Click again to erase all progress" : "Reset my progress") + "</button></div>";
     $("view-home").innerHTML = h;
     renderSync();
   }
@@ -181,7 +191,13 @@
       '<div class="chv-prog"><div class="chv-bar' + (t.n && t.done === t.n ? " full" : "") + '"><i style="width:' + (t.n ? 100 * t.done / t.n : 0) + '%"></i></div><span>' + t.done + " of " + t.n + " lessons · " + hrs(ch.lessons.reduce((a, l) => a + l.min, 0)) + " h</span>" +
       (nx ? '<a class="cta" href="#' + nx.id + '">' + (t.done ? "Continue" : "Start") + " with " + esc(nx.num) + " →</a>" : t.n ? '<span class="chip chip-done">Phase complete</span>' : "") + "</div></header>";
     h += '<ol class="les-list">';
+    let grp = null; const grouped = ch.lessons.some(x => x.group);
     ch.lessons.forEach(l => {
+      const lg = l.group || "";
+      if (grouped && lg !== grp) {
+        grp = lg; const n = ch.lessons.filter(x => (x.group || "") === lg).length;
+        h += '<li class="les-group"><span class="les-group-t">' + groupLabel(lg) + '</span><span class="les-group-n">' + n + (n === 1 ? " item" : " items") + "</span></li>";
+      }
       const q = S.q[l.id];
       h += '<li><a class="les-row' + (isDone(l.id) ? " done" : "") + (nx && nx.id === l.id ? " here" : "") + (onPath(l) ? "" : " off") + '" href="#' + l.id + '"><span class="les-check" aria-hidden="true"></span><span class="les-num">' + esc(l.num) + '</span><span class="les-title">' + esc(l.title) +
         (isDone(l.id) ? "<small>Completed</small>" : nx && nx.id === l.id ? "<small>Up next</small>" : "") + '</span><span class="les-meta">' + (q ? '<span class="chip chip-done">Quiz ' + q[0] + "/" + q[1] + "</span>" : "") + (l.depth ? '<span class="chip chip-depth">' + esc(l.depth) + "</span>" : "") + "<span>" + l.min + " min</span></span></a></li>";
