@@ -1,0 +1,437 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · Infrastructure &amp; Production</a></nav><h1>Load Testing LLM APIs — Why k6 and Locust Lie</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.22</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1722" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain the two anti-patterns (GIL trap, prompt-uniformity trap) that make generic load testers lie for LLM APIs.</li>
+<li>Pick a tool for a given purpose: LLMPerf (benchmark run), k6 + streaming extension (CI gate), guidellm (large-scale synthetic), GenAI-Perf (NVIDIA reference).</li>
+<li>Design four load patterns (steady, ramp, spike, soak) and name the failure mode each catches.</li>
+<li>Build a realistic prompt distribution using mean + stddev of input tokens rather than fixed length.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 17 · 08 (Inference Metrics), Phase 17 · 03 (GPU Autoscaling)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy realistic-prompt generator + latency collector). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Traditional load testers were not designed for streaming responses, variable output lengths, token-level metrics, or GPU saturation. Two traps bite most teams. The GIL trap: Locust's token-level measurement runs tokenization under the Python GIL, which competes with request generation under heavy concurrency; tokenization backlog then inflates reported inter-token latency — your client is the bottleneck, not the server. The prompt-uniformity trap: identical prompts in a loop test one point on the token distribution; real traffic has variable l</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>LLMPerf</td>
+<td>"the LLM harness"</td>
+<td>Anyscale benchmark tool, streaming-aware</td>
+</tr>
+<tr>
+<td>GenAI-Perf</td>
+<td>"NVIDIA tool"</td>
+<td>NVIDIA reference harness</td>
+</tr>
+<tr>
+<td>LLM-Locust</td>
+<td>"Locust for LLMs"</td>
+<td>Locust extension fixing GIL trap</td>
+</tr>
+<tr>
+<td>guidellm</td>
+<td>"synthetic benchmark"</td>
+<td>Large-scale synthetic tool</td>
+</tr>
+<tr>
+<td>k6 Operator</td>
+<td>"K8s k6"</td>
+<td>CRD-based distributed k6</td>
+</tr>
+<tr>
+<td>GIL trap</td>
+<td>"Python client overhead"</td>
+<td>Tokenization backlog inflates reported latency</td>
+</tr>
+<tr>
+<td>Prompt-uniformity trap</td>
+<td>"single-prompt lie"</td>
+<td>Loop with same prompt hits cache, inflates throughput</td>
+</tr>
+<tr>
+<td>Steady-state</td>
+<td>"constant load"</td>
+<td>Flat RPS for N minutes</td>
+</tr>
+<tr>
+<td>Ramp</td>
+<td>"linear up"</td>
+<td>0 to target over duration</td>
+</tr>
+<tr>
+<td>Spike</td>
+<td>"burst test"</td>
+<td>Sudden multiplier then revert</td>
+</tr>
+<tr>
+<td>Soak</td>
+<td>"long test"</td>
+<td>Hours for leak detection</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A <strong>load test</strong> sends a server realistic traffic at increasing volume to find where it breaks before users do. LLM servers have two traps that make ordinary load tests lie. The <strong>prompt-uniformity trap</strong>: if every simulated user sends the same prompt, the server's prefix cache answers almost all of them from memory, and you measure a cache, not a model. The <strong>GIL trap</strong>: Python load tools such as Locust tokenize responses in the same process that sends requests, so at high concurrency the <em>client</em> slows down and its timing numbers include its own delays. A good LLM load test samples prompts from a realistic distribution of lengths and contents, uses a tool that does not bottleneck itself (LLMPerf, k6, GenAI-Perf, LLM-Locust), and runs four shapes of traffic: steady, ramp, spike and soak.</p></div></aside>
+<p>You k6-tested your LLM endpoint at 500 concurrent users. It held. You shipped. In production at 200 actual users the service fell over — P99 TTFT exploded, GPUs pinned.</p>
+<p>Two things happened. First, k6 sent 500 identical prompts — your request-coalescing and prefix caching made it look like you were handling 500 concurrent decodes when you were actually handling one. Second, k6 doesn't track inter-token latency on streaming responses the way the eye experiences it; it sees one HTTP connection, not 500 tokens arriving at varying intervals.</p>
+<p>Load testing for LLMs is its own discipline.</p>
+<h2>Idea 1 · The GIL trap (Locust)</h2>
+<p>Locust uses Python and runs tokenization client-side under the GIL. Under high concurrency the tokenizer queues behind request generation. Reported inter-token latency includes client-side tokenization backlog. You think the server is slow; it's the test harness.</p>
+<figure class="diagram mmfig" data-mmd="a1722" data-h="0389687d29"><div class="dg-scroll"><svg class="dg mm" id="mm0389687d29" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 312.281px; background-color: transparent;" viewBox="0 0 312.28125 763" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm0389687d29{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm0389687d29 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm0389687d29 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm0389687d29 .error-icon{fill:#f4efe7;}#mm0389687d29 .error-text{fill:#0b1018;stroke:#0b1018;}#mm0389687d29 .edge-thickness-normal{stroke-width:1px;}#mm0389687d29 .edge-thickness-thick{stroke-width:3.5px;}#mm0389687d29 .edge-pattern-solid{stroke-dasharray:0;}#mm0389687d29 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm0389687d29 .edge-pattern-dashed{stroke-dasharray:3;}#mm0389687d29 .edge-pattern-dotted{stroke-dasharray:2;}#mm0389687d29 .marker{fill:#6c6357;stroke:#6c6357;}#mm0389687d29 .marker.cross{stroke:#6c6357;}#mm0389687d29 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm0389687d29 p{margin:0;}#mm0389687d29 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm0389687d29 .cluster-label text{fill:#0b1018;}#mm0389687d29 .cluster-label span{color:#0b1018;}#mm0389687d29 .cluster-label span p{background-color:transparent;}#mm0389687d29 .label text,#mm0389687d29 span{fill:#211c16;color:#211c16;}#mm0389687d29 .node rect,#mm0389687d29 .node circle,#mm0389687d29 .node ellipse,#mm0389687d29 .node polygon,#mm0389687d29 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm0389687d29 .rough-node .label text,#mm0389687d29 .node .label text,#mm0389687d29 .image-shape .label,#mm0389687d29 .icon-shape .label{text-anchor:middle;}#mm0389687d29 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm0389687d29 .rough-node .label,#mm0389687d29 .node .label,#mm0389687d29 .image-shape .label,#mm0389687d29 .icon-shape .label{text-align:center;}#mm0389687d29 .node.clickable{cursor:pointer;}#mm0389687d29 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm0389687d29 .arrowheadPath{fill:#0b0b0b;}#mm0389687d29 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm0389687d29 .flowchart-link{stroke:#6c6357;fill:none;}#mm0389687d29 .edgeLabel{background-color:#ffffff;text-align:center;}#mm0389687d29 .edgeLabel p{background-color:#ffffff;}#mm0389687d29 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm0389687d29 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm0389687d29 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm0389687d29 .cluster text{fill:#0b1018;}#mm0389687d29 .cluster span{color:#0b1018;}#mm0389687d29 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm0389687d29 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm0389687d29 rect.text{fill:none;stroke-width:0;}#mm0389687d29 .icon-shape,#mm0389687d29 .image-shape{background-color:#ffffff;text-align:center;}#mm0389687d29 .icon-shape p,#mm0389687d29 .image-shape p{background-color:#ffffff;padding:2px;}#mm0389687d29 .icon-shape .label rect,#mm0389687d29 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm0389687d29 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm0389687d29 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm0389687d29 .node .neo-node{stroke:#b5521b;}#mm0389687d29 [data-look="neo"].node rect,#mm0389687d29 [data-look="neo"].cluster rect,#mm0389687d29 [data-look="neo"].node polygon{stroke:url(#mm0389687d29-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0389687d29 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm0389687d29 [data-look="neo"].node path{stroke:url(#mm0389687d29-gradient);stroke-width:1px;}#mm0389687d29 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0389687d29 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm0389687d29 [data-look="neo"].node circle{stroke:url(#mm0389687d29-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0389687d29 [data-look="neo"].node circle .state-start{fill:#000000;}#mm0389687d29 [data-look="neo"].icon-shape .icon{fill:url(#mm0389687d29-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0389687d29 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm0389687d29-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0389687d29 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm0389687d29_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm0389687d29_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm0389687d29_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M166.406,59L166.406,63.167C166.406,67.333,166.406,75.667,166.406,83.333C166.406,91,166.406,98,166.406,101.5L166.406,105" id="mm0389687d29-L_L_DIST_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_DIST_0" data-points="W3sieCI6MTY2LjQwNjI1LCJ5Ijo1OX0seyJ4IjoxNjYuNDA2MjUsInkiOjg0fSx7IngiOjE2Ni40MDYyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M166.406,181L166.406,185.167C166.406,189.333,166.406,197.667,166.406,205.333C166.406,213,166.406,220,166.406,223.5L166.406,227" id="mm0389687d29-L_DIST_TOOL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DIST_TOOL_0" data-points="W3sieCI6MTY2LjQwNjI1LCJ5IjoxODF9LHsieCI6MTY2LjQwNjI1LCJ5IjoyMDZ9LHsieCI6MTY2LjQwNjI1LCJ5IjoyMzF9XQ==" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M166.406,303L166.406,307.167C166.406,311.333,166.406,319.667,166.406,327.333C166.406,335,166.406,342,166.406,345.5L166.406,349" id="mm0389687d29-L_TOOL_PAT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TOOL_PAT_0" data-points="W3sieCI6MTY2LjQwNjI1LCJ5IjozMDN9LHsieCI6MTY2LjQwNjI1LCJ5IjozMjh9LHsieCI6MTY2LjQwNjI1LCJ5IjozNTN9XQ==" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M166.406,425L166.406,429.167C166.406,433.333,166.406,441.667,166.406,449.333C166.406,457,166.406,464,166.406,467.5L166.406,471" id="mm0389687d29-L_PAT_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PAT_M_0" data-points="W3sieCI6MTY2LjQwNjI1LCJ5Ijo0MjV9LHsieCI6MTY2LjQwNjI1LCJ5Ijo0NTB9LHsieCI6MTY2LjQwNjI1LCJ5Ijo0NzV9XQ==" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M166.406,547L166.406,551.167C166.406,555.333,166.406,563.667,166.477,571.417C166.547,579.167,166.687,586.334,166.758,589.917L166.828,593.501" id="mm0389687d29-L_M_GATE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_GATE_0" data-points="W3sieCI6MTY2LjQwNjI1LCJ5Ijo1NDd9LHsieCI6MTY2LjQwNjI1LCJ5Ijo1NzJ9LHsieCI6MTY2LjkwNjI1LCJ5Ijo1OTcuNX1d" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M137.78,633.5L128.122,639.333C118.465,645.167,99.151,656.833,89.493,667.917C79.836,679,79.836,689.5,79.836,694.75L79.836,700" id="mm0389687d29-L_GATE_FAIL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GATE_FAIL_0" data-points="W3sieCI6MTM3Ljc3OTc4OTcxOTYyNjE3LCJ5Ijo2MzMuNX0seyJ4Ijo3OS44MzU5Mzc1LCJ5Ijo2NjguNX0seyJ4Ijo3OS44MzU5Mzc1LCJ5Ijo3MDR9XQ==" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/><path d="M196.033,633.5L205.523,639.333C215.014,645.167,233.995,656.833,243.486,667.917C252.977,679,252.977,689.5,252.977,694.75L252.977,700" id="mm0389687d29-L_GATE_PASS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_GATE_PASS_0" data-points="W3sieCI6MTk2LjAzMjcxMDI4MDM3MzgzLCJ5Ijo2MzMuNX0seyJ4IjoyNTIuOTc2NTYyNSwieSI6NjY4LjV9LHsieCI6MjUyLjk3NjU2MjUsInkiOjcwNH1d" data-look="classic" marker-end="url(#mm0389687d29_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_L_DIST_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DIST_TOOL_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_TOOL_PAT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PAT_M_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_GATE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(79.8359375, 668.5)"><g class="label" data-id="L_GATE_FAIL_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(252.9765625, 668.5)"><g class="label" data-id="L_GATE_PASS_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm0389687d29-flowchart-L-0" data-look="classic" transform="translate(166.40625, 33.5)"><rect class="basic label-container" style="" x="-81.4609375" y="-25.5" width="162.921875" height="51"/><g class="label" style="" transform="translate(-51.4609375, -10.5)"><rect/><foreignObject width="102.921875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Real traffic logs</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-DIST-1" data-look="classic" transform="translate(166.40625, 145)"><rect class="basic label-container" style="" x="-94.1796875" y="-36" width="188.359375" height="72"/><g class="label" style="" transform="translate(-64.1796875, -21)"><rect/><foreignObject width="128.359375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Prompt length and<br />content distribution</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-TOOL-3" data-look="classic" transform="translate(166.40625, 267)"><rect class="basic label-container" style="" x="-126.5234375" y="-36" width="253.046875" height="72"/><g class="label" style="" transform="translate(-96.5234375, -21)"><rect/><foreignObject width="193.046875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Harness that does not<br />bottleneck itself: LLMPerf, k6</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-PAT-5" data-look="classic" transform="translate(166.40625, 389)"><rect class="basic label-container" style="" x="-106.3203125" y="-36" width="212.640625" height="72"/><g class="label" style="" transform="translate(-76.3203125, -21)"><rect/><foreignObject width="152.640625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Patterns: steady, ramp,<br />spike, soak</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-M-7" data-look="classic" transform="translate(166.40625, 511)"><rect class="basic label-container" style="" x="-93.7109375" y="-36" width="187.421875" height="72"/><g class="label" style="" transform="translate(-63.7109375, -21)"><rect/><foreignObject width="127.421875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>TTFT, TPOT, errors<br />P50 / P95 / P99</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-GATE-9" data-look="classic" transform="translate(166.40625, 615)"><polygon points="9,0 102.484375,0 111.484375,-18 102.484375,-36 9,-36 0,-18" class="label-container" transform="translate(-55.7421875,18)"/><g class="label" style="" transform="translate(-39.2421875, -10.5)"><rect/><foreignObject width="78.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Within SLA?</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-FAIL-11" data-look="classic" transform="translate(79.8359375, 729.5)"><rect class="basic label-container" style="" x="-71.8359375" y="-25.5" width="143.671875" height="51"/><g class="label" style="" transform="translate(-41.8359375, -10.5)"><rect/><foreignObject width="83.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Fail the build</p></span></div></foreignObject></g></g><g class="node default" id="mm0389687d29-flowchart-PASS-13" data-look="classic" transform="translate(252.9765625, 729.5)"><rect class="basic label-container" style="" x="-51.3046875" y="-25.5" width="102.609375" height="51"/><g class="label" style="" transform="translate(-21.3046875, -10.5)"><rect/><foreignObject width="42.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Merge</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm0389687d29-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm0389687d29-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm0389687d29-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>Fix: LLM-Locust extension moves tokenization to separate processes, or use a compiled-language harness (k6, LLMPerf using tokenizers.rs).</p>
+<h2>Idea 2 · The prompt-uniformity trap</h2>
+<p>All known load testers let you configure one prompt. In a loop test of 10,000 iterations the exact same prompt sends each time. Server sees the same prefix every time — prefix cache hits approach 100%, throughput looks great.</p>
+<p>Fix: sample from a prompt distribution. LLMPerf uses <code>--mean-input-tokens 500 --stddev-input-tokens 150</code> — diverse lengths, diverse content.</p>
+<h2>Idea 3 · Four load patterns</h2>
+<ol>
+<li><strong>Steady-state</strong> — constant RPS for 30-60 min. Catches: baseline performance regressions.</li>
+<li><strong>Ramp</strong> — linearly increase RPS from 0 to target over 15 min. Catches: capacity breakpoint, warm-up anomalies.</li>
+<li><strong>Spike</strong> — sudden 3-10x RPS for 2 min then back. Catches: autoscaling latency, queue saturation, cold-start impact.</li>
+<li><strong>Soak</strong> — steady-state for 4-8 hours. Catches: memory leaks, connection-pool drift, observability overflow.</li>
+</ol>
+<h2>Idea 4 · 2026 tool mapping</h2>
+<p><strong>LLMPerf</strong> (Anyscale) — Python but Rust-backed tokenization. Mean/stddev prompts. Streaming-aware. Best default for performance runs.</p>
+<p><strong>NVIDIA GenAI-Perf</strong> — NVIDIA's reference. Uses Triton client; comprehensive metric coverage. Note its ITL excludes TTFT; LLMPerf's includes it. Two tools produce different TPOT for the same server.</p>
+<p><strong>LLM-Locust</strong> (TrueFoundry) — Locust extension that fixes the GIL trap. Familiar Locust DSL + streaming metrics.</p>
+<p><strong>guidellm</strong> — large-scale synthetic benchmarking.</p>
+<p><strong>k6 v2026.1.0</strong> + <strong>k6 Operator 1.0 GA (Sept 2025)</strong>:
+- k6 itself (Go, compiled, no GIL) added streaming-aware metrics.
+- k6 Operator uses TestRun / PrivateLoadZone CRDs for Kubernetes-native distributed testing.
+- Best for CI/CD gates and SLA testing.</p>
+<p><strong>Vegeta</strong> — Go, simpler than k6. Constant-rate HTTP saturation. Not LLM-aware but good for gateway / rate-limit testing.</p>
+<p><strong>Locust 2.43.3 stock</strong> — has the GIL trap for LLM. Only with LLM-Locust extension.</p>
+<h2>Idea 5 · SLA gate in CI</h2>
+<p>Run k6 on the PR with:</p>
+<ul>
+<li>30-50 iterations each at baseline RPS.</li>
+<li>Gate: P50/P95 TTFT, 5xx &lt; 5%, TPOT under threshold.</li>
+<li>Break the build on breach.</li>
+</ul>
+<h2>Idea 6 · Realistic prompt distribution</h2>
+<p>Build from real traffic samples (if you have them) or from published distributions (e.g., ShareGPT prompts for chat, HumanEval for code). Feed the mean + stddev to LLMPerf. Avoid loop-with-one-prompt at all costs.</p>
+<h2>Idea 7 · Numbers you should remember</h2>
+<ul>
+<li>k6 Operator 1.0 GA: September 2025.</li>
+<li>k6 v2026.1.0: streaming-aware metrics.</li>
+<li>Typical LLMPerf run: 100-1000 requests at concurrency X.</li>
+<li>Typical CI gate: 30-50 iterations per PR.</li>
+<li>Four patterns: steady, ramp, spike, soak.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="load-pattern-waves"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">What a uniform test hides</div><div class="co-body"><p>Suppose prefill costs about 0.4 ms per prompt token on a miss and the cached path about 80 ms flat.</p>
+<ol>
+<li>Uniform test: 500 requests, all with the same 2,000-token prompt. 499 are cache hits: TTFT about 80 ms every time. P99 = 80 ms.</li>
+<li>Realistic test: prompt lengths with mean 500 and standard deviation 150, mostly unique content. Cache hits only where a system prompt is shared; a 2,000-token unique prompt takes about 800 ms.</li>
+<li>The P99 in production is set by the long, unique prompts: about 800 ms, ten times what the uniform test reported.</li>
+<li>The same mistake hides concurrency effects: with one cached prefix there is no real prefill load, so the GPU never saturates.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A loop over one prompt mostly measures the prefix cache.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Stock Locust is a good harness for streaming LLM latency at high concurrency.
+  Its client-side tokenization runs under Python's GIL and inflates the latency it reports.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A soak test of 4–8 hours finds memory leaks a 10-minute test misses.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Load-testing at your expected peak is enough.
+  Spike tests at 3–10× catch autoscaling and queueing failures.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: if real prompts follow a log-normal length distribution with a median of 400 tokens, what share of requests is longer than 1,500 tokens?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Sampling realistic prompt lengths</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random, math
+random.seed(6)
+lengths = sorted(int(random.lognormvariate(math.log(400), 0.7)) for _ in range(10_000))
+pct = lambda q: lengths[int(q * len(lengths)) - 1]
+print(f&quot;P50 {pct(0.5)} tokens  P90 {pct(0.9)}  P99 {pct(0.99)}  max {lengths[-1]}&quot;)
+print(f&quot;share over 1,500 tokens: {sum(l &gt; 1500 for l in lengths) / len(lengths):.1%}&quot;)
+ttft = sorted(80 + 0.4 * l for l in lengths)        # unique prompts: no cache
+print(f&quot;TTFT P50 {ttft[4999]:.0f} ms, P99 {ttft[9899]:.0f} ms (uniform test would report 80 ms)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">P50 396 tokens  P90 989  P99 1948  max 5163
+share over 1,500 tokens: 2.9%
+TTFT P50 238 ms, P99 859 ms (uniform test would report 80 ms)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Only about 3% of prompts exceed 1,500 tokens, but they set the tail: P99 TTFT comes out several times the median. A uniform test reports none of this. Build the length distribution from your own logs (or a published set such as ShareGPT) and give the tool both the mean and the spread.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates a load test with realistic prompt distribution, measures effective TPOT, and demonstrates the uniform-prompt trap.</p>
+<p>Here is <code>code/main.py</code>, in 3 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>Request</code>, <code>make_uniform_workload</code>, <code>make_realistic_workload</code>, <code>simulate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Load-test anti-pattern demonstrator — stdlib Python.
+
+Simulates how uniform prompts inflate reported throughput via prefix-cache
+and request-coalescing, while realistic distribution reveals the true ceiling.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+import statistics
+
+
+PREFIX_CACHE_HIT_TTFT_MS = 80
+PREFIX_CACHE_MISS_TTFT_MS = 800
+TPOT_MS = 15
+BATCH_EFFICIENCY_SHARED_PREFIX = 0.8  # batch serves 1/0.8 = 1.25x fewer slots
+
+
+@dataclass
+class Request:
+    prompt_tokens: int
+    prefix_hash: str
+
+
+def make_uniform_workload(n: int = 500) -&gt; list[Request]:
+    return [Request(2000, &quot;single_prefix&quot;) for _ in range(n)]
+
+
+def make_realistic_workload(n: int = 500, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    prefixes = [f&quot;prefix_{i}&quot; for i in range(80)]
+    for _ in range(n):
+        prompt = max(50, int(rng.gauss(500, 180)))
+        reqs.append(Request(prompt, rng.choice(prefixes)))
+    return reqs
+
+
+def simulate(reqs: list[Request], concurrency: int) -&gt; dict:
+    cache: set[str] = set()
+    ttft_samples: list[float] = []
+    # serialize in groups of &quot;concurrency&quot;
+    for i in range(0, len(reqs), concurrency):
+        batch = reqs[i:i + concurrency]
+        unique_prefixes = len({r.prefix_hash for r in batch})
+        for r in batch:
+            hit = r.prefix_hash in cache
+            ttft = PREFIX_CACHE_HIT_TTFT_MS if hit else PREFIX_CACHE_MISS_TTFT_MS
+            if not hit:
+                cache.add(r.prefix_hash)
+            ttft_samples.append(ttft)
+    ttft_samples.sort()
+    p50 = ttft_samples[len(ttft_samples) // 2]
+    p99 = ttft_samples[int(len(ttft_samples) * 0.99) - 1]
+    return {
+        &quot;n&quot;: len(reqs),
+        &quot;p50&quot;: p50,
+        &quot;p99&quot;: p99,
+        &quot;mean&quot;: statistics.mean(ttft_samples),
+        &quot;cache_hits&quot;: sum(1 for t in ttft_samples if t == PREFIX_CACHE_HIT_TTFT_MS),
+    }
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 95)
+    print(&quot;PROMPT-UNIFORMITY TRAP: same test harness, different prompt distributions&quot;)
+    print(&quot;=&quot; * 95)
+
+    for concurrency in (10, 50, 200):
+        print(f&quot;\nConcurrency = {concurrency}&quot;)
+        header = f&quot;{'Workload':22}  {'n':&gt;5}  {'TTFT_P50':&gt;9}  {'TTFT_P99':&gt;9}  {'mean':&gt;7}  cache_hits&quot;
+        print(header)
+        print(&quot;-&quot; * len(header))
+
+        uniform = make_uniform_workload(500)
+        u = simulate(uniform, concurrency)
+        print(f&quot;{'UNIFORM':22}  {u['n']:5}  {u['p50']:8.0f}ms  {u['p99']:8.0f}ms  {u['mean']:6.0f}ms  {u['cache_hits']:4}&quot;)
+
+        realistic = make_realistic_workload(500)
+        r = simulate(realistic, concurrency)
+        print(f&quot;{'REALISTIC':22}  {r['n']:5}  {r['p50']:8.0f}ms  {r['p99']:8.0f}ms  {r['mean']:6.0f}ms  {r['cache_hits']:4}&quot;)
+
+    print(&quot;\nRead: uniform prompts make your endpoint look fast. Realistic prompts tell the truth.&quot;)
+    print(&quot;LLMPerf: --mean-input-tokens + --stddev-input-tokens. Always.&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">===============================================================================================
+PROMPT-UNIFORMITY TRAP: same test harness, different prompt distributions
+===============================================================================================
+
+Concurrency = 10
+Workload                    n   TTFT_P50   TTFT_P99     mean  cache_hits
+------------------------------------------------------------------------
+UNIFORM                   500        80ms        80ms      81ms   499
+REALISTIC                 500        80ms       800ms     194ms   421
+
+Concurrency = 50
+Workload                    n   TTFT_P50   TTFT_P99     mean  cache_hits
+------------------------------------------------------------------------
+UNIFORM                   500        80ms        80ms      81ms   499
+REALISTIC                 500        80ms       800ms     194ms   421
+
+Concurrency = 200
+Workload                    n   TTFT_P50   TTFT_P99     mean  cache_hits
+------------------------------------------------------------------------
+UNIFORM                   500        80ms        80ms      81ms   499
+REALISTIC                 500        80ms       800ms     194ms   421
+
+Read: uniform prompts make your endpoint look fast. Realistic prompts tell the truth.
+LLMPerf: --mean-input-tokens + --stddev-input-tokens. Always.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Two things stand out. Uniform prompts produce 499 cache hits out of 500 and a P99 of 80 ms; realistic prompts show a P99 of 800 ms. And the three concurrency levels print identical rows: this toy does not model queueing, so it shows the uniformity trap but says nothing about capacity. A real ramp test is what finds where concurrency starts to hurt.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team's CI gate runs k6 with 100 virtual users sending one fixed prompt, and passes with P95 TTFT of 120 ms. After release, P95 in production is 1.4 s at 60 users. Give two reasons. (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Uniform prompts measure the cache; sample a realistic length and content distribution.</li>
+<li>Avoid harnesses that bottleneck themselves (stock Locust); use LLMPerf, k6, GenAI-Perf or LLM-Locust.</li>
+<li>Run steady, ramp, spike and soak patterns.</li>
+<li>Gate CI on P50/P95 TTFT, TPOT and error rate.</li>
+<li>State which tool you used: their ITL definitions differ.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-inference-load-testing"><span class="t" style="--cs-hue:352">IM</span>Cheat sheet · Inference Metrics and Load Testing</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-load-test-plan.md</code>. Given workload and SLA, picks tool and designs the four load patterns.</p>
+<p><strong><code>outputs/skill-load-test-plan.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: load-test-plan
+description: Design a realistic LLM load test — pick tool (LLMPerf, k6, GenAI-Perf, guidellm), build four patterns (steady, ramp, spike, soak), and gate in CI.
+version: 1.0.0
+phase: 17
+lesson: 22
+tags: [load-testing, llmperf, k6, genai-perf, guidellm, llm-locust, ci-gate]
+---
+
+Given workload (endpoint, SLA for TTFT/TPOT/error), target scale (concurrency, RPS), and CI posture (PR gate or release-only), produce a load test plan.
+
+Produce:
+
+1. Tool. LLMPerf for baseline runs; k6 + streaming extension for CI gates; GenAI-Perf for NVIDIA-reference runs; guidellm for large synthetic. LLM-Locust only if already on Locust.
+2. Prompt distribution. Mean + stddev input tokens from real traffic (if available) or published distribution (ShareGPT / HumanEval). Forbid loop-with-one-prompt.
+3. Four patterns. Steady, ramp, spike, soak. For each: target RPS, duration, expected failure mode.
+4. CI gate. Specific thresholds: TTFT P95 &lt; X, 5xx &lt; 5%, TPOT &lt; Y. Runtime per PR: 3-5 min.
+5. Metric alignment. Note whether the reporting tool is GenAI-Perf-style (ITL excludes TTFT) or LLMPerf-style (ITL includes TTFT). Pick one and stay consistent.
+6. Output. A script file (k6 JS, LLMPerf CLI) committed to the repo.
+
+Hard rejects:
+- Load test with uniform prompts. Refuse — the numbers lie.
+- Load test without streaming support. Refuse — LLM endpoints are streaming by default.
+- Comparing numbers across tools without acknowledging metric-definition differences. Refuse.
+
+Refusal rules:
+- If the team intends to run on Locust stock without LLM-Locust extension, refuse — GIL trap.
+- If CI gate budget is &lt; 60s per PR, refuse full soak — propose a quick steady-state plus separate nightly soak.
+- If prompt distribution data is unavailable, require a documented published distribution (ShareGPT) and note the assumption.
+
+Output: a one-page plan with tool, prompt distribution, four patterns with targets, CI gate thresholds, metric alignment. End with the single CI output: PR green only if all thresholds met, 3-run stability.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Compare uniform vs realistic distribution — where is the gap?</li>
+<li>Write the k6 script for a CI gate: TTFT P95 &lt; 800 ms at 100 concurrent, runtime 5 minutes.</li>
+<li>Your soak test shows memory growing 50 MB/hour. Name three causes and the instrumentation to pick between them.</li>
+<li>Spike test from 10 RPS to 100 RPS. What's the expected recovery time if Karpenter + vLLM production-stack are in place (Phase 17 · 03 + 18)?</li>
+<li>GenAI-Perf reports TPOT=6ms; LLMPerf reports TPOT=11ms on the same server. Explain.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1722-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Uniform against realistic</span></summary><div class="qa-a"><p>In <code>code/main.py</code> the gap is entirely in the tail: P50 is 80 ms for both, but P99 is 80 ms with uniform prompts and 800 ms with realistic ones, because 499 of 500 uniform requests are cache hits against 421 for the realistic mix. The concurrency levels are identical because the toy has no queueing model.</p></div></details>
+<details class="qa" id="a1722-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A gate that lied</span></summary><div class="qa-a"><p>(1) One fixed prompt: after the first request everything came from the prefix cache, so the gate measured cache latency. (2) No realistic length distribution: production's long prompts set the P95. A third common cause: the test ran against a warm, otherwise idle server, while production also has cold replicas and mixed traffic.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1722-qa3"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">Two engineers benchmark the same server on the same day and report numbers that differ by a few percent. Both used standard benchmark clients. Before you look at the server, what about the clients could explain the gap, and what rules would you set for the team?</span></summary><div class="qa-a"><p><em>Level 2 of 4 · about 8 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> The client is part of the measurement. On one vLLM server the SGLang client read a median first token 3 to 10 percent higher and an output throughput 2 to 8 percent lower than the vLLM client, the two clients sent different random prompts, and temperature 0.7 raised the time per token by 10 to 13 percent at one user against temperature 0. The rules: one client, one temperature, one prompt length distribution with the range ratio stated, a flush and a new seed per run, the clock recorded, and all of that written next to every number.</p>
+<p><strong>Three clients on one server.</strong></p>
+<p>The manual ran the SGLang client, <code>vllm bench serve</code> and its Rust version against one vLLM server with Qwen/Qwen3-0.6B, with a cache reset before every run and the clients alternated over two rounds. Output tokens per second at 64 users:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Temperature</th>
+<th>SGLang client</th>
+<th>vllm bench</th>
+<th>vllm bench, Rust</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>359, 348</td>
+<td>379, 377</td>
+<td>371, 365</td>
+</tr>
+<tr>
+<td>0.7</td>
+<td>331, 343</td>
+<td>360, 363</td>
+<td>356, 353</td>
+</tr>
+</tbody>
+</table></div>
+<p>The two vLLM clients agreed within the noise at 1, 16 and 64 users. The SGLang client read a slower server: a median first token 3 to 10 percent higher, and at 16 and 64 users an output throughput 2 to 8 percent lower. The two clients send different prompt tokens from their random datasets, so part of a small gap can come from the prompts. Temperature 0.7 raised the median time per token over temperature 0 by 10 to 13 percent at one user and 3 to 6 percent at 16 and 64 users.</p>
+<p><strong>Four defaults that change the result.</strong></p>
+<p>The SGLang client makes choices before it measures anything:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>What it does to the result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--random-range-ratio</code></td>
+<td>0.0</td>
+<td>each length is drawn from 1 to the length you asked for, so the average prompt is about half of it</td>
+</tr>
+<tr>
+<td><code>ignore_eos</code></td>
+<td>on</td>
+<td>every request generates exactly the output length you asked for</td>
+</tr>
+<tr>
+<td><code>--request-rate</code></td>
+<td>inf</td>
+<td>all requests are sent at time 0, and only the concurrency cap holds them back</td>
+</tr>
+<tr>
+<td><code>--warmup-requests</code></td>
+<td>1</td>
+<td>one request runs before the clock starts</td>
+</tr>
+</tbody>
+</table></div>
+<p>The first row is the trap. With the default ratio, an input length of 512 gives an average prompt near 256 tokens, and the report says 512. Pass 1.0 or write the length distribution next to the result. With 1.0, 32 prompts of 512 tokens give an input total of 16384 in the report.</p>
+<p><strong>Fixed lengths form waves.</strong></p>
+<p>With the ratio at 1.0 every request has the same length, so requests that start together finish together and their replacements arrive together. At 16 users on the L4, fixed lengths gave a median time to first token of 1,996 ms and a P99 ITL of 82 ms; mixed lengths gave 291 ms and 300 ms. The two settings measure two different servers. Fixed lengths measure bursts, with a slow first token and smooth tokens. Mixed lengths measure steady traffic, with a fast first token and stalls in the stream. Keep 1.0 to compare two builds, and run your real length mix before you set a latency target.</p>
+<p><strong>The client's own queue.</strong></p>
+<p>The SGLang client sends every request from one Python process. A 2026 study found that such a client adds its own queue at high request rates and then reports a first token and a time per token higher than the server gave. Before you trust a number at a high rate, compare one client process with two processes that each send half the rate. The lesson names the same trap for a general load tester: tokenization under the interpreter lock in the client inflates the reported inter-token latency, and one prompt sent in a loop hits the prefix cache on almost every request and inflates the throughput.</p>
+<p><strong>Hand-written scripts.</strong></p>
+<p>One report measured 13 tokens per second for a large model on eight GPUs against 60 from a hosted API. The script counted words split on spaces and included the first-token time in the rate. A word is not a token, and TTFT is not decode time. Use the benchmark client, which counts tokens and keeps TTFT and TPOT apart.</p>
+<p><strong>The rules.</strong></p>
+<ol>
+<li>One client, one version, named in every result.</li>
+<li>One temperature, named in every result.</li>
+<li><code>--random-range-ratio 1.0</code>, or the length distribution written down.</li>
+<li>A flush and a new seed before every run, and the cached tokens recorded.</li>
+<li>The GPU clock recorded and the hot runs set aside.</li>
+<li>Throughput reported only together with the median and P99 TTFT and TPOT at the same cap.</li>
+</ol>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Both are standard clients, so the numbers are comparable." On one server the SGLang client read 3 to 10 percent higher first-token times and 2 to 8 percent lower throughput than the vLLM client; a gap of a few percent can come from the client alone.</li>
+<li>"Temperature does not change speed." Temperature 0.7 raised the median time per token 10 to 13 percent at one user and 3 to 6 percent at 16 and 64 users over temperature 0.</li>
+<li>"Set the input length to 512 and the prompts are 512 tokens." With the default range ratio of 0.0 the average prompt is about 256 tokens; pass 1.0 or state the distribution.</li>
+<li>"A load tester that handles HTTP handles model traffic." A generic tool sends one prompt in a loop, which hits the prefix cache almost every time, and it does not read the token gaps of a stream; use a client that samples prompt lengths and counts tokens.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> Why does the default range ratio describe half the work? Expected: each length is drawn from 1 to the length asked, so the average prompt is about half of it; with 1.0 every prompt has the full length and the input token total in the report confirms it.</li>
+<li><em>(level 3)</em> Fixed lengths gave a late first token and a steady stream, mixed lengths the opposite. Which do you use? Expected: fixed lengths to compare two builds, because they repeat exactly; your real length mix before you set a latency target, because the two shapes measure two different servers.</li>
+<li><em>(level 3)</em> A teammate's hand-written timing loop reads 13 tokens per second where a hosted API reads 60. What is wrong with the loop? Expected: it counted words split on spaces and included the first-token time in the rate; a word is not a token and TTFT is not decode time, so use the benchmark client.</li>
+<li><em>(level 4)</em> At 16 requests per second the client reports a first token you do not believe. How do you check the client itself? Expected: a single-process client adds its own queue at high rates; run two client processes that each send half the rate and compare, and record the CPU use of the client.</li>
+</ul>
+<p><strong>Where it is taught.</strong> Benchmark your server in 15 minutes and the SGLang benchmark section compare the clients, and the load testing lesson names the two client traps.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://tianpan.co/blog/2026-03-19-load-testing-llm-applications">TianPan — Load Testing LLM Applications</a></li>
+<li><a href="https://blog.premai.io/load-testing-llms-tools-metrics-realistic-traffic-simulation-2026/">PremAI — Load Testing LLMs 2026</a></li>
+<li><a href="https://docs.nvidia.com/nim/large-language-models/1.0.0/benchmarking.html">NVIDIA NIM — Introduction to LLM Inference Benchmarking</a></li>
+<li><a href="https://www.truefoundry.com/blog/llm-locust-a-tool-for-benchmarking-llm-performance">TrueFoundry — LLM-Locust</a></li>
+<li><a href="https://github.com/ray-project/llmperf">LLMPerf</a></li>
+<li><a href="https://github.com/grafana/k6-operator">k6 Operator</a></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1722" id="done-a1722">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1722" id="undo-a1722" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1721"><span class="pn-dir">Previous</span><span class="pn-t">17.21 · A/B Testing LLM Features — GrowthBook, Statsig, and the Vibes Problem</span></a><a class="pn next" href="#a1723"><span class="pn-dir">Next</span><span class="pn-t">17.23 · SRE for AI — Multi-Agent Incident Response, Runbooks, Predictive Detection</span></a></div></footer>

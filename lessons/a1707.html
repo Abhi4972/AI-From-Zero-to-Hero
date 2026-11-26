@@ -1,0 +1,354 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · Infrastructure &amp; Production</a></nav><h1>Hardware-Specialized Inference Compilation — FP8 and NVFP4 on Blackwell</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.7</span><span class="chip">75 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1707" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why FP8 stays critical for KV cache and attention even when weights are in NVFP4.</li>
+<li>Compute the HBM footprint of a frontier model under BF16, FP8, and NVFP4 and reason about where the savings come from.</li>
+<li>Name the Blackwell-specific features TRT-LLM exploits (day-0 FP4, MTP, disaggregated serving, all-to-all primitives).</li>
+<li>Decide when TRT-LLM's NVIDIA-lock is worth the 7x cost gap vs vLLM on Hopper.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 17 · 04 (Serving Engine Internals), Phase 10 · 13 (Quantization)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy FP8/NVFP4 memory and cost calculator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Hardware-specialized inference compilation trades portability for throughput, and TensorRT-LLM — NVIDIA-only, tuned for Blackwell — is the clearest example of the trade paying off. On GB200 NVL72 with Dynamo orchestration, SemiAnalysis InferenceX measured $0.012 per million tokens on a 120B model in Q1-Q2 2026, against $0.09/M on H100 + vLLM — a 7x economic gap. The stack compounds two floating-point formats with two serving techniques: FP8 stays critical for KV cache and attention kernels because it has the dynamic r</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP8</td>
+<td>"eight-bit float"</td>
+<td>8-bit floating point; used for KV cache and attention due to dynamic range</td>
+</tr>
+<tr>
+<td>NVFP4</td>
+<td>"four-bit micro"</td>
+<td>NVIDIA's 4-bit microscaling FP format; weights and activations on Blackwell</td>
+</tr>
+<tr>
+<td>MXFP8</td>
+<td>"MX eight"</td>
+<td>Microscaling FP8 variant; hardware-accelerated on Blackwell Tensor Cores</td>
+</tr>
+<tr>
+<td>Day-0 FP4</td>
+<td>"ship FP4 weights"</td>
+<td>Model providers release weights already in FP4; no post-train conversion step</td>
+</tr>
+<tr>
+<td>MTP</td>
+<td>"multi-token prediction"</td>
+<td>TRT-LLM's integrated speculative-decoding draft (Phase 17 · 05)</td>
+</tr>
+<tr>
+<td>Disaggregated serving</td>
+<td>"split prefill/decode"</td>
+<td>Prefill and decode on separate GPU pools; KV transferred over NVLink/IB</td>
+</tr>
+<tr>
+<td>All-to-all</td>
+<td>"MoE expert comm"</td>
+<td>Communication pattern routing tokens to expert GPUs; NVLink 5 cuts 3x</td>
+</tr>
+<tr>
+<td>InferenceX</td>
+<td>"SemiAnalysis inference bench"</td>
+<td>The 2026 industry-accepted cost-per-token benchmark</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>The cost of each generated token depends on four choices stacked on top of each other: the <strong>GPU generation</strong> (NVIDIA's Hopper H100/H200 or the newer Blackwell B200/GB200), the <strong>precision</strong> the numbers are stored in (16-bit, 8-bit FP8 or 4-bit NVFP4), the <strong>serving engine</strong> (vLLM, SGLang, or NVIDIA's own TensorRT-LLM), and the <strong>orchestration</strong> around it (NVIDIA Dynamo splits work across GPUs). Each choice multiplies the others. Fewer bits per weight means less memory to read for every token, and reading memory is what limits generation speed. The catch: the cheapest combination only exists on NVIDIA hardware with NVIDIA's closed software, and 4-bit weights can hurt quality on reasoning tasks, so you trade portability and some accuracy for price.</p></div></aside>
+<p>The frontier of inference economics in 2026 is "how many tokens per dollar". The answer depends on four stacked choices: hardware generation (Hopper H100/H200 vs Blackwell B200/GB200), precision (BF16 → FP8 → NVFP4), serving engine (vLLM vs SGLang vs TRT-LLM), and orchestration (plain vs disaggregated vs Dynamo).</p>
+<p>On Hopper with vLLM, a 120B MoE runs at ~$0.09 per million tokens. On Blackwell with TRT-LLM + Dynamo, the same model runs at ~$0.012 — 7x cheaper. Some of that gap is hardware (Blackwell is 11-15x per-GPU LLM throughput vs Hopper). Some is the stack: FP4 weights, MTP draft, disaggregated prefill/decode, and NVLink 5 all-to-all for MoE expert communication.</p>
+<p>You cannot replicate this outside NVIDIA's stack. That is the tradeoff — portability for economics. Understanding which stack choices give which share of the gap is the point of this lesson.</p>
+<h2>Idea 1 · Why FP8 is still the floor for KV cache</h2>
+<p>A common mistake in 2026: assuming NVFP4 applies everywhere. It does not. KV cache needs FP8 (8-bit floating point) because it stores attention keys and values that span a wide dynamic range. Quantizing KV to FP4 causes catastrophic accuracy loss — the tail of the distribution drops off and attention scores collapse. FP8's exponent bits give KV cache the range it needs.</p>
+<figure class="diagram mmfig" data-mmd="a1707" data-h="a7998109d1"><div class="dg-scroll"><svg class="dg mm" id="mma7998109d1" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 803.062px; background-color: transparent;" viewBox="0 0 803.0625 538" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mma7998109d1{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mma7998109d1 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mma7998109d1 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mma7998109d1 .error-icon{fill:#f4efe7;}#mma7998109d1 .error-text{fill:#0b1018;stroke:#0b1018;}#mma7998109d1 .edge-thickness-normal{stroke-width:1px;}#mma7998109d1 .edge-thickness-thick{stroke-width:3.5px;}#mma7998109d1 .edge-pattern-solid{stroke-dasharray:0;}#mma7998109d1 .edge-thickness-invisible{stroke-width:0;fill:none;}#mma7998109d1 .edge-pattern-dashed{stroke-dasharray:3;}#mma7998109d1 .edge-pattern-dotted{stroke-dasharray:2;}#mma7998109d1 .marker{fill:#6c6357;stroke:#6c6357;}#mma7998109d1 .marker.cross{stroke:#6c6357;}#mma7998109d1 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mma7998109d1 p{margin:0;}#mma7998109d1 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mma7998109d1 .cluster-label text{fill:#0b1018;}#mma7998109d1 .cluster-label span{color:#0b1018;}#mma7998109d1 .cluster-label span p{background-color:transparent;}#mma7998109d1 .label text,#mma7998109d1 span{fill:#211c16;color:#211c16;}#mma7998109d1 .node rect,#mma7998109d1 .node circle,#mma7998109d1 .node ellipse,#mma7998109d1 .node polygon,#mma7998109d1 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mma7998109d1 .rough-node .label text,#mma7998109d1 .node .label text,#mma7998109d1 .image-shape .label,#mma7998109d1 .icon-shape .label{text-anchor:middle;}#mma7998109d1 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mma7998109d1 .rough-node .label,#mma7998109d1 .node .label,#mma7998109d1 .image-shape .label,#mma7998109d1 .icon-shape .label{text-align:center;}#mma7998109d1 .node.clickable{cursor:pointer;}#mma7998109d1 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mma7998109d1 .arrowheadPath{fill:#0b0b0b;}#mma7998109d1 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mma7998109d1 .flowchart-link{stroke:#6c6357;fill:none;}#mma7998109d1 .edgeLabel{background-color:#ffffff;text-align:center;}#mma7998109d1 .edgeLabel p{background-color:#ffffff;}#mma7998109d1 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mma7998109d1 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mma7998109d1 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mma7998109d1 .cluster text{fill:#0b1018;}#mma7998109d1 .cluster span{color:#0b1018;}#mma7998109d1 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mma7998109d1 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mma7998109d1 rect.text{fill:none;stroke-width:0;}#mma7998109d1 .icon-shape,#mma7998109d1 .image-shape{background-color:#ffffff;text-align:center;}#mma7998109d1 .icon-shape p,#mma7998109d1 .image-shape p{background-color:#ffffff;padding:2px;}#mma7998109d1 .icon-shape .label rect,#mma7998109d1 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mma7998109d1 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mma7998109d1 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mma7998109d1 .node .neo-node{stroke:#b5521b;}#mma7998109d1 [data-look="neo"].node rect,#mma7998109d1 [data-look="neo"].cluster rect,#mma7998109d1 [data-look="neo"].node polygon{stroke:url(#mma7998109d1-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mma7998109d1 [data-look="neo"].swimlane.cluster rect{filter:none;}#mma7998109d1 [data-look="neo"].node path{stroke:url(#mma7998109d1-gradient);stroke-width:1px;}#mma7998109d1 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mma7998109d1 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mma7998109d1 [data-look="neo"].node circle{stroke:url(#mma7998109d1-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mma7998109d1 [data-look="neo"].node circle .state-start{fill:#000000;}#mma7998109d1 [data-look="neo"].icon-shape .icon{fill:url(#mma7998109d1-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mma7998109d1 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mma7998109d1-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mma7998109d1 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mma7998109d1_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mma7998109d1_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mma7998109d1_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M234.43,44L244.191,44C253.953,44,273.477,44,299.458,75.781C325.439,107.562,357.878,171.125,374.097,202.906L390.316,234.687" id="mma7998109d1-L_H_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_X_0" data-points="W3sieCI6MjM0LjQyOTY4NzUsInkiOjQ0fSx7IngiOjI5MywieSI6NDR9LHsieCI6MzkyLjEzNDYyNTYzOTkzMTc2LCJ5IjoyMzguMjV9XQ==" data-look="classic" marker-end="url(#mma7998109d1_flowchart-v2-pointEnd)"/><path d="M268,187L272.167,187C276.333,187,284.667,187,300.764,195.165C316.862,203.33,340.724,219.661,352.655,227.826L364.586,235.991" id="mma7998109d1-L_PR_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PR_X_0" data-points="W3sieCI6MjY4LCJ5IjoxODd9LHsieCI6MjkzLCJ5IjoxODd9LHsieCI6MzY3Ljg4NzM5MzExODg5MjUzLCJ5IjoyMzguMjV9XQ==" data-look="classic" marker-end="url(#mma7998109d1_flowchart-v2-pointEnd)"/><path d="M268,340.5L272.167,340.5C276.333,340.5,284.667,340.5,300.764,332.335C316.862,324.17,340.724,307.839,352.655,299.674L364.586,291.509" id="mma7998109d1-L_E_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_X_0" data-points="W3sieCI6MjY4LCJ5IjozNDAuNX0seyJ4IjoyOTMsInkiOjM0MC41fSx7IngiOjM2Ny44ODczOTMxMTg4OTI1MywieSI6Mjg5LjI1fV0=" data-look="classic" marker-end="url(#mma7998109d1_flowchart-v2-pointEnd)"/><path d="M268,483.5L272.167,483.5C276.333,483.5,284.667,483.5,305.053,451.719C325.439,419.938,357.878,356.375,374.097,324.594L390.316,292.813" id="mma7998109d1-L_O_X_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_O_X_0" data-points="W3sieCI6MjY4LCJ5Ijo0ODMuNX0seyJ4IjoyOTMsInkiOjQ4My41fSx7IngiOjM5Mi4xMzQ2MjU2Mzk5MzE3NiwieSI6Mjg5LjI1fV0=" data-look="classic" marker-end="url(#mma7998109d1_flowchart-v2-pointEnd)"/><path d="M492.297,263.75L496.464,263.75C500.63,263.75,508.964,263.75,516.63,263.75C524.297,263.75,531.297,263.75,534.797,263.75L538.297,263.75" id="mma7998109d1-L_X_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_X_C_0" data-points="W3sieCI6NDkyLjI5Njg3NSwieSI6MjYzLjc1fSx7IngiOjUxNy4yOTY4NzUsInkiOjI2My43NX0seyJ4Ijo1NDIuMjk2ODc1LCJ5IjoyNjMuNzV9XQ==" data-look="classic" marker-end="url(#mma7998109d1_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_H_X_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PR_X_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_E_X_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_O_X_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_X_C_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mma7998109d1-flowchart-H-0" data-look="classic" transform="translate(138, 44)"><rect class="basic label-container" style="" x="-96.4296875" y="-36" width="192.859375" height="72"/><g class="label" style="" transform="translate(-66.4296875, -21)"><rect/><foreignObject width="132.859375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Hardware<br />Hopper → Blackwell</p></span></div></foreignObject></g></g><g class="node default" id="mma7998109d1-flowchart-X-1" data-look="classic" transform="translate(405.1484375, 263.75)"><rect class="basic label-container" style="" x="-87.1484375" y="-25.5" width="174.296875" height="51"/><g class="label" style="" transform="translate(-57.1484375, -10.5)"><rect/><foreignObject width="114.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Tokens per dollar</p></span></div></foreignObject></g></g><g class="node default" id="mma7998109d1-flowchart-PR-2" data-look="classic" transform="translate(138, 187)"><rect class="basic label-container" style="" x="-130" y="-57" width="260" height="114"/><g class="label" style="" transform="translate(-100, -42)"><rect/><foreignObject width="200" height="84"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Precision<br />BF16 → FP8 → NVFP4 weights,<br />FP8 KV cache</p></span></div></foreignObject></g></g><g class="node default" id="mma7998109d1-flowchart-E-4" data-look="classic" transform="translate(138, 340.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Engine<br />vLLM, SGLang → TensorRT-LLM</p></span></div></foreignObject></g></g><g class="node default" id="mma7998109d1-flowchart-O-6" data-look="classic" transform="translate(138, 483.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Orchestration<br />Dynamo: disaggregation, routing</p></span></div></foreignObject></g></g><g class="node default" id="mma7998109d1-flowchart-C-9" data-look="classic" transform="translate(668.6796875, 263.75)"><rect class="basic label-container" style="" x="-126.3828125" y="-36" width="252.765625" height="72"/><g class="label" style="" transform="translate(-96.3828125, -21)"><rect/><foreignObject width="192.765625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Up to ~7× cheaper,<br />at the price of NVIDIA lock-in</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mma7998109d1-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mma7998109d1-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mma7998109d1-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>NVFP4 (2025-2026) applies to weights and activations. Microscaling: each block of weights has its own scale factor so small blocks can span different dynamic ranges without per-tensor scale loss. For activations, FP4 holds up because activations are small-range within a layer.</p>
+<p>The typical Blackwell config:</p>
+<ul>
+<li>Weights: NVFP4 (4-bit microscaling).</li>
+<li>Activations: NVFP4.</li>
+<li>KV cache: FP8.</li>
+<li>Attention accumulator: FP32 (softmax stability).</li>
+</ul>
+<h2>Idea 2 · The Blackwell-specific primitives TRT-LLM uses</h2>
+<ul>
+<li><strong>Day-0 FP4 weights</strong>: model providers ship FP4 weights directly; TRT-LLM loads without post-training conversion. No AWQ / GPTQ step for FP4.</li>
+<li><strong>Multi-token prediction (MTP)</strong>: same idea as EAGLE (Phase 17 · 05) but integrated into the TRT-LLM build.</li>
+<li><strong>Disaggregated serving</strong>: prefill and decode on separate GPU pools, KV cache transferred over NVLink or InfiniBand. Same idea as Dynamo (Phase 17 · 20).</li>
+<li><strong>All-to-all communication primitives</strong>: NVLink 5 cut MoE expert communication latency by 3x vs Hopper. TRT-LLM's MoE kernels are tuned for this.</li>
+<li><strong>NVFP4 + MXFP8 microscaling</strong>: hardware-accelerated scale-factor handling on Blackwell Tensor Cores.</li>
+</ul>
+<h2>Idea 3 · The numbers you should memorize</h2>
+<ul>
+<li>HGX B200 at $0.02/M tokens on GPT-OSS-120B via TRT-LLM.</li>
+<li>GB200 NVL72 at $0.012/M tokens via Dynamo (orchestrating TRT-LLM).</li>
+<li>H100 + vLLM ≈ $0.09/M tokens on comparable workload.</li>
+<li>2.8x throughput gain in three months of TRT-LLM updates (2026).</li>
+<li>11-15x per-GPU LLM throughput, Blackwell vs Hopper.</li>
+<li>MLPerf Inference v6.0 (April 2026): Blackwell dominates every submitted task.</li>
+</ul>
+<h2>Idea 4 · What FP4 actually costs in quality</h2>
+<p>NVFP4 is aggressive. On reasoning-heavy workloads (chain-of-thought, math, code-gen with long context), FP4 weights degrade visibly. Per-block calibration mitigates but does not eliminate. Teams shipping reasoning models often use FP8 weights + FP4 activations as a compromise, or stick to H200 with FP8 throughout.</p>
+<p>The rule: always validate task quality on your eval set before committing to NVFP4 weights.</p>
+<h2>Idea 5 · Why this is an NVIDIA-lock decision</h2>
+<p>TRT-LLM is C++ + CUDA + closed-source kernels. Models need to be compiled for a specific GPU SKU. No AMD, no Intel, no ARM. If your infra strategy is multi-vendor, TRT-LLM is a non-starter for the TRT-LLM-served tier — you can still serve from vLLM on mixed hardware. If you are NVIDIA-only, the 7x gap pays for the lock.</p>
+<h2>Idea 6 · 2026 practical recipe</h2>
+<p>For a $100M+ annual inference bill, running on Hopper + vLLM leaves 7-10x on the table. Migrate cost-dominant workloads to Blackwell + TRT-LLM + Dynamo. Keep experimentation tier on H100 + vLLM for model iteration speed. Validate quality on each NVFP4-converted model before production.</p>
+<h2>Idea 7 · The disaggregation bonus</h2>
+<p>TRT-LLM's disaggregated serving (separate prefill and decode pools) is covered in depth in Phase 17 · 20. On Blackwell, the multiplier stacks: FP4 weights × MTP speedup × disaggregated placement × cache-aware routing. The 7x number assumes this full stack.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pipeline-parallel"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>The memory-bandwidth ceiling for decode.</strong> At batch size 1, generating a token reads every active weight once. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">active</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> active parameters stored at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> bytes each and memory bandwidth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> bytes per second,</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">tokens/s</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.1963em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">active</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal">b</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>Halving <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> (16-bit → 8-bit → 4-bit) doubles the ceiling; a mixture-of-experts model reads only its active experts, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">active</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> is what counts, not the total.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A 70B dense model, one request at a time</div><div class="co-body"><ol>
+<li>H100, BF16: bandwidth about 3.35 TB/s; weights 70B × 2 bytes = 140 GB, more than one 80 GB GPU holds, so it needs at least two, but the per-token read is still 140 GB. Ceiling ≈ 3,350 / 140 ≈ 24 tokens/s.</li>
+<li>H100, FP8: 70 GB per token. Ceiling ≈ 48 tokens/s.</li>
+<li>B200, NVFP4 weights: about 8 TB/s and 35 GB per token. Ceiling ≈ 8,000 / 35 ≈ 229 tokens/s.</li>
+<li>So precision gives 2× twice over, and the hardware another 2.4×. The rest of the "7×–15×" figures quoted for Blackwell come from batching, multi-token prediction and disaggregated serving on top.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> NVFP4 can be used for the KV cache too.
+  Keys and values span a wide range; 4-bit KV loses too much. FP8 is the floor for KV cache.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A mixture-of-experts model's decode speed depends on its active parameters.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> TensorRT-LLM engines are compiled for a specific GPU model.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> NVFP4 weights are safe for every workload.
+  Reasoning and long-context code can lose several points; check on your own evaluation set.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 120B mixture-of-experts model has 36B active parameters. Before running the code below: on an H100 in FP8, roughly how many tokens per second can one request get at most?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The bandwidth ceiling, stack by stack</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">stacks = [(&quot;H100 BF16&quot;, 3.35e12, 2), (&quot;H100 FP8&quot;, 3.35e12, 1), (&quot;H200 FP8&quot;, 4.8e12, 1), (&quot;B200 NVFP4&quot;, 8.0e12, 0.5)]
+for name, active in ((&quot;70B dense&quot;, 70e9), (&quot;120B MoE, 36B active&quot;, 36e9)):
+    print(name)
+    for label, bandwidth, bytes_per in stacks:
+        print(f&quot;  {label:11s} {bandwidth / (active * bytes_per):6.0f} tokens/s ceiling&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">70B dense
+  H100 BF16       24 tokens/s ceiling
+  H100 FP8        48 tokens/s ceiling
+  H200 FP8        69 tokens/s ceiling
+  B200 NVFP4     229 tokens/s ceiling
+120B MoE, 36B active
+  H100 BF16       47 tokens/s ceiling
+  H100 FP8        93 tokens/s ceiling
+  H200 FP8       133 tokens/s ceiling
+  B200 NVFP4     444 tokens/s ceiling</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>For the MoE model on H100 FP8 the ceiling is about 93 tokens/s for one request, the same figure <code>code/main.py</code> prints. Each halving of bytes per weight doubles the ceiling, and the B200 adds its higher bandwidth. The script's B200 rows show more than this (about 658 and 1,280 tokens/s) because it also multiplies in the engine and multi-token-prediction gains; treat those as the vendor's claims, and the ceilings above as the physics.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> computes HBM footprint, decode throughput (memory-bound regime), and $/M-tokens for a model across three stacks: H100 + BF16 + vLLM, H100 + FP8 + vLLM, B200 + NVFP4/FP8 + TRT-LLM. Run it to see the compounding effect and the share of the gap each change contributes.</p>
+<p>Here is <code>code/main.py</code>, in 3 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>Stack</code>, <code>hbm_footprint_gb</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy Blackwell + TRT-LLM economics calculator — stdlib Python.
+
+Computes HBM footprint and decode throughput for a model under three stacks:
+  H100 + BF16 + vLLM
+  H100 + FP8 + vLLM
+  B200 + NVFP4 weights / FP8 KV + TRT-LLM + Dynamo
+  GB200 NVL72 + NVFP4 / FP8 + TRT-LLM + Dynamo
+
+The decode-throughput model is memory-bandwidth-limited: tokens/sec is
+proportional to HBM-bandwidth / bytes-per-token. Numbers are pedagogical
+illustrations of the shape of the 2026 Blackwell economics.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Stack:
+    name: str
+    hbm_gb: int               # per-GPU HBM
+    hbm_bw_tbs: float         # HBM bandwidth in TB/s
+    weight_bits: float        # effective weight precision
+    kv_bits: float            # KV cache precision
+    mtp_factor: float         # 1.0 = no draft, 1.8 = MTP on
+    disagg_factor: float      # additional throughput from disaggregation
+    price_per_gpu_hour: float
+
+
+STACKS = [
+    Stack(&quot;H100 + BF16 + vLLM&quot;,           80, 3.35,  16, 16, 1.0,  1.0,  2.50),
+    Stack(&quot;H100 + FP8 + vLLM&quot;,            80, 3.35,   8,  8, 1.0,  1.0,  2.50),
+    Stack(&quot;H200 + FP8 + vLLM&quot;,           141, 4.80,   8,  8, 1.0,  1.0,  3.50),
+    Stack(&quot;B200 + NVFP4 + FP8 + TRT-LLM&quot;, 192, 8.00,   4,  8, 1.8,  1.6,  4.80),
+    Stack(&quot;GB200 NVL72 + TRT-LLM + Dyn&quot;, 192, 8.00,   4,  8, 1.8,  2.5,  6.20),
+]
+
+
+def hbm_footprint_gb(params_b: float, active_b: float, seq_len: int, stack: Stack) -&gt; tuple[float, float]:
+    weight_gb = params_b * stack.weight_bits / 8
+    # KV cache for a typical head config: num_layers * 2 * num_kv_heads * head_dim * seq_len * bytes/element
+    # Use a representative 70B shape scaled by active param size
+    layers = 64 * (active_b / 35.0)**0.5
+    kv_heads = 8
+    head_dim = 128
+    kv_gb = layers * 2 * kv_heads * head_dim * seq_len * (stack.kv_bits / 8) / 1e9
+    return weight_gb, kv_gb
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>decode_throughput</code>, <code>cost_per_million_tokens</code>, <code>print_stack</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def decode_throughput(active_b: float, stack: Stack) -&gt; float:
+    &quot;&quot;&quot;Tokens per second per GPU, memory-bandwidth-limited.
+    Each decoded token reads `active_b * weight_bits/8` bytes of weights.
+    &quot;&quot;&quot;
+    bytes_per_token = active_b * 1e9 * stack.weight_bits / 8
+    raw_tokens_per_s = stack.hbm_bw_tbs * 1e12 / bytes_per_token
+    return raw_tokens_per_s * stack.mtp_factor * stack.disagg_factor
+
+
+def cost_per_million_tokens(active_b: float, stack: Stack) -&gt; float:
+    tps = decode_throughput(active_b, stack)
+    tokens_per_hour = tps * 3600
+    return stack.price_per_gpu_hour / tokens_per_hour * 1e6
+
+
+def print_stack(params_b: float, active_b: float, seq_len: int = 8192) -&gt; None:
+    print(f&quot;Model: {params_b}B total, {active_b}B active, {seq_len:,} tokens context&quot;)
+    print(&quot;-&quot; * 90)
+    print(f&quot;{'stack':40} {'W GB':&gt;7} {'KV GB':&gt;7} {'tok/s':&gt;9} {'$/M tok':&gt;10}&quot;)
+    for s in STACKS:
+        w, kv = hbm_footprint_gb(params_b, active_b, seq_len, s)
+        tps = decode_throughput(active_b, s)
+        cost = cost_per_million_tokens(active_b, s)
+        fits = &quot;&quot; if (w + kv) &lt;= s.hbm_gb else &quot;  (multi-GPU)&quot;
+        print(f&quot;{s.name:40} {w:7.1f} {kv:7.2f} {tps:9.0f} {cost:10.4f}{fits}&quot;)
+    print()
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 90)
+    print(&quot;TOY BLACKWELL + TRT-LLM ECONOMICS: memory-bandwidth-limited decode&quot;)
+    print(&quot;=&quot; * 90)
+    print()
+
+    print_stack(70, 70)    # dense 70B
+    print_stack(120, 36)   # GPT-OSS-120B MoE (30% active)
+    print_stack(405, 405)  # Llama 3.1 405B dense
+    print_stack(671, 37)   # DeepSeek-V3 scale MoE
+
+    print(&quot;=&quot; * 90)
+    print(&quot;KEY FINDING&quot;)
+    print(&quot;-&quot; * 90)
+    print(&quot;  The 7x cost gap stacks from four sources:&quot;)
+    print(&quot;    1. HBM bandwidth (H100 3.35 TB/s vs B200 8.0 TB/s) ~2.4x&quot;)
+    print(&quot;    2. NVFP4 weights (half the bytes per token)       ~2.0x&quot;)
+    print(&quot;    3. MTP draft (~1.8x on accepted tokens)           ~1.8x&quot;)
+    print(&quot;    4. Disaggregation (Dynamo: ~1.6-2.5x)             ~2.0x&quot;)
+    print(&quot;  Product ~14x raw, closer to 7x after overhead and real-traffic alpha.&quot;)
+    print(&quot;  Validate NVFP4 quality before migrating reasoning-heavy workloads.&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">==========================================================================================
+TOY BLACKWELL + TRT-LLM ECONOMICS: memory-bandwidth-limited decode
+==========================================================================================
+
+Model: 70B total, 70B active, 8,192 tokens context
+------------------------------------------------------------------------------------------
+stack                                       W GB   KV GB     tok/s    $/M tok
+H100 + BF16 + vLLM                         140.0    3.04        24    29.0216  (multi-GPU)
+H100 + FP8 + vLLM                           70.0    1.52        48    14.5108
+H200 + FP8 + vLLM                           70.0    1.52        69    14.1782
+B200 + NVFP4 + FP8 + TRT-LLM                35.0    1.52       658     2.0255
+GB200 NVL72 + TRT-LLM + Dyn                 35.0    1.52      1029     1.6744
+
+Model: 120B total, 36B active, 8,192 tokens context
+------------------------------------------------------------------------------------------
+stack                                       W GB   KV GB     tok/s    $/M tok
+H100 + BF16 + vLLM                         240.0    2.18        47    14.9254  (multi-GPU)
+H100 + FP8 + vLLM                          120.0    1.09        93     7.4627  (multi-GPU)
+H200 + FP8 + vLLM                          120.0    1.09       133     7.2917
+B200 + NVFP4 + FP8 + TRT-LLM                60.0    1.09      1280     1.0417
+GB200 NVL72 + TRT-LLM + Dyn                 60.0    1.09      2000     0.8611
+
+Model: 405B total, 405B active, 8,192 tokens context
+------------------------------------------------------------------------------------------
+stack                                       W GB   KV GB     tok/s    $/M tok
+H100 + BF16 + vLLM                         810.0    7.31         4   167.9104  (multi-GPU)
+H100 + FP8 + vLLM                          405.0    3.65         8    83.9552  (multi-GPU)
+H200 + FP8 + vLLM                          405.0    3.65        12    82.0312  (multi-GPU)
+B200 + NVFP4 + FP8 + TRT-LLM               202.5    3.65       114    11.7188  (multi-GPU)
+GB200 NVL72 + TRT-LLM + Dyn                202.5    3.65       178     9.6875  (multi-GPU)
+
+Model: 671B total, 37B active, 8,192 tokens context
+------------------------------------------------------------------------------------------
+stack                                       W GB   KV GB     tok/s    $/M tok
+H100 + BF16 + vLLM                        1342.0    2.21        45    15.3400  (multi-GPU)
+H100 + FP8 + vLLM                          671.0    1.10        91     7.6700  (multi-GPU)
+…
+(14 more lines)</code></pre></div></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team converts its reasoning model to NVFP4 weights and NVFP4 KV cache to fit longer contexts. Throughput jumps; their MATH score drops 9 points. Which choice caused most of the drop, and what is the usual configuration? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Decode speed per request is capped by bandwidth ÷ bytes of active weights.</li>
+<li>Precision, hardware, engine and orchestration multiply; Blackwell + TRT-LLM + Dynamo is the cheapest stack in 2026.</li>
+<li>NVFP4 for weights and activations, FP8 for KV cache, FP32 for attention accumulation.</li>
+<li>Validate quality on your own evals before shipping 4-bit weights.</li>
+<li>The price is lock-in: TensorRT-LLM runs only on NVIDIA GPUs.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-quantization"><span class="t" style="--cs-hue:30">QF</span>Cheat sheet · Quantization Formats Compared</a><a href="#cs-serving-engines-compared"><span class="t" style="--cs-hue:262">SN</span>Cheat sheet · Serving Engines Compared</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-trtllm-blackwell-advisor.md</code>. Given a workload, model size, and annual token volume, it decides whether the Blackwell + TRT-LLM stack is worth the NVIDIA-lock.</p>
+<p><strong><code>outputs/skill-trtllm-blackwell-advisor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: trtllm-blackwell-advisor
+description: Decide whether Blackwell + TensorRT-LLM + Dynamo is worth the NVIDIA-lock for a given workload and budget.
+version: 1.0.0
+phase: 17
+lesson: 07
+tags: [tensorrt-llm, blackwell, b200, gb200, nvfp4, fp8, dynamo]
+---
+
+Given a workload (model size, active params, annual token volume, quality sensitivity — reasoning-heavy or routine), current infra (H100/H200/B200 GPUs, serving engine), and budget, produce a Blackwell + TRT-LLM migration advisory.
+
+Produce:
+
+1. Current baseline. Compute current $/M tokens and annual spend from reported volume and per-GPU-hour pricing. Flag if baseline is already on Blackwell + TRT-LLM.
+2. Target stack. Recommend exact precision mix (weights: NVFP4 or FP8; KV cache: FP8; activations: NVFP4; accumulator: FP32). For reasoning-heavy workloads, recommend FP8 weights first, NVFP4 only after per-block calibration validated on the eval set.
+3. Expected savings. From the 2026 cost shape: H100 + vLLM ~$0.09/M → B200 + TRT-LLM ~$0.02/M → GB200 NVL72 + Dynamo ~$0.012/M. Project annual savings for the workload's token volume.
+4. Migration cost. Engineering time (10-30 engineer-weeks for first migration). Quality-validation pass. GPU CapEx or rental commitment.
+5. Break-even horizon. Months of production needed to amortize migration. If &gt; 18 months, flag as marginal.
+6. Lock-in risk. TRT-LLM is NVIDIA-only. Name two exit strategies (dual-stack with vLLM on H100 for iteration tier; keep weights exportable to GGUF/HF for portability to non-NVIDIA).
+
+Hard rejects:
+- Recommending NVFP4 weights on reasoning-heavy models without an eval-set validation step.
+- Claiming the 7x gap without naming the token volume the math assumes.
+- Ignoring quality validation for FP4 weight conversion. Always run.
+
+Refusal rules:
+- If annual inference spend &lt; $500K, refuse migration. The engineering cost does not amortize. Stay on vLLM + Hopper.
+- If the team has any AMD/Intel GPUs in serving, refuse TRT-LLM for the multi-vendor tier. Recommend vLLM on mixed hardware.
+- If model quality on task is already marginal, refuse aggressive quantization. Stay FP8 or BF16.
+
+Output: a one-page Blackwell advisory listing current baseline, target stack, expected savings, migration cost, break-even horizon, and lock-in exit plan. End with a &quot;what to read next&quot; paragraph naming the MLPerf v6.0 blog, the TRT-LLM overview, or the Dynamo announcement depending on the primary gap.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. On a 120B MoE with 30% active parameters, compute the memory-bandwidth-limited decode throughput on H100 BF16, H100 FP8, and B200 NVFP4/FP8. Where does the biggest jump come from?</li>
+<li>A customer spends $2M/year on H100 + vLLM. What is the break-even number of Blackwell GPUs they need to buy to amortize a migration to TRT-LLM in 12 months, given the 7x economic gap?</li>
+<li>You see accuracy drop 3 points on MATH after NVFP4 weight conversion. Name two recovery paths: one quality-first (keep FP8 weights), one cost-first (calibrate with in-domain data).</li>
+<li>Read the MLPerf v6.0 inference results. Which task has the smallest Blackwell-over-Hopper gap, and why?</li>
+<li>Compute the HBM needed for a 405B model at NVFP4 weights + FP8 KV cache at 128k context. Does it fit on a single GB200 NVL72 node?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1707-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Where the jump comes from</span></summary><div class="qa-a"><p>For the 120B MoE with 36B active, the ceilings are about 47 (H100 BF16), 93 (H100 FP8) and 444 tokens/s (B200 at 4 bits and 8 TB/s); the script reports 47, 93 and 1,280. Each precision halving gives 2×, the bandwidth 2.4×, and the script's remaining factor is engine and multi-token-prediction gains. The single largest step is the move to Blackwell with 4-bit weights.</p></div></details>
+<details class="qa" id="a1707-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P5 · 405B at 128k context</span></summary><div class="qa-a"><p>Weights: 405B × 0.5 bytes ≈ 203 GB. KV cache for Llama 3.1 405B (126 layers, 8 KV heads of 128) in FP8: 2 × 126 × 8 × 128 × 1 byte ≈ 258 KB per token, so 128k tokens ≈ 33 GB per sequence. About 236 GB for one sequence, well within a GB200 NVL72 rack (72 GPUs, about 13 TB of HBM), and even within two B200s.</p></div></details>
+<details class="qa" id="a1707-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · KV cache in 4 bits</span></summary><div class="qa-a"><p>Most of the loss comes from the 4-bit KV cache: attention keys and values span a wide range, and rounding them to 4 bits distorts which earlier tokens get attention, which long reasoning chains depend on. Keep KV in FP8 (and the attention accumulator in FP32); if quality still drops, use FP8 weights for the reasoning model.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://developer.nvidia.com/blog/nvidia-blackwell-ultra-sets-new-inference-records-in-mlperf-debut/">NVIDIA — Blackwell Ultra MLPerf Inference v6.0</a> — April 2026 MLPerf results.</li>
+<li><a href="https://developer.nvidia.com/blog/delivering-massive-performance-leaps-for-mixture-of-experts-inference-on-nvidia-blackwell/">NVIDIA — MoE Inference on Blackwell</a> — NVLink 5 all-to-all and MoE kernels.</li>
+<li><a href="https://nvidia.github.io/TensorRT-LLM/overview.html">TensorRT-LLM Overview</a> — official engine documentation.</li>
+<li><a href="https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/">NVIDIA — Introducing Dynamo</a> — disaggregated orchestration above TRT-LLM.</li>
+<li><a href="https://mlcommons.org/benchmarks/inference-datacenter/">MLPerf Inference</a> — the benchmark suite that publishes Blackwell numbers.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1707" id="done-a1707">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1707" id="undo-a1707" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1706"><span class="pn-dir">Previous</span><span class="pn-t">17.6 · Prefix-Cache Serving — RadixAttention and KV Reuse</span></a><a class="pn next" href="#a1708"><span class="pn-dir">Next</span><span class="pn-t">17.8 · Inference Metrics — TTFT, TPOT, ITL, Goodput, P99</span></a></div></footer>

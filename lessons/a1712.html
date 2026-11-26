@@ -1,0 +1,363 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · Infrastructure &amp; Production</a></nav><h1>Edge Inference — Apple Neural Engine, Qualcomm Hexagon, WebGPU/WebLLM, Jetson</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.12</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1712" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why mobile LLM inference is memory-bandwidth-bound and compute is secondary.</li>
+<li>Enumerate the four edge targets (Apple ANE, Qualcomm Hexagon, WebGPU/WebLLM, NVIDIA Jetson) and match each to a use case.</li>
+<li>Name the 2026 WebGPU coverage gap (Firefox Android catching up) and the Safari iOS 26 landing.</li>
+<li>Pick a quantization format per target (Core ML INT4 + FP16 for ANE, QNN INT8/INT4 for Hexagon, WebGPU Q4 for browser, NVFP4 for Jetson Thor).</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 17 · 04 (Serving Engine Internals), Phase 17 · 09 (Production Quantization)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy bandwidth-bound decode simulator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>The core edge constraint is memory bandwidth, not compute. Mobile DRAM sits at 50-90 GB/s; datacenter HBM3 clears 2-3 TB/s — a 30-50x gap. Decode is memory-bound so the gap is decisive. In 2026 the landscape splits four ways. Apple M4/A18 Neural Engine peaks at 38 TOPS with unified memory (no CPU↔NPU copy). Qualcomm Snapdragon X Elite / 8 Gen 4 Hexagon hits 45 TOPS. WebGPU + WebLLM runs Llama 3.1 8B (Q4) at ~41 tok/s on M3 Max (roughly 70-80% of native); 17.6k GitHub stars, OpenAI-compatible API, ~70-75% mobile</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ANE</td>
+<td>"Apple neural engine"</td>
+<td>On-device NPU in M-series and A-series; unified memory</td>
+</tr>
+<tr>
+<td>Hexagon</td>
+<td>"Qualcomm NPU"</td>
+<td>Snapdragon NPU; QNN SDK for access</td>
+</tr>
+<tr>
+<td>WebGPU</td>
+<td>"browser GPU"</td>
+<td>W3C-standardized browser GPU API; Chrome/Safari 2026</td>
+</tr>
+<tr>
+<td>WebLLM</td>
+<td>"browser LLM runtime"</td>
+<td>MLC-LLM project; Apache 2.0; OpenAI-compatible JS</td>
+</tr>
+<tr>
+<td>Jetson</td>
+<td>"NVIDIA edge"</td>
+<td>Orin Nano / AGX / Thor / T4000 family</td>
+</tr>
+<tr>
+<td>TRT Edge-LLM</td>
+<td>"edge TensorRT"</td>
+<td>2026 edge port of TensorRT-LLM; EAGLE-3 + NVFP4</td>
+</tr>
+<tr>
+<td>Unified memory</td>
+<td>"shared pool"</td>
+<td>CPU and NPU see same RAM; no copy overhead</td>
+</tr>
+<tr>
+<td>Bandwidth-bound</td>
+<td>"memory limited"</td>
+<td>Decode gated by bytes/sec reading weights</td>
+</tr>
+<tr>
+<td>Core ML</td>
+<td>"Apple conversion"</td>
+<td>Apple framework for ANE-native models</td>
+</tr>
+<tr>
+<td>QNN</td>
+<td>"Qualcomm stack"</td>
+<td>Qualcomm Neural Network SDK</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p><strong>Edge inference</strong> means running the model on the user's own device: a phone, a laptop, a browser tab or a small board such as NVIDIA Jetson. It keeps data private, works offline and removes network delay. The limit is <strong>memory bandwidth</strong>, how fast the device can read memory. Every generated token reads all the model's weights once, so a phone that reads 60 GB a second can never generate more than 60 GB ÷ model size tokens a second, whatever its chip's TOPS rating says. Each platform has its own route to its fastest unit: Core ML for Apple's Neural Engine, Qualcomm's QNN for Snapdragon, WebGPU for browsers, TensorRT for Jetson. Small, 4-bit models and short contexts are the rule.</p></div></aside>
+<p>A customer wants an on-device chatbot: voice-first, private-by-default, works offline. On a MacBook Pro M3 Max, Llama 3.1 8B Q4 runs at ~55 tok/s — fine. On an iPhone 16 Pro, the same model runs at 3 tok/s — not fine. On a mid-range Android with Snapdragon 8 Gen 3, 7 tok/s. In the browser via WebGPU on Chrome Android v121+, 4-8 tok/s depending on the device.</p>
+<p>The throughput variance is not a porting issue. It is the bandwidth gap times the quantization format times whether the NPU is accessible from user-space. Edge inference in 2026 is four different problems with four different solutions.</p>
+<h2>Idea 1 · Bandwidth is the real ceiling</h2>
+<p>Decode reads the full set of weights for every token. One 7B model in Q4 is 3.5 GB. Reading 3.5 GB at 50 GB/s takes 70 ms — a theoretical ceiling of ~14 tok/s. At 90 GB/s (high-end mobile DRAM) the ceiling moves to ~25 tok/s. No amount of compute helps below this number.</p>
+<figure class="diagram mmfig" data-mmd="a1712" data-h="916f266dbb"><div class="dg-scroll"><svg class="dg mm" id="mm916f266dbb" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 566.641px; background-color: transparent;" viewBox="0 0 566.640625 540" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm916f266dbb{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm916f266dbb .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm916f266dbb .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm916f266dbb .error-icon{fill:#f4efe7;}#mm916f266dbb .error-text{fill:#0b1018;stroke:#0b1018;}#mm916f266dbb .edge-thickness-normal{stroke-width:1px;}#mm916f266dbb .edge-thickness-thick{stroke-width:3.5px;}#mm916f266dbb .edge-pattern-solid{stroke-dasharray:0;}#mm916f266dbb .edge-thickness-invisible{stroke-width:0;fill:none;}#mm916f266dbb .edge-pattern-dashed{stroke-dasharray:3;}#mm916f266dbb .edge-pattern-dotted{stroke-dasharray:2;}#mm916f266dbb .marker{fill:#6c6357;stroke:#6c6357;}#mm916f266dbb .marker.cross{stroke:#6c6357;}#mm916f266dbb svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm916f266dbb p{margin:0;}#mm916f266dbb .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm916f266dbb .cluster-label text{fill:#0b1018;}#mm916f266dbb .cluster-label span{color:#0b1018;}#mm916f266dbb .cluster-label span p{background-color:transparent;}#mm916f266dbb .label text,#mm916f266dbb span{fill:#211c16;color:#211c16;}#mm916f266dbb .node rect,#mm916f266dbb .node circle,#mm916f266dbb .node ellipse,#mm916f266dbb .node polygon,#mm916f266dbb .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm916f266dbb .rough-node .label text,#mm916f266dbb .node .label text,#mm916f266dbb .image-shape .label,#mm916f266dbb .icon-shape .label{text-anchor:middle;}#mm916f266dbb .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm916f266dbb .rough-node .label,#mm916f266dbb .node .label,#mm916f266dbb .image-shape .label,#mm916f266dbb .icon-shape .label{text-align:center;}#mm916f266dbb .node.clickable{cursor:pointer;}#mm916f266dbb .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm916f266dbb .arrowheadPath{fill:#0b0b0b;}#mm916f266dbb .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm916f266dbb .flowchart-link{stroke:#6c6357;fill:none;}#mm916f266dbb .edgeLabel{background-color:#ffffff;text-align:center;}#mm916f266dbb .edgeLabel p{background-color:#ffffff;}#mm916f266dbb .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm916f266dbb .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm916f266dbb .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm916f266dbb .cluster text{fill:#0b1018;}#mm916f266dbb .cluster span{color:#0b1018;}#mm916f266dbb div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm916f266dbb .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm916f266dbb rect.text{fill:none;stroke-width:0;}#mm916f266dbb .icon-shape,#mm916f266dbb .image-shape{background-color:#ffffff;text-align:center;}#mm916f266dbb .icon-shape p,#mm916f266dbb .image-shape p{background-color:#ffffff;padding:2px;}#mm916f266dbb .icon-shape .label rect,#mm916f266dbb .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm916f266dbb .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm916f266dbb .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm916f266dbb .node .neo-node{stroke:#b5521b;}#mm916f266dbb [data-look="neo"].node rect,#mm916f266dbb [data-look="neo"].cluster rect,#mm916f266dbb [data-look="neo"].node polygon{stroke:url(#mm916f266dbb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm916f266dbb [data-look="neo"].swimlane.cluster rect{filter:none;}#mm916f266dbb [data-look="neo"].node path{stroke:url(#mm916f266dbb-gradient);stroke-width:1px;}#mm916f266dbb [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm916f266dbb [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm916f266dbb [data-look="neo"].node circle{stroke:url(#mm916f266dbb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm916f266dbb [data-look="neo"].node circle .state-start{fill:#000000;}#mm916f266dbb [data-look="neo"].icon-shape .icon{fill:url(#mm916f266dbb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm916f266dbb [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm916f266dbb-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm916f266dbb :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm916f266dbb_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm916f266dbb_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm916f266dbb_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M413.391,69.5L413.391,75.417C413.391,81.333,413.391,93.167,402.884,103.016C392.377,112.866,371.363,120.732,360.856,124.665L350.35,128.598" id="mm916f266dbb-L_D_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_C_0" data-points="W3sieCI6NDEzLjM5MDYyNSwieSI6NjkuNX0seyJ4Ijo0MTMuMzkwNjI1LCJ5IjoxMDV9LHsieCI6MzQ2LjYwMzQxODkzNTY0MzU2LCJ5IjoxMzB9XQ==" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M143.57,80L143.57,84.167C143.57,88.333,143.57,96.667,154.077,104.766C164.584,112.866,185.598,120.732,196.105,124.665L206.611,128.598" id="mm916f266dbb-L_S_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_C_0" data-points="W3sieCI6MTQzLjU3MDMxMjUsInkiOjgwfSx7IngiOjE0My41NzAzMTI1LCJ5IjoxMDV9LHsieCI6MjEwLjM1NzUxODU2NDM1NjQ0LCJ5IjoxMzB9XQ==" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M344.227,181L354.969,185.167C365.712,189.333,387.198,197.667,398.011,205.417C408.824,213.167,408.965,220.334,409.035,223.917L409.105,227.501" id="mm916f266dbb-L_C_P_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_P_0" data-points="W3sieCI6MzQ0LjIyNjYwMTE3NTc0MjYsInkiOjE4MX0seyJ4Ijo0MDguNjgzNTkzNzUsInkiOjIwNn0seyJ4Ijo0MDkuMTgzNTkzNzUsInkiOjIzMS41fV0=" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M358.662,267.5L341.973,273.333C325.283,279.167,291.903,290.833,260.825,305.728C229.747,320.623,200.971,338.746,186.583,347.807L172.195,356.868" id="mm916f266dbb-L_P_SM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_SM_0" data-points="W3sieCI6MzU4LjY2MjQxOTY4NDU3OTQ1LCJ5IjoyNjcuNX0seyJ4IjoyNTguNTIzNDM3NSwieSI6MzAyLjV9LHsieCI6MTY4LjgxMDMwODY4OTAyNDQsInkiOjM1OX1d" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M123.914,359L122.287,349.583C120.66,340.167,117.406,321.333,115.779,303C114.152,284.667,114.152,266.833,114.152,250.75C114.152,234.667,114.152,220.333,127.074,209.196C139.995,198.058,165.837,190.117,178.758,186.146L191.679,182.175" id="mm916f266dbb-L_SM_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SM_C_0" data-points="W3sieCI6MTIzLjkxNDQxOTc3ODk2MzQyLCJ5IjozNTl9LHsieCI6MTE0LjE1MjM0Mzc1LCJ5IjozMDIuNX0seyJ4IjoxMTQuMTUyMzQzNzUsInkiOjI0OX0seyJ4IjoxMTQuMTUyMzQzNzUsInkiOjIwNn0seyJ4IjoxOTUuNTAyOTAwNjgwNjkzMDcsInkiOjE4MX1d" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M415.898,267.5L418.022,273.333C420.146,279.167,424.393,290.833,426.517,301.917C428.641,313,428.641,323.5,428.641,328.75L428.641,334" id="mm916f266dbb-L_P_RT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_RT_0" data-points="W3sieCI6NDE1Ljg5ODEwODkzNjkxNTksInkiOjI2Ny41fSx7IngiOjQyOC42NDA2MjUsInkiOjMwMi41fSx7IngiOjQyOC42NDA2MjUsInkiOjMzOH1d" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/><path d="M428.641,431L428.641,435.167C428.641,439.333,428.641,447.667,428.641,455.333C428.641,463,428.641,470,428.641,473.5L428.641,477" id="mm916f266dbb-L_RT_CTX_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RT_CTX_0" data-points="W3sieCI6NDI4LjY0MDYyNSwieSI6NDMxfSx7IngiOjQyOC42NDA2MjUsInkiOjQ1Nn0seyJ4Ijo0MjguNjQwNjI1LCJ5Ijo0ODF9XQ==" data-look="classic" marker-end="url(#mm916f266dbb_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_D_C_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_C_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C_P_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(258.55041, 302.49057)"><g class="label" data-id="L_P_SM_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SM_C_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(428.640625, 302.5)"><g class="label" data-id="L_P_RT_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RT_CTX_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm916f266dbb-flowchart-D-0" data-look="classic" transform="translate(413.390625, 44)"><rect class="basic label-container" style="" x="-125.3671875" y="-25.5" width="250.734375" height="51"/><g class="label" style="" transform="translate(-95.3671875, -10.5)"><rect/><foreignObject width="190.734375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Device memory bandwidth B</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-C-1" data-look="classic" transform="translate(278.48046875, 155.5)"><rect class="basic label-container" style="" x="-110.0234375" y="-25.5" width="220.046875" height="51"/><g class="label" style="" transform="translate(-80.0234375, -10.5)"><rect/><foreignObject width="160.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Ceiling = B ÷ model size</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-S-2" data-look="classic" transform="translate(143.5703125, 44)"><rect class="basic label-container" style="" x="-94.453125" y="-36" width="188.90625" height="72"/><g class="label" style="" transform="translate(-64.453125, -21)"><rect/><foreignObject width="128.90625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Model size S<br />parameters × bytes</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-P-5" data-look="classic" transform="translate(408.68359375, 249)"><polygon points="9,0 112.828125,0 121.828125,-18 112.828125,-36 9,-36 0,-18" class="label-container" transform="translate(-60.9140625,18)"/><g class="label" style="" transform="translate(-44.4140625, -10.5)"><rect/><foreignObject width="88.828125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Fast enough?</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-SM-7" data-look="classic" transform="translate(128.3203125, 384.5)"><rect class="basic label-container" style="" x="-120.3203125" y="-25.5" width="240.640625" height="51"/><g class="label" style="" transform="translate(-90.3203125, -10.5)"><rect/><foreignObject width="180.640625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Smaller model or fewer bits</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-RT-11" data-look="classic" transform="translate(428.640625, 384.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Use the device's native path<br />Core ML, QNN, WebGPU, TensorRT</p></span></div></foreignObject></g></g><g class="node default" id="mm916f266dbb-flowchart-CTX-13" data-look="classic" transform="translate(428.640625, 506.5)"><rect class="basic label-container" style="" x="-100.21875" y="-25.5" width="200.4375" height="51"/><g class="label" style="" transform="translate(-70.21875, -10.5)"><rect/><foreignObject width="140.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Cap context at 4k–8k</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm916f266dbb-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm916f266dbb-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm916f266dbb-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>Datacenter HBM3 at 3 TB/s clears the same 3.5 GB in 1.2 ms — ceiling is 830 tok/s. Same model, same weights. Different memory subsystem.</p>
+<h2>Idea 2 · Apple Neural Engine (M4 / A18)</h2>
+<ul>
+<li>Up to 38 TOPS. Unified memory (CPU and ANE share the same pool) — no copy overhead.</li>
+<li>Access via Core ML + <code>.mlmodel</code> compiled models, or via Metal Performance Shaders (MPS) through PyTorch.</li>
+<li>Llama.cpp Metal backend uses MPS, not ANE directly; native ANE requires Core ML conversion.</li>
+<li>Best practical path for iOS apps in 2026: Core ML with INT4 weights + FP16 activations.</li>
+</ul>
+<h2>Idea 3 · Qualcomm Hexagon (Snapdragon X Elite / 8 Gen 4)</h2>
+<ul>
+<li>Up to 45 TOPS. Integrated with CPU and GPU in the SoC but separate memory domain.</li>
+<li>QNN (Qualcomm Neural Network) SDK and AI Hub provide conversion from PyTorch/ONNX.</li>
+<li>Chat templates, Llama 3.2, Phi-3 all ship as first-class artifacts on AI Hub.</li>
+</ul>
+<h2>Idea 4 · Intel / AMD NPUs (Lunar Lake, Ryzen AI 300)</h2>
+<ul>
+<li>40-50 TOPS. Software lags behind Apple/Qualcomm; OpenVINO is improving but niche.</li>
+<li>Best for Windows ARM copilot apps; native on AMD/Intel desktops for local-first.</li>
+</ul>
+<h2>Idea 5 · WebGPU + WebLLM</h2>
+<ul>
+<li>Run models in the browser via WebGPU compute shaders; no install.</li>
+<li>Llama 3.1 8B Q4 at ~41 tok/s on M3 Max — roughly 70-80% of native via same backend.</li>
+<li>17.6k GitHub stars on WebLLM; OpenAI-compatible JS API; Apache 2.0.</li>
+<li>2026 coverage: Chrome Android v121+, Safari iOS 26 GA, Firefox Android still catching up. Overall ~70-75% mobile coverage.</li>
+</ul>
+<h2>Idea 6 · NVIDIA Jetson family</h2>
+<ul>
+<li>Orin Nano Super (8GB): fits Llama 3.2 3B, Phi-3 at good tok/s.</li>
+<li>AGX Orin: runs gpt-oss-20b via vLLM at ~40 tok/s.</li>
+<li>Thor / T4000 (JetPack 7.1): 2x AGX Orin performance, EAGLE-3 and NVFP4 supported.</li>
+<li>TensorRT Edge-LLM (2026) supports EAGLE-3 speculative decoding, NVFP4 weights, chunked prefill — the datacenter optimizations ported to edge.</li>
+</ul>
+<h2>Idea 7 · Quantization choice per target</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Target</th>
+<th>Format</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apple ANE</td>
+<td>INT4 weights + FP16 activations</td>
+<td>Core ML conversion path</td>
+</tr>
+<tr>
+<td>Qualcomm Hexagon</td>
+<td>QNN INT8 / INT4</td>
+<td>AI Hub converters</td>
+</tr>
+<tr>
+<td>WebGPU / WebLLM</td>
+<td>Q4 MLC (q4f16_1)</td>
+<td>Use <code>mlc_llm convert_weight</code> + compiled <code>.wasm</code>; GGUF is not supported</td>
+</tr>
+<tr>
+<td>Jetson Orin Nano</td>
+<td>Q4 GGUF or TRT-LLM INT4</td>
+<td>Memory-bound</td>
+</tr>
+<tr>
+<td>Jetson AGX / Thor</td>
+<td>NVFP4 + FP8 KV</td>
+<td>Edge-LLM path</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Idea 8 · The long-context trap on edge</h2>
+<p>Llama 3.1's 128K context is a datacenter feature. On a phone with 8 GB RAM, 4 GB model + 2 GB KV cache for 32K tokens + OS overhead = OOM. Edge deployments keep context at 4K-8K unless aggressive KV quantization (Q4 KV) is accepted.</p>
+<h2>Idea 9 · Voice is the killer app</h2>
+<p>Voice agents are latency-sensitive (first token &lt; 500 ms). Local inference eliminates network latency entirely. Combine with speech-to-text (Whisper Turbo variants run on edge) and edge inference becomes the production-quality voice loop.</p>
+<h2>Idea 10 · Numbers you should remember</h2>
+<ul>
+<li>Apple M4 / A18 ANE: 38 TOPS.</li>
+<li>Qualcomm Hexagon SD X Elite: 45 TOPS.</li>
+<li>WebLLM M3 Max: ~41 tok/s on Llama 3.1 8B Q4.</li>
+<li>AGX Orin: ~40 tok/s on gpt-oss-20b via vLLM.</li>
+<li>Datacenter-edge bandwidth gap: 30-50x.</li>
+<li>WebGPU mobile coverage: ~70-75% (Firefox Android lagging).</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="edge-bandwidth-pipe"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Decode ceiling on any device.</strong> With bandwidth <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> and model size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span></span></span></span> in bytes,</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">tokens/s</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05764em;">S</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">efficiency</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">observed tokens/s</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>Efficiency tells you whether to fix the runtime (low efficiency) or to shrink the model (efficiency already near 100%).</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">An 8B model on an iPhone</div><div class="co-body"><p>Llama 3.1 8B in Q4 is about 4.7 GB. An A18 phone reads about 60 GB/s.</p>
+<ol>
+<li>Ceiling: 60 / 4.7 ≈ 12.8 tokens/s. The lesson observes about 8: efficiency 63%.</li>
+<li>In BF16 (about 16 GB, more than the phone's RAM even before the OS) it could not run at all; in INT8 (about 9.4 GB) the ceiling is about 6.4 tokens/s.</li>
+<li>A 3B model in Q4 (about 1.8 GB): ceiling about 33 tokens/s, fast enough for voice.</li>
+<li>Context: 32k tokens of KV cache for the 8B model at FP16 is about 4 GB more, and the phone runs out of memory. Keep 4k–8k.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> On edge devices, memory bandwidth sets the decode ceiling more than TOPS.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> llama.cpp on a Mac uses the Apple Neural Engine.
+  Its Metal backend uses the GPU through MPS; the Neural Engine needs a Core ML conversion.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> WebLLM needs MLC-compiled weights, not GGUF.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A 128k context is fine on a phone once the model is 4-bit.
+  The KV cache grows with context and does not shrink with weight quantization.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: which gains more tokens per second on a 77 GB/s Snapdragon phone, quantizing an 8B model from Q4 to Q3, or switching from the 8B model to a 3B one at Q4?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Bandwidth ÷ size, on three devices</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">devices = {&quot;iPhone (A18)&quot;: 60, &quot;Snapdragon 8 Gen 3&quot;: 77, &quot;M4 MacBook Air&quot;: 120}
+models = {&quot;8B Q4&quot;: 4.7, &quot;8B Q3&quot;: 3.6, &quot;3B Q4&quot;: 1.8, &quot;1B Q4&quot;: 0.7}
+print(f&quot;{'':20s}&quot; + &quot;&quot;.join(f&quot;{m:&gt;9s}&quot; for m in models))
+for dev, bw in devices.items():
+    print(f&quot;{dev:20s}&quot; + &quot;&quot;.join(f&quot;{bw / size:9.1f}&quot; for size in models.values()))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">                        8B Q4    8B Q3    3B Q4    1B Q4
+iPhone (A18)             12.8     16.7     33.3     85.7
+Snapdragon 8 Gen 3       16.4     21.4     42.8    110.0
+M4 MacBook Air           25.5     33.3     66.7    171.4</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>On the Snapdragon phone, Q4 → Q3 raises the 8B ceiling from about 16 to 21 tokens/s, while a 3B Q4 model reaches about 43. Model size dominates every other choice on the edge. That is why edge products ship 1–3B models and keep 8B for laptops.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> computes theoretical decode throughput ceilings from bandwidth-bound math across edge targets. Compares to observed benchmarks and highlights where bandwidth, not compute, is the bottleneck.</p>
+<p>Here is <code>code/main.py</code>, in 2 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 2 · <code>Target</code>, <code>ceiling</code>, <code>efficiency</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Edge-inference bandwidth-bound decode simulator — stdlib Python.
+
+Computes theoretical decode throughput from (weights_bytes / bandwidth_bytes_per_sec)
+for a range of edge targets. Compares to observed benchmarks. Demonstrates that
+decode is memory-bound, not compute-bound, on edge devices.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Target:
+    name: str
+    bandwidth_gb_s: float
+    observed_toks_per_s_llama8b_q4: float | None
+    notes: str
+
+
+TARGETS = [
+    Target(&quot;Datacenter H100 HBM3&quot;,  3350, 170,  &quot;reference ceiling&quot;),
+    Target(&quot;Jetson AGX Orin&quot;,        205,  45,  &quot;edge-datacenter bridge&quot;),
+    Target(&quot;Apple M3 Max&quot;,           400,  55,  &quot;unified memory MPS&quot;),
+    Target(&quot;Apple M4 (MacBook Air)&quot;, 120,  25,  &quot;consumer laptop&quot;),
+    Target(&quot;Apple A18 (iPhone 16)&quot;,   60,   8,  &quot;phone with ANE&quot;),
+    Target(&quot;Snapdragon 8 Gen 3&quot;,      77,   7,  &quot;mid/high Android&quot;),
+    Target(&quot;Snapdragon X Elite&quot;,     135,  22,  &quot;Windows ARM laptop&quot;),
+    Target(&quot;WebGPU on M3 Max&quot;,       400,  41,  &quot;browser penalty ~25%&quot;),
+    Target(&quot;WebGPU on Pixel 9&quot;,       77,   6,  &quot;mobile browser Chrome 121+&quot;),
+]
+
+
+def ceiling(target: Target, model_gb: float) -&gt; float:
+    seconds_per_token = model_gb / target.bandwidth_gb_s
+    return 1 / seconds_per_token
+
+
+def efficiency(observed: float | None, ceiling_val: float) -&gt; str:
+    if observed is None:
+        return &quot;    -&quot;
+    return f&quot;{observed / ceiling_val * 100:4.0f}%&quot;
+
+
+def main() -&gt; None:
+    model_name = &quot;Llama 3.1 8B Q4&quot;
+    model_gb = 4.7
+    print(&quot;=&quot; * 95)
+    print(f&quot;EDGE DECODE CEILING: {model_name} ({model_gb:.1f} GB in HBM/DRAM)&quot;)
+    print(&quot;=&quot; * 95)
+    header = f&quot;{'Target':26}  {'BW (GB/s)':&gt;9}  {'ceiling (tok/s)':&gt;16}  {'observed':&gt;10}  {'efficiency':&gt;11}  Notes&quot;
+    print(header)
+    print(&quot;-&quot; * len(header))
+    for t in TARGETS:
+        c = ceiling(t, model_gb)
+        obs = t.observed_toks_per_s_llama8b_q4
+        eff = efficiency(obs, c)
+        obs_display = f&quot;{obs:&gt;8.0f}  &quot; if obs is not None else f&quot;{'-':&gt;10}  &quot;
+        print(f&quot;{t.name:26}  {t.bandwidth_gb_s:8.0f}   {c:15.1f}   {obs_display}{eff:&gt;11}  {t.notes}&quot;)
+
+    print()
+    print(&quot;Read: bandwidth sets the ceiling. Compute matters only when runtime is inefficient.&quot;)
+    print()
+    print(&quot;=&quot; * 95)
+    print(&quot;QUANTIZATION IMPACT: same target, different format&quot;)
+    print(&quot;=&quot; * 95)
+    iphone_bw = 60.0
+    for name, size in [(&quot;BF16&quot;, 18.8), (&quot;INT8&quot;, 9.4), (&quot;Q4 GGUF&quot;, 4.7), (&quot;Q3 GGUF&quot;, 3.6)]:
+        c = 1 / (size / iphone_bw)
+        print(f&quot;iPhone 16 + {name:8}  model={size:5.1f} GB  ceiling={c:6.1f} tok/s&quot;)
+</code></pre></div>
+
+<p><strong>Part 2 of 2 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">===============================================================================================
+EDGE DECODE CEILING: Llama 3.1 8B Q4 (4.7 GB in HBM/DRAM)
+===============================================================================================
+Target                      BW (GB/s)   ceiling (tok/s)    observed   efficiency  Notes
+---------------------------------------------------------------------------------------
+Datacenter H100 HBM3            3350             712.8        170          24%  reference ceiling
+Jetson AGX Orin                  205              43.6         45         103%  edge-datacenter bridge
+Apple M3 Max                     400              85.1         55          65%  unified memory MPS
+Apple M4 (MacBook Air)           120              25.5         25          98%  consumer laptop
+Apple A18 (iPhone 16)             60              12.8          8          63%  phone with ANE
+Snapdragon 8 Gen 3                77              16.4          7          43%  mid/high Android
+Snapdragon X Elite               135              28.7         22          77%  Windows ARM laptop
+WebGPU on M3 Max                 400              85.1         41          48%  browser penalty ~25%
+WebGPU on Pixel 9                 77              16.4          6          37%  mobile browser Chrome 121+
+
+Read: bandwidth sets the ceiling. Compute matters only when runtime is inefficient.
+
+===============================================================================================
+QUANTIZATION IMPACT: same target, different format
+===============================================================================================
+iPhone 16 + BF16      model= 18.8 GB  ceiling=   3.2 tok/s
+iPhone 16 + INT8      model=  9.4 GB  ceiling=   6.4 tok/s
+iPhone 16 + Q4 GGUF   model=  4.7 GB  ceiling=  12.8 tok/s
+iPhone 16 + Q3 GGUF   model=  3.6 GB  ceiling=  16.7 tok/s</code></pre></div></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team ships an offline assistant on Android with Llama 3.1 8B Q4 and the full 128k context enabled. It works in testing on a flagship phone with 16 GB RAM, but crashes on mid-range phones after a few long chats. What is the cause, and what two settings fix it? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Decode ceiling = memory bandwidth ÷ model size; datacenter HBM is 30–50× faster than phone memory.</li>
+<li>Use each platform's own path: Core ML, QNN, WebGPU with MLC, TensorRT on Jetson.</li>
+<li>Choose the model size for the device first, then the 4-bit format.</li>
+<li>Keep context to 4k–8k on phones.</li>
+<li>Voice is the strongest edge use case: no network round trip.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-edge-inference"><span class="t" style="--cs-hue:262">EI</span>Cheat sheet · Edge Inference Targets</a><a href="#cs-vision-edge-deployment"><span class="t" style="--cs-hue:25">VP</span>Cheat sheet · Vision Pipelines and Edge Deployment</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-edge-target-picker.md</code>. Given platform (iOS/Android/browser/Jetson), model, and latency/memory budget, picks a quantization format and conversion pipeline.</p>
+<p><strong><code>outputs/skill-edge-target-picker.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: edge-target-picker
+description: Pick an edge inference target (Apple ANE, Qualcomm Hexagon, WebGPU/WebLLM, NVIDIA Jetson) and matching quantization format given device, model, and latency budget.
+version: 1.0.0
+phase: 17
+lesson: 12
+tags: [edge, ane, hexagon, webgpu, webllm, jetson, core-ml, qnn, nvfp4]
+---
+
+Given deployment platform (iOS, Android, browser, robotics/automotive/edge server), model, and latency/memory budget, produce an edge target recommendation.
+
+Produce:
+
+1. Target. Name the specific NPU/GPU (ANE, Hexagon, WebGPU, Jetson Orin Nano / AGX / Thor). Justify with the platform and the 2026 runtime coverage.
+2. Bandwidth ceiling. Compute theoretical decode ceiling: bandwidth_GB_s / model_size_GB. Compare to the user's tok/s requirement. If the ceiling is below the requirement, refuse or propose a smaller model / tighter quantization.
+3. Quantization format. Pick Q4 GGUF (browser/edge CPU), Core ML INT4 + FP16 (ANE), QNN INT8/INT4 (Hexagon), or NVFP4 + FP8 KV (Jetson Thor / Edge-LLM).
+4. Conversion pipeline. Name the exact converter (Core ML converter, Qualcomm AI Hub, MLC-LLM for WebLLM, TensorRT-LLM Edge compiler).
+5. Context budget. State the max context that fits alongside weights in device RAM. For long-context use cases, specify KV quantization (Q4 KV) or refuse.
+6. Fallback. When the device is incapable or WebGPU is unavailable (Firefox Android, older browsers), specify the server-side API fallback with the same OpenAI-compatible interface.
+
+Hard rejects:
+- Promising tok/s above bandwidth ceiling. Refuse — physics.
+- Targeting ANE directly via a non-Core ML runtime in 2026. Only Core ML exposes ANE natively.
+- Assuming WebGPU is on every browser. 2026 coverage is ~70-75% mobile; always specify the fallback.
+
+Refusal rules:
+- If the model is &gt;6 GB and the target is a phone (4-8 GB RAM), refuse — propose a smaller model or aggressive quantization first.
+- If the request is 128K context on a 7B model on iPhone, refuse — device RAM cannot fit without Q4 KV plus sliding-window attention.
+- If the deployment requires long-context streaming on Android via WebGPU and the user requires Firefox support, refuse and require Chrome or a server fallback.
+
+Output: a one-page plan naming target, ceiling, quantization, converter, context budget, fallback. End with a single metric: observed tok/s on the worst-case device in the target fleet.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. For a 7B model in Q4 on a Snapdragon 8 Gen 3 (~77 GB/s bandwidth), compute the decode ceiling. Compare to observed 6-8 tok/s — is the runtime efficient?</li>
+<li>WebGPU on Android requires Chrome v121+. Design a fallback for older browsers — server-side via the same OpenAI-compatible API.</li>
+<li>Your iOS app needs 4K-context streaming. Which model/format combination lets you stay under 4 GB active memory on an iPhone 16?</li>
+<li>Jetson AGX Orin runs gpt-oss-20b at 40 tok/s. Jetson Nano fits only a 3B. If your product targets both, how do you unify the inference stack?</li>
+<li>Argue whether "WebLLM is production-ready in 2026." Cite the coverage, performance, and the Firefox Android gap.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1712-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Efficiency from <code>code/main.py</code></span></summary><div class="qa-a"><p>The table divides observed by ceiling: Jetson AGX Orin and the M4 MacBook Air run near 100% (bandwidth-bound already), the iPhone and M3 Max about 63–65%, WebGPU on a Pixel about 37%. Where efficiency is high, only a smaller model helps; where it is low, a better runtime (a native NPU path instead of a browser) can nearly double speed.</p></div></details>
+<details class="qa" id="a1712-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Long context on a mid-range phone</span></summary><div class="qa-a"><p>The KV cache grows with every token of context: at 32k tokens an 8B model's FP16 KV cache is about 4 GB, on top of a 4.7 GB model and the OS, so phones with 8 GB run out of memory. Cap context at 4k–8k (summarize older turns), and quantize the KV cache, or use a 3B model on mid-range devices.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://v-chandra.github.io/on-device-llms/">On-Device LLMs State of the Union 2026</a> — landscape and benchmarks.</li>
+<li><a href="https://developer.nvidia.com/blog/getting-started-with-edge-ai-on-nvidia-jetson-llms-vlms-and-foundation-models-for-robotics/">NVIDIA Jetson Edge AI</a> — Orin / AGX / Thor.</li>
+<li><a href="https://developer.nvidia.com/blog/accelerating-llm-and-vlm-inference-for-automotive-and-robotics-with-nvidia-tensorrt-edge-llm/">NVIDIA TensorRT Edge-LLM</a> — 2026 edge port announcement.</li>
+<li><a href="https://arxiv.org/html/2412.15803v2">WebLLM (arXiv:2412.15803)</a> — design and benchmarks.</li>
+<li><a href="https://developer.apple.com/documentation/coreml">Apple Core ML</a> — ANE-native conversion.</li>
+<li><a href="https://aihub.qualcomm.com/">Qualcomm AI Hub</a> — pre-converted models for Hexagon.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1712" id="done-a1712">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1712" id="undo-a1712" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1711"><span class="pn-dir">Previous</span><span class="pn-t">17.11 · Multi-Region LLM Serving and KV Cache Locality</span></a><a class="pn next" href="#a1713"><span class="pn-dir">Next</span><span class="pn-t">17.13 · LLM Observability Stack Selection</span></a></div></footer>

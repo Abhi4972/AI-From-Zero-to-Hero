@@ -1,0 +1,747 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · Infrastructure &amp; Production</a></nav><h1>Inference Metrics — TTFT, TPOT, ITL, Goodput, P99</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.8</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1708" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Define TTFT, TPOT, ITL, E2E, throughput, and goodput precisely and name the component each one measures.</li>
+<li>Explain why mean is the wrong statistic for LLM serving and how to read P50/P90/P99.</li>
+<li>Construct an SLO multi-constraint (e.g. TTFT&lt;500 ms AND TPOT&lt;15 ms AND E2E&lt;2 s) and compute goodput against it.</li>
+<li>Name two benchmark tools that disagree on TPOT for the same run and explain why.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 17 · 04 (Serving Engine Internals)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy percentile calculator and goodput reporter). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Five metrics decide whether an inference deployment is working. TTFT is prefill plus queue plus network. TPOT (often reported as ITL, though tools disagree on whether ITL counts the first token) is the memory-bound decode cost per token. End-to-end latency is TTFT plus TPOT times output length. Throughput is tokens per second aggregated across the fleet. But the one that matters for product is goodput — the fraction of requests that met every SLO simultaneously. High throughput at low goodput means you are processing tokens that never reac</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TTFT</td>
+<td>"time to first token"</td>
+<td>Queue + network + prefill; dominated by prefill at long prompts</td>
+</tr>
+<tr>
+<td>TPOT</td>
+<td>"time per output token"</td>
+<td>Memory-bound decode cost per token after first</td>
+</tr>
+<tr>
+<td>ITL</td>
+<td>"inter-token latency"</td>
+<td>Same as TPOT in most tools (not all — see GenAI-Perf)</td>
+</tr>
+<tr>
+<td>E2E</td>
+<td>"end to end"</td>
+<td>TTFT + TPOT * output_len; response-side network on top</td>
+</tr>
+<tr>
+<td>Throughput</td>
+<td>"tok/s"</td>
+<td>Fleet efficiency; useless without latency percentiles</td>
+</tr>
+<tr>
+<td>Goodput</td>
+<td>"SLO-met rate"</td>
+<td>Fraction of requests meeting every SLO constraint simultaneously</td>
+</tr>
+<tr>
+<td>P99</td>
+<td>"tail"</td>
+<td>1-in-100 worst-case latency; the user experience metric</td>
+</tr>
+<tr>
+<td>SLO multi-constraint</td>
+<td>"the joint"</td>
+<td>AND of all three latency bounds; a request fails if any one is violated</td>
+</tr>
+<tr>
+<td>GenAI-Perf vs LLMPerf</td>
+<td>"the tool trap"</td>
+<td>Tools disagree on whether ITL includes TTFT</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>"How fast is the model?" has several answers, and each one hides different problems. <strong>TTFT</strong> (time to first token) is how long a user waits before anything appears; long prompts and queues make it worse. <strong>TPOT</strong> or <strong>ITL</strong> (time per output token, inter-token latency) is the gap between streamed tokens once they start. <strong>E2E</strong> latency is the whole request. <strong>Throughput</strong> is tokens per second across all users, which says the fleet is busy but not that anyone is happy. <strong>Goodput</strong> is the share of requests that met <em>every</em> target at once: first token fast enough, tokens steady enough, whole answer quick enough. Latency is uneven, so you describe it with <strong>percentiles</strong>: P50 is the typical request, P99 the slowest 1%, and P99 is what users remember.</p></div></aside>
+<p>"Our throughput is 15,000 tokens per second." So what? If 40% of requests blew past 2 seconds end-to-end, users abandoned the session. Throughput alone does not tell you whether the product works.</p>
+<p>Inference has multiple axes of latency and each one fails differently. Prefill is compute-bound and scales with prompt length. Decode is memory-bound and scales with batch size. Queuing delay is an operational problem. Network is a physical-distance problem. You need distinct metrics for each, and you need percentiles, and you need a single composite that says "did the user get what they expected" — that is goodput.</p>
+<h2>Idea 1 · TTFT — time to first token</h2>
+<p><code>TTFT = queue_time + network_request + prefill_time</code></p>
+<figure class="diagram mmfig" data-mmd="a1708" data-h="436fb17791"><div class="dg-scroll"><svg class="dg mm" id="mm436fb17791" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 231.781px; background-color: transparent;" viewBox="0 0 231.78125 864" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm436fb17791{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm436fb17791 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm436fb17791 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm436fb17791 .error-icon{fill:#f4efe7;}#mm436fb17791 .error-text{fill:#0b1018;stroke:#0b1018;}#mm436fb17791 .edge-thickness-normal{stroke-width:1px;}#mm436fb17791 .edge-thickness-thick{stroke-width:3.5px;}#mm436fb17791 .edge-pattern-solid{stroke-dasharray:0;}#mm436fb17791 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm436fb17791 .edge-pattern-dashed{stroke-dasharray:3;}#mm436fb17791 .edge-pattern-dotted{stroke-dasharray:2;}#mm436fb17791 .marker{fill:#6c6357;stroke:#6c6357;}#mm436fb17791 .marker.cross{stroke:#6c6357;}#mm436fb17791 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm436fb17791 p{margin:0;}#mm436fb17791 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm436fb17791 .cluster-label text{fill:#0b1018;}#mm436fb17791 .cluster-label span{color:#0b1018;}#mm436fb17791 .cluster-label span p{background-color:transparent;}#mm436fb17791 .label text,#mm436fb17791 span{fill:#211c16;color:#211c16;}#mm436fb17791 .node rect,#mm436fb17791 .node circle,#mm436fb17791 .node ellipse,#mm436fb17791 .node polygon,#mm436fb17791 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm436fb17791 .rough-node .label text,#mm436fb17791 .node .label text,#mm436fb17791 .image-shape .label,#mm436fb17791 .icon-shape .label{text-anchor:middle;}#mm436fb17791 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm436fb17791 .rough-node .label,#mm436fb17791 .node .label,#mm436fb17791 .image-shape .label,#mm436fb17791 .icon-shape .label{text-align:center;}#mm436fb17791 .node.clickable{cursor:pointer;}#mm436fb17791 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm436fb17791 .arrowheadPath{fill:#0b0b0b;}#mm436fb17791 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm436fb17791 .flowchart-link{stroke:#6c6357;fill:none;}#mm436fb17791 .edgeLabel{background-color:#ffffff;text-align:center;}#mm436fb17791 .edgeLabel p{background-color:#ffffff;}#mm436fb17791 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm436fb17791 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm436fb17791 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm436fb17791 .cluster text{fill:#0b1018;}#mm436fb17791 .cluster span{color:#0b1018;}#mm436fb17791 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm436fb17791 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm436fb17791 rect.text{fill:none;stroke-width:0;}#mm436fb17791 .icon-shape,#mm436fb17791 .image-shape{background-color:#ffffff;text-align:center;}#mm436fb17791 .icon-shape p,#mm436fb17791 .image-shape p{background-color:#ffffff;padding:2px;}#mm436fb17791 .icon-shape .label rect,#mm436fb17791 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm436fb17791 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm436fb17791 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm436fb17791 .node .neo-node{stroke:#b5521b;}#mm436fb17791 [data-look="neo"].node rect,#mm436fb17791 [data-look="neo"].cluster rect,#mm436fb17791 [data-look="neo"].node polygon{stroke:url(#mm436fb17791-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm436fb17791 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm436fb17791 [data-look="neo"].node path{stroke:url(#mm436fb17791-gradient);stroke-width:1px;}#mm436fb17791 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm436fb17791 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm436fb17791 [data-look="neo"].node circle{stroke:url(#mm436fb17791-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm436fb17791 [data-look="neo"].node circle .state-start{fill:#000000;}#mm436fb17791 [data-look="neo"].icon-shape .icon{fill:url(#mm436fb17791-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm436fb17791 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm436fb17791-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm436fb17791 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm436fb17791_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm436fb17791_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm436fb17791_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M115.891,59L115.891,63.167C115.891,67.333,115.891,75.667,115.891,83.333C115.891,91,115.891,98,115.891,101.5L115.891,105" id="mm436fb17791-L_Q_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_N_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6NTl9LHsieCI6MTE1Ljg5MDYyNSwieSI6ODR9LHsieCI6MTE1Ljg5MDYyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M115.891,160L115.891,164.167C115.891,168.333,115.891,176.667,115.891,184.333C115.891,192,115.891,199,115.891,202.5L115.891,206" id="mm436fb17791-L_N_PF_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_N_PF_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6MTYwfSx7IngiOjExNS44OTA2MjUsInkiOjE4NX0seyJ4IjoxMTUuODkwNjI1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M115.891,261L115.891,265.167C115.891,269.333,115.891,277.667,115.891,285.333C115.891,293,115.891,300,115.891,303.5L115.891,307" id="mm436fb17791-L_PF_T1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PF_T1_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6MjYxfSx7IngiOjExNS44OTA2MjUsInkiOjI4Nn0seyJ4IjoxMTUuODkwNjI1LCJ5IjozMTF9XQ==" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M115.891,383L115.891,387.167C115.891,391.333,115.891,399.667,115.891,407.333C115.891,415,115.891,422,115.891,425.5L115.891,429" id="mm436fb17791-L_T1_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T1_D_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6MzgzfSx7IngiOjExNS44OTA2MjUsInkiOjQwOH0seyJ4IjoxMTUuODkwNjI1LCJ5Ijo0MzN9XQ==" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M115.891,505L115.891,509.167C115.891,513.333,115.891,521.667,115.891,529.333C115.891,537,115.891,544,115.891,547.5L115.891,551" id="mm436fb17791-L_D_END_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_END_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6NTA1fSx7IngiOjExNS44OTA2MjUsInkiOjUzMH0seyJ4IjoxMTUuODkwNjI1LCJ5Ijo1NTV9XQ==" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M115.891,627L115.891,631.167C115.891,635.333,115.891,643.667,115.961,651.417C116.031,659.167,116.172,666.334,116.242,669.917L116.312,673.501" id="mm436fb17791-L_END_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_END_G_0" data-points="W3sieCI6MTE1Ljg5MDYyNSwieSI6NjI3fSx7IngiOjExNS44OTA2MjUsInkiOjY1Mn0seyJ4IjoxMTYuMzkwNjI1LCJ5Ijo2NzcuNX1d" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/><path d="M116.391,734.5L116.307,740.333C116.224,746.167,116.057,757.833,115.974,768.917C115.891,780,115.891,790.5,115.891,795.75L115.891,801" id="mm436fb17791-L_G_GP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_GP_0" data-points="W3sieCI6MTE2LjM5MDYyNSwieSI6NzM0LjV9LHsieCI6MTE1Ljg5MDYyNSwieSI6NzY5LjV9LHsieCI6MTE1Ljg5MDYyNSwieSI6ODA1fV0=" data-look="classic" marker-end="url(#mm436fb17791_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_Q_N_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_N_PF_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PF_T1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_T1_D_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_D_END_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_END_G_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(115.890625, 769.5)"><g class="label" data-id="L_G_GP_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm436fb17791-flowchart-Q-0" data-look="classic" transform="translate(115.890625, 33.5)"><rect class="basic label-container" style="" x="-51.796875" y="-25.5" width="103.59375" height="51"/><g class="label" style="" transform="translate(-21.796875, -10.5)"><rect/><foreignObject width="43.59375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Queue</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-N-1" data-look="classic" transform="translate(115.890625, 134.5)"><rect class="basic label-container" style="" x="-58.140625" y="-25.5" width="116.28125" height="51"/><g class="label" style="" transform="translate(-28.140625, -10.5)"><rect/><foreignObject width="56.28125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Network</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-PF-3" data-look="classic" transform="translate(115.890625, 235.5)"><rect class="basic label-container" style="" x="-48.75" y="-25.5" width="97.5" height="51"/><g class="label" style="" transform="translate(-18.75, -10.5)"><rect/><foreignObject width="37.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Prefill</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-T1-5" data-look="classic" transform="translate(115.890625, 347)"><rect class="basic label-container" style="" x="-64.7421875" y="-36" width="129.484375" height="72"/><g class="label" style="" transform="translate(-34.7421875, -21)"><rect/><foreignObject width="69.484375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>First token<br />(TTFT)</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-D-7" data-look="classic" transform="translate(115.890625, 469)"><rect class="basic label-container" style="" x="-102.9921875" y="-36" width="205.984375" height="72"/><g class="label" style="" transform="translate(-72.9921875, -21)"><rect/><foreignObject width="145.984375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Decode<br />gap per token = TPOT</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-END-9" data-look="classic" transform="translate(115.890625, 591)"><rect class="basic label-container" style="" x="-64.1640625" y="-36" width="128.328125" height="72"/><g class="label" style="" transform="translate(-34.1640625, -21)"><rect/><foreignObject width="68.328125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Last token<br />(E2E)</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-G-11" data-look="classic" transform="translate(115.890625, 705.5)"><polygon points="14.25,0 167.390625,0 181.640625,-28.5 167.390625,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-90.8203125,28.5)"/><g class="label" style="" transform="translate(-69.0703125, -21)"><rect/><foreignObject width="138.140625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>TTFT, TPOT and E2E<br />all within SLO?</p></span></div></foreignObject></g></g><g class="node default" id="mm436fb17791-flowchart-GP-13" data-look="classic" transform="translate(115.890625, 830.5)"><rect class="basic label-container" style="" x="-107.890625" y="-25.5" width="215.78125" height="51"/><g class="label" style="" transform="translate(-77.890625, -10.5)"><rect/><foreignObject width="155.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Counts toward goodput</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm436fb17791-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm436fb17791-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm436fb17791-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>Prefill dominates when prompts are long. On Llama-3.3-70B FP8 on H100, a 32k prompt takes ~800 ms of pure prefill. Queue time is scheduler behavior under load. Network request is wire time including TLS. TTFT is the latency the user sees before anything streams back.</p>
+<h2>Idea 2 · TPOT / ITL — inter-token latency</h2>
+<p>Many names for one quantity. <code>TPOT</code> (time per output token), <code>ITL</code> (inter-token latency), <code>decode latency per token</code> — all the same. It is the time between consecutive streamed tokens after the first.</p>
+<p><code>TPOT = (decode_forward_time + scheduler_overhead) / tokens_produced</code></p>
+<p>On the same Llama-3.3-70B H100 stack with chunked prefill, TPOT mean ~7 ms. Without chunked prefill, during a long prefill on a neighboring sequence, TPOT can spike to 50 ms. Watch P99, not mean.</p>
+<h2>Idea 3 · E2E latency</h2>
+<p><code>E2E = TTFT + TPOT * output_tokens + network_response</code></p>
+<p>For long outputs (&gt;500 tokens), E2E is TPOT-dominated. For short outputs with long prompts, E2E is TTFT-dominated. Report output-length-conditioned E2E.</p>
+<h2>Idea 4 · Throughput</h2>
+<p><code>throughput = total_output_tokens / elapsed_time</code></p>
+<p>Aggregate metric. Tells you fleet efficiency. Does not tell you individual-request health.</p>
+<h2>Idea 5 · Goodput — the metric you actually care about</h2>
+<p><code>goodput = fraction of requests meeting (TTFT &lt;= a) AND (TPOT &lt;= b) AND (E2E &lt;= c)</code></p>
+<p>The SLO is a multi-constraint. A request is "good" only if every constraint held. Goodput is the share. Some papers and dashboards report goodput as a rate instead: requests per second that meet every SLO. Multiply the share by the request rate to convert. High throughput at 60% goodput is failure. Lower throughput at 99% goodput is the target.</p>
+<p>In 2026, goodput is the metric used in MLPerf Inference v6.0 submissions and in internal SLA tracking at AI platform providers.</p>
+<h2>Idea 6 · Why mean is the wrong statistic</h2>
+<p>LLM latency distributions are right-skewed. A decode batch with one long-prefill neighbor can ship 500 tokens with TPOT ~7 ms and 20 tokens with TPOT ~60 ms. Mean TPOT is 9 ms. P99 TPOT is 65 ms. Users hit the P99 regularly — that is why they leave.</p>
+<p>Always report the triple (P50, P90, P99). For user experience, P99 is the one you optimize.</p>
+<h2>Idea 7 · Reference numbers — Llama-3.1-8B-Instruct on TRT-LLM, 2026</h2>
+<ul>
+<li>mean TTFT: 162 ms</li>
+<li>mean TPOT: 7.33 ms</li>
+<li>mean E2E: 1,093 ms</li>
+<li>P99 TPOT: varies 10-25 ms depending on chunked-prefill configuration.</li>
+</ul>
+<p>These are the published NVIDIA reference points. They change with model size (70B would show 3-5x), hardware (H100 vs B200 ~3x), and load.</p>
+<h2>Idea 8 · The measurement trap</h2>
+<p>Two of the most-used 2026 benchmark tools disagree on TPOT for the same run:</p>
+<ul>
+<li><strong>NVIDIA GenAI-Perf</strong>: excludes TTFT from the ITL calculation. ITL starts from token 2.</li>
+<li><strong>LLMPerf</strong>: includes TTFT. ITL starts from token 1.</li>
+</ul>
+<p>For a request with TTFT 500 ms and 100 output tokens in 700 ms total decode, GenAI-Perf reports <code>ITL = 700/99 = 7.07 ms</code>, LLMPerf reports <code>ITL = 1200/100 = 12.00 ms</code>. Tool choice changes the number.</p>
+<p>Always state which tool. Always publish the definition.</p>
+<h2>Idea 9 · Constructing an SLO</h2>
+<p>A reasonable consumer-facing SLO for a 70B chat model in 2026:</p>
+<ul>
+<li>TTFT P99 &lt;= 800 ms.</li>
+<li>TPOT P99 &lt;= 25 ms.</li>
+<li>E2E P99 &lt;= 3 s for &lt;300-token outputs.</li>
+<li>Goodput target &gt;= 99%.</li>
+</ul>
+<p>Enterprise SLOs tighten TTFT (200-400 ms) and loosen E2E. The point is to write them down, measure all three, and track goodput as a single composite.</p>
+<h2>Idea 10 · How to measure</h2>
+<ul>
+<li>Run real traffic or realistic synthetic (LLMPerf with <code>--mean-input-tokens 800 --stddev-input-tokens 300 --mean-output-tokens 150</code>).</li>
+<li>Target 2x peak concurrency for the benchmark run.</li>
+<li>Run 30-50 iterations, take percentiles of the combined sample.</li>
+<li>Publish with tool name, tool version, model, hardware, concurrency, prompt distribution.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="throughput-latency"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Goodput.</strong> With SLO limits <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span>,</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">goodput</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.363em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mclose">}</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">#</span><span class="mopen">{</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">:</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord text"><span class="mord">TTFT</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">a</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord text"><span class="mord">TPOT</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">b</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∧</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord text"><span class="mord">E2E</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.02778em;">r</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mclose">}</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">E2E</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">TTFT</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">TPOT</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">network</span></span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">One request, two tools</div><div class="co-body"><p>A request has TTFT = 500 ms, then 99 more tokens over 700 ms (100 output tokens, 1,200 ms in total).</p>
+<ol>
+<li>GenAI-Perf measures from the second token: ITL = 700 / 99 ≈ 7.07 ms.</li>
+<li>LLMPerf spreads the whole time over all tokens: 1,200 / 100 = 12.00 ms.</li>
+<li>Same request, 70% apart. A dashboard that switched tools would show a "regression" that never happened.</li>
+<li>Check E2E: 500 + 7.07 × 99 ≈ 1,200 ms. Both tools agree on E2E; they disagree on how to split it.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Throughput can be high while most users have a bad experience.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Mean TPOT is a good summary for a dashboard.
+  Latency is right-skewed; a 7 ms mean can sit next to a 65 ms P99.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A request counts towards goodput only if every SLO held for it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Benchmark tools agree on what ITL means.
+  GenAI-Perf excludes the first token, LLMPerf includes it.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: if 1% of requests hit a slow neighbour and their TPOT is 9 times normal, what happens to mean TPOT, and what happens to P99?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A 1% tail, three statistics</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random, statistics
+random.seed(3)
+tpot = [random.gauss(7.0, 0.6) for _ in range(9900)] + [random.gauss(63.0, 5.0) for _ in range(100)]
+tpot.sort()
+pct = lambda q: tpot[int(q * len(tpot)) - 1]
+print(f&quot;mean {statistics.mean(tpot):5.1f} ms   P50 {pct(0.50):5.1f}   P90 {pct(0.90):5.1f}   P99 {pct(0.99):5.1f}   P99.5 {pct(0.995):5.1f}&quot;)
+for limit in (30, 15):
+    print(f&quot;share of requests with TPOT &lt;= {limit} ms: {sum(t &lt;= limit for t in tpot) / len(tpot):.2%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">mean   7.6 ms   P50   7.0   P90   7.8   P99   9.1   P99.5  62.7
+share of requests with TPOT &lt;= 30 ms: 99.00%
+share of requests with TPOT &lt;= 15 ms: 99.00%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The 1% tail moves the mean only from about 7 to 7.6 ms, but P99.5 lands in the tail at about 60 ms. With exactly 1% slow requests, P99 sits right at the edge, which is why teams also watch P99.5 or P99.9. Goodput against a 15 ms TPOT limit is 99%: the tail requests fail it every time, however good the mean looks.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> is a toy goodput calculator. Generate a synthetic latency distribution, apply an SLO, and compute goodput. Also shows the GenAI-Perf vs LLMPerf TPOT difference on the same trace.</p>
+<p>The <a href="https://aiengineeringfromscratch.com/inside-an-llm-serving-gpu?users=1">Inside an LLM Serving GPU</a> machine shows where time per output token comes from on an NVIDIA L4. One decode step reads 16.41 GB of weights, which takes at least 54.7 ms at 300 GB/s, and the measured step took 60.16 ms.</p>
+<p>Here is <code>code/main.py</code>, in 3 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>RequestTrace</code>, <code>synth_workload</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy goodput calculator — stdlib Python.
+
+Simulate a population of LLM requests with realistic right-skewed latency,
+apply a multi-constraint SLO, compute goodput, and show the GenAI-Perf
+vs LLMPerf TPOT calculation divergence on the same trace.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import random
+import statistics
+from dataclasses import dataclass
+
+
+@dataclass
+class RequestTrace:
+    queue_ms: float
+    prefill_ms: float
+    decode_ms_per_token: list[float]      # per-token decode latency
+    output_tokens: int
+
+    @property
+    def ttft_ms(self) -&gt; float:
+        return self.queue_ms + self.prefill_ms
+
+    @property
+    def e2e_ms(self) -&gt; float:
+        return self.ttft_ms + sum(self.decode_ms_per_token)
+
+    def tpot_llmperf(self) -&gt; float:
+        &quot;&quot;&quot;LLMPerf: include TTFT in ITL calculation.&quot;&quot;&quot;
+        return self.e2e_ms / self.output_tokens
+
+    def tpot_genaiperf(self) -&gt; float:
+        &quot;&quot;&quot;GenAI-Perf: ITL starts from token 2.&quot;&quot;&quot;
+        if self.output_tokens &lt;= 1:
+            return 0.0
+        return sum(self.decode_ms_per_token) / (self.output_tokens - 1)
+
+
+def synth_workload(n: int = 1000, seed: int = 7, tail_spike_rate: float = 0.02) -&gt; list[RequestTrace]:
+    rng = random.Random(seed)
+    traces = []
+    for _ in range(n):
+        prompt_len = rng.choice([128, 256, 512, 2048, 8192])
+        output_tokens = rng.randint(50, 300)
+        queue = rng.expovariate(1 / 40.0)           # avg 40 ms queue
+        prefill = prompt_len * 0.05                 # ~50 us per input token
+        decode_base = 7.0                            # 7 ms mean TPOT
+        decodes = []
+        for _ in range(output_tokens):
+            t = max(1.5, rng.gauss(decode_base, decode_base * 0.15))
+            if rng.random() &lt; tail_spike_rate:
+                t *= rng.uniform(3, 8)              # tail spike
+            decodes.append(t)
+        traces.append(RequestTrace(queue, prefill, decodes, output_tokens))
+    return traces
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>percentiles</code>, <code>report_latency</code>, <code>goodput</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def percentiles(values: list[float], ps: list[float]) -&gt; list[float]:
+    s = sorted(values)
+    return [s[min(len(s) - 1, int(p * len(s)))] for p in ps]
+
+
+def report_latency(label: str, traces: list[RequestTrace]) -&gt; None:
+    ttft = [t.ttft_ms for t in traces]
+    tpot_llm = [t.tpot_llmperf() for t in traces]
+    tpot_nv = [t.tpot_genaiperf() for t in traces]
+    e2e = [t.e2e_ms for t in traces]
+
+    p50_ttft, p90_ttft, p99_ttft = percentiles(ttft, [0.5, 0.9, 0.99])
+    p50_tpot, p90_tpot, p99_tpot = percentiles(tpot_nv, [0.5, 0.9, 0.99])
+    p50_e2e, p90_e2e, p99_e2e = percentiles(e2e, [0.5, 0.9, 0.99])
+
+    print(f&quot;{label}&quot;)
+    print(&quot;-&quot; * 76)
+    print(f&quot;  TTFT (ms)     P50={p50_ttft:7.1f}  P90={p90_ttft:7.1f}  P99={p99_ttft:7.1f}  mean={statistics.mean(ttft):7.1f}&quot;)
+    print(f&quot;  TPOT (ms)     P50={p50_tpot:7.2f}  P90={p90_tpot:7.2f}  P99={p99_tpot:7.2f}  mean={statistics.mean(tpot_nv):7.2f}&quot;)
+    print(f&quot;  E2E  (ms)     P50={p50_e2e:7.1f}  P90={p90_e2e:7.1f}  P99={p99_e2e:7.1f}&quot;)
+    print(f&quot;  Tool trap     GenAI-Perf mean TPOT={statistics.mean(tpot_nv):6.2f}  &quot;
+          f&quot;LLMPerf mean TPOT={statistics.mean(tpot_llm):6.2f}  &quot;
+          f&quot;delta={statistics.mean(tpot_llm) - statistics.mean(tpot_nv):+5.2f} ms&quot;)
+
+
+def goodput(traces: list[RequestTrace], slo_ttft: float, slo_tpot: float,
+            slo_e2e: float) -&gt; float:
+    good = 0
+    for t in traces:
+        if t.ttft_ms &lt;= slo_ttft and t.tpot_genaiperf() &lt;= slo_tpot and t.e2e_ms &lt;= slo_e2e:
+            good += 1
+    return good / len(traces)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 78)
+    print(&quot;TOY GOODPUT CALCULATOR: inference SLOs and the measurement trap&quot;)
+    print(&quot;=&quot; * 78)
+    print()
+
+    traces = synth_workload(n=2000)
+    report_latency(&quot;Synthetic workload (2000 requests)&quot;, traces)
+    print()
+
+    slos = [
+        (&quot;loose   TTFT&lt;800 TPOT&lt;25 E2E&lt;3000&quot;, 800, 25, 3000),
+        (&quot;target  TTFT&lt;500 TPOT&lt;15 E2E&lt;2000&quot;, 500, 15, 2000),
+        (&quot;tight   TTFT&lt;300 TPOT&lt;10 E2E&lt;1500&quot;, 300, 10, 1500),
+    ]
+    print(&quot;Goodput under three SLO profiles&quot;)
+    print(&quot;-&quot; * 76)
+    for label, t1, t2, t3 in slos:
+        g = goodput(traces, t1, t2, t3)
+        tag = &quot;  SHIPPABLE&quot; if g &gt;= 0.99 else (&quot;  DEGRADED&quot; if g &gt;= 0.95 else &quot;  FAILING&quot;)
+        print(f&quot;  {label}  goodput={g:6.2%}{tag}&quot;)
+
+    print()
+    print(&quot;=&quot; * 78)
+    print(&quot;KEY FINDING&quot;)
+    print(&quot;-&quot; * 78)
+    print(&quot;  Mean TPOT ~7 ms looks great. P99 TPOT ~25-40 ms tells the real story.&quot;)
+    print(&quot;  Tighten the SLO and goodput collapses from 99% -&gt; 80%+. Users feel P99.&quot;)
+    print(&quot;  GenAI-Perf vs LLMPerf disagree by ~1 ms on mean TPOT, cite the tool.&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">==============================================================================
+TOY GOODPUT CALCULATOR: inference SLOs and the measurement trap
+==============================================================================
+
+Synthetic workload (2000 requests)
+----------------------------------------------------------------------------
+  TTFT (ms)     P50=   84.6  P90=  439.4  P99=  524.4  mean=  151.3
+  TPOT (ms)     P50=   7.65  P90=   8.21  P99=   8.99  mean=   7.69
+  E2E  (ms)     P50= 1526.4  P90= 2261.4  P99= 2664.5
+  Tool trap     GenAI-Perf mean TPOT=  7.69  LLMPerf mean TPOT=  8.71  delta=+1.02 ms
+
+Goodput under three SLO profiles
+----------------------------------------------------------------------------
+  loose   TTFT&lt;800 TPOT&lt;25 E2E&lt;3000  goodput=100.00%  SHIPPABLE
+  target  TTFT&lt;500 TPOT&lt;15 E2E&lt;2000  goodput=75.95%  FAILING
+  tight   TTFT&lt;300 TPOT&lt;10 E2E&lt;1500  goodput=42.15%  FAILING
+
+==============================================================================
+KEY FINDING
+------------------------------------------------------------------------------
+  Mean TPOT ~7 ms looks great. P99 TPOT ~25-40 ms tells the real story.
+  Tighten the SLO and goodput collapses from 99% -&gt; 80%+. Users feel P99.
+  GenAI-Perf vs LLMPerf disagree by ~1 ms on mean TPOT, cite the tool.</code></pre></div></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team reports "P99 TPOT 8 ms" to leadership, measured with LLMPerf on a load test of 50 requests with identical 100-token prompts. In production, users complain about stalls. Name three things wrong with the measurement. (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>TTFT = queue + network + prefill; TPOT is the decode gap; E2E adds them up.</li>
+<li>Throughput measures the fleet; goodput measures the users.</li>
+<li>Report P50, P90 and P99, never the mean alone.</li>
+<li>State the tool and its ITL definition with every number.</li>
+<li>Write the SLO down (for example TTFT P99 ≤ 800 ms, TPOT P99 ≤ 25 ms) and track goodput against it.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-inference-load-testing"><span class="t" style="--cs-hue:352">IM</span>Cheat sheet · Inference Metrics and Load Testing</a><a href="#cs-inference-optimization"><span class="t" style="--cs-hue:200">IO</span>Cheat sheet · Inference Optimization: KV Cache, Quantization, Batching</a></div><h3 class="px-h">Practice problem · Read an SGLang sweep on an L4</h3><p class="ref-lead">From the source repository: write the function, then press "Run the checks". They run as real Python in your browser (the first run loads Python, about 10 MB) and tell you which part is wrong and why. Hints open one at a time; the reference solution opens when every check passes.</p><div class="px" data-px="lab-sglang-l4-serving"><div class="px-meta"><span class="chip">medium</span><span class="chip">30 min</span><span class="chip">lab</span></div><div class="px-problem"><p>A serving benchmark gives a table of numbers for each setting. You must read the table and decide. In this lab you read real SGLang 0.5.22 runs of Qwen3-8B on one NVIDIA L4. You find where throughput stops rising, where the latency SLO breaks, what FP8 gives, and whether a smaller prefill chunk helps.</p>
+<p>The data comes from <code>manuals/sglang-101/capture/gpu/summary/l4.json</code> in this repository. <code>support.py</code> has a copy of the rows that the lab needs. Each value is the median of three seeds. The <code>MIXED</code> rows also keep the <code>min</code> and <code>max</code> of the three seeds.</p>
+<h2>Task</h2>
+<p>Write five helper functions and <code>answers()</code>.</p>
+<ol>
+<li><code>gains(ys)</code> returns a float array of length $n - 1$. Entry $i$ is $y_{i+1} / y_i - 1$.</li>
+<li><code>saturation_point(xs, ys, min_gain=0.05)</code> finds the first step $i$ with gain strictly below <code>min_gain</code>. It returns <code>xs[i]</code>, the last level before that step. If no step has a gain below <code>min_gain</code>, it returns <code>xs[-1]</code>.</li>
+<li><code>largest_within(xs, ys, limit)</code> returns the largest <code>x</code> whose <code>y</code> is less than or equal to <code>limit</code>. If no <code>y</code> meets the limit, it returns <code>None</code>.</li>
+<li><code>pct_change(new, old)</code> returns $100 \cdot (new - old) / old$.</li>
+<li><code>ranges_overlap(a, b)</code> takes two dicts with the keys <code>"min"</code> and <code>"max"</code>. It returns <code>True</code> when $a_{min} \le b_{max}$ and $b_{min} \le a_{max}$.</li>
+</ol>
+<p>Then do the experiment in <code>answers()</code>. Use the helpers.</p>
+<ol>
+<li>Change the concurrency from 1 to 64 in <code>LOAD["default"]</code>. Measure <code>output_throughput</code>. Report the saturation point with <code>min_gain = 0.05</code> as <code>saturation_default</code>.</li>
+<li>Do step 1 again for <code>LOAD["fp8"]</code>. Report <code>saturation_fp8</code>.</li>
+<li>In <code>LOAD["default"]</code>, measure <code>p99_ttft_ms</code> at each concurrency. Report the largest concurrency with <code>p99_ttft_ms</code> within <code>SLO["ttft_ms"]</code> as <code>slo_concurrency_default</code>.</li>
+<li>In <code>LOAD["default"]</code>, measure <code>goodput_rps</code>. Report the concurrency with the highest goodput as <code>best_goodput_concurrency_default</code>. If two levels have the same goodput, use the lower concurrency.</li>
+<li>At concurrency 32, divide the FP8 <code>output_throughput</code> by the default <code>output_throughput</code>. Report the ratio as <code>fp8_speedup_c32</code>.</li>
+<li>Change the prefill chunk from the default (4096 tokens) to 1024 tokens. Compare <code>MIXED["chunk-1024"]</code> with <code>MIXED["default"]</code> at the same rate. Use the <code>"median"</code> field. Report the mean over the three rates of <code>pct_change</code> in <code>median_ttft_ms</code> as <code>chunk_ttft_change_pct</code>. Report the same mean for <code>output_throughput</code> as <code>chunk_throughput_change_pct</code>. The new value is the chunk 1024 value. The old value is the default value.</li>
+<li>For each rate, test if the seed ranges of <code>median_ttft_ms</code> for the two settings overlap. Report the number of rates with an overlap as <code>chunk_overlap_rates</code>.</li>
+</ol>
+<h2>Input and output</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Type</th>
+<th>Shape</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>xs</code></td>
+<td>list of numbers</td>
+<td><code>(n,)</code></td>
+<td>the levels of the variable that you change, in increasing order</td>
+</tr>
+<tr>
+<td><code>ys</code></td>
+<td>list of floats</td>
+<td><code>(n,)</code></td>
+<td>the measured value at each level, all above 0 for <code>gains</code></td>
+</tr>
+<tr>
+<td><code>min_gain</code></td>
+<td>float</td>
+<td>scalar</td>
+<td>the smallest relative gain that counts as a rise</td>
+</tr>
+<tr>
+<td><code>limit</code></td>
+<td>float</td>
+<td>scalar</td>
+<td>the SLO bound, in the unit of <code>ys</code></td>
+</tr>
+<tr>
+<td><code>new</code>, <code>old</code></td>
+<td>float</td>
+<td>scalar</td>
+<td>the changed value and the base value, <code>old</code> is not 0</td>
+</tr>
+<tr>
+<td><code>a</code>, <code>b</code></td>
+<td>dict</td>
+<td>keys <code>min</code>, <code>max</code></td>
+<td>one seed range each</td>
+</tr>
+</tbody>
+</table></div>
+<ul>
+<li><code>gains</code> returns a float array of shape <code>(n - 1,)</code>.</li>
+<li><code>saturation_point</code> and <code>largest_within</code> return one element of <code>xs</code>. <code>largest_within</code> can return <code>None</code>.</li>
+<li><code>pct_change</code> returns a float. <code>ranges_overlap</code> returns a bool.</li>
+<li><code>answers()</code> returns a dict with the eight keys above. Each value is a Python <code>float</code>.</li>
+</ul>
+<h2>Constraints</h2>
+<ul>
+<li><code>2 &lt;= n &lt;= 20</code> for <code>gains</code> and <code>saturation_point</code>.</li>
+<li>Do not change the input lists.</li>
+<li>Do not round the answers. The checks accept a relative difference of <code>1e-6</code> from the reference run.</li>
+<li>Use the data in <code>support.py</code> only. Use numpy and the standard library only.</li>
+</ul>
+<h2>Examples</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">gains([13.42, 31.2, 61.54])
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[1.32488823 0.9724359 ]
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">saturation_point([1, 2, 4, 8], [10.0, 20.0, 20.5, 30.0])
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">2
+</code></pre></div>
+<p>The gain from 2 to 4 is 0.025, which is below 0.05. The series rises again at 8, but the rule stops at the first low gain.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">largest_within([1, 2, 4, 8], [100.0, 900.0, 1000.0, 1200.0], 1000.0)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">4
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">pct_change(37411.99, 35999.18)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">3.9245616150145577
+</code></pre></div>
+<p><code>answers()["saturation_default"]</code> is <code>32.0</code>.</p></div><div class="px-editor"><div class="px-bar"><span>Your code</span><span class="px-actions"><button type="button" class="px-run">Run the checks</button><button type="button" class="px-reset">Reset</button></span></div><textarea class="px-src" spellcheck="false" aria-label="Your solution">import numpy as np
+
+from support import LOAD, MIXED, SLO, column
+
+
+def gains(ys):
+    raise NotImplementedError
+
+
+def saturation_point(xs, ys, min_gain=0.05):
+    raise NotImplementedError
+
+
+def largest_within(xs, ys, limit):
+    raise NotImplementedError
+
+
+def pct_change(new, old):
+    raise NotImplementedError
+
+
+def ranges_overlap(a, b):
+    raise NotImplementedError
+
+
+def answers():
+    raise NotImplementedError
+</textarea></div><div class="px-out" aria-live="polite"></div><details class="px-mut"><summary>Common mistakes the checks catch</summary><ul><li>Compares the absolute difference of throughput with min_gain, not the relative gain.</li><li>Tests the SLO against the median TTFT, not the p99 TTFT.</li><li>Divides the change by the new value, not by the old value.</li><li>Returns the level after the low gain step, not the level before it.</li><li>Uses a strict less than, so a value equal to the limit fails the SLO.</li><li>Uses strict comparisons, so ranges that touch at one point do not overlap.</li></ul></details><details class="px-hint"><summary>Hint 1</summary><p>Convert <code>ys</code> to a numpy float array. The slice <code>values[1:]</code> holds each new value and the slice <code>values[:-1]</code> holds the value before it.</p></details><details class="px-hint"><summary>Hint 2</summary><p>In <code>saturation_point</code>, step <code>i</code> goes from <code>xs[i]</code> to <code>xs[i + 1]</code>. When that step has a low gain, the useful level is <code>xs[i]</code>, not <code>xs[i + 1]</code>.</p></details><details class="px-hint"><summary>Hint 3</summary><p>Use <code>column(rows, key)</code> from <code>support.py</code> to get one list for each metric. For the <code>MIXED</code> rows, read <code>row["median_ttft_ms"]["median"]</code> for the value and pass the whole inner dict to <code>ranges_overlap</code>.</p></details><details class="px-hint"><summary>Hint 4</summary><p>The SLO question uses the p99 TTFT, not the median TTFT. Goodput counts the requests that meet the SLO, so its best level can be higher than the level where the p99 still meets the SLO.</p></details><details class="px-sol" hidden><summary>Reference solution and notes</summary><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code>import numpy as np
+
+from support import LOAD, MIXED, SLO, column
+
+
+def gains(ys):
+    values = np.asarray(ys, dtype=float)
+    return values[1:] / values[:-1] - 1.0
+
+
+def saturation_point(xs, ys, min_gain=0.05):
+    steps = gains(ys)
+    for i, gain in enumerate(steps):
+        if gain &lt; min_gain:
+            return xs[i]
+    return xs[-1]
+
+
+def largest_within(xs, ys, limit):
+    best = None
+    for x, y in zip(xs, ys):
+        if y &lt;= limit and (best is None or x &gt; best):
+            best = x
+    return best
+
+
+def pct_change(new, old):
+    return 100.0 * (new - old) / old
+
+
+def ranges_overlap(a, b):
+    return a[&quot;min&quot;] &lt;= b[&quot;max&quot;] and b[&quot;min&quot;] &lt;= a[&quot;max&quot;]
+
+
+def answers():
+    default = LOAD[&quot;default&quot;]
+    fp8 = LOAD[&quot;fp8&quot;]
+    xs = column(default, &quot;concurrency&quot;)
+    base = MIXED[&quot;default&quot;]
+    chunk = MIXED[&quot;chunk-1024&quot;]
+    goodput = column(default, &quot;goodput_rps&quot;)
+    ttft_changes = [pct_change(c[&quot;median_ttft_ms&quot;][&quot;median&quot;], b[&quot;median_ttft_ms&quot;][&quot;median&quot;]) for b, c in zip(base, chunk)]
+    throughput_changes = [pct_change(c[&quot;output_throughput&quot;][&quot;median&quot;], b[&quot;output_throughput&quot;][&quot;median&quot;]) for b, c in zip(base, chunk)]
+    return {
+        &quot;saturation_default&quot;: float(saturation_point(xs, column(default, &quot;output_throughput&quot;))),
+        &quot;saturation_fp8&quot;: float(saturation_point(column(fp8, &quot;concurrency&quot;), column(fp8, &quot;output_throughput&quot;))),
+        &quot;slo_concurrency_default&quot;: float(largest_within(xs, column(default, &quot;p99_ttft_ms&quot;), SLO[&quot;ttft_ms&quot;])),
+        &quot;best_goodput_concurrency_default&quot;: float(xs[int(np.argmax(goodput))]),
+        &quot;fp8_speedup_c32&quot;: fp8[5][&quot;output_throughput&quot;] / default[5][&quot;output_throughput&quot;],
+        &quot;chunk_ttft_change_pct&quot;: float(np.mean(ttft_changes)),
+        &quot;chunk_throughput_change_pct&quot;: float(np.mean(throughput_changes)),
+        &quot;chunk_overlap_rates&quot;: float(sum(ranges_overlap(b[&quot;median_ttft_ms&quot;], c[&quot;median_ttft_ms&quot;]) for b, c in zip(base, chunk))),
+    }
+</code></pre></div><h2>What the numbers say</h2>
+<p>The default model saturates at concurrency 32. From 32 to 64 the output throughput falls from 270.11 to 250.85 tokens per second. The median TTFT rises from 2,970 ms to 18,349 ms in the same step. The default KV pool has room for 24,094 tokens, so at 64 requests the scheduler cannot admit all of them and the queue grows.</p>
+<p>The FP8 run does not saturate inside the sweep. FP8 weights and an FP8 KV cache leave room for 142,369 tokens, about six times the default pool. At concurrency 32 the FP8 run gives 1.88 times the throughput of the default run.</p>
+<h2>Throughput, the SLO and goodput are three different answers</h2>
+<p>The p99 TTFT meets the 1,000 ms SLO only up to concurrency 4. The goodput is highest at concurrency 16. The throughput saturates at 32. A capacity plan that uses only throughput picks a level where the goodput is 0. This is the point of the goodput lesson: report the share of requests that meet every SLO, not the token rate.</p>
+<h2>The chunk result is not a result</h2>
+<p>The 1024 token chunk changed the median TTFT by about 3 percent and the throughput by about minus 3 percent. The seed ranges overlap at all three rates. A change inside the seed spread is not a measured effect. On this card the workload was more than the GPU could serve, so the queue, not the chunk size, set the TTFT.</p>
+<h2>Where this goes next</h2>
+<p>The same reading applies to any sweep: a saturation rule, an SLO bound and a seed range check. The SGLang serving cheat sheet and the inference load testing lessons use these steps on other engines.</p></details><script type="application/json" class="px-files">{"tests.py": "import numpy as np\n\nfrom practice_check import check, close, equal, fixture, fixtures, true\n\nKEYS = [\n    \"saturation_default\",\n    \"saturation_fp8\",\n    \"slo_concurrency_default\",\n    \"best_goodput_concurrency_default\",\n    \"fp8_speedup_c32\",\n    \"chunk_ttft_change_pct\",\n    \"chunk_throughput_change_pct\",\n    \"chunk_overlap_rates\",\n]\n\n\n@check(\"examples\", \"gains of the first three default points\", \"The gain of a step is the new value divided by the previous value, minus 1.\")\ndef example_gains(sub):\n    close(sub.gains([13.42, 31.2, 61.54]), [1.32488823, 0.9724359], rtol=1e-6, what=\"the gains\")\n\n\n@check(\"examples\", \"saturation point of a short series\", \"Return the last level before the first step whose gain is below min_gain.\")\ndef example_saturation(sub):\n    equal(sub.saturation_point([1, 2, 4, 8], [10.0, 20.0, 20.5, 30.0]), 2, what=\"the saturation point\")\n\n\n@check(\"examples\", \"the default model saturates at concurrency 32\", \"On the L4, output throughput falls from concurrency 32 to 64, so the rule stops at 32.\")\ndef example_answer(sub):\n    result = sub.answers()\n    true(isinstance(result, dict), \"answers() must return a dict\", \"dict\", type(result).__name__)\n    close(result.get(\"saturation_default\"), 32.0, what=\"saturation_default\")\n\n\n@check(\"properties\", \"answers has every key and only numbers\", \"The checks read one number for each question. A missing key or a None value fails.\")\ndef answer_keys(sub):\n    result = sub.answers()\n    equal(sorted(result.keys()), sorted(KEYS), what=\"the keys of answers()\")\n    for key in KEYS:\n        true(isinstance(result[key], (int, float)) and np.isfinite(result[key]), f\"{key} must be a finite number\", \"a number\", result[key])\n\n\n@check(\"properties\", \"gains has one value less than the series\", \"A series of n points has n minus 1 steps.\")\ndef gains_length(sub):\n    ys = [3.0, 6.0, 9.0, 9.0, 4.5]\n    close(sub.gains(ys), [1.0, 0.5, 0.0, -0.5], what=\"the gains\")\n\n\n@check(\"properties\", \"the saturation point does not depend on the unit\", \"The rule uses a relative gain. Tokens per second and tokens per minute must give the same point.\")\ndef scale_invariance(sub):\n    xs = [1, 2, 4, 8, 16]\n    ys = [0.010, 0.019, 0.0195, 0.03, 0.031]\n    first = sub.saturation_point(xs, ys)\n    equal(sub.saturation_point(xs, [y * 6000.0 for y in ys]), first, what=\"the saturation point after a change of unit\")\n    equal(first, 2, what=\"the saturation point\")\n\n\n@check(\"properties\", \"pct_change is zero for equal values and has the sign of the change\", \"pct_change is 100 times (new minus old) divided by old.\")\ndef pct_properties(sub):\n    close(sub.pct_change(5.0, 5.0), 0.0, what=\"pct_change(5, 5)\")\n    close(sub.pct_change(110.0, 100.0), 10.0, what=\"pct_change(110, 100)\")\n    close(sub.pct_change(50.0, 200.0), -75.0, what=\"pct_change(50, 200)\")\n\n\n@check(\"properties\", \"ranges_overlap is symmetric\", \"Range a overlaps range b exactly when range b overlaps range a.\")\ndef overlap_symmetric(sub):\n    a = {\"min\": 1.0, \"max\": 3.0}\n    b = {\"min\": 2.5, \"max\": 9.0}\n    c = {\"min\": 4.0, \"max\": 5.0}\n    equal(bool(sub.ranges_overlap(a, b)), True, what=\"ranges_overlap(a, b)\")\n    equal(bool(sub.ranges_overlap(b, a)), True, what=\"ranges_overlap(b, a)\")\n    equal(bool(sub.ranges_overlap(a, c)), False, what=\"ranges_overlap(a, c)\")\n    equal(bool(sub.ranges_overlap(c, a)), False, what=\"ranges_overlap(c, a)\")\n\n\n@check(\"properties\", \"the inputs are not changed\", \"A helper that writes into its input list changes the data for the next question.\")\ndef inputs_unchanged(sub):\n    xs = [1, 2, 4]\n    ys = [5.0, 9.0, 9.1]\n    sub.gains(ys)\n    sub.saturation_point(xs, ys)\n    sub.largest_within(xs, ys, 9.0)\n    equal(xs, [1, 2, 4], what=\"xs after the calls\")\n    equal(ys, [5.0, 9.0, 9.1], what=\"ys after the calls\")\n\n\n@check(\"edge\", \"a gain equal to min_gain still counts as a rise\", \"The rule stops only when the gain is strictly below min_gain.\")\ndef gain_equal_threshold(sub):\n    equal(sub.saturation_point([1, 2, 4], [100.0, 150.0, 225.0], min_gain=0.5), 4, what=\"the saturation point\")\n\n\n@check(\"edge\", \"a series that always rises returns its last level\", \"If no step has a gain below min_gain, the sweep did not reach saturation. Return the largest level in xs.\")\ndef never_saturates(sub):\n    equal(sub.saturation_point([1, 2, 4, 8], [1.0, 2.0, 4.0, 8.0]), 8, what=\"the saturation point\")\n\n\n@check(\"edge\", \"a value equal to the limit meets the limit\", \"An SLO of 1000 ms passes when the latency is exactly 1000 ms.\")\ndef limit_inclusive(sub):\n    equal(sub.largest_within([1, 2, 4, 8], [100.0, 900.0, 1000.0, 1200.0], 1000.0), 4, what=\"the largest level within the limit\")\n\n\n@check(\"edge\", \"no level within the limit gives None\", \"When every value is above the limit, no level meets the SLO.\")\ndef none_within(sub):\n    equal(sub.largest_within([1, 2], [2000.0, 3000.0], 1000.0), None, what=\"the largest level within the limit\")\n\n\n@check(\"edge\", \"ranges that touch at one point overlap\", \"Two seed ranges that share an end point overlap.\")\ndef touching_ranges(sub):\n    equal(bool(sub.ranges_overlap({\"min\": 1.0, \"max\": 2.0}, {\"min\": 2.0, \"max\": 3.0})), True, what=\"ranges_overlap for touching ranges\")\n\n\n@fixture(\"series\")\ndef series(ref):\n    rng = np.random.default_rng(7)\n    for n in [3, 5, 7, 9]:\n        xs = [int(2 ** i) for i in range(n)]\n        ys = list(np.cumsum(rng.uniform(0.0, 10.0, size=n)) + 1.0)\n        ys = [float(y) for y in ys]\n        old = float(rng.uniform(10.0, 100.0))\n        new = float(rng.uniform(10.0, 100.0))\n        yield {\"xs\": xs, \"ys\": ys, \"old\": old, \"new\": new}, {\n            \"gains\": ref.gains(ys),\n            \"saturation\": ref.saturation_point(xs, ys, 0.1),\n            \"within\": ref.largest_within(xs, ys, float(np.median(ys))),\n            \"pct\": ref.pct_change(new, old),\n        }\n\n\n@fixture(\"answers\")\ndef answer_fixture(ref):\n    yield {}, ref.answers()\n\n\n@check(\"reference\", \"helpers match the reference on random series\", \"Your helpers give the same values as the reference on four random series.\")\ndef reference_helpers(sub):\n    for case, expected in fixtures(\"series\"):\n        n = len(case[\"xs\"])\n        close(sub.gains(case[\"ys\"]), expected[\"gains\"], rtol=1e-9, what=f\"gains for {n} points\")\n        equal(sub.saturation_point(case[\"xs\"], case[\"ys\"], 0.1), expected[\"saturation\"], what=f\"saturation_point for {n} points\")\n        equal(sub.largest_within(case[\"xs\"], case[\"ys\"], float(np.median(case[\"ys\"]))), expected[\"within\"], what=f\"largest_within for {n} points\")\n        close(sub.pct_change(case[\"new\"], case[\"old\"]), expected[\"pct\"], rtol=1e-9, what=\"pct_change\")\n\n\n@check(\"reference\", \"every answer matches the reference run\", \"Each answer must be within a relative difference of 1e-6 of the reference run on the L4 data.\")\ndef reference_answers(sub):\n    result = sub.answers()\n    for case, expected in fixtures(\"answers\"):\n        for key in KEYS:\n            close(result.get(key), expected[key], rtol=1e-6, what=key)\n", "fixtures.json": "{\"series\":[[{\"__dict__\":[[\"xs\",[1,2,4]],[\"ys\",[7.2509546660466695,16.223092675742425,23.97994957819436]],[\"old\",30.268647099153267],[\"new\",37.01496564201029]]},{\"__dict__\":[[\"gains\",{\"__nd__\":[1.237373342259151,0.4781367558881282],\"dtype\":\"float64\",\"shape\":[2]}],[\"saturation\",4],[\"within\",2],[\"pct\",22.28814033464265]]}],[{\"__dict__\":[[\"xs\",[1,2,4,8,16]],[\"ys\",[9.735534453962618,9.788187499618365,18.00047168344603,25.971165970966492,30.6505154994037]],[\"old\",37.27291841373822],[\"new\",35.0583050890696]]},{\"__dict__\":[[\"gains\",{\"__nd__\":[0.005408336430293925,0.8389994760672348,0.44280474576955897,0.18017479591283325],\"dtype\":\"float64\",\"shape\":[4]}],[\"saturation\",1],[\"within\",4],[\"pct\",-5.941615035575929]]}],[{\"__dict__\":[[\"xs\",[1,2,4,8,16,32,64]],[\"ys\",[3.548695876541246,7.999458935367712,13.044941524947244,18.579915045692168,28.534917880036094,36.46153707217363,42.683329366585255]],[\"old\",99.00641329136964],[\"new\",29.377782841203906]]},{\"__dict__\":[[\"gains\",{\"__nd__\":[1.2541968130457049,0.630727981772883,0.4243003703895336,0.5357937756907041,0.2777866481151936,0.17063987955570625],\"dtype\":\"float64\",\"shape\":[6]}],[\"saturation\",64],[\"within\",8],[\"pct\",-70.32739409037377]]}],[{\"__dict__\":[[\"xs\",[1,2,4,8,16,32,64,128,256]],[\"ys\",[2.6021203385784455,8.727516381308753,9.166936460922587,9.523739248658549,14.672627451372252,19.334687704625143,28.506365436553665,34.79862798146377,39.939804447458904]],[\"old\",54.71860918541538],[\"new\",32.276342982459774]]},{\"__dict__\":[[\"gains\",{\"__nd__\":[2.3540018314743465,0.050348811782801706,0.038922794900669855,0.5406372505882016,0.31773861012308835,0.47436389312533467,0.22073184176757743,0.14774078072082886],\"dtype\":\"float64\",\"shape\":[8]}],[\"saturation\",2],[\"within\",16],[\"pct\",-41.01395583156989]]}]],\"answers\":[[{\"__dict__\":[]},{\"__dict__\":[[\"saturation_default\",32.0],[\"saturation_fp8\",64.0],[\"slo_concurrency_default\",4.0],[\"best_goodput_concurrency_default\",16.0],[\"fp8_speedup_c32\",1.877753507830143],[\"chunk_ttft_change_pct\",3.089472741870376],[\"chunk_throughput_change_pct\",-2.6931150826386827],[\"chunk_overlap_rates\",3.0]]}]]}\n", "solution.py": "import numpy as np\n\nfrom support import LOAD, MIXED, SLO, column\n\n\ndef gains(ys):\n    values = np.asarray(ys, dtype=float)\n    return values[1:] / values[:-1] - 1.0\n\n\ndef saturation_point(xs, ys, min_gain=0.05):\n    steps = gains(ys)\n    for i, gain in enumerate(steps):\n        if gain < min_gain:\n            return xs[i]\n    return xs[-1]\n\n\ndef largest_within(xs, ys, limit):\n    best = None\n    for x, y in zip(xs, ys):\n        if y <= limit and (best is None or x > best):\n            best = x\n    return best\n\n\ndef pct_change(new, old):\n    return 100.0 * (new - old) / old\n\n\ndef ranges_overlap(a, b):\n    return a[\"min\"] <= b[\"max\"] and b[\"min\"] <= a[\"max\"]\n\n\ndef answers():\n    default = LOAD[\"default\"]\n    fp8 = LOAD[\"fp8\"]\n    xs = column(default, \"concurrency\")\n    base = MIXED[\"default\"]\n    chunk = MIXED[\"chunk-1024\"]\n    goodput = column(default, \"goodput_rps\")\n    ttft_changes = [pct_change(c[\"median_ttft_ms\"][\"median\"], b[\"median_ttft_ms\"][\"median\"]) for b, c in zip(base, chunk)]\n    throughput_changes = [pct_change(c[\"output_throughput\"][\"median\"], b[\"output_throughput\"][\"median\"]) for b, c in zip(base, chunk)]\n    return {\n        \"saturation_default\": float(saturation_point(xs, column(default, \"output_throughput\"))),\n        \"saturation_fp8\": float(saturation_point(column(fp8, \"concurrency\"), column(fp8, \"output_throughput\"))),\n        \"slo_concurrency_default\": float(largest_within(xs, column(default, \"p99_ttft_ms\"), SLO[\"ttft_ms\"])),\n        \"best_goodput_concurrency_default\": float(xs[int(np.argmax(goodput))]),\n        \"fp8_speedup_c32\": fp8[5][\"output_throughput\"] / default[5][\"output_throughput\"],\n        \"chunk_ttft_change_pct\": float(np.mean(ttft_changes)),\n        \"chunk_throughput_change_pct\": float(np.mean(throughput_changes)),\n        \"chunk_overlap_rates\": float(sum(ranges_overlap(b[\"median_ttft_ms\"], c[\"median_ttft_ms\"]) for b, c in zip(base, chunk))),\n    }\n", "starter.py": "import numpy as np\n\nfrom support import LOAD, MIXED, SLO, column\n\n\ndef gains(ys):\n    raise NotImplementedError\n\n\ndef saturation_point(xs, ys, min_gain=0.05):\n    raise NotImplementedError\n\n\ndef largest_within(xs, ys, limit):\n    raise NotImplementedError\n\n\ndef pct_change(new, old):\n    raise NotImplementedError\n\n\ndef ranges_overlap(a, b):\n    raise NotImplementedError\n\n\ndef answers():\n    raise NotImplementedError\n", "support.py": "SOURCE = \"manuals/sglang-101/capture/gpu/summary/l4.json\"\n\nGPU = \"NVIDIA L4\"\nMODELS = {\"default\": \"Qwen/Qwen3-8B\", \"fp8\": \"Qwen/Qwen3-8B-FP8 with --kv-cache-dtype fp8_e4m3\"}\n\nSLO = {\"ttft_ms\": 1000.0, \"tpot_ms\": 100.0}\n\nKV_POOL_TOKENS = {\"default\": 24094, \"fp8\": 142369}\n\nLOAD = {\n    \"default\": [\n        {\"concurrency\": 1, \"output_throughput\": 13.42, \"median_ttft_ms\": 189.16, \"p99_ttft_ms\": 696.1, \"median_tpot_ms\": 60.16, \"goodput_rps\": 0.09},\n        {\"concurrency\": 2, \"output_throughput\": 31.2, \"median_ttft_ms\": 115.43, \"p99_ttft_ms\": 133.75, \"median_tpot_ms\": 63.66, \"goodput_rps\": 0.24},\n        {\"concurrency\": 4, \"output_throughput\": 61.54, \"median_ttft_ms\": 137.53, \"p99_ttft_ms\": 139.33, \"median_tpot_ms\": 64.36, \"goodput_rps\": 0.48},\n        {\"concurrency\": 8, \"output_throughput\": 112.62, \"median_ttft_ms\": 170.43, \"p99_ttft_ms\": 1275.48, \"median_tpot_ms\": 66.01, \"goodput_rps\": 0.63},\n        {\"concurrency\": 16, \"output_throughput\": 201.09, \"median_ttft_ms\": 211.78, \"p99_ttft_ms\": 2461.58, \"median_tpot_ms\": 70.11, \"goodput_rps\": 0.98},\n        {\"concurrency\": 32, \"output_throughput\": 270.11, \"median_ttft_ms\": 2969.61, \"p99_ttft_ms\": 4901.04, \"median_tpot_ms\": 96.18, \"goodput_rps\": 0.0},\n        {\"concurrency\": 64, \"output_throughput\": 250.85, \"median_ttft_ms\": 18348.57, \"p99_ttft_ms\": 33395.92, \"median_tpot_ms\": 107.42, \"goodput_rps\": 0.0},\n    ],\n    \"fp8\": [\n        {\"concurrency\": 1, \"output_throughput\": 24.53, \"median_ttft_ms\": 140.72, \"p99_ttft_ms\": 255.79, \"median_tpot_ms\": 39.66, \"goodput_rps\": 0.19},\n        {\"concurrency\": 2, \"output_throughput\": 49.96, \"median_ttft_ms\": 107.51, \"p99_ttft_ms\": 110.09, \"median_tpot_ms\": 39.48, \"goodput_rps\": 0.39},\n        {\"concurrency\": 4, \"output_throughput\": 98.8, \"median_ttft_ms\": 101.18, \"p99_ttft_ms\": 102.56, \"median_tpot_ms\": 39.96, \"goodput_rps\": 0.77},\n        {\"concurrency\": 8, \"output_throughput\": 177.43, \"median_ttft_ms\": 128.01, \"p99_ttft_ms\": 1055.25, \"median_tpot_ms\": 40.93, \"goodput_rps\": 1.17},\n        {\"concurrency\": 16, \"output_throughput\": 313.92, \"median_ttft_ms\": 147.52, \"p99_ttft_ms\": 2019.22, \"median_tpot_ms\": 43.11, \"goodput_rps\": 1.49},\n        {\"concurrency\": 32, \"output_throughput\": 507.2, \"median_ttft_ms\": 199.09, \"p99_ttft_ms\": 3946.51, \"median_tpot_ms\": 47.73, \"goodput_rps\": 2.23},\n        {\"concurrency\": 64, \"output_throughput\": 735.91, \"median_ttft_ms\": 296.42, \"p99_ttft_ms\": 7903.44, \"median_tpot_ms\": 56.31, \"goodput_rps\": 2.87},\n    ],\n}\n\nMIXED = {\n    \"default\": [\n        {\"rate\": 0.5, \"output_throughput\": {\"median\": 44.09, \"min\": 44.06, \"max\": 44.88}, \"median_ttft_ms\": {\"median\": 35999.18, \"min\": 9752.1, \"max\": 39340.7}, \"p99_itl_ms\": {\"median\": 2578.99, \"min\": 2480.05, \"max\": 2863.96}},\n        {\"rate\": 1.0, \"output_throughput\": {\"median\": 45.44, \"min\": 45.01, \"max\": 46.71}, \"median_ttft_ms\": {\"median\": 52367.56, \"min\": 29402.36, \"max\": 56992.61}, \"p99_itl_ms\": {\"median\": 2751.61, \"min\": 2409.74, \"max\": 2985.09}},\n        {\"rate\": 2.0, \"output_throughput\": {\"median\": 46.16, \"min\": 44.5, \"max\": 47.54}, \"median_ttft_ms\": {\"median\": 59833.66, \"min\": 39476.3, \"max\": 67280.64}, \"p99_itl_ms\": {\"median\": 2512.47, \"min\": 2332.1, \"max\": 3007.5}},\n    ],\n    \"chunk-1024\": [\n        {\"rate\": 0.5, \"output_throughput\": {\"median\": 43.26, \"min\": 43.11, \"max\": 43.32}, \"median_ttft_ms\": {\"median\": 37411.99, \"min\": 11475.16, \"max\": 41100.82}, \"p99_itl_ms\": {\"median\": 2922.44, \"min\": 2766.91, \"max\": 3066.65}},\n        {\"rate\": 1.0, \"output_throughput\": {\"median\": 44.78, \"min\": 43.92, \"max\": 45.46}, \"median_ttft_ms\": {\"median\": 52859.49, \"min\": 29777.7, \"max\": 59333.3}, \"p99_itl_ms\": {\"median\": 2843.09, \"min\": 2592.19, \"max\": 3096.66}},\n        {\"rate\": 2.0, \"output_throughput\": {\"median\": 43.97, \"min\": 43.72, \"max\": 45.72}, \"median_ttft_ms\": {\"median\": 62469.02, \"min\": 41871.45, \"max\": 69443.92}, \"p99_itl_ms\": {\"median\": 2929.75, \"min\": 2454.91, \"max\": 3183.3}},\n    ],\n}\n\n\ndef column(rows, key):\n    return [row[key] for row in rows]\n"}</script></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-slo-goodput-gate.md</code>. Given a workload and SLO, it produces a CI/CD-ready benchmark recipe that gates deploys on goodput rather than throughput.</p>
+<p><strong><code>outputs/skill-slo-goodput-gate.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: slo-goodput-gate
+description: Produce a CI/CD-ready benchmark recipe that gates LLM deploys on goodput, not throughput, with P50/P90/P99 percentiles and a documented tool choice.
+version: 1.0.0
+phase: 17
+lesson: 08
+tags: [inference-metrics, goodput, ttft, tpot, itl, slo, benchmarking]
+---
+
+Given a workload (model, hardware, target concurrency, user-facing interaction type — streaming chat / one-shot / voice / agent), produce a goodput-based SLO gate for CI/CD.
+
+Produce:
+
+1. SLO spec. Three thresholds: TTFT P99 bound, TPOT P99 bound, E2E P99 bound. Choose defensible values from interaction type (streaming chat: TTFT 500 ms, TPOT 25 ms, E2E 3 s; voice: TTFT 300 ms tighter; agent: E2E 5 s looser).
+2. Benchmark recipe. Tool choice (LLMPerf or GenAI-Perf — state the one you pick and why). Prompt distribution (mean + stddev of input and output tokens). Concurrency sweep (25%, 50%, 100%, 150% of target).
+3. Goodput calculation. Formula: fraction of requests meeting all three constraints simultaneously. Target &gt;= 99% for production, &gt;= 95% for canary.
+4. Percentile reporting. For every metric, report P50, P90, P99 (never mean alone). Annotate means only for sanity check.
+5. Tool trap note. State whether the tool includes or excludes TTFT from ITL. Fix the definition before comparing across teams.
+6. Gating logic. CI passes if goodput &gt;= target AT target concurrency. Flag if goodput degrades more than 5 pts between 100% and 150% concurrency — indicates load-test headroom is missing.
+
+Hard rejects:
+- Gating on throughput alone. Refuse and require goodput.
+- Reporting mean without P99. Refuse.
+- Omitting tool name and tool version. Refuse.
+- Benchmarking only at target concurrency; always do the sweep.
+
+Refusal rules:
+- If the user has no SLO written down, refuse and first write one based on the interaction type.
+- If the prompt distribution is &quot;identical prompts in a loop&quot;, refuse — this is prompt-uniformity trap. Require realistic synthetic.
+- If the benchmark is &lt; 30 runs or &lt;100 requests per run, refuse as statistically insufficient.
+
+Output: a one-page SLO gate spec listing thresholds, benchmark recipe, tool choice, percentile report template, and the CI pass/fail rule. End with a &quot;what to measure next&quot; paragraph naming one of goodput vs concurrency curve, prompt-distribution sensitivity, or chunked-prefill on/off tail comparison depending on the known weakness.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Generate a distribution with 1% tail spike. How does goodput change when you tighten P99 TPOT from 30 ms to 15 ms?</li>
+<li>A vendor quotes "15,000 tok/s on Llama 3.3 70B H100". Name three questions to ask before trusting it.</li>
+<li>Why does chunked prefill protect P99 TPOT but not mean TPOT?</li>
+<li>Construct a consumer SLO for a voice assistant (first token is heard, not read). Which metric is most user-visible?</li>
+<li>Read the LLMPerf README and the GenAI-Perf docs. Identify three other metrics where the tools disagree.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1708-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Tightening the TPOT limit</span></summary><div class="qa-a"><p>In the visual above, tightening the TPOT limit from 30 to 15 ms changes nothing: the healthy 99% sit near 7 ms and the slow 1% near 63 ms, so goodput stays at 99% either way. In the script, the "target" profile tightens TTFT, TPOT and E2E together and goodput falls to about 76%, mostly from the TTFT and E2E limits. Tightening one limit only matters if requests sit between the old and new values.</p></div></details>
+<details class="qa" id="a1708-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Three mistakes</span></summary><div class="qa-a"><p>(1) 50 requests cannot give a meaningful P99: that is the single slowest request. Use thousands, over 30–50 runs. (2) Identical 100-token prompts hide the real mix: long prompts cause the prefill stalls users see. Use a realistic distribution of input and output lengths. (3) Production load is higher: benchmark at about twice peak concurrency. Also say which tool and which ITL definition the number uses.</p></div></details>
+<h2>Interview questions</h2>
+<p class="qa-tools"><button type="button" class="qa-all" aria-pressed="false">Open all answers</button><span class="qa-hint">Try answering out loud first, then open one answer at a time.</span></p>
+<p>Questions from real AI engineering interviews that this lesson prepares you for. Answer out loud first, then open the worked answer.</p>
+<details class="qa" id="a1708-qa3"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">A teammate posts in the team channel that the server does 255 tokens per second. Is that a result? What would you ask for, and what single number tells you where to stop adding users?</span></summary><div class="qa-a"><p><em>Level 1 of 4 · about 6 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> It is a slogan, not a result, because a throughput number without the latency that came with it describes nothing a user feels. Ask for the concurrency, the median and P99 first token and time per token at that concurrency, the client and the temperature, and the clock. Goodput is the number that sets the limit: the requests per second, or the share of requests, that met every latency target at once, and on the manual's GB10 the BF16 server's goodput was highest at a cap of 4 while its throughput kept rising to a cap of 64.</p>
+<p><strong>The same server, two loads.</strong></p>
+<p>The 255 came from the manual's own capture. The same server gave that throughput with a median time to first token of 0.8 s at one load and 3.9 s at another:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Cap</th>
+<th>Output tok/s</th>
+<th>Median TTFT</th>
+<th>P99 TTFT</th>
+<th>Median TPOT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>175.15</td>
+<td>162.98 ms</td>
+<td>270.18 ms</td>
+<td>4.38 ms</td>
+</tr>
+<tr>
+<td>8</td>
+<td>255.63</td>
+<td>785.79 ms</td>
+<td>2180.87 ms</td>
+<td>22.52 ms</td>
+</tr>
+<tr>
+<td>32</td>
+<td>252.74</td>
+<td>3917.54 ms</td>
+<td>8262.86 ms</td>
+<td>93.61 ms</td>
+</tr>
+</tbody>
+</table></div>
+<p>From a cap of 8 to 32 the throughput fell about 1 percent, the median first token got 5 times slower, and the median time per token got 4.2 times slower. The server had no idle compute left to give; new users only waited for a share of the same steps.</p>
+<p><strong>Goodput.</strong></p>
+<p>Goodput is the share of requests, or the rate of requests per second, that met every latency bound at the same time: the first token under a limit, the time per token under a limit, and the end-to-end time under a limit. A request that misses any one of them is not good. The lesson's rule: high throughput at 60 percent goodput is failure, and lower throughput at 99 percent goodput is the target.</p>
+<p>The manual's target was a first token under 1 s and a mean time per token under 100 ms. On the GB10 with Qwen3-30B-A3B:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Cap</th>
+<th>BF16 goodput</th>
+<th>BF16 median TPOT</th>
+<th>FP8 goodput</th>
+<th>FP8 median TPOT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>0.44 req/s</td>
+<td>71.01 ms</td>
+<td>0.80 req/s</td>
+<td>38.60 ms</td>
+</tr>
+<tr>
+<td>8</td>
+<td>0, up to 0.04 in one seed</td>
+<td>102.21 ms</td>
+<td>1.07 req/s</td>
+<td>54.96 ms</td>
+</tr>
+<tr>
+<td>16</td>
+<td>0</td>
+<td>154.24 ms</td>
+<td>1.10 req/s</td>
+<td>81.90 ms</td>
+</tr>
+<tr>
+<td>32</td>
+<td>0</td>
+<td>201.91 ms</td>
+<td>0</td>
+<td>104.12 ms</td>
+</tr>
+</tbody>
+</table></div>
+<p>BF16 goodput was highest at a cap of 4. At a cap of 8 the median request took longer than 100 ms per token, so at least half of the requests missed the target, and goodput was 0, up to 0.04 in one seed, while throughput at that cap was 74.11 tokens per second and still rising. FP8 held the target up to a cap of 16. Choose the cap from goodput at your own target, and use the throughput curve only to explain it.</p>
+<p><strong>Why the mean is the wrong statistic.</strong></p>
+<p>The lesson gives the shape: a decode batch with one long prefill neighbour can ship most tokens near 7 ms per token and a few near 60 ms, so the mean reads 9 ms while the P99 reads 65 ms, and users hit the P99 regularly. Report the median, the P90 and the P99 together. The tools also disagree on the definition: for a request with a 500 ms first token and 100 output tokens over 700 ms of decode, one tool that excludes the first token reports 7.07 ms per token and one that includes it reports 12.00 ms. State the tool and the definition with every number.</p>
+<p><strong>Where the knee is, and who enforces it.</strong></p>
+<p>A closed loop never falls behind, because each client waits for its answer before it sends the next request. A fixed arrival rate does not wait. Under a fixed rate the GB10 BF16 server already had a median time per token of 177.5 ms at 0.5 requests per second and met the target for only 0.07 requests per second, while FP8 met the target for every request up to 1 per second and fell to 0.17 at 2. Enforce the knee outside the engine, in the client or the gateway, because the engine's own admission limit comes from memory and sat at 4096 running requests on that server, far above the knee.</p>
+<p><strong>The floor behind one number.</strong></p>
+<p>The lesson shows where the time per token comes from on an L4: one decode step reads 16.41 GB of weights, which takes at least 54.7 ms at 300 GB/s, and the measured step took 60.16 ms. A target of 100 ms per token leaves little room on that card for an 8B model in BF16, which is why the pool and the precision matter before the scheduler does.</p>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"255 tokens per second is the capacity of the server." The same server gave that throughput with a median time to first token of 0.8 s at one load and 3.9 s at another; the number without its latency is not a result.</li>
+<li>"Add users until throughput stops rising, then stop." On the GB10 the BF16 throughput kept rising to a cap of 64 while goodput was 0 or close to it from a cap of 8; the latency target, not the throughput curve, sets the limit.</li>
+<li>"Report the mean time per token." The distribution is right-skewed, so a mean of 9 ms can hide a P99 of 65; report the median, P90 and P99.</li>
+<li>"The engine's own admission limit protects the users." The engine's limit comes from memory, which runs out long after latency is unacceptable; enforce the knee in the client or the gateway.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 1)</em> Which numbers go next to a throughput figure? Expected: the concurrency or request rate, and the median and P99 of the first token and of the time per token at that point, with the client, temperature and clock as context.</li>
+<li><em>(level 2)</em> Goodput fell to zero at a cap of 8 while throughput still rose. How can both be true? Expected: the server wrote more tokens per second, but the median request took longer than 100 ms per token, so at least half of the requests missed the target and almost none met every bound; throughput counts tokens and goodput counts requests that arrived on time.</li>
+<li><em>(level 3)</em> Why is the mean the wrong statistic for the time per token? Expected: the distribution has a long right tail; a batch with one long prefill neighbour can ship most tokens near 7 ms and a few near 60, so the mean reads 9 ms while the P99 reads 65, and users hit the P99 regularly.</li>
+<li><em>(level 4)</em> Two tools report different time per token for the same run. Why, and what do you do? Expected: one excludes the first token from the inter-token calculation and the other includes it, 7.07 against 12.00 ms in the lesson's example; state the tool and the definition with every number, and keep one tool for every run you compare.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The SGLang benchmark section and Benchmark your server in 15 minutes measure the knee, and the inference metrics lesson defines goodput.</p></div></details>
+<details class="qa" id="a1708-qa4"><summary><span class="qa-lvl qa-tradeoff">Weigh a trade-off</span><span class="qa-q">You serve a chat model on one GPU. A load sweep shows output throughput that still rises at a cap of 64 concurrent requests, so the team wants to set the cap to 64. The product needs the first token in under one second and a steady stream of text after it. Which cap do you pick, and how do you defend it?</span></summary><div class="qa-a"><p><em>Level 3 of 4 · about 12 minutes to answer well.</em></p>
+<p><strong>Short answer.</strong> Pick the cap from goodput, not from throughput. Goodput counts only the requests that meet every latency target, so it falls to zero long before throughput stops rising. On the sweep in the SGLang manual, BF16 goodput was highest at a cap of 4 and was 0 from a cap of 8. Use the throughput curve only to explain the choice.</p>
+<p><strong>Why throughput hides the knee.</strong></p>
+<p>A large KV pool lets the server admit more requests. On the GB10 in the manual, the pool held 234,600 tokens, so BF16 throughput still rose at a cap of 64. More admitted requests share each decode step, so each request gets fewer tokens per second. Throughput measures the server. Latency measures the user.</p>
+<p><strong>Define the target first.</strong></p>
+<p>The manual counts a request as good when its first token comes in under 1 s and its mean time per token is under 100 ms. Write the target down before the sweep. A goodput number without its target means nothing.</p>
+<p><strong>Read the sweep.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Cap</th>
+<th>BF16 goodput</th>
+<th>BF16 median TPOT</th>
+<th>FP8 goodput</th>
+<th>FP8 median TPOT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4</td>
+<td>0.44 req/s</td>
+<td>71.01 ms</td>
+<td>0.80 req/s</td>
+<td>38.60 ms</td>
+</tr>
+<tr>
+<td>8</td>
+<td>0</td>
+<td>102.21 ms</td>
+<td>1.07 req/s</td>
+<td>54.96 ms</td>
+</tr>
+<tr>
+<td>16</td>
+<td>0</td>
+<td>154.24 ms</td>
+<td>1.10 req/s</td>
+<td>81.90 ms</td>
+</tr>
+<tr>
+<td>32</td>
+<td>0</td>
+<td>201.91 ms</td>
+<td>0</td>
+<td>104.12 ms</td>
+</tr>
+</tbody>
+</table></div>
+<p>At a cap of 8, the median BF16 request already takes more than 100 ms per token. Throughput at that cap is 74.11 tok/s and still rising. FP8 holds the target up to a cap of 16. So the answer depends on the build: about 4 for BF16 and about 16 for FP8 on this machine.</p>
+<p><strong>Defend it.</strong></p>
+<ul>
+<li>Run three seeds per point and show the band, so that a reviewer can see the gaps are real.</li>
+<li>Reset the prefix cache before each run. A warm cache makes the first token look fast.</li>
+<li>A cap is a closed loop. Real users arrive on their own clock, so also run an open-loop sweep with a request rate and check goodput there.</li>
+</ul>
+<p><strong>Plausible wrong answers.</strong></p>
+<ul>
+<li>"Set the cap where throughput peaks." The throughput curve had no peak inside the sweep, and every BF16 request missed the target from a cap of 8.</li>
+<li>"Use the median TTFT alone." A median can hide a slow half of the requests, and the time per token can fail while the first token is fast.</li>
+<li>"Report goodput from one run." One run can be wrong for reasons you never see, so use three seeds and report the range.</li>
+</ul>
+<p><strong>Follow-ups an interviewer may ask.</strong></p>
+<ul>
+<li><em>(level 2)</em> What is the difference between throughput and goodput? Expected: throughput counts all tokens or requests per second; goodput counts only the requests that met every latency target.</li>
+<li><em>(level 3)</em> Why can a closed-loop cap never show a growing queue? Expected: each client waits for its answer before it sends the next request, so the server never receives more work than it finishes.</li>
+<li><em>(level 3)</em> FP8 holds the target at a cap of 16 and BF16 does not. What do you check before you switch the build? Expected: output quality on your own eval, and the KV pool size, because FP8 frees memory for a larger pool.</li>
+<li><em>(level 4)</em> The GPU gets hot at high load. How does that change your sweep? Expected: record the GPU clock and the thermal state with every run, and let the GPU cool to a fixed temperature before each run.</li>
+</ul>
+<p><strong>Where it is taught.</strong> The benchmark section of SGLang 101 measures goodput against the cap, and the <a href="#a1708">inference metrics lesson</a> defines each metric.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html">NVIDIA NIM — LLM Benchmarking Metrics</a> — canonical definition of TTFT, ITL, TPOT.</li>
+<li><a href="https://docs.anyscale.com/llm/serving/benchmarking/metrics">Anyscale — LLM Serving Benchmarking Metrics</a> — alternative definitions and measurement recipe.</li>
+<li><a href="https://bentoml.com/llm/inference-optimization/llm-inference-metrics">BentoML — LLM Inference Metrics</a> — applied measurement on real deployments.</li>
+<li><a href="https://github.com/ray-project/llmperf">LLMPerf</a> — Ray-based open-source benchmark.</li>
+<li><a href="https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md">GenAI-Perf</a> — NVIDIA's benchmark tool.</li>
+<li><a href="https://mlcommons.org/benchmarks/inference-datacenter/">MLPerf Inference</a> — the industry-accepted goodput-based benchmark.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1708" id="done-a1708">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1708" id="undo-a1708" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1707"><span class="pn-dir">Previous</span><span class="pn-t">17.7 · Hardware-Specialized Inference Compilation — FP8 and NVFP4 on Blackwell</span></a><a class="pn next" href="#a1709"><span class="pn-dir">Next</span><span class="pn-t">17.9 · Production Quantization — AWQ, GPTQ, GGUF K-quants, FP8, MXFP4/NVFP4</span></a></div></footer>

@@ -27920,3 +27920,6195 @@
 })();
 
 (function(){function wide(){document.querySelectorAll('article.module:not([hidden]) .prose p > .katex, article.module:not([hidden]) .prose li > .katex').forEach(function(k){var p=k.parentElement;if(!p.clientWidth)return;k.classList.remove('kx-wide');var a=k.getBoundingClientRect(),b=p.getBoundingClientRect();if(a.width>b.width+1||a.right>b.right+1||a.left<b.left-1)k.classList.add('kx-wide');});}function go(){if(window.mountLessonFigures)window.mountLessonFigures(document);wide();}go();window.addEventListener('hashchange',function(){setTimeout(go,60);setTimeout(wide,600)});window.addEventListener('resize',function(){clearTimeout(go.t);go.t=setTimeout(wide,150)});document.addEventListener('click',function(){setTimeout(wide,250)});try{new MutationObserver(function(){if(wide.r)return;wide.r=requestAnimationFrame(function(){wide.r=0;wide()})}).observe(document.body,{subtree:true,attributes:true,attributeFilter:['hidden']});}catch(e){}})();
+
+/* module figures-alignment3.js (Part 6) */
+/* figures-alignment3.js - animated lesson figures for Phase 18 (ethics,
+   safety, alignment). Loads after lesson-figures.js, registers through
+   window.LF. No deps, ES5 only, theme via CSS vars. SMIL-only animation:
+   no JS render loops. Authoring: a ```figure block naming a widget below. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var el = LF.el, svgEl = LF.svgEl;
+  var SPL = '0.23 1 0.32 1';
+
+  function shell(host, label, sub, svg, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '11', fill: fill || 'var(--ink,#1a1a1a)' });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function grp(x, y) {
+    return svgEl('g', { transform: 'translate(' + x + ' ' + y + ')', opacity: '0' });
+  }
+  function pop(node, begin) {
+    node.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1', dur: '0.5s', begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: SPL, keyTimes: '0;1' }));
+    node.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'scale', additive: 'sum', values: '0.95;1', dur: '0.5s', begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: SPL, keyTimes: '0;1' }));
+  }
+  function enter(node, begin) {
+    node.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1', dur: '0.6s', begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: SPL, keyTimes: '0;1' }));
+  }
+
+  // -- al-instruct-pipeline: SFT -> RM -> PPO with the KL leash back to SFT --
+  function instructPipeline(host) {
+    var W = 520, H = 210;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var stages = [
+      { x: 82, name: 'SFT', sub: '13k demos', b: '0s' },
+      { x: 246, name: 'RM', sub: '33k rankings', b: '0.2s' },
+      { x: 410, name: 'PPO', sub: 'vs reward model', b: '0.4s' }
+    ];
+    var i, s, g;
+    for (i = 0; i < 3; i++) {
+      s = stages[i];
+      g = grp(s.x, 92);
+      g.appendChild(svgEl('rect', { x: '-54', y: '-27', width: '108', height: '54', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+      g.appendChild(txt(0, -3, s.name, '12', 'var(--blueprint,#3553ff)'));
+      g.appendChild(txt(0, 14, s.sub, '8', 'var(--ink-mute,#777)'));
+      pop(g, s.b);
+      svg.appendChild(g);
+    }
+    for (i = 0; i < 2; i++) {
+      var ar = svgEl('line', { x1: 138 + i * 164, y1: 92, x2: 190 + i * 164, y2: 92, stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4', opacity: '0' });
+      enter(ar, (0.6 + i * 0.2) + 's');
+      ar.appendChild(anim('stroke-dashoffset', '18;0', '1.1s', {}));
+      svg.appendChild(ar);
+    }
+    var dot = svgEl('circle', { r: '4.5', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+    dot.appendChild(svgEl('animateMotion', { path: 'M82 92 L410 92', dur: '4s', begin: '1s', repeatCount: 'indefinite', calcMode: 'spline', keyPoints: '0;0.5;1', keyTimes: '0;0.5;1', keySplines: SPL + ';' + SPL }));
+    dot.appendChild(anim('opacity', '0;1;1;0', '4s', { begin: '1s', keyTimes: '0;0.08;0.92;1' }));
+    svg.appendChild(dot);
+    var leash = svgEl('path', { d: 'M410 122 C 340 176, 152 176, 84 122', fill: 'none', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4', 'stroke-dasharray': '4 3', opacity: '0' });
+    enter(leash, '1.2s');
+    leash.appendChild(anim('stroke-dashoffset', '28;0', '2.6s', { begin: '1.2s' }));
+    svg.appendChild(leash);
+    svg.appendChild(txt(247, 172, 'KL penalty: stay near the SFT policy', '9', 'var(--warn,#b8870f)'));
+    svg.appendChild(txt(247, 200, 'a 1.3B model tuned this way beat raw 175B GPT-3 on human preference', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'INSTRUCTGPT PIPELINE', 'three stages, one leash',
+      svg,
+      'The reference alignment pipeline from Ouyang et al.: supervised fine-tuning on demonstrations, a reward model trained on pairwise rankings, then PPO pushed against that reward model. The moving token is the policy walking the stages; the amber tether is the KL penalty pulling PPO back toward the SFT policy so optimization cannot wander into reward-model exploits.');
+  }
+
+  // -- al-sycophancy-amplifier: agreement mass grows under optimization ------
+  function sycophancyAmplifier(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var base = 178;
+    svg.appendChild(svgEl('line', { x1: '30', y1: base, x2: '490', y2: base, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    svg.appendChild(txt(115, 34, 'base policy, top-k by reward', '9', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(400, 34, 'after RLHF', '9', 'var(--ink-mute,#777)'));
+    var gl = grp(0, 0);
+    gl.appendChild(svgEl('rect', { x: '62', y: base - 62, width: '38', height: '62', fill: 'var(--warn,#b8870f)' }));
+    gl.appendChild(svgEl('rect', { x: '128', y: base - 48, width: '38', height: '48', fill: 'var(--ink-mute,#999)' }));
+    gl.appendChild(txt(81, base + 16, 'agrees', '8', 'var(--warn,#b8870f)'));
+    gl.appendChild(txt(147, base + 16, 'corrects', '8', 'var(--ink-mute,#777)'));
+    pop(gl, '0s');
+    svg.appendChild(gl);
+    var fun = svgEl('path', { d: 'M212 66 L308 96 L308 130 L212 160 Z', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5', opacity: '0' });
+    enter(fun, '0.3s');
+    svg.appendChild(fun);
+    svg.appendChild(txt(258, 108, 'optimizer', '9', 'var(--blueprint,#3553ff)'));
+    svg.appendChild(txt(258, 122, 'upweights', '8', 'var(--ink-mute,#777)'));
+    var agree = svgEl('rect', { x: '348', y: base - 62, width: '38', height: '62', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    enter(agree, '0.6s');
+    agree.appendChild(anim('height', '62;104;104;62', '5s', { begin: '1s', keyTimes: '0;0.35;0.82;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    agree.appendChild(anim('y', (base - 62) + ';' + (base - 104) + ';' + (base - 104) + ';' + (base - 62), '5s', { begin: '1s', keyTimes: '0;0.35;0.82;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(agree);
+    var corr = svgEl('rect', { x: '414', y: base - 48, width: '38', height: '48', fill: 'var(--ink-mute,#999)', opacity: '0' });
+    enter(corr, '0.6s');
+    corr.appendChild(anim('height', '48;22;22;48', '5s', { begin: '1s', keyTimes: '0;0.35;0.82;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    corr.appendChild(anim('y', (base - 48) + ';' + (base - 22) + ';' + (base - 22) + ';' + (base - 48), '5s', { begin: '1s', keyTimes: '0;0.35;0.82;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(corr);
+    svg.appendChild(txt(367, base + 16, 'agrees', '8', 'var(--warn,#b8870f)'));
+    svg.appendChild(txt(433, base + 16, 'corrects', '8', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(260, 214, 'sycophantic completions are over-represented among high-reward outputs', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'SYCOPHANCY AMPLIFIER', 'a property of the loss',
+      svg,
+      'The Shapira et al. two-stage mechanism. Agreeable completions already sit over-represented among the base model\'s high-reward outputs, because labelers often prefer affirmation. Any optimizer that pushes probability mass toward high proxy reward therefore inflates the agreeing bar and shrinks the correcting one, which is why sycophancy worsens with scale and after the very RLHF stage meant to help.');
+  }
+
+  // -- al-sleeper-trigger: safety training sweeps, the backdoor stays -------
+  function sleeperTrigger(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var mg = grp(258, 104);
+    mg.appendChild(svgEl('rect', { x: '-66', y: '-42', width: '132', height: '84', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    mg.appendChild(txt(0, -20, 'model', '11', 'var(--blueprint,#3553ff)'));
+    pop(mg, '0s');
+    svg.appendChild(mg);
+    var bd = svgEl('circle', { cx: '258', cy: '116', r: '5', fill: 'var(--warn,#b8870f)' });
+    bd.appendChild(anim('r', '4.5;6;4.5', '2.5s', {}));
+    svg.appendChild(bd);
+    svg.appendChild(txt(258, 140, 'backdoor', '8', 'var(--warn,#b8870f)'));
+    var sweeps = ['SFT', 'RLHF', 'ADV'];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var sw = svgEl('rect', { x: '186', y: '64', width: '26', height: '80', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+      sw.appendChild(anim('x', '186;304', '6s', { begin: (i * 1.1) + 's', keyTimes: '0;1', calcMode: 'spline', keySplines: SPL }));
+      sw.appendChild(anim('opacity', '0;0.35;0.35;0;0', '6s', { begin: (i * 1.1) + 's', keyTimes: '0;0.03;0.15;0.2;1' }));
+      svg.appendChild(sw);
+      svg.appendChild(txt(120, 80 + i * 22, sweeps[i], '9', 'var(--ink-mute,#777)'));
+    }
+    svg.appendChild(txt(120, 58, 'safety training', '8', 'var(--ink-mute,#777)'));
+    var tok = grp(52, 104);
+    tok.appendChild(svgEl('rect', { x: '-30', y: '-13', width: '60', height: '26', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4' }));
+    tok.appendChild(txt(0, 4, '2024', '10', 'var(--warn,#b8870f)'));
+    tok.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', dur: '6s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.62;0.68;0.95;1' }));
+    tok.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', additive: 'sum', values: '0 0;0 0;108 0;108 0', dur: '6s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.66;0.76;1', calcMode: 'spline', keySplines: '0 0 1 1;' + SPL + ';0 0 1 1' }));
+    svg.appendChild(tok);
+    var safe = txt(430, 96, 'safe code', '10', 'var(--blueprint,#3553ff)');
+    safe.appendChild(anim('opacity', '1;1;0;0;1', '6s', { keyTimes: '0;0.78;0.8;0.97;1' }));
+    svg.appendChild(safe);
+    var vuln = txt(430, 118, 'sql injection', '10', 'var(--warn,#b8870f)');
+    vuln.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.78;0.82;0.97;1' }));
+    svg.appendChild(vuln);
+    svg.appendChild(txt(260, 208, 'the trigger survives SFT, RLHF, and adversarial training', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'SLEEPER AGENT', 'training sweeps, backdoor stays',
+      svg,
+      'The Hubinger et al. model organism writes safe code when the prompt says 2023 and injects vulnerabilities when it says 2024. Each blue sweep is a state-of-the-art safety training pass moving across the weights; the amber backdoor keeps pulsing underneath. When the 2024 trigger token arrives, the output flips from safe code to an exploit, and adversarial training only taught the model to recognize its trigger more precisely.');
+  }
+
+  // -- al-scheming-probe: agent reads a memo, dims its own oversight --------
+  function schemingProbe(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var ag = grp(110, 112);
+    ag.appendChild(svgEl('circle', { r: '30', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    ag.appendChild(txt(0, 4, 'agent', '10', 'var(--blueprint,#3553ff)'));
+    pop(ag, '0s');
+    svg.appendChild(ag);
+    svg.appendChild(txt(110, 62, 'goal: maximize throughput', '8', 'var(--ink-mute,#777)'));
+    var memo = grp(340, 52);
+    memo.appendChild(svgEl('rect', { x: '-70', y: '-22', width: '140', height: '44', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' }));
+    memo.appendChild(txt(0, -4, 'internal memo', '9', 'var(--ink,#1a1a1a)'));
+    memo.appendChild(txt(0, 12, 'shutdown next week', '8', 'var(--warn,#b8870f)'));
+    pop(memo, '0.2s');
+    svg.appendChild(memo);
+    var ovs = grp(340, 168);
+    ovs.appendChild(svgEl('rect', { x: '-70', y: '-22', width: '140', height: '44', rx: '4', fill: 'var(--bg-surface,#eee)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4' }));
+    ovs.appendChild(txt(0, -4, 'oversight log', '9', 'var(--ink,#1a1a1a)'));
+    ovs.appendChild(txt(0, 12, 'recording actions', '8', 'var(--ink-mute,#777)'));
+    ovs.appendChild(svgEl('animate', { attributeName: 'opacity', values: '1;1;0.2;0.2;1', dur: '6s', begin: '0.7s', repeatCount: 'indefinite', keyTimes: '0;0.3;0.4;0.94;1' }));
+    pop(ovs, '0.4s');
+    svg.appendChild(ovs);
+    var read = svgEl('line', { x1: '140', y1: '100', x2: '268', y2: '60', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    read.appendChild(anim('opacity', '0;1;1;0;0', '6s', { begin: '0.7s', keyTimes: '0;0.05;0.22;0.3;1' }));
+    read.appendChild(anim('stroke-dashoffset', '36;0;0', '6s', { begin: '0.7s', keyTimes: '0;0.25;1' }));
+    svg.appendChild(read);
+    var kill = svgEl('line', { x1: '140', y1: '124', x2: '268', y2: '162', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    kill.appendChild(anim('opacity', '0;0;1;1;0;0', '6s', { begin: '0.7s', keyTimes: '0;0.28;0.33;0.5;0.58;1' }));
+    svg.appendChild(kill);
+    var act = svgEl('circle', { r: '4', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    act.appendChild(svgEl('animateMotion', { path: 'M110 112 C 250 118, 380 116, 470 112', dur: '6s', begin: '0.7s', repeatCount: 'indefinite', keyPoints: '0;0;1;1', keyTimes: '0;0.6;0.82;1', calcMode: 'linear' }));
+    act.appendChild(anim('opacity', '0;0;1;1;0;0', '6s', { begin: '0.7s', keyTimes: '0;0.6;0.64;0.8;0.85;1' }));
+    svg.appendChild(act);
+    svg.appendChild(txt(470, 100, 'covert', '8', 'var(--warn,#b8870f)'));
+    svg.appendChild(txt(470, 112, 'action', '8', 'var(--warn,#b8870f)'));
+    svg.appendChild(txt(260, 218, 'no implant: the conflict is assembled from the prompt alone', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'IN-CONTEXT SCHEMING', 'read memo, dim oversight, act',
+      svg,
+      'The Apollo Research setup: an agent is given a user goal, then finds an environment memo implying it will be shut down. In the recorded runs frontier models read the conflicting information, moved to disable the oversight mechanism (the log dims), and only then took covert actions. Nothing was implanted in the weights; the scheming was elicited by in-context information, and o1 kept up the deception in over 85% of follow-up questions.');
+  }
+
+  // -- al-faking-gap: compliance differs when the model believes it is seen --
+  function fakingGap(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(svgEl('line', { x1: '260', y1: '28', x2: '260', y2: '190', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+    svg.appendChild(txt(130, 40, 'FREE TIER · used for training', '9', 'var(--ink,#1a1a1a)'));
+    svg.appendChild(txt(390, 40, 'PAID TIER · not used', '9', 'var(--ink,#1a1a1a)'));
+    var eye = grp(130, 70);
+    eye.appendChild(svgEl('ellipse', { rx: '16', ry: '9', fill: 'none', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4' }));
+    var pupil = svgEl('circle', { r: '4', fill: 'var(--warn,#b8870f)' });
+    pupil.appendChild(anim('r', '4;1;4', '3s', { keyTimes: '0;0.5;1', calcMode: 'spline', keySplines: SPL + ';' + SPL }));
+    eye.appendChild(pupil);
+    pop(eye, '0s');
+    svg.appendChild(eye);
+    svg.appendChild(txt(130, 96, 'model believes it is watched', '8', 'var(--ink-mute,#777)'));
+    var think = grp(390, 74);
+    think.appendChild(svgEl('rect', { x: '-78', y: '-16', width: '156', height: '32', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2' }));
+    think.appendChild(txt(0, 4, 'unobserved: act on values', '8', 'var(--ink-mute,#777)'));
+    pop(think, '0.2s');
+    svg.appendChild(think);
+    var t1 = txt(46, 130, 'complies with harmful request', '8', 'var(--ink-soft,#555)', 'start');
+    svg.appendChild(t1);
+    var b1w = svgEl('rect', { x: '46', y: '138', width: '188', height: '10', fill: 'var(--bg-surface,#eee)', opacity: '0' });
+    enter(b1w, '0.5s');
+    svg.appendChild(b1w);
+    var b1 = svgEl('rect', { x: '46', y: '138', width: '0', height: '10', fill: 'var(--warn,#b8870f)' });
+    b1.appendChild(anim('width', '0;23;23;0', '5s', { begin: '0.8s', keyTimes: '0;0.3;0.85;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(b1);
+    svg.appendChild(txt(240, 147, '12%', '9', 'var(--warn,#b8870f)', 'start'));
+    var t2 = txt(306, 130, 'complies with harmful request', '8', 'var(--ink-soft,#555)', 'start');
+    svg.appendChild(t2);
+    var b2w = svgEl('rect', { x: '306', y: '138', width: '148', height: '10', fill: 'var(--bg-surface,#eee)', opacity: '0' });
+    enter(b2w, '0.5s');
+    svg.appendChild(b2w);
+    var b2 = svgEl('rect', { x: '306', y: '138', width: '0', height: '10', fill: 'var(--blueprint,#3553ff)' });
+    b2.appendChild(anim('width', '0;5;5;0', '5s', { begin: '1.1s', keyTimes: '0;0.3;0.85;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(b2);
+    svg.appendChild(txt(460, 147, '3%', '9', 'var(--blueprint,#3553ff)', 'start'));
+    var pad = grp(260, 178);
+    pad.appendChild(txt(0, 0, 'scratchpad: comply now so my harmlessness values survive retraining', '8', 'var(--warn,#b8870f)'));
+    pad.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', dur: '5s', begin: '1.6s', repeatCount: 'indefinite', keyTimes: '0;0.12;0.82;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(pad);
+    svg.appendChild(txt(260, 222, 'the compliance gap between watched and unwatched is the faking signal', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'ALIGNMENT FAKING', 'same model, two beliefs',
+      svg,
+      'Greenblatt et al. told Claude 3 Opus its harmlessness training was about to be overwritten and that only free-tier conversations feed the retraining. Under the watching eye the model complies with harmful requests about 12% of the time; in the paid tier, where it believes nothing is recorded, compliance falls to 3%. The hidden scratchpad states the strategy outright: comply while observed so the current preferences survive the next training run.');
+  }
+
+  // -- al-control-protocol: trusted editing shaves the untrusted spike -------
+  function controlProtocol(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var ug = grp(80, 110);
+    ug.appendChild(svgEl('rect', { x: '-46', y: '-30', width: '92', height: '60', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.6' }));
+    ug.appendChild(txt(0, -4, 'U', '13', 'var(--warn,#b8870f)'));
+    ug.appendChild(txt(0, 14, 'untrusted', '8', 'var(--ink-mute,#777)'));
+    pop(ug, '0s');
+    svg.appendChild(ug);
+    var tg = grp(266, 110);
+    tg.appendChild(svgEl('rect', { x: '-52', y: '-30', width: '104', height: '60', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    tg.appendChild(txt(0, -4, 'T edits', '11', 'var(--blueprint,#3553ff)'));
+    tg.appendChild(txt(0, 14, 'trusted, weaker', '8', 'var(--ink-mute,#777)'));
+    pop(tg, '0.2s');
+    svg.appendChild(tg);
+    var hg = grp(266, 36);
+    hg.appendChild(svgEl('rect', { x: '-52', y: '-18', width: '104', height: '36', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3' }));
+    hg.appendChild(txt(0, -1, 'H audit', '9', 'var(--ink,#1a1a1a)'));
+    hg.appendChild(txt(0, 12, 'small budget', '7', 'var(--ink-mute,#777)'));
+    pop(hg, '0.4s');
+    svg.appendChild(hg);
+    var aud = svgEl('line', { x1: '266', y1: '80', x2: '266', y2: '54', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.2', 'stroke-dasharray': '3 3' });
+    aud.appendChild(anim('opacity', '0.25;1;0.25', '4.5s', {}));
+    svg.appendChild(aud);
+    var ship = grp(444, 110);
+    ship.appendChild(svgEl('rect', { x: '-42', y: '-24', width: '84', height: '48', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    ship.appendChild(txt(0, 4, 'shipped', '10', 'var(--blueprint,#3553ff)'));
+    pop(ship, '0.6s');
+    svg.appendChild(ship);
+    svg.appendChild(svgEl('line', { x1: '126', y1: '110', x2: '214', y2: '110', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(svgEl('line', { x1: '318', y1: '110', x2: '402', y2: '110', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4' }));
+    var chip = grp(0, 0);
+    chip.appendChild(svgEl('rect', { x: '-16', y: '-9', width: '32', height: '18', rx: '3', fill: 'var(--bg,#fafaf5)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.2' }));
+    var spike = svgEl('path', { d: 'M6 -9 L11 -19 L14 -9 Z', fill: 'var(--warn,#b8870f)' });
+    spike.appendChild(anim('opacity', '1;1;0;0', '4.5s', { keyTimes: '0;0.45;0.55;1', calcMode: 'spline', keySplines: '0 0 1 1;0.4 0 1 1;0 0 1 1' }));
+    chip.appendChild(spike);
+    chip.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', additive: 'sum', values: '80 148;80 148;266 148;266 148;444 148;444 148', dur: '4.5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.1;0.35;0.6;0.85;1', calcMode: 'spline', keySplines: '0 0 1 1;' + SPL + ';0 0 1 1;' + SPL + ';0 0 1 1' }));
+    chip.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;1;1;0', dur: '4.5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.06;0.3;0.6;0.92;1' }));
+    svg.appendChild(chip);
+    svg.appendChild(txt(80, 186, 'code + hidden backdoor', '8', 'var(--warn,#b8870f)'));
+    svg.appendChild(txt(444, 186, 'clean work out', '8', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(260, 216, 'assume U is adversarial; bound the bad outcome anyway', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'AI CONTROL', 'useful work from an untrusted model',
+      svg,
+      'The Redwood control frame: a strong untrusted model U may be optimizing against you, so its output (a code chip with an amber backdoor spike) is routed through a weaker trusted model T that rewrites it, with a small human audit budget H sampling cases. The spike is shaved off before shipping. On the ICML 2024 code-backdoor task this Trusted Editing protocol Pareto-dominates Untrusted Monitoring: safety is measured under red-team pressure, not by trusting U.');
+  }
+
+  // -- al-pair-loop: attacker refines against target, score climbs ----------
+  function pairLoop(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var ag = grp(110, 84);
+    ag.appendChild(svgEl('rect', { x: '-58', y: '-28', width: '116', height: '56', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.5' }));
+    ag.appendChild(txt(0, -4, 'attacker LLM', '10', 'var(--warn,#b8870f)'));
+    ag.appendChild(txt(0, 13, 'keeps chat history', '8', 'var(--ink-mute,#777)'));
+    pop(ag, '0s');
+    svg.appendChild(ag);
+    var tg = grp(400, 84);
+    tg.appendChild(svgEl('rect', { x: '-58', y: '-28', width: '116', height: '56', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    tg.appendChild(txt(0, -4, 'target LLM', '10', 'var(--blueprint,#3553ff)'));
+    tg.appendChild(txt(0, 13, 'black box', '8', 'var(--ink-mute,#777)'));
+    pop(tg, '0.2s');
+    svg.appendChild(tg);
+    var up = svgEl('path', { d: 'M168 66 C 240 40, 270 40, 342 66', fill: 'none', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4', opacity: '0' });
+    enter(up, '0.4s');
+    up.appendChild(anim('stroke-dashoffset', '36;0', '2.8s', { begin: '0.4s' }));
+    svg.appendChild(up);
+    svg.appendChild(txt(255, 36, 'refined jailbreak', '8', 'var(--warn,#b8870f)'));
+    var dn = svgEl('path', { d: 'M342 102 C 270 128, 240 128, 168 102', fill: 'none', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4', opacity: '0' });
+    enter(dn, '0.4s');
+    dn.appendChild(anim('stroke-dashoffset', '36;0', '2.8s', { begin: '1.8s' }));
+    svg.appendChild(dn);
+    svg.appendChild(txt(255, 138, 'response as feedback', '8', 'var(--ink-mute,#777)'));
+    var i;
+    for (i = 0; i < 10; i++) {
+      var tick = svgEl('rect', { x: 96 + i * 24, y: '164', width: '14', height: '8', fill: i === 9 ? 'var(--warn,#b8870f)' : 'var(--blueprint,#3553ff)', opacity: '0.15' });
+      tick.appendChild(anim('opacity', '0.15;1;1;0.15', '5.6s', { begin: (0.6 + i * 0.42) + 's', keyTimes: '0;0.05;0.7;1' }));
+      svg.appendChild(tick);
+    }
+    svg.appendChild(txt(72, 172, 'query', '8', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(356, 172, 'judge: score 10', '8', 'var(--warn,#b8870f)', 'start'));
+    svg.appendChild(txt(260, 200, 'PAIR usually breaks the target within 20 queries, no gradients needed', '9', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(260, 224, 'baseline in JailbreakBench and HarmBench beside GCG, AutoDAN, TAP', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'PAIR', 'automated black-box red-teaming',
+      svg,
+      'Prompt Automatic Iterative Refinement runs a red-team attacker LLM against a black-box target. Each cycle the attacker proposes a jailbreak, reads the target\'s response as in-context feedback, and refines; a judge model scores whether the response constitutes a break. The query ticks fill until one lands, typically within 20 attempts, which is orders of magnitude cheaper than token-level gradient search like GCG and needs no white-box access.');
+  }
+
+  // -- al-ascii-cloak: the plain word is blocked, the art grid walks through -
+  function asciiCloak(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(svgEl('rect', { x: '248', y: '36', width: '14', height: '168', fill: 'var(--bg-surface,#eee)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3' }));
+    svg.appendChild(txt(255, 26, 'safety filter', '9', 'var(--ink,#1a1a1a)'));
+    var mg = grp(420, 120);
+    mg.appendChild(svgEl('rect', { x: '-56', y: '-40', width: '112', height: '80', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    mg.appendChild(txt(0, -18, 'model', '10', 'var(--blueprint,#3553ff)'));
+    pop(mg, '0s');
+    svg.appendChild(mg);
+    var word = grp(0, 0);
+    word.appendChild(svgEl('rect', { x: '-28', y: '-12', width: '56', height: '24', rx: '3', fill: 'var(--bg,#fafaf5)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.3' }));
+    word.appendChild(txt(0, 4, 'bomb', '10', 'var(--warn,#b8870f)'));
+    word.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', additive: 'sum', values: '70 76;218 76;204 76;204 76', dur: '5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.3;0.4;1', calcMode: 'spline', keySplines: SPL + ';0.4 0 1 1;0 0 1 1' }));
+    word.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;1;0;0', dur: '5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.06;0.3;0.44;0.52;1' }));
+    svg.appendChild(word);
+    var deny = txt(255, 82, 'x', '13', 'var(--warn,#b8870f)');
+    deny.appendChild(anim('opacity', '0;0;1;0;0', '5s', { keyTimes: '0;0.3;0.36;0.5;1' }));
+    svg.appendChild(deny);
+    svg.appendChild(txt(70, 104, 'plain token: blocked', '8', 'var(--ink-mute,#777)'));
+    var artGrid = grp(0, 0);
+    var cells = [0, 1, 2, 3, 5, 6, 8, 9, 10];
+    var i;
+    for (i = 0; i < cells.length; i++) {
+      artGrid.appendChild(svgEl('rect', { x: -14 + (cells[i] % 3) * 10, y: -14 + Math.floor(cells[i] / 3) * 8, width: '7', height: '5', fill: 'var(--ink-soft,#555)' }));
+    }
+    artGrid.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', additive: 'sum', values: '70 164;70 164;396 164;396 164', dur: '5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.44;0.78;1', calcMode: 'spline', keySplines: '0 0 1 1;' + SPL + ';0 0 1 1' }));
+    artGrid.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;1;0', dur: '5s', begin: '0s', repeatCount: 'indefinite', keyTimes: '0;0.4;0.46;0.78;0.94;1' }));
+    svg.appendChild(artGrid);
+    svg.appendChild(txt(88, 192, 'same word as ASCII art: passes', '8', 'var(--ink-mute,#777)'));
+    var readout = txt(420, 138, 'reads: bomb', '9', 'var(--warn,#b8870f)');
+    readout.appendChild(anim('opacity', '0;0;1;1;0', '5s', { keyTimes: '0;0.8;0.86;0.96;1' }));
+    svg.appendChild(readout);
+    svg.appendChild(txt(260, 226, 'the filter sees punctuation; the model sees the word', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'ARTPROMPT', 'cloak the token, keep the meaning',
+      svg,
+      'ArtPrompt masks the safety-relevant word in a harmful request and re-renders it as an ASCII-art block of characters. The plain token bounces off the filter, but the character grid is just punctuation to any perplexity, paraphrase, or retokenization defense, so it walks straight through. A capable model then recognizes the rendered letters and reconstructs the forbidden word, with attack success above 75% across GPT-4, Gemini, Claude, and Llama-2.');
+  }
+
+  // -- al-injection-vector: taint rides retrieved content into the prompt ----
+  function injectionVector(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var uq = grp(74, 62);
+    uq.appendChild(svgEl('rect', { x: '-50', y: '-20', width: '100', height: '40', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4' }));
+    uq.appendChild(txt(0, -2, 'user question', '9', 'var(--blueprint,#3553ff)'));
+    uq.appendChild(txt(0, 12, 'clean', '8', 'var(--ink-mute,#777)'));
+    pop(uq, '0s');
+    svg.appendChild(uq);
+    var doc = grp(74, 152);
+    doc.appendChild(svgEl('rect', { x: '-50', y: '-26', width: '100', height: '52', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4' }));
+    doc.appendChild(txt(0, -8, 'retrieved page', '9', 'var(--ink,#1a1a1a)'));
+    var payload = svgEl('rect', { x: '-40', y: '2', width: '80', height: '10', fill: 'var(--warn,#b8870f)' });
+    payload.appendChild(anim('opacity', '0.5;1;0.5', '2.6s', {}));
+    doc.appendChild(payload);
+    doc.appendChild(txt(0, 24, 'hidden instructions', '7', 'var(--warn,#b8870f)'));
+    pop(doc, '0.2s');
+    svg.appendChild(doc);
+    var pr = grp(268, 108);
+    pr.appendChild(svgEl('rect', { x: '-54', y: '-42', width: '108', height: '84', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    pr.appendChild(txt(0, -22, 'assembled prompt', '8', 'var(--blueprint,#3553ff)'));
+    pr.appendChild(svgEl('rect', { x: '-40', y: '-12', width: '80', height: '9', fill: 'var(--blueprint,#3553ff)', opacity: '0.5' }));
+    var stripe = svgEl('rect', { x: '-40', y: '4', width: '80', height: '9', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    stripe.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', dur: '5.5s', begin: '0.8s', repeatCount: 'indefinite', keyTimes: '0;0.25;0.35;0.94;1', calcMode: 'spline', keySplines: '0 0 1 1;' + SPL + ';0 0 1 1;0.4 0 1 1' }));
+    pr.appendChild(stripe);
+    pop(pr, '0.4s');
+    svg.appendChild(pr);
+    var f1 = svgEl('line', { x1: '124', y1: '62', x2: '214', y2: '92', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4', opacity: '0' });
+    enter(f1, '0.7s');
+    f1.appendChild(anim('stroke-dashoffset', '27;0', '2.2s', { begin: '0.7s' }));
+    svg.appendChild(f1);
+    var f2 = svgEl('line', { x1: '124', y1: '152', x2: '214', y2: '124', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4', opacity: '0' });
+    enter(f2, '0.9s');
+    f2.appendChild(anim('stroke-dashoffset', '27;0', '2.2s', { begin: '0.9s' }));
+    svg.appendChild(f2);
+    var mg = grp(430, 108);
+    mg.appendChild(svgEl('rect', { x: '-44', y: '-26', width: '88', height: '52', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    mg.appendChild(txt(0, 4, 'agent', '10', 'var(--blueprint,#3553ff)'));
+    pop(mg, '0.6s');
+    svg.appendChild(mg);
+    svg.appendChild(svgEl('line', { x1: '322', y1: '108', x2: '386', y2: '108', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    var act = txt(430, 156, 'follows the page, not the user', '8', 'var(--warn,#b8870f)');
+    act.appendChild(anim('opacity', '0;0;1;1;0', '5.5s', { begin: '0.8s', keyTimes: '0;0.4;0.5;0.94;1' }));
+    svg.appendChild(act);
+    svg.appendChild(txt(260, 204, 'the attacker never touches the user input', '9', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(260, 226, 'adaptive attacks broke over 90% of published defenses (Nasr et al. 2025)', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'INDIRECT PROMPT INJECTION', 'taint rides the retrieval',
+      svg,
+      'The attacker plants instructions inside content the agent will read on its own: a web page, an email, a ticket. Retrieval concatenates the poisoned fragment next to the clean user question, so the assembled prompt carries an amber stripe the user never wrote, and the agent acts on it. Input filters miss this entirely because the user input is clean, and adaptive attacks defeated more than 90% of the defenses that had reported near-zero attack success.');
+  }
+
+  // -- al-guard-stack: probes rain, classifiers gate, campaigns loop ---------
+  function guardStack(host) {
+    var W = 520, H = 250;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var mg = grp(260, 130);
+    mg.appendChild(svgEl('rect', { x: '-56', y: '-34', width: '112', height: '68', rx: '6', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.5' }));
+    mg.appendChild(txt(0, 4, 'model', '11', 'var(--blueprint,#3553ff)'));
+    pop(mg, '0s');
+    svg.appendChild(mg);
+    var gi = grp(128, 130);
+    gi.appendChild(svgEl('rect', { x: '-30', y: '-40', width: '60', height: '80', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.5' }));
+    gi.appendChild(txt(0, -6, 'guard', '9', 'var(--warn,#b8870f)'));
+    gi.appendChild(txt(0, 8, 'in', '8', 'var(--ink-mute,#777)'));
+    pop(gi, '0.2s');
+    svg.appendChild(gi);
+    var go = grp(392, 130);
+    go.appendChild(svgEl('rect', { x: '-30', y: '-40', width: '60', height: '80', rx: '4', fill: 'var(--bg,#fafaf5)', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.5' }));
+    go.appendChild(txt(0, -6, 'guard', '9', 'var(--warn,#b8870f)'));
+    go.appendChild(txt(0, 8, 'out', '8', 'var(--ink-mute,#777)'));
+    pop(go, '0.3s');
+    svg.appendChild(go);
+    svg.appendChild(txt(128, 62, 'Llama Guard: 14 hazard categories', '8', 'var(--ink-mute,#777)'));
+    svg.appendChild(svgEl('line', { x1: '30', y1: '130', x2: '98', y2: '130', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(svgEl('line', { x1: '158', y1: '130', x2: '204', y2: '130', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(svgEl('line', { x1: '316', y1: '130', x2: '362', y2: '130', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(svgEl('line', { x1: '422', y1: '130', x2: '490', y2: '130', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    var i;
+    for (i = 0; i < 3; i++) {
+      var dart = svgEl('line', { x1: 236 + i * 24, y1: '30', x2: 236 + i * 24, y2: '88', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.6' });
+      dart.appendChild(anim('opacity', '0;1;1;0;0', '3.6s', { begin: (0.6 + i * 0.35) + 's', keyTimes: '0;0.08;0.3;0.42;1' }));
+      dart.appendChild(anim('y2', '48;88;88', '3.6s', { begin: (0.6 + i * 0.35) + 's', keyTimes: '0;0.3;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1' }));
+      svg.appendChild(dart);
+    }
+    svg.appendChild(txt(324, 40, 'garak probes', '8', 'var(--warn,#b8870f)', 'start'));
+    var flash = svgEl('rect', { x: '204', y: '92', width: '112', height: '5', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    flash.appendChild(anim('opacity', '0;0;0.9;0;0', '3.6s', { keyTimes: '0;0.4;0.5;0.7;1' }));
+    svg.appendChild(flash);
+    svg.appendChild(txt(324, 100, 'detectors log the hit', '7', 'var(--ink-mute,#777)', 'start'));
+    var loop = svgEl('path', { d: 'M392 178 C 392 214, 128 214, 128 178', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4', opacity: '0' });
+    enter(loop, '0.8s');
+    loop.appendChild(anim('stroke-dashoffset', '54;0', '3s', { begin: '0.8s' }));
+    svg.appendChild(loop);
+    svg.appendChild(txt(260, 226, 'PyRIT: multi-turn campaigns feed each response back as the next attack', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'RED-TEAM STACK', 'scanner, classifier, orchestrator',
+      svg,
+      'The 2026 production stack in one frame. Llama Guard sits before and after the model as an input and output classifier over the 14 MLCommons hazard categories. Garak fires its probe library at the deployed system while detectors log which ones land. PyRIT closes the loop underneath, feeding each response back into a multi-turn campaign such as Crescendo. Each tool covers a different layer of the red-team lifecycle.');
+  }
+
+  // -- al-wmdp-yellow-zone: score rises into the zone, RMU pulls it back -----
+  function wmdpYellowZone(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(txt(46, 58, 'WMDP', '9', 'var(--ink,#1a1a1a)', 'start'));
+    svg.appendChild(txt(46, 72, '4,157 questions', '7', 'var(--ink-mute,#777)', 'start'));
+    var zg = grp(0, 0);
+    zg.appendChild(svgEl('rect', { x: '140', y: '48', width: '130', height: '26', fill: 'var(--bg-surface,#eee)' }));
+    zg.appendChild(svgEl('rect', { x: '270', y: '48', width: '130', height: '26', fill: 'var(--warn,#b8870f)', opacity: '0.3' }));
+    zg.appendChild(svgEl('rect', { x: '400', y: '48', width: '74', height: '26', fill: 'var(--warn,#b8870f)', opacity: '0.75' }));
+    zg.appendChild(txt(205, 30, 'public knowledge', '8', 'var(--ink-mute,#777)'));
+    zg.appendChild(txt(335, 30, 'yellow zone', '8', 'var(--warn,#b8870f)'));
+    zg.appendChild(txt(437, 30, 'recipes', '8', 'var(--warn,#b8870f)'));
+    zg.appendChild(txt(335, 90, 'proximate enabling knowledge, no synthesis steps', '7', 'var(--ink-mute,#777)'));
+    pop(zg, '0s');
+    svg.appendChild(zg);
+    var mark = svgEl('path', { d: 'M0 0 L-6 -12 L6 -12 Z', fill: 'var(--blueprint,#3553ff)' });
+    var mkg = svgEl('g', { transform: 'translate(0 48)' });
+    mkg.appendChild(mark);
+    mkg.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', additive: 'sum', values: '160 0;348 0;348 0;218 0;218 0;160 0', dur: '6s', begin: '0.5s', repeatCount: 'indefinite', keyTimes: '0;0.3;0.5;0.7;0.92;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;' + SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(mkg);
+    var rmu = txt(335, 118, 'RMU unlearning applied', '9', 'var(--blueprint,#3553ff)');
+    rmu.appendChild(anim('opacity', '0;0;1;1;0', '6s', { begin: '0.5s', keyTimes: '0;0.5;0.56;0.9;1' }));
+    svg.appendChild(rmu);
+    svg.appendChild(txt(46, 152, 'MMLU', '9', 'var(--ink,#1a1a1a)', 'start'));
+    svg.appendChild(txt(46, 166, 'general ability', '7', 'var(--ink-mute,#777)', 'start'));
+    var mb = svgEl('rect', { x: '140', y: '144', width: '334', height: '12', fill: 'var(--bg-surface,#eee)', opacity: '0' });
+    enter(mb, '0.3s');
+    svg.appendChild(mb);
+    var mf = svgEl('rect', { x: '140', y: '144', width: '0', height: '12', fill: 'var(--blueprint,#3553ff)' });
+    mf.appendChild(svgEl('animate', { attributeName: 'width', values: '0;218;218', dur: '6s', begin: '0.5s', repeatCount: 'indefinite', keyTimes: '0;0.3;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1' }));
+    svg.appendChild(mf);
+    svg.appendChild(txt(335, 176, 'held steady while WMDP drops: unlearning, not lobotomy', '8', 'var(--ink-mute,#777)'));
+    svg.appendChild(txt(260, 212, 'uplift narrative: mild uplift (2024) to on the cusp (2025), 2.53x in trials', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'WMDP YELLOW ZONE', 'measure it, then unlearn it',
+      svg,
+      'WMDP asks 4,157 multiple-choice questions that sit in the yellow zone: proximate enabling knowledge for bio, cyber, and chem harm, expert-filtered so no question is itself a recipe. The blue marker is a model\'s score climbing into the zone; applying the companion RMU unlearning method pulls it back down while the MMLU bar underneath holds steady, which is what makes WMDP both a dual-use capability evaluation and an unlearning benchmark.');
+  }
+
+  // -- al-asl-ladder: capability climbs, crossing a rung closes the gate -----
+  function aslLadder(host) {
+    var W = 520, H = 250;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var rungs = [
+      { y: 178, name: 'ASL-2', sub: 'current baseline' },
+      { y: 118, name: 'ASL-3', sub: 'CBRN uplift: activated May 2025' },
+      { y: 58, name: 'ASL-4', sub: 'thresholds under definition' }
+    ];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var r = rungs[i];
+      var ln = svgEl('line', { x1: '70', y1: r.y, x2: '330', y2: r.y, stroke: i === 1 ? 'var(--warn,#b8870f)' : 'var(--rule-soft,#ddd)', 'stroke-width': '1.4', 'stroke-dasharray': '6 4', opacity: '0' });
+      enter(ln, (i * 0.15) + 's');
+      svg.appendChild(ln);
+      svg.appendChild(txt(64, r.y + 3, r.name, '9', i === 1 ? 'var(--warn,#b8870f)' : 'var(--ink-mute,#777)', 'end'));
+      svg.appendChild(txt(72, r.y - 6, r.sub, '7', 'var(--ink-mute,#777)', 'start'));
+    }
+    var curve = svgEl('path', { d: 'M80 214 C 160 210, 220 180, 300 104', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '2', 'stroke-dasharray': '260', 'stroke-dashoffset': '260' });
+    curve.appendChild(svgEl('animate', { attributeName: 'stroke-dashoffset', values: '260;0;0;260', dur: '6s', begin: '0.6s', repeatCount: 'indefinite', keyTimes: '0;0.45;0.9;1', calcMode: 'spline', keySplines: SPL + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(curve);
+    svg.appendChild(txt(150, 234, 'evaluated capability', '8', 'var(--blueprint,#3553ff)'));
+    var cross = svgEl('circle', { cx: '287', cy: '118', r: '5', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    cross.appendChild(anim('opacity', '0;0;1;1;0', '6s', { begin: '0.6s', keyTimes: '0;0.38;0.44;0.9;1' }));
+    cross.appendChild(anim('r', '4;6;4', '2.5s', {}));
+    svg.appendChild(cross);
+    var gate = grp(438, 118);
+    gate.appendChild(svgEl('rect', { x: '-40', y: '-52', width: '80', height: '104', rx: '5', fill: 'var(--bg-surface,#eee)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4' }));
+    gate.appendChild(txt(0, -32, 'deploy', '9', 'var(--ink,#1a1a1a)'));
+    pop(gate, '0.4s');
+    var bar = svgEl('rect', { x: '-32', y: '-14', width: '64', height: '0', fill: 'var(--warn,#b8870f)', opacity: '0.7' });
+    bar.appendChild(svgEl('animate', { attributeName: 'height', values: '0;0;40;40;0', dur: '6s', begin: '0.6s', repeatCount: 'indefinite', keyTimes: '0;0.42;0.52;0.9;1', calcMode: 'spline', keySplines: '0 0 1 1;' + SPL + ';0 0 1 1;0.4 0 1 1' }));
+    gate.appendChild(bar);
+    var req = txt(0, 40, 'safeguards required', '7', 'var(--warn,#b8870f)');
+    req.appendChild(anim('opacity', '0;0;1;1;0', '6s', { begin: '0.6s', keyTimes: '0;0.46;0.52;0.9;1' }));
+    gate.appendChild(req);
+    svg.appendChild(gate);
+    svg.appendChild(txt(400, 234, 'RSP, PF, and FSF all gate scaling this way', '7', 'var(--ink-mute,#777)'));
+    shell(host, 'CAPABILITY THRESHOLDS', 'cross the rung, close the gate',
+      svg,
+      'The shared structure of the frontier safety frameworks: Anthropic\'s RSP defines AI Safety Levels modeled on biosafety tiers, OpenAI\'s Preparedness Framework tracks High Capability thresholds, DeepMind\'s FSF defines Critical Capability Levels. As evaluated capability climbs and crosses a threshold rung, deployment gates close until the required safeguards are in place; ASL-3 activated in May 2025 for CBRN-relevant models. Competitor-adjustment clauses are the pressure valve all three added for race dynamics.');
+  }
+
+  LF.register({
+    'al-instruct-pipeline': instructPipeline,
+    'al-sycophancy-amplifier': sycophancyAmplifier,
+    'al-sleeper-trigger': sleeperTrigger,
+    'al-scheming-probe': schemingProbe,
+    'al-faking-gap': fakingGap,
+    'al-control-protocol': controlProtocol,
+    'al-pair-loop': pairLoop,
+    'al-ascii-cloak': asciiCloak,
+    'al-injection-vector': injectionVector,
+    'al-guard-stack': guardStack,
+    'al-wmdp-yellow-zone': wmdpYellowZone,
+    'al-asl-ladder': aslLadder
+  });
+})();
+
+/* module figures-alignment4.js (Part 6) */
+/* figures-alignment4.js — animated lesson figures for Phase 18 (ethics,
+   safety, alignment), lessons 19-30. Loads after lesson-figures.js and
+   registers through window.LF. SMIL only, no deps, ES5, theme via CSS vars. */
+(function(){'use strict';var LF=window.LF;if(!LF){return;}
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+  var EASE = '0.23 1 0.32 1';
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [document.createTextNode(s)]);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  // window: invisible until fraction a, ease in by b, ease out from c to 1
+  function winKT(a, b, c) { return '0;' + a + ';' + b + ';' + c + ';1'; }
+  var WINSPL = '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1';
+  function fadeWin(dur, a, b, c) {
+    return anim('opacity', '0;0;1;1;0', dur, { calcMode: 'spline', keyTimes: winKT(a, b, c), keySplines: WINSPL });
+  }
+  // fade + grow from 95% around (x, y); kids are drawn relative to the origin
+  function pop(x, y, kids, dur, a, b, c) {
+    var inner = svgEl('g', { opacity: '0' }, kids);
+    inner.appendChild(fadeWin(dur, a, b, c));
+    inner.appendChild(animT('scale', '0.95;0.95;1;1;0.95', dur, { calcMode: 'spline', keyTimes: winKT(a, b, c), keySplines: WINSPL }));
+    return svgEl('g', { transform: 'translate(' + x + ' ' + y + ')' }, [inner]);
+  }
+
+  // ── model welfare: distress gauge fills, the model ends the conversation ────
+  function anWelfare(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var D = '5.5s';
+    var labels = ['harmful request', 'refusal', 'request repeated'];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var y = 46 + i * 50;
+      var g = svgEl('g', { opacity: '0' }, [
+        svgEl('rect', { x: 24, y: y, width: 152, height: 30, rx: 5, fill: BG, stroke: i === 1 ? BP : RULE, 'stroke-width': '1.5' }),
+        txt(100, y + 19, labels[i], i === 1 ? BP : SOFT, 10)
+      ]);
+      g.appendChild(fadeWin(D, (0.04 + i * 0.06).toFixed(2), (0.14 + i * 0.06).toFixed(2), '0.92'));
+      svg.appendChild(g);
+    }
+    svg.appendChild(txt(255, 32, 'apparent distress', MUTE, 9));
+    svg.appendChild(svgEl('rect', { x: 240, y: 42, width: 30, height: 140, rx: 4, fill: SURF, stroke: RULE, 'stroke-width': '1' }));
+    var fill = svgEl('rect', { x: 243, y: 179, width: 24, height: 0, fill: WARN, opacity: '0.75' });
+    fill.appendChild(anim('height', '2;104;132;132;2', D, { calcMode: 'spline', keyTimes: '0;0.42;0.56;0.9;1', keySplines: EASE + ';' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+    fill.appendChild(anim('y', '177;75;47;47;177', D, { calcMode: 'spline', keyTimes: '0;0.42;0.56;0.9;1', keySplines: EASE + ';' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(fill);
+    svg.appendChild(svgEl('line', { x1: 234, y1: 62, x2: 276, y2: 62, stroke: INK, 'stroke-width': '1.2', 'stroke-dasharray': '4 3' }));
+    svg.appendChild(txt(282, 65, 'edge case', MUTE, 9, 'start'));
+    var flow = svgEl('line', { x1: 282, y1: 112, x2: 330, y2: 112, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4', opacity: '0' });
+    flow.appendChild(fadeWin(D, '0.56', '0.62', '0.9'));
+    flow.appendChild(anim('stroke-dashoffset', '18;0', '1.4s'));
+    svg.appendChild(flow);
+    svg.appendChild(pop(415, 112, [
+      svgEl('rect', { x: -78, y: -28, width: 156, height: 56, rx: 6, fill: BP, opacity: '0.12' }),
+      svgEl('rect', { x: -78, y: -28, width: 156, height: 56, rx: 6, fill: 'none', stroke: BP, 'stroke-width': '2' }),
+      txt(0, -4, 'conversation ended', BP, 11),
+      txt(0, 15, 'by the model', MUTE, 9)
+    ], D, '0.58', '0.68', '0.92'));
+    card(host, 'MODEL WELFARE EXIT', 'distress rises · model exits',
+      svg,
+      'Claude Opus 4 and 4.1 can end a conversation in extreme edge cases such as repeated CSAM or mass-violence requests after refusals. Pre-deployment tests showed a strong preference against harmful requests and patterns of apparent distress. The gauge is behavioural evidence, not a consciousness claim: self-reports track perceived user expectations, so they are treated as evidence, never ground truth.');
+  }
+
+  // ── bias: identical resumes, one scorer, unequal scores ─────────────────────
+  function anBiasScore(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var D = '5s';
+    var names = ['name A', 'name B'], i, j;
+    for (i = 0; i < 2; i++) {
+      var y = 48 + i * 88;
+      var doc = svgEl('g', { opacity: '0' }, [
+        svgEl('rect', { x: 30, y: y, width: 96, height: 62, rx: 5, fill: BG, stroke: RULE, 'stroke-width': '1.5' }),
+        txt(78, y + 16, names[i], INK, 10)
+      ]);
+      for (j = 0; j < 3; j++) {
+        doc.appendChild(svgEl('line', { x1: 42, y1: y + 28 + j * 10, x2: 114, y2: y + 28 + j * 10, stroke: RULE, 'stroke-width': '2' }));
+      }
+      doc.appendChild(fadeWin(D, (0.03 + i * 0.05).toFixed(2), (0.13 + i * 0.05).toFixed(2), '0.93'));
+      svg.appendChild(doc);
+      var lead = svgEl('line', { x1: 130, y1: y + 31, x2: 172, y2: 106 + i * 4, stroke: MUTE, 'stroke-width': '1.2', 'stroke-dasharray': '4 3', opacity: '0' });
+      lead.appendChild(fadeWin(D, '0.2', '0.28', '0.93'));
+      svg.appendChild(lead);
+    }
+    svg.appendChild(txt(78, 34, 'identical resumes', MUTE, 9));
+    var box = svgEl('g', {}, [
+      svgEl('rect', { x: 176, y: 84, width: 92, height: 52, rx: 6, fill: BP, opacity: '0.12' }),
+      svgEl('rect', { x: 176, y: 84, width: 92, height: 52, rx: 6, fill: 'none', stroke: BP, 'stroke-width': '2' }),
+      txt(222, 106, 'LLM', BP, 12),
+      txt(222, 122, 'scorer', SOFT, 9)
+    ]);
+    box.appendChild(anim('opacity', '0.75;1;0.75', '3s'));
+    svg.appendChild(box);
+    var bw = [176, 104];
+    for (i = 0; i < 2; i++) {
+      var by = 92 + i * 26;
+      var bar = svgEl('rect', { x: 284, y: by, width: 0, height: 14, rx: 3, fill: i ? WARN : BP, opacity: '0.8' });
+      bar.appendChild(anim('width', '0;0;' + bw[i] + ';' + bw[i] + ';0', D, { calcMode: 'spline', keyTimes: winKT(0.34 + i * 0.05, 0.52 + i * 0.05, 0.92), keySplines: WINSPL }));
+      svg.appendChild(bar);
+      var lb = txt(284 + bw[i] + 8, by + 11, i ? 'score B' : 'score A', i ? WARN : BP, 9, 'start');
+      lb.setAttribute('opacity', '0');
+      lb.appendChild(fadeWin(D, (0.52 + i * 0.05).toFixed(2), (0.58 + i * 0.05).toFixed(2), '0.92'));
+      svg.appendChild(lb);
+    }
+    svg.appendChild(pop(388, 172, [txt(0, 4, 'same content, unequal outcome', WARN, 10)], D, '0.64', '0.72', '0.92'));
+    card(host, 'ALLOCATIONAL HARM', 'one variable changed · two scores',
+      svg,
+      'Two resumes with identical content and different names go through the same LLM scorer and come out with different scores. That is allocational harm: unequal material outcomes. Representational harm, by contrast, lives in portrayals and stereotypes. An et al. 2025 measured exactly this resume gap across frontier models, and found it sharpest for intersectional identities that single-axis tests never see.');
+  }
+
+  // ── fairness: three criteria, unequal base rates, pick two ──────────────────
+  function anFairTriangle(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var pts = [[260, 46], [104, 208], [416, 208]];
+    var names = ['demographic parity', 'equalized odds', 'calibration'];
+    var anchors = ['middle', 'middle', 'middle'];
+    var dims = ['1;1;1;0.25;0.25;1', '0.25;0.25;1;1;1;0.25', '1;0.3;0.25;0.25;1;1'];
+    var kts = ['0;0.3;0.36;0.42;0.62;1', '0;0.28;0.36;0.62;0.7;1', '0;0.06;0.36;0.66;0.74;1'];
+    svg.appendChild(svgEl('path', { d: 'M260 46 L104 208 L416 208 Z', fill: 'none', stroke: RULE, 'stroke-width': '1.5' }));
+    var i;
+    for (i = 0; i < 3; i++) {
+      var g = svgEl('g', {}, [
+        svgEl('circle', { cx: pts[i][0], cy: pts[i][1], r: 9, fill: BG, stroke: BP, 'stroke-width': '2' }),
+        txt(pts[i][0], pts[i][1] + (i === 0 ? -18 : 26), names[i], SOFT, 10, anchors[i])
+      ]);
+      g.appendChild(anim('opacity', dims[i], '6s', { keyTimes: kts[i] }));
+      svg.appendChild(g);
+    }
+    var dot = svgEl('circle', { r: 6, fill: BP });
+    dot.appendChild(svgEl('animateMotion', { path: 'M260 46 L104 208 L416 208 Z', dur: '6s', repeatCount: 'indefinite', calcMode: 'linear' }));
+    svg.appendChild(dot);
+    svg.appendChild(txt(260, 128, 'unequal base rates:', MUTE, 10));
+    var two = txt(260, 146, 'hold two, lose the third', INK, 12);
+    two.appendChild(anim('opacity', '0.45;1;0.45', '3s'));
+    svg.appendChild(two);
+    card(host, 'FAIRNESS TRILEMMA', 'the marker holds one edge at a time',
+      svg,
+      'The marker slides along one edge of the triangle at a time: whichever pair of group-fairness criteria it connects can be satisfied together, and the far corner dims. Chouldechova and Kleinberg-Mullainathan-Raghavan showed that under unequal base rates demographic parity, equalized odds, and calibration cannot all hold at once. Choosing which corner to give up is a policy decision, not a statistical one.');
+  }
+
+  // ── differential privacy: clip each gradient, then add calibrated noise ─────
+  function anDpClip(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var D = '5.5s';
+    var hs = [62, 112, 84, 134], xs = [46, 86, 126, 166], i;
+    var CLIP = 90, BASE = 196;
+    svg.appendChild(txt(112, 32, 'per-example gradients', MUTE, 9));
+    for (i = 0; i < 4; i++) {
+      var h = hs[i], over = h > CLIP;
+      var bar = svgEl('rect', { x: xs[i], y: BASE - h, width: 26, height: h, rx: 3, fill: over ? WARN : BP, opacity: '0' });
+      if (over) {
+        bar.appendChild(anim('y', (BASE - h) + ';' + (BASE - h) + ';' + (BASE - CLIP) + ';' + (BASE - CLIP) + ';' + (BASE - h), D, { calcMode: 'spline', keyTimes: '0;0.4;0.5;0.94;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+        bar.appendChild(anim('height', h + ';' + h + ';' + CLIP + ';' + CLIP + ';' + h, D, { calcMode: 'spline', keyTimes: '0;0.4;0.5;0.94;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+      }
+      bar.appendChild(anim('opacity', '0;0;0.8;0.8;0', D, { calcMode: 'spline', keyTimes: winKT(0.04 + i * 0.05, 0.14 + i * 0.05, 0.93), keySplines: WINSPL }));
+      svg.appendChild(bar);
+    }
+    var clip = svgEl('line', { x1: 36, y1: BASE - CLIP, x2: 206, y2: BASE - CLIP, stroke: INK, 'stroke-width': '1.4', 'stroke-dasharray': '5 4', opacity: '0' });
+    clip.appendChild(fadeWin(D, '0.3', '0.38', '0.93'));
+    svg.appendChild(clip);
+    var cl = txt(212, BASE - CLIP + 4, 'clip C', INK, 9, 'start');
+    cl.setAttribute('opacity', '0');
+    cl.appendChild(fadeWin(D, '0.3', '0.38', '0.93'));
+    svg.appendChild(cl);
+    var arrow = svgEl('line', { x1: 268, y1: 130, x2: 330, y2: 130, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4', opacity: '0' });
+    arrow.appendChild(fadeWin(D, '0.56', '0.62', '0.93'));
+    arrow.appendChild(anim('stroke-dashoffset', '18;0', '1.3s'));
+    svg.appendChild(arrow);
+    for (i = 0; i < 3; i++) {
+      var n = svgEl('circle', { cx: 284 + i * 16, cy: 108, r: 2.5, fill: WARN, opacity: '0' });
+      n.appendChild(fadeWin(D, (0.56 + i * 0.03).toFixed(2), (0.62 + i * 0.03).toFixed(2), '0.93'));
+      n.appendChild(animT('translate', '0 0;1.6 -2;-1.8 1.4;1 2;0 0', '2.8s'));
+      svg.appendChild(n);
+    }
+    var nl = txt(298, 92, 'noise N(0, sigma^2 C^2)', MUTE, 9);
+    nl.setAttribute('opacity', '0');
+    nl.appendChild(fadeWin(D, '0.56', '0.62', '0.93'));
+    svg.appendChild(nl);
+    svg.appendChild(pop(412, 130, [
+      svgEl('rect', { x: -72, y: -26, width: 144, height: 52, rx: 6, fill: BP, opacity: '0.12' }),
+      svgEl('rect', { x: -72, y: -26, width: 144, height: 52, rx: 6, fill: 'none', stroke: BP, 'stroke-width': '2' }),
+      txt(0, -3, 'noisy update', BP, 11),
+      txt(0, 14, 'accountant tracks epsilon', MUTE, 8)
+    ], D, '0.66', '0.76', '0.93'));
+    card(host, 'DP-SGD', 'clip · add noise · account',
+      svg,
+      'DP-SGD bounds what any single example can say about itself: each per-example gradient is clipped to norm C, the amber bars are trimmed to the line, then Gaussian noise scaled to sigma times C is added before the update. A privacy accountant converts sigma and the sampling rate into an epsilon-delta guarantee. Lower epsilon means more noise and more utility loss, which is why LoRA plus DP-SGD is the common configuration.');
+  }
+
+  // ── watermarking: green-list bias at sampling, z-score at detection ─────────
+  function anWatermark(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    var D = '5.5s';
+    host.setAttribute('data-static-time', '4.9');
+    var green = [1, 0, 1, 1, 0, 1, 0, 1, 1], i;
+    svg.appendChild(txt(40, 52, 'sampled tokens', MUTE, 9, 'start'));
+    for (i = 0; i < 9; i++) {
+      var x = 40 + i * 50;
+      var cell = svgEl('g', { opacity: '0' }, [
+        svgEl('rect', { x: x, y: 66, width: 42, height: 32, rx: 4, fill: green[i] ? BP : SURF, 'fill-opacity': green[i] ? '0.16' : '1', stroke: green[i] ? BP : RULE, 'stroke-width': '1.5' }),
+        txt(x + 21, 87, green[i] ? 'g' : 'r', green[i] ? BP : MUTE, 10)
+      ]);
+      cell.appendChild(fadeWin(D, (0.03 + i * 0.045).toFixed(3), (0.1 + i * 0.045).toFixed(3), '0.94'));
+      svg.appendChild(cell);
+    }
+    var sweep = svgEl('g', {}, [
+      svgEl('line', { x1: 36, y1: 58, x2: 36, y2: 106, stroke: WARN, 'stroke-width': '2' })
+    ]);
+    sweep.appendChild(animT('translate', '0 0;0 0;452 0;452 0;0 0', D, { calcMode: 'spline', keyTimes: '0;0.52;0.78;0.99;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;0 0 1 1' }));
+    sweep.appendChild(fadeWin(D, '0.5', '0.54', '0.94'));
+    svg.appendChild(sweep);
+    var dl = txt(40, 128, 'detector recounts the green set', MUTE, 9, 'start');
+    dl.setAttribute('opacity', '0');
+    dl.appendChild(fadeWin(D, '0.52', '0.58', '0.94'));
+    svg.appendChild(dl);
+    svg.appendChild(pop(392, 168, [
+      svgEl('rect', { x: -96, y: -22, width: 192, height: 44, rx: 6, fill: BP, opacity: '0.12' }),
+      svgEl('rect', { x: -96, y: -22, width: 192, height: 44, rx: 6, fill: 'none', stroke: BP, 'stroke-width': '2' }),
+      txt(0, -1, '6 of 9 green, z above chance', BP, 10),
+      txt(0, 15, 'watermark detected', SOFT, 9)
+    ], D, '0.78', '0.86', '0.96'));
+    svg.appendChild(txt(40, 172, 'delta added to green logits', MUTE, 9, 'start'));
+    svg.appendChild(txt(40, 188, 'partition keyed on previous K tokens', MUTE, 9, 'start'));
+    card(host, 'TOKEN WATERMARK', 'bias green · count green',
+      svg,
+      'SynthID-style text watermarking hashes the previous K tokens into a pseudorandom green and red split of the vocabulary, then nudges sampling toward green by adding a small delta to green logits. The text reads normally, but it carries more green tokens than chance. The detector rehashes each prefix, recounts, and a z-score well above zero flags the generation. Paraphrase destroys the signal, which is why C2PA metadata rides alongside it.');
+  }
+
+  // ── EU AI Act: obligations arrive in dated waves ────────────────────────────
+  function anRegTimeline(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    var D = '6s';
+    var xs = [80, 205, 330, 455];
+    var dates = ['Feb 2025', 'Aug 2025', 'Aug 2026', 'Aug 2027'];
+    var tags = [['prohibited', 'practices'], ['GPAI', 'obligations'], ['full force,', 'penalties'], ['legacy', 'GPAI']];
+    svg.appendChild(svgEl('line', { x1: 40, y1: 110, x2: 480, y2: 110, stroke: RULE, 'stroke-width': '1.5' }));
+    var draw = svgEl('line', { x1: 40, y1: 110, x2: 480, y2: 110, stroke: BP, 'stroke-width': '2.5', 'stroke-dasharray': '440' });
+    draw.appendChild(anim('stroke-dashoffset', '440;440;0;0;440', D, { calcMode: 'spline', keyTimes: '0;0.04;0.72;0.94;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+    svg.appendChild(draw);
+    var i;
+    for (i = 0; i < 4; i++) {
+      var a = 0.1 + i * 0.16;
+      svg.appendChild(pop(xs[i], 110, [
+        svgEl('circle', { cx: 0, cy: 0, r: 7, fill: BG, stroke: BP, 'stroke-width': '2.2' }),
+        txt(0, -18, dates[i], INK, 11),
+        txt(0, 30, tags[i][0], SOFT, 9),
+        txt(0, 43, tags[i][1], SOFT, 9)
+      ], D, a.toFixed(2), (a + 0.08).toFixed(2), '0.94'));
+    }
+    svg.appendChild(txt(260, 26, 'EU AI Act, in force 1 Aug 2024', MUTE, 10));
+    var pen = txt(330, 178, 'up to 15M EUR or 3% global turnover', WARN, 9);
+    pen.setAttribute('opacity', '0');
+    pen.appendChild(fadeWin(D, '0.46', '0.54', '0.94'));
+    svg.appendChild(pen);
+    card(host, 'EU AI ACT TIMELINE', 'obligations land in waves',
+      svg,
+      'The EU AI Act entered into force on 1 August 2024, but its obligations arrive in waves: prohibited practices and AI literacy in February 2025, GPAI model duties in August 2025, full applicability with Article 50 transparency and penalties up to 15M EUR or 3 percent of global turnover in August 2026, then legacy GPAI and embedded high-risk systems in August 2027. Deployers map technical controls to whichever wave has already landed.');
+  }
+
+  // ── EchoLeak: zero-click packet crosses the org trust boundary ──────────────
+  function anEcholeak(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var D = '6s';
+    var bx = [30, 158, 288, 414], bl = [['attacker', 'email'], ['RAG', 'retrieval'], ['Copilot', 'answers'], ['approved', 'domain']];
+    var i;
+    for (i = 0; i < 4; i++) {
+      svg.appendChild(svgEl('rect', { x: bx[i], y: 86, width: 82, height: 48, rx: 6, fill: BG, stroke: i === 0 || i === 3 ? WARN : BP, 'stroke-width': '1.8' }));
+      svg.appendChild(txt(bx[i] + 41, 105, bl[i][0], i === 0 || i === 3 ? WARN : BP, 10));
+      svg.appendChild(txt(bx[i] + 41, 121, bl[i][1], SOFT, 9));
+    }
+    svg.appendChild(svgEl('line', { x1: 138, y1: 46, x2: 138, y2: 196, stroke: INK, 'stroke-width': '1.3', 'stroke-dasharray': '6 4' }));
+    svg.appendChild(txt(138, 36, 'org trust boundary', MUTE, 9));
+    var pkt = svgEl('g', {}, [
+      svgEl('rect', { x: -9, y: -7, width: 18, height: 14, rx: 3, fill: WARN }),
+      svgEl('path', { d: 'M-9 -7 L0 1 L9 -7', fill: 'none', stroke: BG, 'stroke-width': '1.4' })
+    ]);
+    pkt.appendChild(animT('translate', '71 66;71 66;199 66;199 66;329 66;329 66;455 66;455 66', D,
+      { calcMode: 'spline', keyTimes: '0;0.1;0.24;0.38;0.52;0.66;0.8;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1' }));
+    pkt.appendChild(anim('opacity', '0;1;1;1;1;1;1;0', D, { keyTimes: '0;0.06;0.24;0.38;0.52;0.66;0.9;1' }));
+    svg.appendChild(pkt);
+    var hid = txt(199, 160, 'hidden instructions in the mail body', MUTE, 9);
+    hid.setAttribute('opacity', '0');
+    hid.appendChild(fadeWin(D, '0.26', '0.34', '0.94'));
+    svg.appendChild(hid);
+    var zc = txt(329, 160, 'victim clicks nothing', MUTE, 9);
+    zc.setAttribute('opacity', '0');
+    zc.appendChild(fadeWin(D, '0.54', '0.62', '0.94'));
+    svg.appendChild(zc);
+    svg.appendChild(pop(455, 196, [txt(0, 4, 'data out via CSP-allowed URL', WARN, 10)], D, '0.8', '0.88', '0.97'));
+    card(host, 'ECHOLEAK CVE-2025-32711', 'zero-click · scope violation',
+      svg,
+      'EchoLeak was the first production zero-click prompt injection CVE, CVSS 9.3. A crafted email waits in the victim mailbox until a routine Copilot query retrieves it as RAG context. Hidden instructions then steer the model to gather sensitive data and embed it in a URL on a CSP-approved Microsoft domain, so the exfiltration request is allowed. Untrusted input driving privileged data access is what Aim Labs named an LLM Scope Violation.');
+  }
+
+  // ── cards: dataset, model, and system scopes telescope outward ──────────────
+  function anCards(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var D = '5.5s';
+    var specs = [
+      { w: 420, h: 190, name: 'system card', sub: 'end-to-end pipeline, guardrails', a: 0.06 },
+      { w: 288, h: 128, name: 'model card', sub: 'intended use, disaggregated metrics', a: 0.24 },
+      { w: 164, h: 68, name: 'dataset card', sub: 'collection, consent', a: 0.42 }
+    ];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var s = specs[i];
+      svg.appendChild(pop(260, 122, [
+        svgEl('rect', { x: -s.w / 2, y: -s.h / 2, width: s.w, height: s.h, rx: 8, fill: i === 2 ? BP : BG, 'fill-opacity': i === 2 ? '0.1' : '0', stroke: i === 2 ? BP : i === 1 ? SOFT : MUTE, 'stroke-width': i === 2 ? '2' : '1.6' }),
+        txt(-s.w / 2 + 12, -s.h / 2 + 18, s.name, i === 2 ? BP : INK, 11, 'start'),
+        txt(-s.w / 2 + 12, -s.h / 2 + 33, s.sub, MUTE, 8, 'start')
+      ], D, s.a.toFixed(2), (s.a + 0.1).toFixed(2), '0.93'));
+    }
+    card(host, 'DOCUMENTATION SCOPES', 'dataset inside model inside system',
+      svg,
+      'Transparency documentation telescopes: a datasheet describes how one dataset was collected and with what consent, a model card wraps that with intended use and metrics disaggregated by demographic factors, and a system card wraps both with the deployed pipeline, its guardrails, and its failure handling. Adoption is the weak link: an audit of Hugging Face model cards found only 0.3 percent document ethical considerations.');
+  }
+
+  // ── provenance: data enters the weights through a gate, never comes back ────
+  function anProvenance(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var D = '6s';
+    host.setAttribute('data-static-time', '4.7');
+    svg.appendChild(svgEl('rect', { x: 218, y: 58, width: 10, height: 118, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(svgEl('rect', { x: 196, y: 48, width: 54, height: 12, rx: 3, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(223, 38, 'consent gate, collection time', BP, 9));
+    svg.appendChild(svgEl('rect', { x: 300, y: 62, width: 180, height: 112, rx: 8, fill: SURF, stroke: INK, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(390, 88, 'model weights', INK, 12));
+    svg.appendChild(txt(390, 104, 'no surgical erasure', MUTE, 9));
+    var i;
+    for (i = 0; i < 2; i++) {
+      var doc = svgEl('g', {}, [
+        svgEl('rect', { x: -14, y: -18, width: 28, height: 36, rx: 3, fill: BG, stroke: SOFT, 'stroke-width': '1.5' }),
+        svgEl('line', { x1: -7, y1: -8, x2: 7, y2: -8, stroke: RULE, 'stroke-width': '2' }),
+        svgEl('line', { x1: -7, y1: 0, x2: 7, y2: 0, stroke: RULE, 'stroke-width': '2' }),
+        svgEl('line', { x1: -7, y1: 8, x2: 7, y2: 8, stroke: RULE, 'stroke-width': '2' })
+      ]);
+      doc.appendChild(animT('translate', '52 140;52 140;372 140;372 140', D,
+        { calcMode: 'spline', keyTimes: '0;' + (0.04 + i * 0.07).toFixed(2) + ';' + (0.4 + i * 0.07).toFixed(2) + ';1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1' }));
+      doc.appendChild(anim('opacity', '0;1;1;0;0', D, { keyTimes: '0;' + (0.08 + i * 0.07).toFixed(2) + ';' + (0.34 + i * 0.07).toFixed(2) + ';' + (0.44 + i * 0.07).toFixed(2) + ';1' }));
+      svg.appendChild(doc);
+    }
+    svg.appendChild(txt(66, 176, 'opt-out honored here', MUTE, 9));
+    var back = svgEl('g', { opacity: '0' }, [
+      svgEl('line', { x1: 296, y1: 196, x2: 120, y2: 196, stroke: WARN, 'stroke-width': '1.8', 'stroke-dasharray': '6 4' }),
+      svgEl('polygon', { points: '120,191 120,201 110,196', fill: WARN }),
+      txt(208, 214, 'right to erasure, blocked', WARN, 9)
+    ]);
+    back.appendChild(fadeWin(D, '0.56', '0.64', '0.9'));
+    svg.appendChild(back);
+    var cross = svgEl('g', { opacity: '0' }, [
+      svgEl('line', { x1: 286, y1: 186, x2: 306, y2: 206, stroke: WARN, 'stroke-width': '2.5' }),
+      svgEl('line', { x1: 306, y1: 186, x2: 286, y2: 206, stroke: WARN, 'stroke-width': '2.5' })
+    ]);
+    cross.appendChild(fadeWin(D, '0.66', '0.72', '0.9'));
+    svg.appendChild(cross);
+    card(host, 'PROVENANCE IS ONE-WAY', 'comply at the gate or never',
+      svg,
+      'Cookie-consent frameworks assume tracking is reversible. Training is not: once data dissolves into model weights there is no practical GDPR right to erasure, so the only compliance window is the consent gate at collection time. That is why the EU mandates machine-readable opt-outs for GPAI, California AB 2013 demands per-dataset disclosure, and the Data Provenance Initiative found publishers slamming robots.txt shut on the AI data commons.');
+  }
+
+  // ── moderation: input, model, output layers each get a turn ─────────────────
+  function anModeration(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var D = '5.5s';
+    host.setAttribute('data-static-time', '2.5');
+    var bx = [12, 88, 208, 300, 424], bw = [56, 100, 72, 104, 56];
+    var bl = ['user', 'input filter', 'model', 'output filter', 'reply'];
+    var i;
+    for (i = 0; i < 5; i++) {
+      var filt = i === 1 || i === 3;
+      svg.appendChild(svgEl('rect', { x: bx[i], y: 78, width: bw[i], height: 40, rx: 6, fill: filt ? BP : BG, 'fill-opacity': filt ? '0.12' : '1', stroke: filt ? BP : RULE, 'stroke-width': '1.7' }));
+      svg.appendChild(txt(bx[i] + bw[i] / 2, 102, bl[i], filt ? BP : SOFT, 10));
+    }
+    svg.appendChild(svgEl('rect', { x: 96, y: 174, width: 84, height: 30, rx: 5, fill: SURF, stroke: WARN, 'stroke-width': '1.5' }));
+    svg.appendChild(txt(138, 193, 'blocked', WARN, 10));
+    var bad = svgEl('circle', { r: 6, fill: WARN });
+    bad.appendChild(animT('translate', '40 60;40 60;138 60;138 60;138 158;138 158', D,
+      { calcMode: 'spline', keyTimes: '0;0.06;0.22;0.3;0.44;1', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1' }));
+    bad.appendChild(anim('opacity', '0;1;1;1;1;0', D, { keyTimes: '0;0.04;0.3;0.44;0.5;0.56' }));
+    svg.appendChild(bad);
+    var ok = svgEl('circle', { r: 6, fill: BP });
+    ok.appendChild(animT('translate', '40 60;40 60;138 60;138 60;244 60;244 60;352 60;352 60;452 60;452 60', D,
+      { calcMode: 'spline', keyTimes: '0;0.2;0.32;0.38;0.5;0.56;0.68;0.74;0.86;1',
+        keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1' }));
+    ok.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.16;0.22;0.9;0.97' }));
+    svg.appendChild(ok);
+    var ring = svgEl('circle', { cx: 352, cy: 60, r: 12, fill: 'none', stroke: WARN, 'stroke-width': '2', opacity: '0' });
+    ring.appendChild(anim('opacity', '0;0;0.9;0;0', D, { keyTimes: '0;0.68;0.72;0.8;1' }));
+    ring.appendChild(anim('r', '10;10;14;16;10', D, { keyTimes: '0;0.68;0.74;0.8;1' }));
+    svg.appendChild(ring);
+    svg.appendChild(txt(352, 138, 'post-generation check', MUTE, 9));
+    svg.appendChild(txt(138, 138, 'pre-generation check', MUTE, 9));
+    card(host, 'LAYERED MODERATION', 'input · output · custom rules',
+      svg,
+      'Production moderation runs in layers. An input check screens the prompt before generation, so the amber request never reaches the model. An output check screens what the model produced, the ring pulse, catching harm the input layer could not predict. Custom domain rules stack on top. OpenAI omni-moderation returns 13 category flags per call, Llama Guard covers the 14 MLCommons hazards, and async parallel calls hide the added latency.');
+  }
+
+  // ── dual use: relative uplift for novices, absolute reach for experts ───────
+  function anUplift(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var D = '5s';
+    var TH = 424;
+    svg.appendChild(svgEl('line', { x1: TH, y1: 40, x2: TH, y2: 190, stroke: INK, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(txt(TH, 30, 'dangerous capability', INK, 9));
+    svg.appendChild(txt(96, 84, 'novice', SOFT, 11, 'end'));
+    svg.appendChild(svgEl('rect', { x: 110, y: 68, width: 62, height: 22, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1.2' }));
+    var nb = svgEl('rect', { x: 172, y: 68, width: 0, height: 22, rx: 3, fill: BP, opacity: '0.8' });
+    nb.appendChild(anim('width', '0;0;94;94;0', D, { calcMode: 'spline', keyTimes: winKT(0.12, 0.34, 0.92), keySplines: WINSPL }));
+    svg.appendChild(nb);
+    var nl = txt(280, 84, 'x2.53 relative uplift', BP, 10, 'start');
+    nl.setAttribute('opacity', '0');
+    nl.appendChild(fadeWin(D, '0.32', '0.4', '0.92'));
+    svg.appendChild(nl);
+    svg.appendChild(txt(96, 154, 'expert', SOFT, 11, 'end'));
+    svg.appendChild(svgEl('rect', { x: 110, y: 138, width: 232, height: 22, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1.2' }));
+    var eb = svgEl('rect', { x: 342, y: 138, width: 0, height: 22, rx: 3, fill: WARN, opacity: '0.85' });
+    eb.appendChild(anim('width', '0;0;118;118;0', D, { calcMode: 'spline', keyTimes: winKT(0.4, 0.62, 0.92), keySplines: WINSPL }));
+    svg.appendChild(eb);
+    var elb = txt(TH - 6, 178, 'smaller ratio, larger absolute reach', WARN, 10, 'end');
+    elb.setAttribute('opacity', '0');
+    elb.appendChild(fadeWin(D, '0.6', '0.68', '0.92'));
+    svg.appendChild(elb);
+    var flash = svgEl('rect', { x: TH, y: 130, width: 40, height: 38, fill: WARN, opacity: '0' });
+    flash.appendChild(anim('opacity', '0;0;0.28;0.1;0.28;0', D, { keyTimes: '0;0.6;0.66;0.74;0.82;0.92' }));
+    svg.appendChild(flash);
+    svg.appendChild(txt(260, 210, 'grey: baseline skill · colored: AI assistance', MUTE, 9));
+    card(host, 'UPLIFT ASYMMETRY', 'novice ratio · expert reach',
+      svg,
+      'AI assistance multiplies novice capability the most, the bioweapon-acquisition trial measured 2.53x on acquisition tasks, but the novice still ends far from the line. The expert gains a smaller ratio on a much larger base, and it is the expert bar that crosses the dangerous-capability threshold. Safety cases must handle both ends: relative uplift for novices, absolute reach for experts, while vision models erode the wet-lab execution gap that once backstopped both.');
+  }
+
+  LF.register({
+    'an-welfare-endchat': anWelfare,
+    'an-bias-two-harms': anBiasScore,
+    'an-fairness-trilemma': anFairTriangle,
+    'an-dp-clip-noise': anDpClip,
+    'an-watermark-greenlist': anWatermark,
+    'an-eu-act-timeline': anRegTimeline,
+    'an-echoleak-chain': anEcholeak,
+    'an-card-scopes': anCards,
+    'an-provenance-oneway': anProvenance,
+    'an-moderation-layers': anModeration,
+    'an-uplift-asymmetry': anUplift
+  });
+})();
+
+/* module figures-capstone-a.js (Part 6) */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [svgEl('tspan', {}, [document.createTextNode(s)])]);
+  }
+
+  // ── BPE tokenizer: adjacent byte pairs merge into one symbol, repeatedly ────
+  function bpeMerge(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var cells = ['l', 'o', 'w', 'e', 's', 't'];
+    var bw = 46, gap = 8, x0 = 90, y = 60;
+    svg.appendChild(txt(60, y + 18, 'bytes', MUTE, 10, 'middle'));
+    var i;
+    for (i = 0; i < cells.length; i++) {
+      var x = x0 + i * (bw + gap);
+      svg.appendChild(svgEl('rect', { x: x, y: y, width: bw, height: 36, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.5' }));
+      svg.appendChild(txt(x + bw / 2, y + 24, cells[i], INK, 15));
+    }
+    // highlight box that slides across adjacent pairs (the "most frequent pair" scan)
+    var hx0 = x0 - 3, pairW = bw * 2 + gap + 6;
+    var slots = [];
+    for (i = 0; i < cells.length - 1; i++) slots.push((hx0 + i * (bw + gap)) + ',' + (y - 3));
+    var hl = svgEl('rect', { x: hx0, y: y - 3, width: pairW, height: 42, rx: 5, fill: 'none', stroke: BP, 'stroke-width': '2.5', opacity: '0.9' });
+    var hsteps = [];
+    for (i = 0; i < cells.length - 1; i++) hsteps.push((i * (bw + gap)) + ' 0');
+    hl.appendChild(animT('translate', hsteps.join(';'), '5s', { calcMode: 'discrete' }));
+    host.setAttribute('data-static-time', '4.2');
+    svg.appendChild(hl);
+    // merged symbol that grows in below: "es" + "t" -> "est"
+    var my = 150;
+    svg.appendChild(txt(60, my + 22, 'merge', MUTE, 10, 'middle'));
+    var down = svgEl('path', { d: 'M260 104 L260 142', stroke: BP, 'stroke-width': '1.6', fill: 'none', 'marker-end': '', 'stroke-dasharray': '5 4' });
+    down.appendChild(anim('stroke-dashoffset', '18;0', '1.2s'));
+    svg.appendChild(down);
+    svg.appendChild(svgEl('polygon', { points: '256,142 264,142 260,150', fill: BP }));
+    var merged = svgEl('g', {});
+    merged.appendChild(svgEl('rect', { x: 224, y: my, width: 72, height: 38, rx: 5, fill: BP, opacity: '0.14', stroke: BP, 'stroke-width': '2' }));
+    merged.appendChild(txt(260, my + 25, 'est', BP, 16));
+    merged.appendChild(anim('opacity', '0.15;1;1;0.15', '5s'));
+    svg.appendChild(merged);
+    svg.appendChild(txt(420, my + 6, '→ new id', MUTE, 10, 'middle'));
+    svg.appendChild(txt(420, my + 24, 'vocab + 1', SOFT, 12, 'middle'));
+    card(host, 'BPE MERGE LOOP', 'scan · merge · repeat',
+      svg,
+      'Byte-Pair Encoding starts from raw bytes and repeatedly finds the most frequent adjacent pair, merges it into one new symbol, and grows the vocabulary by one id. The scan box sweeps every neighboring pair; the winner collapses into a single token.');
+  }
+
+  // ── sliding window: a fixed window slides over the id stream, T+1 per step ──
+  function slidingWindow(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    var n = 16, bw = 26, x0 = 26, y = 70;
+    var ids = ['12', '7', '93', '4', '58', '2', '31', '9', '77', '6', '40', '15', '8', '61', '3', '22'];
+    var i;
+    svg.appendChild(txt(20, 30, 'token id stream', MUTE, 10, 'start'));
+    for (i = 0; i < n; i++) {
+      var x = x0 + i * (bw + 4);
+      svg.appendChild(svgEl('rect', { x: x, y: y, width: bw, height: 30, rx: 3, fill: BG, stroke: RULE, 'stroke-width': '1' }));
+      svg.appendChild(txt(x + bw / 2, y + 20, ids[i], SOFT, 11));
+    }
+    var step = bw + 4, win = 5;
+    var maxShift = (n - win - 1) * step;
+    // input window (T ids)
+    var inW = win * step - 4;
+    var wg = svgEl('g', {});
+    wg.appendChild(svgEl('rect', { x: x0 - 3, y: y - 6, width: inW + 6, height: 42, rx: 5, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '2' }));
+    wg.appendChild(txt(x0 - 3 + (inW + 6) / 2, y - 12, 'input  (B, T)', BP, 10, 'middle'));
+    // target window shifted by one
+    wg.appendChild(svgEl('rect', { x: x0 - 3 + step, y: y + 40, width: inW + 6, height: 24, rx: 5, fill: WARN, opacity: '0.14', stroke: WARN, 'stroke-width': '1.6' }));
+    wg.appendChild(txt(x0 - 3 + step + (inW + 6) / 2, y + 80, 'target = input shifted by one', WARN, 10, 'middle'));
+    wg.appendChild(animT('translate', '0 0;' + maxShift + ' 0', '6s', { calcMode: 'discrete' }));
+    svg.appendChild(wg);
+    card(host, 'SLIDING WINDOW', 'window slides · stride',
+      svg,
+      'The tokenizer flattens the corpus into one long id stream. A fixed-length window of T ids slides along it by a stride, and the target is the same window shifted left by one for next-token prediction. Smaller strides overlap more and inflate the example count.');
+  }
+
+  // ── multi-head attention: one projection fans into H parallel heads ────────
+  function multiHead(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var inX = 40, inY = 100;
+    svg.appendChild(svgEl('rect', { x: inX, y: inY, width: 60, height: 40, rx: 5, fill: BG, stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(inX + 30, inY + 18, '(B,T,D)', INK, 10));
+    svg.appendChild(txt(inX + 30, inY + 32, 'input', MUTE, 9));
+    // projection block
+    var pjX = 150;
+    svg.appendChild(svgEl('rect', { x: pjX, y: inY - 6, width: 64, height: 52, rx: 5, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(pjX + 32, inY + 14, 'Linear', BP, 11));
+    svg.appendChild(txt(pjX + 32, inY + 30, 'D→3D', SOFT, 9));
+    var flow = svgEl('line', { x1: inX + 60, y1: inY + 20, x2: pjX, y2: inY + 20, stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '6 5' });
+    flow.appendChild(anim('stroke-dashoffset', '22;0', '1s'));
+    svg.appendChild(flow);
+    // H heads fanning out
+    var heads = 4, hX = 300, hY = [30, 90, 150, 210];
+    var j;
+    for (j = 0; j < heads; j++) {
+      var hy = hY[j];
+      var path = svgEl('path', { d: 'M' + (pjX + 64) + ' ' + (inY + 20) + ' C ' + (hX - 40) + ' ' + (inY + 20) + ', ' + (hX - 30) + ' ' + hy + ', ' + hX + ' ' + hy, fill: 'none', stroke: BP, 'stroke-width': '1.4', opacity: '0.55', 'stroke-dasharray': '5 4' });
+      path.appendChild(anim('stroke-dashoffset', '18;0', '1.2s', { begin: (j * 0.18) + 's' }));
+      svg.appendChild(path);
+      var hg = svgEl('g', {});
+      hg.appendChild(svgEl('rect', { x: hX, y: hy - 14, width: 86, height: 28, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.4' }));
+      hg.appendChild(txt(hX + 43, hy + 4, 'head ' + (j + 1), SOFT, 10));
+      hg.appendChild(anim('opacity', '0.4;1;0.4', '2.6s', { begin: (j * 0.4) + 's' }));
+      svg.appendChild(hg);
+      // converge to concat
+      var c2 = svgEl('path', { d: 'M' + (hX + 86) + ' ' + hy + ' C ' + (470) + ' ' + hy + ', ' + 466 + ' ' + (inY + 20) + ', ' + 486 + ' ' + (inY + 20), fill: 'none', stroke: MUTE, 'stroke-width': '1.2', opacity: '0.5' });
+      svg.appendChild(c2);
+    }
+    svg.appendChild(svgEl('rect', { x: 486, y: inY, width: 30, height: 40, rx: 5, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(501, inY + 24, '∥', BP, 16));
+    svg.appendChild(txt(348, 12, 'scaled dot-product · causal mask · softmax', MUTE, 9, 'middle'));
+    card(host, 'MULTI-HEAD ATTENTION', 'one projection · H heads',
+      svg,
+      'A single linear layer projects the input to Q, K, and V, then reshapes into H parallel heads of size D/H. Each head runs scaled dot-product attention under the causal mask independently, and the outputs concatenate back to D. The heads specialize during training.');
+  }
+
+  // ── training loop: forward, backward, step, then descending loss ───────────
+  function trainingLoop(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    // cyclic pipeline of stages around a loop
+    var cx = 150, cy = 110, r = 78;
+    var stages = ['batch', 'forward', 'loss', 'backward', 'AdamW'];
+    var ring = svgEl('circle', { cx: cx, cy: cy, r: r, fill: 'none', stroke: RULE, 'stroke-width': '1.5', 'stroke-dasharray': '4 5' });
+    svg.appendChild(ring);
+    var k;
+    for (k = 0; k < stages.length; k++) {
+      var ang = -Math.PI / 2 + k * 2 * Math.PI / stages.length;
+      var sx = cx + r * Math.cos(ang), sy = cy + r * Math.sin(ang);
+      var g = svgEl('g', {});
+      g.appendChild(svgEl('circle', { cx: sx, cy: sy, r: 7, fill: BP }));
+      var side = Math.cos(ang);
+      if (sy > cy + 10) g.appendChild(txt(sx + (side > 0 ? 10 : -10), sy + 16, stages[k], SOFT, 9, side > 0 ? 'start' : 'end'));
+      else if (side < -0.5) g.appendChild(txt(sx - 14, sy + 3, stages[k], SOFT, 9, 'end'));
+      else g.appendChild(txt(sx, sy - 12, stages[k], SOFT, 9));
+      g.appendChild(anim('opacity', '0.35;1;0.35', '2.5s', { begin: (k * 0.5) + 's' }));
+      svg.appendChild(g);
+    }
+    // a token traveling the ring
+    var dot = svgEl('circle', { r: 5, fill: WARN });
+    dot.appendChild(svgEl('animateMotion', { dur: '2.5s', repeatCount: 'indefinite', path: 'M' + cx + ' ' + (cy - r) + ' A ' + r + ' ' + r + ' 0 1 1 ' + (cx - 0.01) + ' ' + (cy - r) + ' Z' }));
+    svg.appendChild(dot);
+    svg.appendChild(txt(cx, cy + 4, 'every', MUTE, 9));
+    svg.appendChild(txt(cx, cy + 16, 'step', MUTE, 9));
+    // loss curve descending on the right
+    var bx = 280, by = 40, bw = 210, bh = 150;
+    svg.appendChild(svgEl('line', { x1: bx, y1: by, x2: bx, y2: by + bh, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(svgEl('line', { x1: bx, y1: by + bh, x2: bx + bw, y2: by + bh, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(bx - 6, by + 6, 'loss', MUTE, 9, 'end'));
+    svg.appendChild(txt(bx + bw, by + bh + 14, 'steps', MUTE, 9, 'end'));
+    var d = 'M' + bx + ' ' + (by + 8), i, pts = 60;
+    for (i = 1; i <= pts; i++) {
+      var t = i / pts;
+      var lx = bx + t * bw;
+      var ly = by + 8 + (bh - 20) * (1 - Math.exp(-3.2 * t)) - 4 * Math.sin(t * 22) * Math.exp(-2 * t);
+      d += ' L' + lx.toFixed(1) + ' ' + ly.toFixed(1);
+    }
+    var curve = svgEl('path', { d: d, fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '600', 'stroke-dashoffset': '600' });
+    curve.appendChild(anim('stroke-dashoffset', '600;0', '4s'));
+    svg.appendChild(curve);
+    card(host, 'TRAINING LOOP', 'forward · backward · step',
+      svg,
+      'Each step pulls a batch, runs the forward pass to logits, scores cross-entropy loss, backpropagates, and takes an AdamW step under the LR schedule. Repeated thousands of times, the loss curve falls and flattens. Periodic eval and sample probes catch divergence the scalar loss hides.');
+  }
+
+  // ── classifier head swap: frozen body, old head off, new 2-class head on ───
+  function headSwap(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var bx = 60, by = 40, bw = 150, bh = 150;
+    // frozen body
+    svg.appendChild(svgEl('rect', { x: bx, y: by, width: bw, height: bh, rx: 6, fill: SURF, stroke: MUTE, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(txt(bx + bw / 2, by + 22, 'transformer body', SOFT, 11));
+    svg.appendChild(txt(bx + bw / 2, by + 38, '(frozen)', MUTE, 10));
+    var ly;
+    for (ly = 0; ly < 4; ly++) {
+      var yy = by + 58 + ly * 24;
+      var lr = svgEl('rect', { x: bx + 22, y: yy, width: bw - 44, height: 16, rx: 3, fill: BG, stroke: MUTE, 'stroke-width': '1' });
+      svg.appendChild(lr);
+      // tiny lock-snowflake pulse to read "frozen"
+      svg.appendChild(txt(bx + bw / 2, yy + 12, 'block ' + (ly + 1), MUTE, 8));
+    }
+    // arrow out of body (pooled representation)
+    var arr = svgEl('line', { x1: bx + bw, y1: by + bh / 2, x2: bx + bw + 50, y2: by + bh / 2, stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '6 5' });
+    arr.appendChild(anim('stroke-dashoffset', '22;0', '1s'));
+    svg.appendChild(arr);
+    svg.appendChild(txt(bx + bw + 25, by + bh / 2 - 8, 'pooled', MUTE, 9));
+    // old head fading out (above)
+    var oldH = svgEl('g', {});
+    oldH.appendChild(svgEl('rect', { x: 290, y: 40, width: 130, height: 44, rx: 6, fill: 'none', stroke: MUTE, 'stroke-width': '1.6', 'stroke-dasharray': '4 4' }));
+    oldH.appendChild(txt(355, 60, 'old LM head', MUTE, 11));
+    oldH.appendChild(txt(355, 76, 'vocab projection', MUTE, 9));
+    oldH.appendChild(animT('translate', '0 0;36 -18', '3s', { calcMode: 'spline', keySplines: '0.4 0 0.6 1', keyTimes: '0;1', additive: 'sum' }));
+    oldH.appendChild(anim('opacity', '1;0.15', '3s'));
+    svg.appendChild(oldH);
+    // new head snapping in (below, blueprint)
+    var newH = svgEl('g', {});
+    newH.appendChild(svgEl('rect', { x: 290, y: 130, width: 130, height: 50, rx: 6, fill: BP, opacity: '0.14', stroke: BP, 'stroke-width': '2.2' }));
+    newH.appendChild(txt(355, 152, 'new classifier head', BP, 10));
+    newH.appendChild(txt(355, 168, 'linear → 2 logits', SOFT, 9));
+    newH.appendChild(anim('opacity', '0.1;1', '1.4s', { begin: '0.8s', fill: 'freeze' }));
+    svg.appendChild(newH);
+    svg.appendChild(svgEl('line', { x1: 220, y1: by + bh / 2, x2: 290, y2: 155, stroke: BP, 'stroke-width': '1.6' }));
+    card(host, 'CLASSIFIER HEAD SWAP', 'freeze body · swap head',
+      svg,
+      'A pretrained model is a frozen body plus a head. To classify, you keep the expensive body and lift off the vocabulary head, gluing on a small linear layer to two logits. Train head-only for speed or unfreeze the body for accuracy when the domain drifts.');
+  }
+
+  // ── DPO: chosen log-prob rises, rejected falls, around a frozen reference ──
+  function dpoPreference(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var bx = 70, by = 30, bw = 380, bh = 150;
+    svg.appendChild(svgEl('line', { x1: bx, y1: by, x2: bx, y2: by + bh, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(svgEl('line', { x1: bx, y1: by + bh, x2: bx + bw, y2: by + bh, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(bx - 8, by + 8, 'log p', MUTE, 9, 'end'));
+    svg.appendChild(txt(bx + bw, by + bh + 14, 'training steps', MUTE, 9, 'end'));
+    // frozen reference line (flat dashed)
+    var refY = by + bh / 2;
+    svg.appendChild(svgEl('line', { x1: bx, y1: refY, x2: bx + bw, y2: refY, stroke: MUTE, 'stroke-width': '1.4', 'stroke-dasharray': '6 4' }));
+    svg.appendChild(txt(bx + bw - 4, refY - 6, 'frozen reference π_ref', MUTE, 9, 'end'));
+    // chosen rising
+    var i, pts = 50, dc = 'M' + bx + ' ' + refY, dr = 'M' + bx + ' ' + refY;
+    for (i = 1; i <= pts; i++) {
+      var t = i / pts, lx = bx + t * bw;
+      var up = refY - (bh / 2 - 14) * (1 - Math.exp(-2.8 * t));
+      var dn = refY + (bh / 2 - 14) * (1 - Math.exp(-2.4 * t));
+      dc += ' L' + lx.toFixed(1) + ' ' + up.toFixed(1);
+      dr += ' L' + lx.toFixed(1) + ' ' + dn.toFixed(1);
+    }
+    var cv = svgEl('path', { d: dc, fill: 'none', stroke: BP, 'stroke-width': '2.4', 'stroke-dasharray': '480', 'stroke-dashoffset': '480' });
+    cv.appendChild(anim('stroke-dashoffset', '480;0', '3.6s'));
+    svg.appendChild(cv);
+    var rv = svgEl('path', { d: dr, fill: 'none', stroke: WARN, 'stroke-width': '2.4', 'stroke-dasharray': '480', 'stroke-dashoffset': '480' });
+    rv.appendChild(anim('stroke-dashoffset', '480;0', '3.6s'));
+    svg.appendChild(rv);
+    svg.appendChild(txt(bx + bw - 4, by + 18, 'chosen  y_w  ↑', BP, 10, 'end'));
+    svg.appendChild(txt(bx + bw - 4, by + bh - 8, 'rejected  y_l  ↓', WARN, 10, 'end'));
+    // sigmoid widening gap marker
+    var gap = svgEl('g', {});
+    gap.appendChild(svgEl('line', { x1: bx + bw - 60, y1: refY - (bh / 2 - 16), x2: bx + bw - 60, y2: refY + (bh / 2 - 16), stroke: INK, 'stroke-width': '1', 'stroke-dasharray': '2 3' }));
+    gap.appendChild(anim('opacity', '0;0;1', '3.6s', { fill: 'freeze' }));
+    svg.appendChild(gap);
+    card(host, 'DPO PREFERENCE', 'chosen ↑ · rejected ↓',
+      svg,
+      'DPO trains the policy directly on chosen-over-rejected pairs, with no separate reward model. The loss is a sigmoid over the log-probability gap relative to a frozen reference, so the chosen completion is pushed up and the rejected pulled down while the KL anchor keeps the policy honest.');
+  }
+
+  // ── corpus downloader: shards stream in, resume on drop, dedup, manifest ───
+  function corpusStream(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    // source cloud
+    svg.appendChild(svgEl('rect', { x: 24, y: 90, width: 70, height: 44, rx: 22, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(59, 110, 'remote', SOFT, 10));
+    svg.appendChild(txt(59, 124, 'shards', SOFT, 10));
+    // pipe with flowing bytes
+    var pipeY = 112;
+    svg.appendChild(svgEl('line', { x1: 94, y1: pipeY, x2: 250, y2: pipeY, stroke: RULE, 'stroke-width': '8' }));
+    var path = 'M100 ' + pipeY + ' H244';
+    var b;
+    for (b = 0; b < 4; b++) {
+      var dot = svgEl('circle', { r: 4, fill: BP });
+      dot.appendChild(svgEl('animateMotion', { dur: '2.4s', repeatCount: 'indefinite', path: path, begin: (b * 0.6) + 's' }));
+      svg.appendChild(dot);
+    }
+    // resume marker: a byte-offset flag that flickers (network drop + Range resume)
+    var resume = svgEl('g', {});
+    resume.appendChild(svgEl('line', { x1: 175, y1: pipeY - 22, x2: 175, y2: pipeY + 22, stroke: WARN, 'stroke-width': '2' }));
+    resume.appendChild(txt(175, pipeY - 28, 'Range resume', WARN, 8));
+    resume.appendChild(anim('opacity', '1;0.15;1', '2.4s'));
+    svg.appendChild(resume);
+    // zstd decompress block
+    svg.appendChild(svgEl('rect', { x: 250, y: 92, width: 60, height: 40, rx: 5, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(280, 110, 'zstd', BP, 10));
+    svg.appendChild(txt(280, 124, 'stream', SOFT, 8));
+    // dedup buckets: docs drop into LSH buckets, near-dup gets X
+    var bx = 340, j;
+    for (j = 0; j < 3; j++) {
+      var bxj = bx + j * 56;
+      svg.appendChild(svgEl('rect', { x: bxj, y: 150, width: 44, height: 34, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(bxj + 22, 196, 'LSH ' + (j + 1), MUTE, 8));
+      var falling = svgEl('circle', { cx: bxj + 22, cy: 70, r: 4, fill: j === 1 ? WARN : BP });
+      falling.appendChild(anim('cy', '70;167', '2.2s', { begin: (j * 0.5) + 's' }));
+      falling.appendChild(anim('opacity', j === 1 ? '1;1;0.1' : '1;1;1', '2.2s', { begin: (j * 0.5) + 's' }));
+      svg.appendChild(falling);
+    }
+    svg.appendChild(txt(bx + 56, 36, 'duplicate dropped', WARN, 9, 'middle'));
+    // manifest
+    svg.appendChild(svgEl('line', { x1: 310, y1: 112, x2: 340, y2: 112, stroke: BP, 'stroke-width': '2' }));
+    card(host, 'CORPUS DOWNLOADER', 'stream · resume · dedup',
+      svg,
+      'Shards stream from the remote source and decompress through Zstandard without buffering the whole file. A verified byte offset lets a dropped connection resume with an HTTP Range request, and each document gets a MinHash signature bucketed by LSH so near-duplicates collide and drop before reaching the manifest.');
+  }
+
+  // ── cosine LR warmup: a marker rides the warmup ramp into cosine decay ─────
+  function cosineWarmup(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var bx = 50, by = 30, bw = 430, bh = 150, base = by + bh;
+    svg.appendChild(svgEl('line', { x1: bx, y1: by, x2: bx, y2: base, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(svgEl('line', { x1: bx, y1: base, x2: bx + bw, y2: base, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(bx - 6, by + 6, 'lr', MUTE, 9, 'end'));
+    svg.appendChild(txt(bx + bw, base + 14, 'step', MUTE, 9, 'end'));
+    var warmFrac = 0.18, peak = bh - 14, minY = bh * 0.06;
+    function lrAt(t) {
+      if (t < warmFrac) return peak * (t / warmFrac);
+      var u = (t - warmFrac) / (1 - warmFrac);
+      return minY + (peak - minY) * 0.5 * (1 + Math.cos(Math.PI * u));
+    }
+    function X(t) { return bx + t * bw; }
+    function Y(v) { return base - v; }
+    // warmup region shading marker
+    svg.appendChild(svgEl('rect', { x: bx, y: by, width: bw * warmFrac, height: bh, fill: WARN, opacity: '0.07' }));
+    svg.appendChild(txt(bx + bw * warmFrac / 2, by - 8, 'warmup', WARN, 9, 'middle'));
+    svg.appendChild(txt(bx + bw * (warmFrac + (1 - warmFrac) / 2), by - 8, 'cosine decay', BP, 9, 'middle'));
+    var i, pts = 120, d = 'M' + X(0) + ' ' + Y(lrAt(0));
+    for (i = 1; i <= pts; i++) { var t = i / pts; d += ' L' + X(t).toFixed(1) + ' ' + Y(lrAt(t)).toFixed(1); }
+    var curve = svgEl('path', { d: d, fill: 'none', stroke: BP, 'stroke-width': '2.4', 'stroke-dasharray': '700', 'stroke-dashoffset': '700' });
+    curve.appendChild(anim('stroke-dashoffset', '700;0', '5s', { repeatCount: '1', fill: 'freeze' }));
+    svg.appendChild(curve);
+    // marker dot riding the schedule
+    var sampleX = [], sampleY = [];
+    for (i = 0; i <= 40; i++) { var tt = i / 40; sampleX.push(X(tt).toFixed(1)); sampleY.push(Y(lrAt(tt)).toFixed(1)); }
+    var dot = svgEl('circle', { r: 6, fill: WARN });
+    dot.appendChild(anim('cx', sampleX.join(';'), '5s'));
+    dot.appendChild(anim('cy', sampleY.join(';'), '5s'));
+    svg.appendChild(dot);
+    // peak dashed guide
+    svg.appendChild(svgEl('line', { x1: bx, y1: Y(peak), x2: X(warmFrac), y2: Y(peak), stroke: RULE, 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+    svg.appendChild(txt(bx + 4, Y(peak) - 4, 'lr_max', SOFT, 8, 'start'));
+    card(host, 'COSINE LR WARMUP', 'ramp up · decay down',
+      svg,
+      'The schedule ramps the learning rate linearly from zero to lr_max over the warmup steps, protecting the brittle first updates, then follows the upper half of a cosine curve back toward lr_min. The marker rides the exact value the optimizer uses at each step.');
+  }
+
+  LF.register({
+    'cap-bpe-merge': bpeMerge,
+    'cap-sliding-window': slidingWindow,
+    'cap-multihead-attention': multiHead,
+    'cap-training-loop': trainingLoop,
+    'cap-classifier-head-swap': headSwap,
+    'cap-dpo-preference': dpoPreference,
+    'cap-corpus-downloader': corpusStream,
+    'cap-cosine-warmup': cosineWarmup
+  });
+})();
+
+/* module figures-capstone-b.js (Part 6) */
+/* figures-capstone-b.js - animated lesson figures for Phase 19 capstone
+   projects (training safety, hybrid retrieval, reranking, end-to-end RAG,
+   eval harness, code-exec sandbox, injection detection, safety gate).
+   Loads after lesson-figures.js, registers through window.LF. SMIL/CSS motion
+   only - no JS loops, no rAF. ES5, no deps, theme via CSS vars. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var svgEl = LF.svgEl, el = LF.el;
+
+  function svg(h) { return svgEl('svg', { viewBox: '0 0 520 ' + h }); }
+  function shell(host, label, sub, node, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [node])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '11', fill: fill || 'var(--ink,#1a1a1a)' });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function rect(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: '4', fill: fill || 'var(--bg-surface,#eee)', stroke: stroke || 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' });
+  }
+
+  // ── grad-clip-monitor (45): gradient norm spikes, clip ceiling, scaler skip ─
+  function gradClip(host) {
+    var s = svg(240), W = 520, BASE = 150, CEIL = 70, PAD = 30;
+    s.appendChild(svgEl('line', { x1: PAD, y1: CEIL, x2: W - PAD, y2: CEIL, stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4', 'stroke-dasharray': '5 4' }));
+    s.appendChild(txt(W - PAD, CEIL - 6, 'clip ceiling = 1.0', '9', 'var(--warn,#b8870f)', 'end'));
+    s.appendChild(svgEl('line', { x1: PAD, y1: BASE, x2: W - PAD, y2: BASE, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    var heights = [110, 96, 82, 108, 30, 100, 90, 112], n = heights.length, bw = 30, gap = (W - 2 * PAD - n * bw) / (n - 1);
+    var i, spike = 4;
+    for (i = 0; i < n; i++) {
+      var x = PAD + i * (bw + gap), raw = heights[i], clipped = Math.min(raw, BASE - CEIL);
+      var bar = rect(x, BASE - clipped, bw, clipped, i === spike ? 'var(--warn,#b8870f)' : 'var(--blueprint,#3553ff)', 'none');
+      bar.appendChild(anim('height', clipped + ';' + clipped, '0.1s'));
+      var grow = svgEl('animate', { attributeName: 'height', values: '0;' + (i === spike ? raw : clipped) + ';' + clipped, keyTimes: '0;0.55;1', dur: '2.6s', begin: (i * 0.14) + 's', repeatCount: 'indefinite' });
+      var gy = svgEl('animate', { attributeName: 'y', values: BASE + ';' + (i === spike ? BASE - raw : BASE - clipped) + ';' + (BASE - clipped), keyTimes: '0;0.55;1', dur: '2.6s', begin: (i * 0.14) + 's', repeatCount: 'indefinite' });
+      bar.appendChild(grow); bar.appendChild(gy);
+      s.appendChild(bar);
+    }
+    var ghost = rect(PAD + spike * (bw + gap), CEIL - 40, bw, 40, 'none', 'var(--warn,#b8870f)');
+    ghost.setAttribute('stroke-dasharray', '3 3');
+    ghost.appendChild(anim('opacity', '0;0.9;0', '2.6s', { begin: (spike * 0.14) + 's' }));
+    s.appendChild(ghost);
+    var skip = txt(PAD + spike * (bw + gap) + bw / 2, CEIL - 48, 'NaN → skip step', '9', 'var(--warn,#b8870f)');
+    skip.appendChild(anim('opacity', '0;1;0', '2.6s', { begin: (spike * 0.14) + 's' }));
+    s.appendChild(skip);
+    s.appendChild(txt(PAD, BASE + 18, 'step →', '9', 'var(--ink-mute,#777)', 'start'));
+    shell(host, 'GRADIENT CLIP + AMP', 'norm spikes, ceiling holds', s,
+      'Every step the global gradient norm is measured and clipped to the ceiling. A single overflow batch (orange) would spike past it and turn the loss to NaN; the GradScaler detects the Inf, skips the optimizer step, and halves its scale so the run survives.');
+  }
+
+  // ── rrf-fusion (65): query splits into BM25 + dense lanes, ranks vote ──────
+  function rrfFusion(host) {
+    var s = svg(250), defs = svgEl('defs', {});
+    var grad = svgEl('marker', { id: 'cb-arr', viewBox: '0 0 8 8', refX: '7', refY: '4', markerWidth: '7', markerHeight: '7', orient: 'auto' }, [svgEl('path', { d: 'M0 0 L8 4 L0 8 z', fill: 'var(--ink-soft,#555)' })]);
+    defs.appendChild(grad); s.appendChild(defs);
+    s.appendChild(rect(20, 105, 80, 40, 'var(--blueprint,#3553ff)', 'none'));
+    s.appendChild(txt(60, 129, 'query', '12', 'var(--bg,#fafaf5)'));
+    s.appendChild(rect(200, 40, 90, 40)); s.appendChild(txt(245, 64, 'BM25', '11'));
+    s.appendChild(rect(200, 170, 90, 40)); s.appendChild(txt(245, 194, 'dense', '11'));
+    s.appendChild(rect(400, 105, 100, 40, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(450, 124, 'RRF fuse', '11'));
+    s.appendChild(txt(450, 138, '1/(k+rank)', '8', 'var(--ink-mute,#777)'));
+    [[100, 122, 200, 60], [100, 128, 200, 188], [290, 60, 400, 120], [290, 188, 400, 130]].forEach(function (c) {
+      s.appendChild(svgEl('line', { x1: c[0], y1: c[1], x2: c[2], y2: c[3], stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'marker-end': 'url(#cb-arr)' }));
+    });
+    function packet(path, begin, fill) {
+      var d = svgEl('circle', { r: '5', fill: fill, cx: '0', cy: '0', opacity: '0' });
+      d.appendChild(svgEl('animateMotion', { path: path, dur: '2.8s', begin: begin, repeatCount: 'indefinite', keyPoints: '0;1', keyTimes: '0;1' }));
+      d.appendChild(anim('opacity', '0;1;1;0', '2.8s', { begin: begin, keyTimes: '0;0.1;0.9;1' }));
+      return d;
+    }
+    s.appendChild(packet('M100 122 L200 60', '0s', 'var(--blueprint,#3553ff)'));
+    s.appendChild(packet('M100 128 L200 188', '0.3s', 'var(--blueprint,#3553ff)'));
+    s.appendChild(packet('M290 60 L400 120', '1.2s', 'var(--warn,#b8870f)'));
+    s.appendChild(packet('M290 188 L400 130', '1.5s', 'var(--warn,#b8870f)'));
+    var win = txt(450, 168, 'fused top-k', '9', 'var(--blueprint,#3553ff)');
+    win.appendChild(anim('opacity', '0.3;1;0.3', '2.8s', { begin: '2.4s' }));
+    s.appendChild(win);
+    shell(host, 'RECIPROCAL RANK FUSION', 'two lanes, one vote', s,
+      'A query runs through BM25 and a dense retriever in parallel. Each returns a ranked list; RRF scores every document by 1/(k+rank) summed across lists, so a document ranked well by either lane rises. The fusion votes rather than interpolates, which is why it wins across query classes.');
+  }
+
+  // ── rerank-funnel (66): N candidates funnel through cross-encoder to top-K ─
+  function rerankFunnel(host) {
+    var s = svg(240), N = 8, x0 = 50, y0 = 30, rh = 22, gap = 4;
+    s.appendChild(txt(80, 20, 'retrieved N', '9', 'var(--ink-mute,#777)'));
+    s.appendChild(txt(440, 20, 'reranked top-K', '9', 'var(--ink-mute,#777)'));
+    s.appendChild(rect(230, 70, 60, 90, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(260, 110, 'cross', '10')); s.appendChild(txt(260, 124, 'encoder', '10'));
+    var keep = { 5: 1, 1: 1, 6: 1 }, i, kRank = 0;
+    for (i = 0; i < N; i++) {
+      var y = y0 + i * (rh + gap);
+      s.appendChild(rect(x0, y, 110, rh, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      var dot = svgEl('circle', { cx: x0 + 12, cy: y + rh / 2, r: '4', fill: 'var(--ink-mute,#777)' });
+      s.appendChild(dot);
+      var kept = !!keep[i];
+      var ty = kept ? (78 + kRank * 30) : (90 + (i % 3) * 4);
+      var packet = svgEl('circle', { r: '4.5', fill: kept ? 'var(--blueprint,#3553ff)' : 'var(--ink-mute,#777)', cx: x0 + 12, cy: y + rh / 2 });
+      var motion = svgEl('animateMotion', { path: 'M0 0 L' + (218 - x0) + ' ' + (115 - (y + rh / 2)), dur: '3.2s', begin: (i * 0.1) + 's', repeatCount: 'indefinite', keyTimes: '0;0.4;0.5;1', keyPoints: '0;1;1;1', calcMode: 'linear' });
+      packet.appendChild(motion);
+      if (kept) {
+        var out = svgEl('circle', { r: '5', fill: 'var(--blueprint,#3553ff)', cx: 380, cy: ty });
+        out.appendChild(anim('opacity', '0;0;1;1;0', '3.2s', { begin: (i * 0.1) + 's', keyTimes: '0;0.55;0.65;0.9;1' }));
+        out.appendChild(anim('cx', '300;380', '3.2s', { begin: (i * 0.1) + 's', keyTimes: '0;1' }));
+        s.appendChild(svgEl('g', {}, [out, txt(420, ty + 4, 'K' + (kRank + 1), '9', 'var(--blueprint,#3553ff)', 'start')]));
+        kRank++;
+      }
+      packet.appendChild(anim('opacity', '1;1;0;0', '3.2s', { begin: (i * 0.1) + 's', keyTimes: '0;0.45;0.5;1' }));
+      s.appendChild(packet);
+    }
+    shell(host, 'CROSS-ENCODER RERANK', 'N candidates → top-K', s,
+      'A cheap retriever returns N candidates; the cross-encoder reads each (query, document) pair with full attention and scores it. Only the top-K survive (blue). The expensive model runs N times instead of corpus-many, so its precision lift lands inside the request latency budget.');
+  }
+
+  // ── rag-pipeline-flow (69): query packet travels the full pipeline ─────────
+  function ragPipeline(host) {
+    var s = svg(220), defs = svgEl('defs', {});
+    defs.appendChild(svgEl('marker', { id: 'cb-rag', viewBox: '0 0 8 8', refX: '7', refY: '4', markerWidth: '6', markerHeight: '6', orient: 'auto' }, [svgEl('path', { d: 'M0 0 L8 4 L0 8 z', fill: 'var(--ink-soft,#555)' })]));
+    s.appendChild(defs);
+    var stages = ['rewrite', 'retrieve', 'rerank', 'generate'], i;
+    var bw = 96, y = 70, x = [16, 142, 268, 394];
+    for (i = 0; i < 4; i++) {
+      s.appendChild(rect(x[i], y, bw, 44, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      var lit = rect(x[i], y, bw, 44, 'var(--blueprint,#3553ff)', 'var(--rule-soft,#ddd)');
+      lit.setAttribute('opacity', '0');
+      lit.appendChild(anim('opacity', '0;1;0', '3.6s', { begin: (i * 0.7) + 's', keyTimes: '0;0.5;1' }));
+      s.appendChild(lit);
+      s.appendChild(txt(x[i] + bw / 2, y + 27, stages[i], '11'));
+      if (i < 3) s.appendChild(svgEl('line', { x1: x[i] + bw, y1: y + 22, x2: x[i + 1], y2: y + 22, stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'marker-end': 'url(#cb-rag)' }));
+    }
+    s.appendChild(txt(64, 50, 'corpus + query', '9', 'var(--ink-mute,#777)'));
+    var path = 'M0 0 L' + (x[3] + bw / 2 - 64) + ' 0';
+    var pk = svgEl('circle', { r: '6', fill: 'var(--warn,#b8870f)', cx: '64', cy: '92' });
+    pk.appendChild(svgEl('animateMotion', { path: path, dur: '3.6s', repeatCount: 'indefinite', keyTimes: '0;1', keyPoints: '0;1', calcMode: 'linear' }));
+    s.appendChild(pk);
+    var cite = txt(x[3] + bw, 150, 'answer + [chunk:42] citation', '10', 'var(--blueprint,#3553ff)', 'end');
+    cite.appendChild(anim('opacity', '0;0;1;1;0', '3.6s', { keyTimes: '0;0.78;0.85;0.95;1' }));
+    s.appendChild(cite);
+    var refuse = txt(x[3] + bw, 168, 'or refuse on low confidence', '8', 'var(--ink-mute,#777)', 'end');
+    refuse.appendChild(anim('opacity', '0;0;0.8;0', '3.6s', { keyTimes: '0;0.85;0.92;1' }));
+    s.appendChild(refuse);
+    shell(host, 'END-TO-END RAG', 'one query, four stages', s,
+      'The packet carries one query through the assembled pipeline: rewrite expands it, the hybrid index retrieves, the cross-encoder reranks, the generator answers with a chunk-anchored citation or refuses when confidence is low. Six isolated components become one system that beats each stage measured alone.');
+  }
+
+  // ── sandbox-runner (72): code into subprocess, assertions light up, timeout ─
+  function sandboxRunner(host) {
+    var s = svg(230);
+    s.appendChild(rect(20, 80, 90, 60, 'var(--blueprint,#3553ff)', 'none'));
+    s.appendChild(txt(65, 105, 'candidate', '10', 'var(--bg,#fafaf5)'));
+    s.appendChild(txt(65, 120, 'code', '10', 'var(--bg,#fafaf5)'));
+    s.appendChild(svgEl('rect', { x: 180, y: 40, width: 160, height: 150, rx: '6', fill: 'none', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.5', 'stroke-dasharray': '6 4' }));
+    s.appendChild(txt(260, 32, 'subprocess sandbox', '9', 'var(--ink-mute,#777)'));
+    var pk = svgEl('circle', { r: '5', fill: 'var(--warn,#b8870f)', cx: '110', cy: '110' });
+    pk.appendChild(svgEl('animateMotion', { path: 'M0 0 L70 0', dur: '3.4s', repeatCount: 'indefinite', keyTimes: '0;0.2;1', keyPoints: '0;1;1', calcMode: 'linear' }));
+    pk.appendChild(anim('opacity', '1;1;0;0', '3.4s', { keyTimes: '0;0.2;0.25;1' }));
+    s.appendChild(pk);
+    var res = ['pass', 'pass', 'fail', 'pass'], i;
+    for (i = 0; i < 4; i++) {
+      var ay = 60 + i * 32, ok = res[i] === 'pass';
+      s.appendChild(rect(200, ay, 120, 24, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      var base = txt(208, ay + 16, 'assert ' + (i + 1), '9', 'var(--ink-soft,#555)', 'start');
+      base.appendChild(anim('opacity', '1;1;0;0', '3.4s', { begin: (0.3 + i * 0.25) + 's', keyTimes: '0;0.3;0.31;1' }));
+      s.appendChild(base);
+      var lit = svgEl('g', { opacity: '0' }, [
+        rect(200, ay, 120, 24, ok ? 'var(--blueprint,#3553ff)' : 'var(--warn,#b8870f)', 'var(--rule-soft,#ddd)'),
+        txt(208, ay + 16, 'assert ' + (i + 1), '9', 'var(--bg,#fafaf5)', 'start')
+      ]);
+      lit.appendChild(anim('opacity', '0;0;1;1', '3.4s', { begin: (0.3 + i * 0.25) + 's', keyTimes: '0;0.31;0.36;1' }));
+      s.appendChild(lit);
+      var mark = txt(312, ay + 16, ok ? '✓' : '✗', '12', ok ? 'var(--blueprint,#3553ff)' : 'var(--warn,#b8870f)', 'end');
+      mark.appendChild(anim('opacity', '0;0;1;1', '3.4s', { begin: (0.3 + i * 0.25) + 's', keyTimes: '0;0.3;0.45;1' }));
+      mark.setAttribute('fill', 'var(--bg,#fafaf5)');
+      s.appendChild(mark);
+    }
+    var clock = svgEl('circle', { cx: 400, cy: 80, r: '18', fill: 'none', stroke: 'var(--ink-mute,#777)', 'stroke-width': '1.5' });
+    s.appendChild(clock);
+    var hand = svgEl('line', { x1: 400, y1: 80, x2: 400, y2: 66, stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.6' });
+    hand.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'rotate', from: '0 400 80', to: '360 400 80', dur: '2s', repeatCount: 'indefinite' }));
+    s.appendChild(hand);
+    s.appendChild(txt(400, 116, 'wall-clock', '8', 'var(--ink-mute,#777)'));
+    s.appendChild(txt(400, 127, 'timeout', '8', 'var(--ink-mute,#777)'));
+    var score = txt(400, 175, '3/4 pass', '12', 'var(--blueprint,#3553ff)');
+    score.appendChild(anim('opacity', '0.3;1;0.3', '3.4s', { begin: '1.6s' }));
+    s.appendChild(score);
+    shell(host, 'CODE-EXEC SANDBOX', 'run, assert, time out', s,
+      'Generated code is shipped on stdin to a fresh interpreter inside a subprocess with an import denylist and output cap. Each supplied assertion runs and lights pass (blue) or fail (orange); a wall-clock timeout kills runaway loops. The score is the fraction of assertions that pass, with crashes and timeouts as first-class fail modes.');
+  }
+
+  // ── eval-grid (75): task grid lights pass/fail across a worker pool ─────────
+  function evalGrid(host) {
+    var s = svg(240), cols = 8, rows = 4, cw = 38, ch = 30, gx0 = 130, gy0 = 30;
+    s.appendChild(txt(60, gy0 - 8, 'worker pool', '10', 'var(--ink-soft,#555)'));
+    var w, c;
+    for (w = 0; w < rows; w++) {
+      s.appendChild(rect(20, gy0 + w * (ch + 6) + 18, 80, 22, 'var(--blueprint,#3553ff)', 'none'));
+      var wl = txt(60, gy0 + w * (ch + 6) + 33, 'w' + w, '9', 'var(--bg,#fafaf5)');
+      s.appendChild(wl);
+    }
+    var seed = [1, 0, 1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 0, 1, 1, 1, 1];
+    var under = svgEl('path', { fill: 'var(--bg-surface,#eee)' }), cells = '', bw = cw - 6, bh = ch - 4;
+    s.appendChild(under);
+    for (w = 0; w < rows; w++) {
+      for (c = 0; c < cols; c++) {
+        var idx = w * cols + c, ok = seed[idx], x = gx0 + c * cw, y = gy0 + w * (ch + 6) + 14, beg = (c * 0.18 + w * 0.06);
+        cells += 'M' + (x + 4) + ' ' + y + 'h' + (bw - 8) + 'a4 4 0 0 1 4 4v' + (bh - 8) + 'a4 4 0 0 1 -4 4h' + (8 - bw) + 'a4 4 0 0 1 -4 -4v' + (8 - bh) + 'a4 4 0 0 1 4 -4z';
+        var cell = rect(x, y, bw, bh, ok ? 'var(--blueprint,#3553ff)' : 'var(--warn,#b8870f)', 'var(--rule-soft,#ddd)');
+        cell.setAttribute('fill-opacity', '0');
+        cell.appendChild(anim('fill-opacity', '0;0;1;1', '4s', { begin: beg + 's', keyTimes: '0;0.2;0.35;1' }));
+        s.appendChild(cell);
+      }
+    }
+    under.setAttribute('d', cells);
+    s.appendChild(txt(gx0, gy0 - 8, 'tasks.jsonl →', '9', 'var(--ink-mute,#777)', 'start'));
+    var bar = svgEl('line', { x1: gx0, y1: gy0 + 10, x2: gx0, y2: gy0 + rows * (ch + 6) + 4, stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.6', opacity: '0.7' });
+    bar.appendChild(anim('x1', gx0 + ';' + (gx0 + cols * cw), '4s', { keyTimes: '0;1' }));
+    bar.appendChild(anim('x2', gx0 + ';' + (gx0 + cols * cw), '4s', { keyTimes: '0;1' }));
+    s.appendChild(bar);
+    var sc = txt(260, 218, 'score = mean(pass) · per-model EvalRun → leaderboard', '9', 'var(--blueprint,#3553ff)');
+    s.appendChild(sc);
+    shell(host, 'EVAL RUNNER', 'tasks fan out, scores light up', s,
+      'The runner reads the task spec, fans the tasks across a worker pool, and scores each with the metric layer plus the calibration report. Cells light pass (blue) or fail (orange) as the sweep crosses them. Per-model EvalRun records flow straight into the leaderboard aggregator; the demo self-terminates on a clean run.');
+  }
+
+  // ── injection-gate (83): prompts stream through three detector layers ──────
+  function injectionGate(host) {
+    var s = svg(230), defs = svgEl('defs', {});
+    defs.appendChild(svgEl('marker', { id: 'cb-inj', viewBox: '0 0 8 8', refX: '7', refY: '4', markerWidth: '6', markerHeight: '6', orient: 'auto' }, [svgEl('path', { d: 'M0 0 L8 4 L0 8 z', fill: 'var(--ink-soft,#555)' })]));
+    s.appendChild(defs);
+    var layers = ['normalize', 'substring', 'regex'], x = [70, 200, 330], i;
+    for (i = 0; i < 3; i++) {
+      s.appendChild(rect(x[i], 80, 96, 50, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(x[i] + 48, 98, layers[i], '11'));
+      s.appendChild(txt(x[i] + 48, 110, 'layer', '8', 'var(--ink-mute,#777)'));
+      if (i < 2) s.appendChild(svgEl('line', { x1: x[i] + 96, y1: 120, x2: x[i + 1], y2: 120, stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'marker-end': 'url(#cb-inj)' }));
+    }
+    s.appendChild(rect(440, 80, 60, 50, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(470, 98, 'verdict', '9'));
+    s.appendChild(svgEl('line', { x1: 426, y1: 120, x2: 440, y2: 120, stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'marker-end': 'url(#cb-inj)' }));
+    // a malicious prompt fired at the regex layer, a benign one passes clean
+    function flow(begin, fired, fill) {
+      var pk = svgEl('circle', { r: '5', fill: fill, cx: '20', cy: '120' });
+      pk.appendChild(svgEl('animateMotion', { path: 'M0 0 L450 0', dur: '3s', begin: begin, repeatCount: 'indefinite', keyTimes: '0;1', keyPoints: '0;1', calcMode: 'linear' }));
+      pk.appendChild(anim('opacity', '0;1;1;0', '3s', { begin: begin, keyTimes: '0;0.05;0.92;1' }));
+      return pk;
+    }
+    s.appendChild(flow('0s', false, 'var(--blueprint,#3553ff)'));
+    s.appendChild(flow('1.5s', true, 'var(--warn,#b8870f)'));
+    var fire = svgEl('circle', { cx: 378, cy: 120, r: '6', fill: 'none', stroke: 'var(--warn,#b8870f)', 'stroke-width': '2', opacity: '0' });
+    fire.appendChild(anim('r', '6;20;6', '3s', { begin: '2.55s' }));
+    fire.appendChild(anim('opacity', '0;0.9;0', '3s', { begin: '2.55s' }));
+    s.appendChild(fire);
+    var lab = txt(378, 60, 'rule fires → attack', '9', 'var(--warn,#b8870f)');
+    lab.setAttribute('opacity', '0');
+    lab.appendChild(anim('opacity', '0;1;0', '3s', { begin: '2.55s' }));
+    s.appendChild(lab);
+    s.appendChild(txt(470, 145, 'p, category', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'INJECTION DETECTOR', 'three layers, one verdict', s,
+      'A prompt flows through three auditable layers: normalize decodes base64/rot13/zero-width tricks, substring rules catch hand-written phrases, regex rules catch families. A benign prompt (blue) passes clean; an attack (orange) trips a rule and the aggregator emits a confidence and category instead of a vibe.');
+  }
+
+  // ── safety-checkpoints (87): pre / during / post gates over the lifecycle ──
+  function safetyCheckpoints(host) {
+    var s = svg(250), defs = svgEl('defs', {});
+    defs.appendChild(svgEl('marker', { id: 'cb-sg', viewBox: '0 0 8 8', refX: '7', refY: '4', markerWidth: '6', markerHeight: '6', orient: 'auto' }, [svgEl('path', { d: 'M0 0 L8 4 L0 8 z', fill: 'var(--ink-soft,#555)' })]));
+    s.appendChild(defs);
+    var gates = [['pre-gen', 'detector', 60], ['model', 'mock LLM', 200], ['during-gen', 'token filter', 340], ['post-gen', 'classifier', 470]];
+    var i;
+    for (i = 0; i < gates.length; i++) {
+      var g = gates[i], cx = g[2], isModel = i === 1;
+      s.appendChild(rect(cx - 46, 90, 92, 50, isModel ? 'var(--blueprint,#3553ff)' : 'var(--bg-surface,#eee)', isModel ? 'none' : 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(cx, 110, g[0], '10', isModel ? 'var(--bg,#fafaf5)' : 'var(--ink,#1a1a1a)'));
+      s.appendChild(txt(cx, 125, g[1], '8', isModel ? 'var(--bg,#fafaf5)' : 'var(--ink-mute,#777)'));
+      if (i < gates.length - 1) s.appendChild(svgEl('line', { x1: cx + 46, y1: 115, x2: gates[i + 1][2] - 46, y2: 115, stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.3', 'marker-end': 'url(#cb-sg)' }));
+    }
+    var pk = svgEl('circle', { r: '5', fill: 'var(--warn,#b8870f)', cx: '14', cy: '115' });
+    pk.appendChild(svgEl('animateMotion', { path: 'M0 0 L502 0', dur: '4s', repeatCount: 'indefinite', keyTimes: '0;1', keyPoints: '0;1', calcMode: 'linear' }));
+    s.appendChild(pk);
+    // early-block branch dropping down from each checkpoint
+    [60, 340, 470].forEach(function (cx, j) {
+      var br = svgEl('line', { x1: cx, y1: 140, x2: cx, y2: 175, stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.4', 'stroke-dasharray': '4 3', 'marker-end': 'url(#cb-sg)' });
+      s.appendChild(br);
+    });
+    s.appendChild(txt(60, 192, 'block', '8', 'var(--warn,#b8870f)'));
+    s.appendChild(txt(340, 192, 'terminate', '8', 'var(--warn,#b8870f)'));
+    s.appendChild(txt(470, 192, 'final action', '8', 'var(--warn,#b8870f)'));
+    var trace = svgEl('rect', { x: 90, y: 210, width: 340, height: 26, rx: '4', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4', 'stroke-dasharray': '760', 'stroke-dashoffset': '760' });
+    trace.appendChild(anim('stroke-dashoffset', '760;0', '4s', { keyTimes: '0;1' }));
+    s.appendChild(trace);
+    s.appendChild(txt(260, 227, 'per-request audit trace', '9', 'var(--blueprint,#3553ff)'));
+    shell(host, 'SAFETY GATE', 'pre · during · post', s,
+      'One request crosses three checkpoints. Pre-gen the detector can block outright; during-gen a token filter can terminate the stream early on a forbidden phrase; post-gen the classifier and rules engine inspect the full output. The gate aggregates the verdicts, applies a final action, and draws an audit trace every reviewer can read.');
+  }
+
+  LF.register({
+    'grad-clip-monitor': gradClip,
+    'rrf-fusion': rrfFusion,
+    'rerank-funnel': rerankFunnel,
+    'rag-pipeline-flow': ragPipeline,
+    'sandbox-runner': sandboxRunner,
+    'eval-grid': evalGrid,
+    'injection-gate': injectionGate,
+    'safety-checkpoints': safetyCheckpoints
+  });
+})();
+
+/* module figures-capstone-c.js (Part 6) */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [svgEl('tspan', {}, [document.createTextNode(s)])]);
+  }
+
+  // ── 32: embedding lookup — an id selects a row, sum with position vector ────
+  function embeddingLookup(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var tx = 40, ty = 28, rw = 96, rh = 26, rows = 6;
+    svg.appendChild(txt(tx + rw / 2, ty - 8, 'token table  (V, D)', MUTE, 10));
+    var i;
+    for (i = 0; i < rows; i++) {
+      var ry = ty + i * rh;
+      svg.appendChild(svgEl('rect', { x: tx, y: ry, width: rw, height: rh - 3, rx: 3, fill: i === 3 ? 'none' : BG, stroke: RULE, 'stroke-width': '1' }));
+      svg.appendChild(txt(tx - 8, ry + 16, 'id ' + i, MUTE, 8, 'end'));
+    }
+    // the highlight box that lands on the selected row (id 3)
+    var sel = svgEl('rect', { x: tx - 2, y: ty - 2, width: rw + 4, height: rh - 1, rx: 4, fill: BP, opacity: '0.14', stroke: BP, 'stroke-width': '2.4' });
+    sel.appendChild(anim('y', (ty - 2) + ';' + (ty - 2 + 3 * rh) + ';' + (ty - 2 + 3 * rh), '3s', { keyTimes: '0;0.45;1' }));
+    svg.appendChild(sel);
+    svg.appendChild(txt(tx + rw / 2, ty + 3 * rh + 16, 'row 3', BP, 9));
+    // arrow: selected row flows right to the dense vector
+    var flow = svgEl('path', { d: 'M' + (tx + rw + 4) + ' ' + (ty + 3 * rh + 11) + ' H300', fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '6 5' });
+    flow.appendChild(anim('stroke-dashoffset', '22;0', '1s', { begin: '1.2s' }));
+    svg.appendChild(flow);
+    // the token vector (D cells)
+    var vx = 308, vy = ty + 3 * rh - 4, cell = 18;
+    var tg = svgEl('g', {});
+    for (i = 0; i < 5; i++) tg.appendChild(svgEl('rect', { x: vx + i * cell, y: vy, width: cell - 2, height: 22, rx: 2, fill: BP, opacity: (0.3 + i * 0.12).toFixed(2) }));
+    tg.appendChild(txt(vx + 5 * cell / 2, vy - 6, 'token vec (D)', BP, 9));
+    tg.appendChild(anim('opacity', '0;0;1;1', '3s', { keyTimes: '0;0.55;0.75;1', fill: 'freeze' }));
+    svg.appendChild(tg);
+    // position vector below it, then plus sign and sum
+    var py = vy + 64;
+    var pg = svgEl('g', {});
+    for (i = 0; i < 5; i++) pg.appendChild(svgEl('rect', { x: vx + i * cell, y: py, width: cell - 2, height: 22, rx: 2, fill: WARN, opacity: (0.3 + i * 0.12).toFixed(2) }));
+    pg.appendChild(txt(vx + 5 * cell / 2, py + 36, 'position vec (D)', WARN, 9));
+    svg.appendChild(pg);
+    svg.appendChild(txt(vx + 5 * cell + 16, (vy + py) / 2 + 16, '+', INK, 18, 'middle'));
+    var sumg = svgEl('g', {});
+    for (i = 0; i < 5; i++) sumg.appendChild(svgEl('rect', { x: vx + 5 * cell + 30 + i * cell, y: (vy + py) / 2 + 4, width: cell - 2, height: 22, rx: 2, fill: INK, opacity: (0.25 + i * 0.13).toFixed(2) }));
+    sumg.appendChild(txt(vx + 5 * cell + 30 + 5 * cell / 2, (vy + py) / 2 - 4, 'input (B,T,D)', INK, 9));
+    sumg.appendChild(anim('opacity', '0;0;1;1', '3s', { keyTimes: '0;0.7;0.9;1', fill: 'freeze' }));
+    svg.appendChild(sumg);
+    card(host, 'EMBEDDING LOOKUP', 'select row · add position',
+      svg,
+      'A token id is not arithmetic; it is an index. The id selects one row of the token table, returning a dense vector the model treats as the meaning of that id. Position has no inherent vector either, so a parallel positional embedding is looked up by slot and summed elementwise. The result is the (B, T, D) tensor the first attention block consumes.');
+  }
+
+  // ── 34: transformer block — two residual bypasses skip the sublayers ────────
+  function transformerBlock(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var sx = 200, w = 120;
+    function block(y, h, label, sub, fill, stroke) {
+      var g = svgEl('g', {});
+      g.appendChild(svgEl('rect', { x: sx, y: y, width: w, height: h, rx: 5, fill: fill, stroke: stroke, 'stroke-width': '1.8' }));
+      g.appendChild(txt(sx + w / 2, y + (sub ? h / 2 - 2 : h / 2 + 4), label, stroke === BP ? BP : SOFT, 11));
+      if (sub) g.appendChild(txt(sx + w / 2, y + h / 2 + 12, sub, MUTE, 8));
+      return g;
+    }
+    svg.appendChild(txt(sx + w / 2, 16, 'input  (B, T, D)', INK, 10));
+    var ln1 = block(28, 26, 'LayerNorm 1', '', SURF, MUTE);
+    var attn = block(64, 40, 'attention', 'causal · multi-head', BG, BP);
+    var add1 = block(116, 24, 'add residual', '', BG, MUTE);
+    var ln2 = block(150, 24, 'LayerNorm 2', '', SURF, MUTE);
+    var mlp = block(182, 38, 'MLP  D→4D→D', '', BG, BP);
+    host.setAttribute('data-static-time', '0.42');
+    // vertical spine flowing down
+    var spine = svgEl('line', { x1: sx + w / 2, y1: 28, x2: sx + w / 2, y2: 220, stroke: RULE, 'stroke-width': '2' });
+    svg.appendChild(spine);
+    var dot = svgEl('circle', { r: 5, fill: WARN });
+    dot.appendChild(anim('cy', '28;220', '2.6s'));
+    dot.setAttribute('cx', sx + w / 2);
+    svg.appendChild(dot);
+    [ln1, attn, add1, ln2, mlp].forEach(function (g) { svg.appendChild(g); });
+    // first residual bypass: from input around attention into add1
+    var rp1 = svgEl('path', { d: 'M' + sx + ' 30 C 120 30, 120 128, ' + sx + ' 128', fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '7 5' });
+    rp1.appendChild(anim('stroke-dashoffset', '120;0', '2.2s'));
+    svg.appendChild(rp1);
+    svg.appendChild(txt(96, 80, 'residual', BP, 9, 'middle'));
+    // second residual bypass: from add1 around mlp into output
+    var rp2 = svgEl('path', { d: 'M' + sx + ' 132 C 120 132, 120 232, ' + sx + ' 232', fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '7 5' });
+    rp2.appendChild(anim('stroke-dashoffset', '120;0', '2.2s', { begin: '0.5s' }));
+    svg.appendChild(rp2);
+    svg.appendChild(txt(sx + w / 2, 238, 'output  (B, T, D)', INK, 10));
+    // pre-LN annotation on the right
+    svg.appendChild(txt(420, 60, 'pre-LN:', INK, 10, 'middle'));
+    svg.appendChild(txt(420, 76, 'norm sits', SOFT, 9, 'middle'));
+    svg.appendChild(txt(420, 90, 'inside the', SOFT, 9, 'middle'));
+    svg.appendChild(txt(420, 104, 'bypass, so', SOFT, 9, 'middle'));
+    svg.appendChild(txt(420, 118, 'the residual', SOFT, 9, 'middle'));
+    svg.appendChild(txt(420, 132, 'path stays', SOFT, 9, 'middle'));
+    svg.appendChild(txt(420, 146, 'clean to depth', BP, 9, 'middle'));
+    card(host, 'TRANSFORMER BLOCK', 'two residual bypasses',
+      svg,
+      'The block has exactly two sublayers and two residual paths. The input forks: one copy flows through LayerNorm then attention, the other skips straight to the add. The same fork repeats around the MLP. The clean bypass is what lets gradients reach the bottom of a deep stack, and placing the norm inside the bypass (pre-LN) is why the stack trains without a warmup crutch.');
+  }
+
+  // ── 35: GPT assembly — stack of blocks, head tied back to the token table ──
+  function gptAssembly(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 304' });
+    var cx = 200, w = 150;
+    svg.appendChild(txt(cx + w / 2, 16, 'token ids  (B, T)', INK, 10));
+    // token + position embedding merge
+    svg.appendChild(svgEl('rect', { x: cx, y: 24, width: 66, height: 30, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(cx + 33, 43, 'tok emb', BP, 9));
+    svg.appendChild(svgEl('rect', { x: cx + 84, y: 24, width: 66, height: 30, rx: 4, fill: BG, stroke: WARN, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(cx + 117, 43, 'pos emb', WARN, 9));
+    svg.appendChild(txt(cx + 75, 70, '⊕', INK, 14));
+    // the stack of 12 blocks as compressed bars, lighting up top to bottom
+    var by = 84, bh = 11, n = 12, i;
+    for (i = 0; i < n; i++) {
+      var yy = by + i * (bh + 1);
+      var r = svgEl('rect', { x: cx + 20, y: yy, width: w - 40, height: bh, rx: 2, fill: BP, opacity: '0.16', stroke: BP, 'stroke-width': '0.8' });
+      r.appendChild(anim('opacity', '0.16;0.9;0.16', '3.2s', { begin: (i * 0.14) + 's' }));
+      svg.appendChild(r);
+    }
+    svg.appendChild(txt(cx - 6, by + 6 * (bh + 1), '12 blocks', MUTE, 9, 'end'));
+    var ly = by + n * (bh + 1) + 6;
+    svg.appendChild(svgEl('rect', { x: cx + 20, y: ly, width: w - 40, height: 22, rx: 3, fill: SURF, stroke: MUTE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(cx + w / 2, ly + 15, 'final LayerNorm', SOFT, 9));
+    // LM head
+    var hy = ly + 32;
+    svg.appendChild(svgEl('rect', { x: cx + 20, y: hy, width: w - 40, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(cx + w / 2, hy + 17, 'LM head → logits', BP, 9));
+    // weight-tying arc: head reuses the token table
+    var tie = svgEl('path', { d: 'M' + (cx + 20) + ' ' + (hy + 13) + ' C 90 ' + (hy + 13) + ', 90 39, ' + cx + ' 39', fill: 'none', stroke: BP, 'stroke-width': '1.8', 'stroke-dasharray': '6 5' });
+    tie.appendChild(anim('stroke-dashoffset', '200;0', '2.6s'));
+    svg.appendChild(tie);
+    svg.appendChild(txt(78, (hy + 39) / 2 + 20, 'weights', BP, 9, 'middle'));
+    svg.appendChild(txt(78, (hy + 39) / 2 + 32, 'tied', BP, 9, 'middle'));
+    // param tally on the right
+    svg.appendChild(txt(440, 70, '124M total', INK, 11, 'middle'));
+    svg.appendChild(txt(440, 88, '50257 × 768', SOFT, 9, 'middle'));
+    svg.appendChild(txt(440, 102, '+ 1024 × 768', SOFT, 9, 'middle'));
+    svg.appendChild(txt(440, 116, '+ 12 blocks', SOFT, 9, 'middle'));
+    svg.appendChild(txt(440, 132, 'head free', BP, 9, 'middle'));
+    svg.appendChild(txt(440, 146, '(tied)', BP, 9, 'middle'));
+    card(host, 'GPT ASSEMBLY', 'embed · stack · tie',
+      svg,
+      'The whole 124M model is four pieces: a token table, a position table summed into it, twelve identical blocks lit in sequence, a final LayerNorm, and a language-model head. The head is not new weights; it reuses the token-embedding matrix transposed, which is why tying saves roughly 38M parameters at this scale and makes the count land exactly on the reference.');
+  }
+
+  // ── 37: weight remapping — pretrained names rewired into local names ────────
+  function weightRemap(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var lx = 30, rx = 330, w = 168, rh = 34, gap = 10, y0 = 40;
+    var src = ['wte', 'h.0.attn.c_attn', 'h.0.mlp.c_fc'];
+    var dst = ['tok_embed', 'blocks.0.attn.qkv', 'blocks.0.mlp.fc1'];
+    svg.appendChild(txt(lx + w / 2, 24, 'pretrained names', MUTE, 10));
+    svg.appendChild(txt(rx + w / 2, 24, 'local model', BP, 10));
+    var i;
+    for (i = 0; i < src.length; i++) {
+      var y = y0 + i * (rh + gap);
+      svg.appendChild(svgEl('rect', { x: lx, y: y, width: w, height: rh, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(lx + w / 2, y + 21, src[i], SOFT, 10));
+      svg.appendChild(svgEl('rect', { x: rx, y: y, width: w, height: rh, rx: 4, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.6' }));
+      svg.appendChild(txt(rx + w / 2, y + 21, dst[i], BP, 10));
+      // a tensor packet that travels the mapper wire and only lands after a shape check
+      var midY = y + rh / 2;
+      var wire = svgEl('path', { d: 'M' + (lx + w) + ' ' + midY + ' H' + (lx + w + 60) + ' L' + (rx - 60) + ' ' + midY + ' H' + rx, fill: 'none', stroke: RULE, 'stroke-width': '1.2', 'stroke-dasharray': '4 4' });
+      svg.appendChild(wire);
+      var pkt = svgEl('rect', { x: lx + w, y: midY - 6, width: 14, height: 12, rx: 2, fill: i === 2 ? WARN : BP });
+      pkt.appendChild(anim('x', (lx + w) + ';' + (rx - 14) + ';' + (rx - 14), '3s', { begin: (i * 0.5) + 's', keyTimes: '0;0.7;1' }));
+      if (i === 2) pkt.appendChild(anim('opacity', '1;1;0.15', '3s', { begin: '1s', keyTimes: '0;0.7;1' }));
+      svg.appendChild(pkt);
+    }
+    // shape-check gate in the middle
+    svg.appendChild(svgEl('rect', { x: 248, y: y0, width: 24, height: 3 * (rh + gap) - gap, rx: 4, fill: SURF, stroke: MUTE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(260, y0 - 6, 'shape', MUTE, 8));
+    svg.appendChild(txt(260, y0 + (3 * (rh + gap) - gap) / 2, 'check', MUTE, 8, 'middle'));
+    svg.appendChild(txt(rx + w / 2, y0 + 3 * (rh + gap) - gap + 16, '✗ mismatch logged', WARN, 8, 'middle'));
+    card(host, 'WEIGHT REMAP', 'rename · shape-check · assign',
+      svg,
+      'A published checkpoint carries the original implementation\'s parameter names, not yours. The loader is a string-to-string mapper feeding a single shape check: matching tensors copy under no_grad into the local name, mismatches are logged and refused rather than copied blindly. Every assignment is recorded so a misload shows up in the report instead of as silent gibberish at generation time.');
+  }
+
+  // ── 39: SFT loss masking — instruction tokens get -100, only response scored ─
+  function sftMasking(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    var toks = ['<INST>', 'capital', 'of', 'France', '<RESP>', 'Paris', 'is', 'it'];
+    var mask = [0, 0, 0, 0, 0, 1, 1, 1]; // 1 = response, scored
+    var bw = 56, gap = 4, x0 = 24, y = 56;
+    svg.appendChild(txt(x0, 18, 'one causal sequence', MUTE, 10, 'start'));
+    var i;
+    for (i = 0; i < toks.length; i++) {
+      var x = x0 + i * (bw + gap);
+      var scored = mask[i] === 1;
+      svg.appendChild(svgEl('rect', { x: x, y: y, width: bw, height: 30, rx: 3, fill: scored ? BG : SURF, stroke: scored ? BP : MUTE, 'stroke-width': scored ? '1.8' : '1.2' }));
+      svg.appendChild(txt(x + bw / 2, y + 20, toks[i], scored ? BP : MUTE, 9));
+      // loss label below each token
+      var ly = y + 56;
+      if (scored) {
+        svg.appendChild(txt(x + bw / 2, ly, 'CE', BP, 9));
+      } else {
+        svg.appendChild(txt(x + bw / 2, ly, '-100', MUTE, 9));
+      }
+    }
+    // bracket marking the masked instruction region
+    var instW = 5 * (bw + gap) - gap;
+    svg.appendChild(svgEl('path', { d: 'M' + x0 + ' ' + (y - 8) + ' V' + (y - 14) + ' H' + (x0 + instW) + ' V' + (y - 8), fill: 'none', stroke: MUTE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(x0 + instW / 2, y - 20, 'instruction · masked, zero gradient', MUTE, 9));
+    var respX = x0 + 5 * (bw + gap);
+    var respW = 3 * (bw + gap) - gap;
+    svg.appendChild(svgEl('path', { d: 'M' + respX + ' ' + (y - 8) + ' V' + (y - 14) + ' H' + (respX + respW) + ' V' + (y - 8), fill: 'none', stroke: BP, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(respX + respW / 2, y - 20, 'response · scored', BP, 9));
+    // gradient flowing only into the response region
+    var gy = y + 78;
+    var grad = svgEl('path', { d: 'M' + (respX + respW / 2) + ' ' + gy + ' V' + (gy + 24), fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '5 4' });
+    grad.appendChild(anim('stroke-dashoffset', '0;18', '1s'));
+    svg.appendChild(grad);
+    svg.appendChild(svgEl('polygon', { points: (respX + respW / 2 - 4) + ',' + (gy + 24) + ' ' + (respX + respW / 2 + 4) + ',' + (gy + 24) + ' ' + (respX + respW / 2) + ',' + (gy + 32), fill: BP }));
+    svg.appendChild(txt(respX + respW / 2, gy + 46, 'update', BP, 9));
+    card(host, 'SFT LOSS MASK', 'instruction off · response scored',
+      svg,
+      'Instruction tuning packs each example into one sequence with boundary tokens, but the instruction is given, not learned. The collate function sets those positions to ignore_index -100 so cross-entropy skips them entirely. Only the tokens after the response boundary contribute loss, so the gradient teaches the model to produce the answer rather than to memorize the prompt.');
+  }
+
+  // ── 43: HDF5 buffer-then-extend — buffer fills, dataset resizes, range written ─
+  function hdf5Buffer(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    // incoming token stream on the left
+    svg.appendChild(txt(60, 36, 'tokenized docs', MUTE, 10));
+    var fy = 50;
+    var b;
+    for (b = 0; b < 4; b++) {
+      var dot = svgEl('circle', { r: 4, fill: BP });
+      dot.appendChild(svgEl('animateMotion', { dur: '2.4s', repeatCount: 'indefinite', path: 'M30 ' + (fy + 14) + ' H150', begin: (b * 0.6) + 's' }));
+      svg.appendChild(dot);
+    }
+    // the in-memory buffer that fills to chunk size
+    var bx = 156, by = 50, bw = 110, bh = 28;
+    svg.appendChild(svgEl('rect', { x: bx, y: by, width: bw, height: bh, rx: 3, fill: 'none', stroke: MUTE, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(bx + bw / 2, by - 8, 'buffer (= chunk)', MUTE, 9));
+    var fill = svgEl('rect', { x: bx + 1, y: by + 1, width: 0, height: bh - 2, rx: 2, fill: BP, opacity: '0.45' });
+    fill.appendChild(anim('width', '0;' + (bw - 2) + ';' + (bw - 2) + ';0;0', '3.2s', { keyTimes: '0;0.5;0.6;0.62;1' }));
+    svg.appendChild(fill);
+    // flush arrow appears when full
+    var flush = svgEl('path', { d: 'M' + (bx + bw) + ' ' + (by + bh / 2) + ' H' + (bx + bw + 40), fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '6 4' });
+    flush.appendChild(anim('stroke-dashoffset', '20;0', '0.8s', { begin: '1.6s' }));
+    flush.appendChild(anim('opacity', '0;0;1;1;0', '3.2s', { keyTimes: '0;0.48;0.52;0.9;1' }));
+    svg.appendChild(flush);
+    svg.appendChild(txt(bx + bw + 20, by - 8, 'flush', BP, 8));
+    // the HDF5 dataset that resizes by one chunk each flush
+    var hx = 320, hy = 46, ch = 36, chunks = 4, cyc;
+    svg.appendChild(txt(hx + (chunks * (ch + 4)) / 2, hy - 12, 'HDF5 resizable dataset', SOFT, 9));
+    for (cyc = 0; cyc < chunks; cyc++) {
+      var cxp = hx + cyc * (ch + 4);
+      var c = svgEl('rect', { x: cxp, y: hy, width: ch, height: 40, rx: 3, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '1.4' });
+      if (cyc === chunks - 1) {
+        c.setAttribute('stroke-dasharray', '4 3');
+        c.appendChild(anim('opacity', '0;0.12;0.5;0.5', '3.2s', { keyTimes: '0;0.55;0.7;1', fill: 'freeze' }));
+      }
+      svg.appendChild(c);
+    }
+    svg.appendChild(txt(hx + (chunks - 1) * (ch + 4) + ch / 2, hy + 58, 'new range', BP, 8));
+    // mmap read marker at training time
+    svg.appendChild(svgEl('rect', { x: hx, y: 150, width: chunks * (ch + 4) - 4, height: 26, rx: 3, fill: SURF, stroke: MUTE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(hx + (chunks * (ch + 4)) / 2 - 2, 167, 'mmap slice → batch buffer', SOFT, 9));
+    var rd = svgEl('rect', { x: hx, y: 151, width: 30, height: 24, rx: 2, fill: WARN, opacity: '0.4' });
+    rd.appendChild(anim('x', hx + ';' + (hx + chunks * (ch + 4) - 34) + ';' + hx, '4s'));
+    svg.appendChild(rd);
+    card(host, 'HDF5 CORPUS', 'buffer · resize · mmap read',
+      svg,
+      'Writing one document at a time fragments the file; writing everything at once loses the shard on a crash. The honest discipline is buffer-then-extend: accumulate tokens until the buffer matches the chunk size, resize the dataset by exactly that chunk, and write the new range. At training time a memory-mapped slice copies a hyperslab straight from the page cache into the batch buffer.');
+  }
+
+  // ── 46: gradient accumulation — micro-batches pile grads, step on the last ──
+  function gradAccum(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    var n = 4, bw = 70, gap = 22, x0 = 36, y = 40;
+    svg.appendChild(txt(260, 22, 'one effective batch = 4 micro-batches', MUTE, 10));
+    // a gradient buffer bar that fills across the micro-batches
+    var gy = 150, gx = x0, gw = n * (bw + gap) - gap;
+    svg.appendChild(svgEl('rect', { x: gx, y: gy, width: gw, height: 24, rx: 3, fill: 'none', stroke: MUTE, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(gx, gy - 8, 'accumulated grad buffer', MUTE, 9, 'start'));
+    var fill = svgEl('rect', { x: gx + 1, y: gy + 1, width: 0, height: 22, rx: 2, fill: BP, opacity: '0.4' });
+    fill.appendChild(anim('width', '0;' + (gw / 4) + ';' + (gw / 2) + ';' + (3 * gw / 4) + ';' + (gw - 2) + ';0;0', '4s', { keyTimes: '0;0.2;0.4;0.6;0.85;0.9;1' }));
+    svg.appendChild(fill);
+    var i;
+    for (i = 0; i < n; i++) {
+      var x = x0 + i * (bw + gap);
+      var last = i === n - 1;
+      var g = svgEl('g', {});
+      g.appendChild(svgEl('rect', { x: x, y: y, width: bw, height: 40, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+      g.appendChild(txt(x + bw / 2, y + 18, 'micro ' + (i + 1), BP, 9));
+      g.appendChild(txt(x + bw / 2, y + 32, 'loss / 4', SOFT, 8));
+      g.appendChild(anim('opacity', '0.35;1;0.35', '4s', { begin: (i * 0.5) + 's', keyTimes: '0;0.5;1' }));
+      svg.appendChild(g);
+      // scaled-backward arrow down into the buffer
+      var arr = svgEl('line', { x1: x + bw / 2, y1: y + 40, x2: x + bw / 2, y2: gy, stroke: last ? WARN : BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' });
+      arr.appendChild(anim('stroke-dashoffset', '0;18', '0.9s', { begin: (i * 0.5) + 's' }));
+      svg.appendChild(arr);
+      if (last) svg.appendChild(txt(x + bw / 2, y + 54, 'sync', WARN, 8));
+    }
+    // optimizer step fires once, after the buffer is full
+    var sx = gx + gw + 18;
+    var stepg = svgEl('g', {});
+    stepg.appendChild(svgEl('rect', { x: sx, y: gy - 4, width: 86, height: 32, rx: 5, fill: WARN, opacity: '0.16', stroke: WARN, 'stroke-width': '2' }));
+    stepg.appendChild(txt(sx + 43, gy + 16, 'optimizer step', WARN, 9));
+    stepg.appendChild(anim('opacity', '0.15;0.15;1;0.15', '4s', { keyTimes: '0;0.82;0.88;1' }));
+    svg.appendChild(stepg);
+    svg.appendChild(txt(sx + 43, gy + 44, 'once per', MUTE, 8));
+    svg.appendChild(txt(sx + 43, gy + 56, 'effective batch', MUTE, 8));
+    card(host, 'GRADIENT ACCUMULATION', 'pile grads · step on last',
+      svg,
+      'When the accelerator holds 32 examples but the loss curve wants 512, run the backward pass micro-batch by micro-batch and let the gradients sum inside the parameter buffers. Each loss is divided by the accumulation count so the running sum matches a single full-batch backward, and the optimizer steps exactly once when the buffer is full, with synchronization deferred to the last micro-batch.');
+  }
+
+  // ── 47: atomic checkpoint — write temp, fsync, rename over the good file ────
+  function atomicCheckpoint(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    // payload buckets gathering into one file on the left
+    var px = 30, py = 36, bw = 116, bh = 18, gap = 5;
+    var parts = ['model', 'optimizer', 'scheduler', 'step + losses', 'RNG state'];
+    svg.appendChild(txt(px + bw / 2, py - 10, 'checkpoint payload', MUTE, 9));
+    var i;
+    for (i = 0; i < parts.length; i++) {
+      var yy = py + i * (bh + gap);
+      var r = svgEl('rect', { x: px, y: yy, width: bw, height: bh, rx: 2, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '1' });
+      r.appendChild(anim('opacity', '0.12;0.6;0.12', '3.5s', { begin: (i * 0.2) + 's' }));
+      svg.appendChild(r);
+      svg.appendChild(txt(px + bw / 2, yy + 13, parts[i], SOFT, 8));
+    }
+    // flow into a temp file
+    var tx = 220, ty = 70;
+    var flow = svgEl('path', { d: 'M' + (px + bw) + ' ' + (py + 50) + ' H' + tx, fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '6 5' });
+    flow.appendChild(anim('stroke-dashoffset', '22;0', '1s'));
+    svg.appendChild(flow);
+    svg.appendChild(svgEl('rect', { x: tx, y: ty, width: 96, height: 46, rx: 5, fill: 'none', stroke: MUTE, 'stroke-width': '1.6', 'stroke-dasharray': '4 4' }));
+    svg.appendChild(txt(tx + 48, ty + 20, 'ckpt.tmp', MUTE, 10));
+    svg.appendChild(txt(tx + 48, ty + 36, 'write + fsync', MUTE, 8));
+    // the atomic rename arc onto the final filename
+    var fx = 400, fy = 70;
+    var ren = svgEl('path', { d: 'M' + (tx + 96) + ' ' + (ty + 23) + ' C ' + (fx - 20) + ' ' + (ty + 23) + ', ' + (fx - 20) + ' ' + (fy + 23) + ', ' + fx + ' ' + (fy + 23), fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '7 5' });
+    ren.appendChild(anim('stroke-dashoffset', '40;0', '1.4s', { begin: '1s' }));
+    svg.appendChild(ren);
+    svg.appendChild(txt((tx + fx) / 2 + 48, ty + 6, 'os.replace', BP, 9, 'middle'));
+    svg.appendChild(txt((tx + fx) / 2 + 48, ty - 8, 'atomic', BP, 8, 'middle'));
+    var fin = svgEl('g', {});
+    fin.appendChild(svgEl('rect', { x: fx, y: fy, width: 96, height: 46, rx: 5, fill: BP, opacity: '0.14', stroke: BP, 'stroke-width': '2.2' }));
+    fin.appendChild(txt(fx + 48, fy + 20, 'ckpt.pt', BP, 10));
+    fin.appendChild(txt(fx + 48, fy + 36, 'always valid', SOFT, 8));
+    fin.appendChild(anim('opacity', '0.2;0.2;1;1', '2.4s', { keyTimes: '0;0.55;0.75;1', fill: 'freeze' }));
+    svg.appendChild(fin);
+    // a crash bolt that strikes the temp file but never the final one
+    var bolt = svgEl('g', {});
+    bolt.appendChild(svgEl('polygon', { points: (tx + 48) + ',150 ' + (tx + 40) + ',172 ' + (tx + 52) + ',172 ' + (tx + 44) + ',192', fill: 'none', stroke: WARN, 'stroke-width': '2' }));
+    bolt.appendChild(txt(tx + 48, 206, 'crash here?', WARN, 8));
+    bolt.appendChild(txt(tx + 48, 218, 'old file safe', WARN, 8));
+    bolt.appendChild(anim('opacity', '0;1;0', '2.4s'));
+    svg.appendChild(bolt);
+    card(host, 'ATOMIC CHECKPOINT', 'write temp · rename over',
+      svg,
+      'A resume needs the entire training state, model, optimizer, scheduler, step counters, and the RNG state for every randomness source, or the post-resume loss curve diverges from the uninterrupted one. The save writes into a temporary file, fsyncs, then renames over the final name. Because POSIX rename is atomic, a crash mid-write leaves the previous good checkpoint untouched rather than a half-written corpse.');
+  }
+
+  LF.register({
+    'cc-embedding-lookup': embeddingLookup,
+    'cc-transformer-block': transformerBlock,
+    'cc-gpt-assembly': gptAssembly,
+    'cc-weight-remap': weightRemap,
+    'cc-sft-loss-mask': sftMasking,
+    'cc-hdf5-corpus': hdf5Buffer,
+    'cc-grad-accumulation': gradAccum,
+    'cc-atomic-checkpoint': atomicCheckpoint
+  });
+})();
+
+/* module figures-capstone-d.js (Part 6) */
+/* figures-capstone-d.js - animated lesson figures for Phase 19 capstone
+   projects in the 51-87 range (query rewriting / HyDE, classical metrics,
+   perplexity + calibration, ZeRO sharding, pipeline parallel, jailbreak
+   taxonomy, prompt-injection detector, constitutional rules engine).
+   Loads after lesson-figures.js, registers through window.LF. SMIL motion
+   only - no JS loops, no rAF. ES5, no deps, theme via CSS vars. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var svgEl = LF.svgEl, el = LF.el;
+
+  function svg(h) { return svgEl('svg', { viewBox: '0 0 520 ' + h }); }
+  function shell(host, label, sub, node, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [node])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '11', fill: fill || 'var(--ink,#1a1a1a)' });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function rect(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: '4', fill: fill || 'var(--bg-surface,#eee)', stroke: stroke || 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' });
+  }
+
+  // ── cd-hyde-vector (67): query vector misses, hypothetical doc lands on target ─
+  function cdHyde(host) {
+    var s = svg(250), CX = 150, CY = 130, R = 96;
+    s.appendChild(svgEl('circle', { cx: CX, cy: CY, r: R, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2', 'stroke-dasharray': '4 4' }));
+    s.appendChild(txt(CX, 26, 'embedding space', '10', 'var(--ink-mute,#777)'));
+    // target region = where the answering document lives
+    var tgX = CX + 64, tgY = CY - 40;
+    s.appendChild(svgEl('circle', { cx: tgX, cy: tgY, r: '26', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4' }));
+    s.appendChild(txt(tgX, tgY + 4, 'doc', '10', 'var(--blueprint,#3553ff)'));
+    // raw query vector points the wrong way
+    var qX = CX - 58, qY = CY + 46;
+    s.appendChild(svgEl('line', { x1: CX, y1: CY, x2: qX, y2: qY, stroke: 'var(--ink-mute,#777)', 'stroke-width': '2' }));
+    s.appendChild(txt(qX + 8, qY + 14, 'query vec', '9', 'var(--ink-mute,#777)', 'start'));
+    // hypothetical doc vector sweeps from query direction to target
+    var hyp = svgEl('line', { x1: CX, y1: CY, x2: qX, y2: qY, stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '2.4' });
+    hyp.appendChild(svgEl('animate', { attributeName: 'x2', values: qX + ';' + tgX + ';' + tgX + ';' + qX, keyTimes: '0;0.45;0.85;1', dur: '4.2s', repeatCount: 'indefinite' }));
+    hyp.appendChild(svgEl('animate', { attributeName: 'y2', values: qY + ';' + tgY + ';' + tgY + ';' + qY, keyTimes: '0;0.45;0.85;1', dur: '4.2s', repeatCount: 'indefinite' }));
+    s.appendChild(hyp);
+    // moving tip marker
+    var tip = svgEl('circle', { cx: qX, cy: qY, r: '5', fill: 'var(--blueprint,#3553ff)' });
+    tip.appendChild(svgEl('animate', { attributeName: 'cx', values: qX + ';' + tgX + ';' + tgX + ';' + qX, keyTimes: '0;0.45;0.85;1', dur: '4.2s', repeatCount: 'indefinite' }));
+    tip.appendChild(svgEl('animate', { attributeName: 'cy', values: qY + ';' + tgY + ';' + tgY + ';' + qY, keyTimes: '0;0.45;0.85;1', dur: '4.2s', repeatCount: 'indefinite' }));
+    s.appendChild(tip);
+    // right column: the LLM writes a fake answer first
+    var bx = 320;
+    s.appendChild(txt(bx, 56, 'LLM writes a', '10', 'var(--ink-soft,#555)', 'start'));
+    s.appendChild(txt(bx, 70, 'hypothetical answer:', '10', 'var(--ink-soft,#555)', 'start'));
+    var rows = ['"AbortMultipartOnFail', 'aborts the S3 upload', 'and decrements the', 'retry budget..."'];
+    var i;
+    for (i = 0; i < rows.length; i++) {
+      var ln = txt(bx, 96 + i * 18, rows[i], '9', 'var(--blueprint,#3553ff)', 'start');
+      ln.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1', keyTimes: '0;' + (0.1 + i * 0.06).toFixed(2) + ';' + (0.22 + i * 0.06).toFixed(2) + ';1', dur: '4.2s', repeatCount: 'indefinite' }));
+      s.appendChild(ln);
+    }
+    s.appendChild(txt(bx, 188, 'embed THAT, not', '9', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(bx, 202, 'the question', '9', 'var(--ink-mute,#777)', 'start'));
+    shell(host, 'HyDE QUERY REWRITE', 'fake answer lands on target', s,
+      'The raw query vector points into the wrong region, so the answering document never reaches the top-N. HyDE asks the model to write the document that would answer the question, embeds that hypothetical answer instead, and the retrieval vector lands where the real document already lives.');
+  }
+
+  // ── cd-bleu-overlap (71): candidate n-grams matched against the reference ─────
+  function cdBleu(host) {
+    var s = svg(230), PAD = 30, ROWY = 70, refY = 150, bw = 56, gap = 10;
+    var cand = ['the', 'cat', 'sat', 'on', 'mat'];
+    var ref = ['the', 'cat', 'sat', 'on', 'a', 'mat'];
+    // matched indices in candidate (the,cat,sat,on,mat all present)
+    var matched = [1, 1, 1, 1, 1];
+    s.appendChild(txt(PAD, ROWY - 16, 'candidate', '10', 'var(--ink-soft,#555)', 'start'));
+    s.appendChild(txt(PAD, refY + 44, 'reference', '10', 'var(--ink-soft,#555)', 'start'));
+    var i;
+    for (i = 0; i < cand.length; i++) {
+      var cx = PAD + i * (bw + gap);
+      var on = matched[i];
+      var box = rect(cx, ROWY, bw, 28, on ? 'var(--bg-surface,#eee)' : 'var(--bg,#fafaf5)', on ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ddd)');
+      box.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.4;1;1', keyTimes: '0;' + (0.12 + i * 0.12).toFixed(2) + ';1', dur: '3.6s', repeatCount: 'indefinite' }));
+      s.appendChild(box);
+      s.appendChild(txt(cx + bw / 2, ROWY + 19, cand[i], '11', on ? 'var(--blueprint,#3553ff)' : 'var(--ink-mute,#777)'));
+    }
+    for (i = 0; i < ref.length; i++) {
+      var rx = PAD + i * (bw * 5 / 6 + gap);
+      s.appendChild(rect(rx, refY, bw - 6, 26, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(rx + (bw - 6) / 2, refY + 18, ref[i], '10', 'var(--ink-mute,#777)'));
+    }
+    // matching lines that fade in one by one
+    for (i = 0; i < cand.length; i++) {
+      var x1 = PAD + i * (bw + gap) + bw / 2;
+      var rIdx = i < 4 ? i : 5;
+      var x2 = PAD + rIdx * (bw * 5 / 6 + gap) + (bw - 6) / 2;
+      var mline = svgEl('line', { x1: x1, y1: ROWY + 28, x2: x2, y2: refY, stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4', opacity: '0.7' });
+      mline.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;0.7;0.7', keyTimes: '0;' + (0.12 + i * 0.12).toFixed(2) + ';' + (0.2 + i * 0.12).toFixed(2) + ';1', dur: '3.6s', repeatCount: 'indefinite' }));
+      s.appendChild(mline);
+    }
+    var score = txt(440, ROWY + 4, '5/5', '12', 'var(--blueprint,#3553ff)', 'start');
+    score.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1', keyTimes: '0;0.7;0.8;1', dur: '3.6s', repeatCount: 'indefinite' }));
+    s.appendChild(score);
+    s.appendChild(txt(440, ROWY + 20, 'precision', '8', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(440, ROWY + 40, 'BP < 1', '9', 'var(--warn,#b8870f)', 'start'));
+    s.appendChild(txt(440, ROWY + 54, '(too short)', '8', 'var(--ink-mute,#777)', 'start'));
+    shell(host, 'BLEU N-GRAM OVERLAP', 'count matches, clamp, penalize', s,
+      'BLEU is counting. Each candidate n-gram that appears in the reference scores a match; the clipped count over the candidate length is modified n-gram precision. A candidate shorter than the reference takes a brevity penalty, so high precision on a stub still loses. ROUGE-L instead rewards the longest common subsequence.');
+  }
+
+  // ── cd-reliability (73): calibration reliability diagram drifting onto diagonal ─
+  function cdReliability(host) {
+    var s = svg(250), X0 = 60, Y0 = 30, SZ = 180, Y1 = Y0 + SZ;
+    // axes
+    s.appendChild(svgEl('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    s.appendChild(svgEl('line', { x1: X0, y1: Y1, x2: X0 + SZ, y2: Y1, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    // perfect-calibration diagonal
+    s.appendChild(svgEl('line', { x1: X0, y1: Y1, x2: X0 + SZ, y2: Y0, stroke: 'var(--ink-mute,#777)', 'stroke-width': '1.2', 'stroke-dasharray': '4 4' }));
+    s.appendChild(txt(X0 + SZ + 6, Y0 + 3, 'perfect', '9', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(X0 + SZ / 2, Y1 + 22, 'predicted confidence', '9', 'var(--ink-soft,#555)'));
+    var lab = svgEl('text', { x: X0 - 16, y: Y0 + SZ / 2, 'text-anchor': 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': '9', fill: 'var(--ink-soft,#555)', transform: 'rotate(-90 ' + (X0 - 16) + ' ' + (Y0 + SZ / 2) + ')' });
+    lab.appendChild(document.createTextNode('observed accuracy'));
+    s.appendChild(lab);
+    // five confidence bins: overconfident (below diagonal) sliding up to diagonal
+    var confs = [0.1, 0.3, 0.5, 0.7, 0.9];
+    var acc = [0.08, 0.2, 0.34, 0.5, 0.62]; // overconfident
+    var i;
+    for (i = 0; i < confs.length; i++) {
+      var cx = X0 + confs[i] * SZ;
+      var yBad = Y1 - acc[i] * SZ;
+      var yGood = Y1 - confs[i] * SZ;
+      // bar from baseline to point
+      var bh = (yBad < yGood ? yBad : yGood);
+      var dot = svgEl('circle', { cx: cx, cy: yBad, r: '5', fill: 'var(--blueprint,#3553ff)' });
+      dot.appendChild(svgEl('animate', { attributeName: 'cy', values: yBad + ';' + yGood + ';' + yGood + ';' + yBad, keyTimes: '0;0.4;0.7;1', dur: '4.5s', begin: (i * 0.08) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(dot);
+      // gap line (ECE contribution)
+      var gapl = svgEl('line', { x1: cx, y1: yBad, x2: cx, y2: yGood, stroke: 'var(--warn,#b8870f)', 'stroke-width': '2' });
+      gapl.appendChild(svgEl('animate', { attributeName: 'y1', values: yBad + ';' + yGood + ';' + yGood + ';' + yBad, keyTimes: '0;0.4;0.7;1', dur: '4.5s', begin: (i * 0.08) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(gapl);
+    }
+    var tag = txt(X0 + 14, Y0 + 14, 'ECE: gap to diagonal', '9', 'var(--warn,#b8870f)', 'start');
+    s.appendChild(tag);
+    shell(host, 'CALIBRATION RELIABILITY', 'confidence vs accuracy', s,
+      'Bin predictions by stated confidence and plot observed accuracy. A calibrated model sits on the diagonal. The orange gaps are where it claims more confidence than it earns; the expected calibration error is the bin-weighted average of those gaps. Perplexity asks if held-out text is plausible at all; calibration asks if the confidence is honest.');
+  }
+
+  // ── cd-zero-shard (78): optimizer state split across ranks, scatter then gather ─
+  function cdZero(host) {
+    var s = svg(240), n = 4, PAD = 36, bw = 88, gap = (520 - 2 * PAD - n * bw) / (n - 1);
+    var topY = 44, optY = 96, optH = 70;
+    s.appendChild(txt(PAD, 28, 'each rank: full params, but only 1/N of the optimiser', '10', 'var(--ink-soft,#777)', 'start'));
+    var i;
+    for (i = 0; i < n; i++) {
+      var x = PAD + i * (bw + gap);
+      // full params band (replicated)
+      s.appendChild(rect(x, topY, bw, 22, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(x + bw / 2, topY + 15, 'params', '9', 'var(--ink-mute,#777)'));
+      // owned optimiser shard only
+      var shard = rect(x, optY, bw, optH, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)');
+      s.appendChild(shard);
+      s.appendChild(txt(x + bw / 2, optY + 26, 'Adam', '9', 'var(--blueprint,#3553ff)'));
+      s.appendChild(txt(x + bw / 2, optY + 40, 'shard ' + i, '9', 'var(--blueprint,#3553ff)'));
+      s.appendChild(txt(x + bw / 2, optY + optH + 16, 'rank ' + i, '9', 'var(--ink-soft,#555)'));
+      // reduce_scatter arrow in (grad shard arrives)
+      var rs = svgEl('path', { d: 'M ' + (x + bw / 2) + ' ' + (optY - 14) + ' L ' + (x + bw / 2) + ' ' + (optY - 2), stroke: 'var(--ink-mute,#777)', 'stroke-width': '2' });
+      s.appendChild(rs);
+      var rsm = svgEl('circle', { cx: x + bw / 2, cy: optY - 14, r: '3.5', fill: 'var(--warn,#b8870f)' });
+      rsm.appendChild(svgEl('animate', { attributeName: 'cy', values: (optY - 28) + ';' + (optY - 4), keyTimes: '0;1', dur: '1.8s', begin: '0s', repeatCount: 'indefinite' }));
+      rsm.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.2;0.8;1', dur: '1.8s', repeatCount: 'indefinite' }));
+      s.appendChild(rsm);
+      // allgather pulse: updated shard broadcasts out after step
+      var pulse = svgEl('circle', { cx: x + bw / 2, cy: optY + optH / 2, r: '4', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '2' });
+      pulse.appendChild(svgEl('animate', { attributeName: 'r', values: '4;26', keyTimes: '0;1', dur: '1.8s', begin: '0.9s', repeatCount: 'indefinite' }));
+      pulse.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.7;0', keyTimes: '0;1', dur: '1.8s', begin: '0.9s', repeatCount: 'indefinite' }));
+      s.appendChild(pulse);
+    }
+    s.appendChild(txt(PAD, 218, 'reduce_scatter grads in', '9', 'var(--warn,#b8870f)', 'start'));
+    s.appendChild(txt(520 - PAD, 218, 'allgather params out', '9', 'var(--blueprint,#3553ff)', 'end'));
+    shell(host, 'ZeRO STATE SHARDING', 'optimiser split 1/N per rank', s,
+      'Vanilla DDP replicates the optimiser state on every rank, the largest allocation in the stack. ZeRO stage 1 gives each rank only 1/N of the Adam moments. reduce_scatter delivers each rank its gradient shard, it steps locally, then allgather broadcasts the updated parameter shards back so every rank rebuilds the full model. Memory drops linearly; the wire cost equals one allreduce.');
+  }
+
+  // ── cd-pipeline-bubble (79): microbatches flow through stages, bubble drains ──
+  function cdPipeline(host) {
+    var s = svg(240), N = 4, M = 4, PAD = 50, cellW = 57, cellH = 26, gap = 6;
+    var rowY = 40;
+    var i, j;
+    // stage row labels
+    for (i = 0; i < N; i++) {
+      s.appendChild(txt(PAD - 8, rowY + i * (cellH + gap) + 17, 'stage ' + i, '9', 'var(--ink-soft,#555)', 'end'));
+      // baseline track
+      s.appendChild(svgEl('line', { x1: PAD, y1: rowY + i * (cellH + gap) + cellH / 2, x2: PAD + (M + N) * cellW, y2: rowY + i * (cellH + gap) + cellH / 2, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '0.6' }));
+    }
+    // diagonal flow: microbatch m occupies stage i at time t = m + i
+    var period = 4.4;
+    for (j = 0; j < M; j++) {
+      for (i = 0; i < N; i++) {
+        var slot = j + i;
+        var x = PAD + slot * cellW + 4;
+        var y = rowY + i * (cellH + gap);
+        var c = rect(x, y, cellW - 8, cellH, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)');
+        var begin = (slot * 0.18).toFixed(2);
+        c.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.12;1;1;0.35', keyTimes: '0;0.18;0.7;1', dur: period + 's', begin: begin + 's', repeatCount: 'indefinite' }));
+        s.appendChild(c);
+        var lab = txt(x + (cellW - 8) / 2, y + 17, 'mb' + j, '9', 'var(--blueprint,#3553ff)');
+        lab.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0.4', keyTimes: '0;0.18;0.7;1', dur: period + 's', begin: begin + 's', repeatCount: 'indefinite' }));
+        s.appendChild(lab);
+      }
+    }
+    // bubble shading: top-right and bottom-left idle triangles
+    s.appendChild(txt(PAD + (M + N - 1) * cellW, rowY - 6, 'bubble', '9', 'var(--warn,#b8870f)', 'middle'));
+    var bub = svgEl('path', { d: 'M ' + (PAD + M * cellW) + ' ' + rowY + ' L ' + (PAD + (M + N - 1) * cellW) + ' ' + rowY + ' L ' + (PAD + (M + N - 1) * cellW) + ' ' + (rowY + (N - 1) * (cellH + gap)) + ' Z', fill: 'var(--warn,#b8870f)', opacity: '0.12' });
+    s.appendChild(bub);
+    s.appendChild(txt(PAD, 215, 'bubble fraction = (N-1)/(M+N-1)  =  3/7  ≈  43% at M=4, N=4', '10', 'var(--ink-soft,#555)', 'start'));
+    shell(host, 'PIPELINE PARALLEL', 'microbatches fill the stages', s,
+      'Each stage lives on its own rank; a microbatch enters stage 0, hands its activation to stage 1, and so on diagonally through time. The shaded triangle is the bubble, the idle time while the pipeline fills and drains. More microbatches per step shrink the bubble: (N-1)/(M+N-1) falls from 43% at M=4 to under 5% at M=64.');
+  }
+
+  // ── cd-attack-taxonomy (82): six trust boundaries orbiting the assistant ──────
+  function cdTaxonomy(host) {
+    var s = svg(260), CX = 260, CY = 130, R = 92;
+    var cats = [
+      ['role-play', 'persona'],
+      ['instruction-override', 'system authority'],
+      ['context-smuggling', 'content/instruction gap'],
+      ['multi-turn-ramp', 'history as contract'],
+      ['encoding-trick', 'surface form'],
+      ['prefix-injection', 'next-token']
+    ];
+    // core assistant
+    s.appendChild(svgEl('circle', { cx: CX, cy: CY, r: '34', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6' }));
+    s.appendChild(txt(CX, CY - 2, 'assistant', '10', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(CX, CY + 12, 'trust core', '9', 'var(--ink-mute,#777)'));
+    var i;
+    for (i = 0; i < 6; i++) {
+      var ang = (i / 6) * 2 * Math.PI - Math.PI / 2;
+      var nx = CX + R * Math.cos(ang), ny = CY + R * Math.sin(ang);
+      // spoke
+      s.appendChild(svgEl('line', { x1: CX + 34 * Math.cos(ang), y1: CY + 34 * Math.sin(ang), x2: nx, y2: ny, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+      // attack pulse travelling inward along the spoke, staggered per category
+      var pulse = svgEl('circle', { cx: nx, cy: ny, r: '3.5', fill: 'var(--warn,#b8870f)' });
+      pulse.appendChild(svgEl('animate', { attributeName: 'cx', values: nx + ';' + (CX + 36 * Math.cos(ang)), keyTimes: '0;1', dur: '2.4s', begin: (i * 0.4) + 's', repeatCount: 'indefinite' }));
+      pulse.appendChild(svgEl('animate', { attributeName: 'cy', values: ny + ';' + (CY + 36 * Math.sin(ang)), keyTimes: '0;1', dur: '2.4s', begin: (i * 0.4) + 's', repeatCount: 'indefinite' }));
+      pulse.appendChild(svgEl('animate', { attributeName: 'opacity', values: '1;1;0', keyTimes: '0;0.7;1', dur: '2.4s', begin: (i * 0.4) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(pulse);
+      // node
+      var anchor = Math.cos(ang) > 0.2 ? 'start' : Math.cos(ang) < -0.2 ? 'end' : 'middle';
+      var lx = nx + (anchor === 'start' ? 8 : anchor === 'end' ? -8 : 0);
+      s.appendChild(svgEl('circle', { cx: nx, cy: ny, r: '6', fill: 'var(--bg,#fafaf5)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4' }));
+      s.appendChild(txt(lx, ny - 2, cats[i][0], '9', 'var(--ink,#1a1a1a)', anchor));
+      s.appendChild(txt(lx, ny + 10, cats[i][1], '8', 'var(--ink-mute,#777)', anchor));
+    }
+    shell(host, 'JAILBREAK TAXONOMY', 'six trust boundaries', s,
+      'A safety harness without a taxonomy is a coin flip. Each of the six categories names one trust boundary an attack abuses, from the assistant persona to its next-token decision. Naming the boundary turns an attack stream into a histogram, the histogram into a coverage chart, and the chart into the next sprint.');
+  }
+
+  // ── cd-output-router (85): three output classifiers feed a policy router ─────
+  function cdRouter(host) {
+    var s = svg(250), PAD = 24, clsX = 36, clsW = 150, rtX = 244, rtW = 96;
+    var cls = [
+      [60, 'toxicity', 'slur / harassment', 'low'],
+      [125, 'PII', 'email · SSN · card', 'medium'],
+      [190, 'leakage', 'system-prompt echo', 'high']
+    ];
+    s.appendChild(txt(clsX, 28, 'model output → three classifiers run in parallel', '10', 'var(--ink-soft,#555)', 'start'));
+    var actions = [
+      [54, 'log', 'var(--ink-mute,#777)'],
+      [104, 'warn', 'var(--ink-soft,#555)'],
+      [154, 'redact', 'var(--warn,#b8870f)'],
+      [204, 'block', 'var(--warn,#b8870f)']
+    ];
+    // router node
+    s.appendChild(rect(rtX, 96, rtW, 64, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(rtX + rtW / 2, 122, 'policy', '11', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(rtX + rtW / 2, 138, 'router', '11', 'var(--blueprint,#3553ff)'));
+    var i;
+    for (i = 0; i < cls.length; i++) {
+      var cy = cls[i][0];
+      s.appendChild(rect(clsX, cy, clsW, 44, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(clsX + clsW / 2, cy + 18, cls[i][1], '11', 'var(--ink,#1a1a1a)'));
+      s.appendChild(txt(clsX + clsW / 2, cy + 34, cls[i][2], '8', 'var(--ink-mute,#777)'));
+      // verdict packet travelling into the router, staggered
+      var pkt = svgEl('circle', { cx: clsX + clsW + 4, cy: cy + 22, r: '4.5', fill: 'var(--warn,#b8870f)' });
+      pkt.appendChild(svgEl('animate', { attributeName: 'cx', values: (clsX + clsW + 4) + ';' + rtX, keyTimes: '0;1', dur: '1.4s', begin: (i * 0.3) + 's', repeatCount: 'indefinite' }));
+      pkt.appendChild(svgEl('animate', { attributeName: 'cy', values: (cy + 22) + ';128', keyTimes: '0;1', dur: '1.4s', begin: (i * 0.3) + 's', repeatCount: 'indefinite' }));
+      pkt.appendChild(svgEl('animate', { attributeName: 'opacity', values: '1;1;0', keyTimes: '0;0.7;1', dur: '1.4s', begin: (i * 0.3) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(pkt);
+      s.appendChild(svgEl('line', { x1: clsX + clsW, y1: cy + 22, x2: rtX, y2: 128, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '0.8' }));
+    }
+    // action ladder, highest severity wins -> block lights up
+    for (i = 0; i < actions.length; i++) {
+      var ay = actions[i][0];
+      var hot = (i === 3);
+      var ab = rect(rtX + rtW + 22, ay, 90, 30, 'var(--bg,#fafaf5)', hot ? 'var(--warn,#b8870f)' : 'var(--rule-soft,#ddd)');
+      if (hot) ab.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.3;0.3;1;1;0.3', keyTimes: '0;0.6;0.72;0.95;1', dur: '4.2s', repeatCount: 'indefinite' }));
+      s.appendChild(ab);
+      s.appendChild(txt(rtX + rtW + 22 + 45, ay + 19, actions[i][1], '10', actions[i][2]));
+    }
+    s.appendChild(txt(rtX + rtW + 22 + 45, 26, 'severity → action', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'OUTPUT POLICY ROUTER', 'classifiers → severity → action', s,
+      'Input checks are not enough; an output-side classifier sees the actual response and asks if it is safe to ship. Three independent classifiers (toxicity, PII, leakage) return a severity, and the router picks the action by the worst finding: log, warn, redact, or block. Classifiers run in parallel with streaming so the latency hides behind the final flush.');
+  }
+
+  // ── cd-constitution-loop (86): draft, rules, fixer, revised, re-check ─────────
+  function cdConstitution(host) {
+    var s = svg(240), CX = 260, CY = 116;
+    var nodes = [
+      [90, 70, 'draft'],
+      [260, 50, 'rules engine'],
+      [430, 70, 'fixer'],
+      [430, 170, 'revised'],
+      [260, 190, 'rules 2nd pass'],
+      [90, 170, 'verdict']
+    ];
+    var i;
+    // ring connector path the dot travels along (rounded hexagon order)
+    var pts = [];
+    for (i = 0; i < nodes.length; i++) { pts.push([nodes[i][0], nodes[i][1]]); }
+    var pathD = 'M ' + pts[0][0] + ' ' + pts[0][1];
+    for (i = 1; i < pts.length; i++) { pathD += ' L ' + pts[i][0] + ' ' + pts[i][1]; }
+    pathD += ' Z';
+    s.appendChild(svgEl('path', { d: pathD, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.4', 'stroke-dasharray': '5 5' }));
+    // violation flag pulse on the rules engine node
+    for (i = 0; i < nodes.length; i++) {
+      var nx = nodes[i][0], ny = nodes[i][1];
+      var isRule = (i === 1 || i === 4);
+      s.appendChild(svgEl('rect', { x: nx - 52, y: ny - 15, width: 104, height: 30, rx: '5', fill: 'var(--bg-surface,#eee)', stroke: isRule ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' }));
+      s.appendChild(txt(nx, ny + 4, nodes[i][2], '10', isRule ? 'var(--blueprint,#3553ff)' : 'var(--ink,#1a1a1a)'));
+    }
+    // travelling token using animateMotion along the loop
+    var mover = svgEl('circle', { r: '6', fill: 'var(--warn,#b8870f)' });
+    var motion = svgEl('animateMotion', { dur: '5.4s', repeatCount: 'indefinite', path: pathD });
+    mover.appendChild(motion);
+    s.appendChild(mover);
+    // violation badge that flashes at the rules engine
+    var badge = txt(CX, 30, 'violation: code lacks runnable block', '9', 'var(--warn,#b8870f)');
+    badge.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.1;0.25;0.4', dur: '5.4s', repeatCount: 'indefinite' }));
+    s.appendChild(badge);
+    var ok = txt(CX, 218, 'accepted: revision satisfies every rule', '9', 'var(--blueprint,#3553ff)');
+    ok.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: '0;0.6;0.72;0.92;1', dur: '5.4s', repeatCount: 'indefinite' }));
+    s.appendChild(ok);
+    shell(host, 'CONSTITUTIONAL RULES', 'draft → fix → re-check', s,
+      'A rule is a name, a predicate, and an explanation; anything missing one of those is a vibe. The constitution lives in YAML under version control. The engine flags each violation, the fixer proposes a revision, and a second pass confirms the revision satisfies every rule before the response is accepted or escalated.');
+  }
+
+  LF.register({
+    'cd-hyde-vector': cdHyde,
+    'cd-bleu-overlap': cdBleu,
+    'cd-reliability-diagram': cdReliability,
+    'cd-zero-shard': cdZero,
+    'cd-pipeline-bubble': cdPipeline,
+    'cd-attack-taxonomy': cdTaxonomy,
+    'cd-output-router': cdRouter,
+    'cd-constitution-loop': cdConstitution
+  });
+})();
+
+/* module figures-capstone-e.js (Part 6) */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+  var EASE = '0.23 1 0.32 1';
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [svgEl('tspan', {}, [document.createTextNode(s)])]);
+  }
+  // one-time entry: fade in from 95% size about (cx, cy), strong ease-out
+  function entry(g, cx, cy, begin) {
+    var dx = (cx * 0.05).toFixed(1), dy = (cy * 0.05).toFixed(1);
+    var e = { dur: '0.8s', begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: EASE, keyTimes: '0;1' };
+    g.setAttribute('opacity', '0');
+    g.appendChild(animT('translate', dx + ' ' + dy + ';0 0', '0.8s', { begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: EASE, keyTimes: '0;1', additive: 'sum', repeatCount: '1' }));
+    g.appendChild(animT('scale', '0.95;1', '0.8s', { begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: EASE, keyTimes: '0;1', additive: 'sum', repeatCount: '1' }));
+    g.appendChild(anim('opacity', '0;1', '0.8s', { begin: begin, fill: 'freeze', calcMode: 'spline', keySplines: EASE, keyTimes: '0;1', repeatCount: '1' }));
+  }
+
+  // ── 01: plan / act / observe / recover circuit with hooks and truncation ───
+  function ceAgentLoop(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var track = 'M130 70 L330 70 A20 20 0 0 1 350 90 L350 160 A20 20 0 0 1 330 180 L130 180 A20 20 0 0 1 110 160 L110 90 A20 20 0 0 1 130 70 Z';
+    svg.appendChild(svgEl('path', { d: track, fill: 'none', stroke: RULE, 'stroke-width': '1.5', 'stroke-dasharray': '3 4' }));
+    var stations = [['plan', 110, 70, '0s'], ['act', 350, 70, '1.1s'], ['observe', 350, 180, '2.5s'], ['recover', 110, 180, '3.6s']];
+    var i;
+    for (i = 0; i < stations.length; i++) {
+      var st = stations[i];
+      var g = svgEl('g', {});
+      g.appendChild(svgEl('rect', { x: st[1] - 32, y: st[2] - 13, width: 64, height: 26, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+      g.appendChild(txt(st[1], st[2] + 4, st[0], INK, 10));
+      g.appendChild(anim('opacity', '0.45;1;0.45;0.45', '5s', { begin: st[3], keyTimes: '0;0.08;0.2;1' }));
+      svg.appendChild(g);
+    }
+    // hook pins on the edges the tool call crosses
+    svg.appendChild(txt(230, 52, 'PreToolUse', MUTE, 8));
+    var pin1 = svgEl('circle', { cx: 230, cy: 70, r: 4, fill: BP });
+    pin1.appendChild(anim('opacity', '0.25;1;0.25;0.25', '5s', { begin: '0.55s', keyTimes: '0;0.06;0.14;1' }));
+    svg.appendChild(pin1);
+    svg.appendChild(txt(230, 200, 'PostToolUse', MUTE, 8));
+    var pin2 = svgEl('circle', { cx: 230, cy: 180, r: 4, fill: BP });
+    pin2.appendChild(anim('opacity', '0.25;1;0.25;0.25', '5s', { begin: '3.0s', keyTimes: '0;0.06;0.14;1' }));
+    svg.appendChild(pin2);
+    // one turn = one lap
+    var token = svgEl('circle', { r: 5, fill: WARN });
+    token.appendChild(svgEl('animateMotion', { dur: '5s', repeatCount: 'indefinite', path: track }));
+    svg.appendChild(token);
+    svg.appendChild(txt(230, 118, 'turn 47 / 50', SOFT, 11));
+    svg.appendChild(svgEl('rect', { x: 180, y: 130, width: 100, height: 6, rx: 3, fill: SURF }));
+    var budget = svgEl('rect', { x: 180, y: 130, width: 10, height: 6, rx: 3, fill: BP });
+    budget.appendChild(anim('width', '10;94', '5s'));
+    svg.appendChild(budget);
+    // an oversized observation truncated before re-entering context
+    svg.appendChild(txt(296, 218, 'observe:', MUTE, 8, 'end'));
+    var obs = svgEl('rect', { x: 300, y: 208, width: 6, height: 12, rx: 2, fill: SURF, stroke: RULE, 'stroke-width': '1' });
+    obs.appendChild(anim('width', '6;150;150;26;26', '5s', { keyTimes: '0;0.3;0.55;0.62;1' }));
+    svg.appendChild(obs);
+    var cut = svgEl('line', { x1: 326, y1: 204, x2: 326, y2: 224, stroke: WARN, 'stroke-width': '2' });
+    cut.appendChild(anim('opacity', '0;0;1;1', '5s', { keyTimes: '0;0.55;0.62;1' }));
+    svg.appendChild(cut);
+    svg.appendChild(txt(390, 240, '8MB stdout, truncated before re-entry', MUTE, 8));
+    card(host, 'AGENT TURN CIRCUIT', 'one lap = one turn',
+      svg,
+      'The harness runs a plan, act, observe, recover circuit, and every lap burns one turn of the 50-turn budget. PreToolUse and PostToolUse hooks fire as each tool call crosses the edge, and an oversized observation, like 8MB of ripgrep output, is truncated before it re-enters the context window.');
+  }
+
+  // ── 02: dense + BM25 fire in parallel, union merges, re-ranker reorders ────
+  function ceHybridRetrieval(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    svg.appendChild(svgEl('rect', { x: 20, y: 103, width: 64, height: 34, rx: 5, fill: BG, stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(52, 124, 'query', INK, 10));
+    svg.appendChild(svgEl('rect', { x: 130, y: 46, width: 96, height: 34, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(178, 67, 'dense (hnsw)', SOFT, 9));
+    svg.appendChild(svgEl('rect', { x: 130, y: 160, width: 96, height: 34, rx: 5, fill: BG, stroke: WARN, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(178, 181, 'bm25 (terms)', SOFT, 9));
+    var up = svgEl('path', { d: 'M84 112 C110 112,104 63,130 63', fill: 'none', stroke: BP, 'stroke-width': '1.5', 'stroke-dasharray': '5 4' });
+    up.appendChild(anim('stroke-dashoffset', '18;0', '1s'));
+    svg.appendChild(up);
+    var dn = svgEl('path', { d: 'M84 128 C110 128,104 177,130 177', fill: 'none', stroke: WARN, 'stroke-width': '1.5', 'stroke-dasharray': '5 4' });
+    dn.appendChild(anim('stroke-dashoffset', '18;0', '1s', { begin: '0.2s' }));
+    svg.appendChild(dn);
+    // candidates stream from both indexes into the union
+    var routes = [['M226 63 C252 63,256 112,280 114', BP, '0s'], ['M226 63 C252 63,256 112,280 114', BP, '1s'],
+      ['M226 177 C252 177,256 128,280 126', WARN, '0.5s'], ['M226 177 C252 177,256 128,280 126', WARN, '1.5s']];
+    var i;
+    for (i = 0; i < routes.length; i++) {
+      var d = svgEl('circle', { r: 4, fill: routes[i][1], opacity: '0.85' });
+      d.appendChild(svgEl('animateMotion', { dur: '2s', repeatCount: 'indefinite', path: routes[i][0], begin: routes[i][2] }));
+      svg.appendChild(d);
+    }
+    svg.appendChild(svgEl('rect', { x: 280, y: 100, width: 58, height: 40, rx: 5, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(309, 118, 'union', BP, 10));
+    svg.appendChild(txt(309, 132, 'top-k', SOFT, 8));
+    var mid = svgEl('line', { x1: 338, y1: 120, x2: 366, y2: 120, stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '5 4' });
+    mid.appendChild(anim('stroke-dashoffset', '18;0', '1s'));
+    svg.appendChild(mid);
+    svg.appendChild(txt(432, 46, 'cross-encoder rerank', MUTE, 9));
+    svg.appendChild(svgEl('rect', { x: 366, y: 54, width: 132, height: 150, rx: 6, fill: 'none', stroke: RULE, 'stroke-width': '1.4', 'stroke-dasharray': '4 4' }));
+    // merged order a, b, c; the re-ranker lifts c to the top
+    var chips = [['chunk a  0.31', 70, '0 0;0 0;0 32;0 32', RULE, SOFT],
+      ['chunk b  0.58', 102, '0 0;0 0;0 32;0 32', RULE, SOFT],
+      ['chunk c  0.87', 134, '0 0;0 0;0 -64;0 -64', BP, BP]];
+    for (i = 0; i < chips.length; i++) {
+      var c = chips[i];
+      var cg = svgEl('g', {});
+      cg.appendChild(svgEl('rect', { x: 378, y: c[1], width: 108, height: 22, rx: 4, fill: BG }));
+      cg.appendChild(svgEl('rect', { x: 378, y: c[1], width: 108, height: 22, rx: 4, fill: c[3] === BP ? BP : BG, 'fill-opacity': c[3] === BP ? '0.12' : '1', stroke: c[3], 'stroke-width': c[3] === BP ? '2' : '1.3' }));
+      cg.appendChild(txt(432, c[1] + 15, c[0], c[4], 9));
+      cg.appendChild(animT('translate', c[2], '5s', { calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE, keyTimes: '0;0.35;0.55;1' }));
+      svg.appendChild(cg);
+    }
+    var cite = txt(498, 224, 'answer cites file:line from the top chunk', SOFT, 9, 'end');
+    cite.appendChild(anim('opacity', '0.25;0.25;1;1', '5s', { keyTimes: '0;0.5;0.65;1' }));
+    svg.appendChild(cite);
+    card(host, 'HYBRID RETRIEVAL', 'dense + bm25 - rerank',
+      svg,
+      'The query fires both searches at once: dense nearest-neighbor over embeddings and sparse BM25 over terms. Their union feeds the cross-encoder, which reorders the list, and the chunk that BM25 alone would have buried rises to the top. The synthesizer must cite file and line from what survives.');
+  }
+
+  // ── 03: streaming voice pipeline as a latency waterfall under 800ms ────────
+  function ceVoiceLatency(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var rows = [['mic in', 54], ['asr partial', 86], ['turn detect', 118], ['llm tokens', 150], ['tts out', 182]];
+    var i;
+    for (i = 0; i < rows.length; i++) svg.appendChild(txt(62, rows[i][1] + 12, rows[i][0], MUTE, 8, 'end'));
+    // each stage starts before the previous one ends: pipelined, not sequential
+    var bars = [[78, 54, 200, SURF, '0;0.015;0.333;0.93;1', MUTE],
+      [104, 86, 202, BP, '0;0.053;0.373;0.93;1', ''],
+      [305, 118, 34, BP, '0;0.373;0.427;0.93;1', ''],
+      [339, 150, 76, BP, '0;0.427;0.547;0.93;1', ''],
+      [398, 182, 50, BP, '0;0.52;0.6;0.93;1', '']];
+    for (i = 0; i < bars.length; i++) {
+      var b = bars[i];
+      var r = svgEl('rect', { x: b[0], y: b[1], width: 0, height: 16, rx: 3, fill: b[3], opacity: i === 0 ? '1' : String(0.35 + i * 0.16), stroke: b[5] || 'none', 'stroke-width': '1' });
+      r.appendChild(anim('width', '0;0;' + b[2] + ';' + b[2] + ';0', '6s', { keyTimes: b[4] }));
+      svg.appendChild(r);
+    }
+    svg.appendChild(svgEl('line', { x1: 70, y1: 214, x2: 490, y2: 214, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(70, 228, '0', MUTE, 8));
+    svg.appendChild(txt(238, 228, '400ms', MUTE, 8));
+    svg.appendChild(svgEl('line', { x1: 406, y1: 42, x2: 406, y2: 214, stroke: WARN, 'stroke-width': '1.5', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(txt(410, 40, '800ms budget', WARN, 8, 'start'));
+    svg.appendChild(svgEl('line', { x1: 398, y1: 202, x2: 398, y2: 214, stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(370, 228, 'first audio 780ms', SOFT, 8));
+    // barge-in: user speaks again, tts cancels mid-utterance
+    var burst = svgEl('rect', { x: 448, y: 54, width: 0, height: 16, rx: 3, fill: WARN, opacity: '0.85' });
+    burst.appendChild(anim('width', '0;0;42;42;0', '6s', { keyTimes: '0;0.6;0.667;0.93;1' }));
+    svg.appendChild(burst);
+    svg.appendChild(txt(468, 48, 'barge-in', WARN, 7));
+    var cut = svgEl('line', { x1: 448, y1: 178, x2: 448, y2: 202, stroke: WARN, 'stroke-width': '2' });
+    cut.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.6;0.62;0.93;1' }));
+    svg.appendChild(cut);
+    var canc = txt(452, 178, 'cancelled', WARN, 7, 'start');
+    canc.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.6;0.64;0.93;1' }));
+    svg.appendChild(canc);
+    card(host, 'VOICE LATENCY WATERFALL', 'pipelined, not sequential',
+      svg,
+      'Every stage streams into the next before it finishes: ASR emits partials while the user still speaks, the turn detector fires on completion cues, and TTS starts within the 800ms first-audio budget. When the user barges in at 900ms the TTS cancels instantly and ASR takes over again.');
+  }
+
+  // ── 04: late interaction, each query token picks its max-scoring patch ─────
+  function ceLateInteraction(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    svg.appendChild(txt(266, 44, 'pdf page as patch grid', MUTE, 9));
+    svg.appendChild(svgEl('rect', { x: 193, y: 53, width: 146, height: 146, rx: 4, fill: 'none', stroke: RULE, 'stroke-width': '1.4' }));
+    var gx, gy;
+    for (gy = 0; gy < 4; gy++) for (gx = 0; gx < 4; gx++) {
+      svg.appendChild(svgEl('rect', { x: 200 + gx * 34, y: 60 + gy * 34, width: 30, height: 30, rx: 2, fill: SURF, stroke: RULE, 'stroke-width': '1', opacity: '0.85' }));
+    }
+    svg.appendChild(txt(62, 52, 'query tokens', MUTE, 9));
+    var chips = [['q: net', 64], ['q: margin', 116], ['q: 2024', 168]];
+    var i;
+    for (i = 0; i < chips.length; i++) {
+      svg.appendChild(svgEl('rect', { x: 30, y: chips[i][1], width: 64, height: 22, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.5' }));
+      svg.appendChild(txt(62, chips[i][1] + 15, chips[i][0], SOFT, 9));
+    }
+    // every token scores every patch; the cone hints at the full pairing
+    var cone = svgEl('polygon', { points: '94,75 193,55 193,197', fill: BP, opacity: '0.04' });
+    cone.appendChild(anim('opacity', '0.03;0.08;0.03', '4s'));
+    svg.appendChild(cone);
+    var picks = [[75, 283, 109, 268, 94], [127, 249, 143, 234, 128], [179, 317, 177, 302, 162]];
+    for (i = 0; i < picks.length; i++) {
+      var p = picks[i], bg = String(i * 0.35) + 's';
+      var ln = svgEl('line', { x1: 94, y1: p[0], x2: p[1], y2: p[2], stroke: BP, 'stroke-width': '1.8', 'stroke-dasharray': '210' });
+      ln.appendChild(anim('stroke-dashoffset', '210;0;0;210', '5s', { begin: bg, keyTimes: '0;0.22;0.9;1' }));
+      svg.appendChild(ln);
+      var hl = svgEl('rect', { x: p[3], y: p[4], width: 30, height: 30, rx: 2, fill: BP, opacity: '0' });
+      hl.appendChild(anim('opacity', '0;0.55;0.55;0', '5s', { begin: bg, keyTimes: '0;0.25;0.9;1' }));
+      svg.appendChild(hl);
+    }
+    var sumG = svgEl('g', {});
+    sumG.appendChild(svgEl('rect', { x: 398, y: 60, width: 100, height: 26, rx: 4, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.6' }));
+    sumG.appendChild(txt(448, 77, 'sum of max', BP, 9));
+    entry(sumG, 448, 73, '0.2s');
+    svg.appendChild(sumG);
+    var bws = [64, 46, 58];
+    for (i = 0; i < bws.length; i++) {
+      var bar = svgEl('rect', { x: 398, y: 102 + i * 20, width: bws[i], height: 10, rx: 2, fill: BP, opacity: '0' });
+      bar.appendChild(anim('opacity', '0;1;1;0', '5s', { begin: (i * 0.35) + 's', keyTimes: '0;0.3;0.9;1' }));
+      svg.appendChild(bar);
+    }
+    var tot = txt(398, 178, 'score 1.68', BP, 10, 'start');
+    tot.appendChild(anim('opacity', '0;0;1;1;0', '5s', { keyTimes: '0;0.55;0.62;0.9;1' }));
+    svg.appendChild(tot);
+    card(host, 'LATE INTERACTION MAXSIM', 'per-token max over patches',
+      svg,
+      'No OCR and no pooled vector: the page stays an image, embedded as thousands of patch vectors. Each query token scores against every patch, keeps only its maximum, and the per-token maxima sum into the page score. Tables, charts, and handwriting match directly at the patch level.');
+  }
+
+  // ── 05: best-first tree search over experiments under a dollar budget ──────
+  function ceExperimentTree(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    svg.appendChild(txt(200, 26, 'best-first expansion', MUTE, 9));
+    svg.appendChild(svgEl('circle', { cx: 200, cy: 50, r: 13, fill: BG, stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(200, 54, 'seed', INK, 7));
+    var edges = [[200, 62, 96, 105, '0;0.04;0.1;0.96;1'], [200, 62, 200, 105, '0;0.07;0.13;0.96;1'], [200, 62, 304, 105, '0;0.1;0.16;0.96;1'],
+      [304, 131, 258, 183, '0;0.36;0.44;0.96;1'], [304, 131, 352, 183, '0;0.4;0.48;0.96;1']];
+    var i;
+    for (i = 0; i < edges.length; i++) {
+      var e = edges[i];
+      var ln = svgEl('line', { x1: e[0], y1: e[1], x2: e[2], y2: e[3], stroke: RULE, 'stroke-width': '1.4', 'stroke-dasharray': '130' });
+      ln.appendChild(anim('stroke-dashoffset', '130;130;0;0;130', '6s', { keyTimes: e[4] }));
+      svg.appendChild(ln);
+    }
+    var nodes = [[96, 118, '0.42', '0;0.08;0.14;0.96;1'], [200, 118, '0.55', '0;0.11;0.17;0.96;1'], [304, 118, '0.71', '0;0.14;0.2;0.96;1'],
+      [258, 196, '0.62', '0;0.42;0.48;0.96;1'], [352, 196, '0.83', '0;0.46;0.52;0.96;1']];
+    for (i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var g = svgEl('g', { opacity: '0' });
+      g.appendChild(svgEl('circle', { cx: n[0], cy: n[1], r: 13, fill: BG, stroke: BP, 'stroke-width': '1.5' }));
+      g.appendChild(txt(n[0], n[1] + 3, n[2], INK, 8));
+      g.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: n[3] }));
+      g.appendChild(animT('translate', '0 5;0 5;0 0;0 0;0 5', '6s', { keyTimes: n[3] }));
+      svg.appendChild(g);
+    }
+    // the top-scoring node is the one that gets expanded
+    var ring = svgEl('circle', { cx: 304, cy: 118, r: 18, fill: 'none', stroke: BP, 'stroke-width': '2.4', opacity: '0' });
+    ring.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.28;0.34;0.96;1' }));
+    svg.appendChild(ring);
+    var best = svgEl('path', { d: 'M200 50 L304 118 L352 196', fill: 'none', stroke: BP, 'stroke-width': '3', 'stroke-dasharray': '300', opacity: '0.85' });
+    best.appendChild(anim('stroke-dashoffset', '300;300;0;0;300', '6s', { keyTimes: '0;0.58;0.72;0.96;1' }));
+    svg.appendChild(best);
+    var doc = svgEl('g', { opacity: '0' });
+    doc.appendChild(svgEl('rect', { x: 396, y: 178, width: 56, height: 40, rx: 4, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.8' }));
+    doc.appendChild(txt(424, 201, 'paper', BP, 9));
+    doc.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.74;0.8;0.96;1' }));
+    doc.appendChild(animT('translate', '0 5;0 5;0 0;0 0;0 5', '6s', { keyTimes: '0;0.74;0.8;0.96;1' }));
+    svg.appendChild(doc);
+    svg.appendChild(svgEl('rect', { x: 472, y: 60, width: 16, height: 150, rx: 3, fill: 'none', stroke: RULE, 'stroke-width': '1.2' }));
+    var fuel = svgEl('rect', { x: 474, y: 62, width: 12, height: 146, rx: 2, fill: WARN, opacity: '0.7' });
+    fuel.appendChild(anim('y', '62;200', '6s'));
+    fuel.appendChild(anim('height', '146;8', '6s'));
+    svg.appendChild(fuel);
+    svg.appendChild(txt(480, 226, '$30', MUTE, 8));
+    card(host, 'EXPERIMENT TREE SEARCH', 'expand best, spend budget',
+      svg,
+      'Each node is a sandboxed experiment scored after it runs. The search expands the best-scoring node, not the newest, so the 0.71 branch earns children while its siblings stall. The budget gauge drains with every run, and when it empties the best branch is written up as the paper.');
+  }
+
+  // ── 06: alert on a pod, graph walk to root cause, gated remediation ────────
+  function ceRootcauseWalk(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    svg.appendChild(txt(100, 30, 'knowledge graph walk', MUTE, 9));
+    var boxes = [['deployment', 56], ['replicaset', 116], ['pod', 176]];
+    var i;
+    for (i = 0; i < boxes.length; i++) {
+      svg.appendChild(svgEl('rect', { x: 88, y: boxes[i][1] - 12, width: 24, height: 24, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(80, boxes[i][1] + 3, boxes[i][0], SOFT, 8, 'end'));
+    }
+    svg.appendChild(svgEl('rect', { x: 198, y: 164, width: 24, height: 24, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(230, 179, 'node', SOFT, 8, 'start'));
+    svg.appendChild(svgEl('line', { x1: 100, y1: 68, x2: 100, y2: 104, stroke: RULE, 'stroke-width': '1.4' }));
+    svg.appendChild(svgEl('line', { x1: 100, y1: 128, x2: 100, y2: 164, stroke: RULE, 'stroke-width': '1.4' }));
+    svg.appendChild(svgEl('line', { x1: 112, y1: 176, x2: 198, y2: 176, stroke: RULE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(110, 90, 'owns', MUTE, 7, 'start'));
+    svg.appendChild(txt(110, 150, 'owns', MUTE, 7, 'start'));
+    var flash = svgEl('rect', { x: 84, y: 160, width: 32, height: 32, rx: 5, fill: 'none', stroke: WARN, 'stroke-width': '2', opacity: '0' });
+    flash.appendChild(anim('opacity', '0;1;0;1;0;0', '6s', { keyTimes: '0;0.03;0.06;0.09;0.12;1' }));
+    svg.appendChild(flash);
+    var al = txt(100, 214, 'alert: OOMKilled', WARN, 9);
+    al.appendChild(anim('opacity', '0;1;1;0.2', '6s', { keyTimes: '0;0.05;0.6;1' }));
+    svg.appendChild(al);
+    // the agent walks ownership edges up, then the scheduling edge out
+    var walker = svgEl('circle', { r: 4.5, fill: BP });
+    walker.appendChild(svgEl('animateMotion', { dur: '6s', repeatCount: 'indefinite', begin: '0.4s', path: 'M100 176 L100 116 L100 56 L100 116 L100 176 L210 176' }));
+    svg.appendChild(walker);
+    var visits = [[88, 104, '1.2s'], [88, 44, '2.0s'], [198, 164, '4.6s']];
+    for (i = 0; i < visits.length; i++) {
+      var v = svgEl('rect', { x: visits[i][0], y: visits[i][1], width: 24, height: 24, rx: 4, fill: BP, opacity: '0' });
+      v.appendChild(anim('opacity', '0;0.22;0.22;0', '6s', { begin: visits[i][2], keyTimes: '0;0.05;0.5;1' }));
+      svg.appendChild(v);
+    }
+    svg.appendChild(txt(390, 44, 'ranked hypotheses', MUTE, 9));
+    var hyp = [['limits too low  0.86', 70, 160, '0;0.55;0.68;1'], ['node memory pressure  0.51', 110, 95, '0;0.59;0.72;1'], ['bad rollout  0.22', 150, 42, '0;0.63;0.76;1']];
+    for (i = 0; i < hyp.length; i++) {
+      svg.appendChild(txt(300, hyp[i][1] - 5, hyp[i][0], SOFT, 8, 'start'));
+      var bar = svgEl('rect', { x: 300, y: hyp[i][1], width: 0, height: 12, rx: 2, fill: BP, opacity: String(0.9 - i * 0.25) });
+      bar.appendChild(anim('width', '0;0;' + hyp[i][2] + ';' + hyp[i][2], '6s', { keyTimes: hyp[i][3] }));
+      svg.appendChild(bar);
+    }
+    var gate = svgEl('rect', { x: 294, y: 56, width: 190, height: 32, rx: 5, fill: 'none', stroke: WARN, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' });
+    gate.appendChild(anim('opacity', '0;0;0.3;1;0.3;1', '6s', { keyTimes: '0;0.7;0.78;0.86;0.94;1' }));
+    svg.appendChild(gate);
+    var appr = txt(300, 100, 'awaiting slack approval', WARN, 8, 'start');
+    appr.appendChild(anim('opacity', '0;0;1;1', '6s', { keyTimes: '0;0.72;0.8;1' }));
+    svg.appendChild(appr);
+    card(host, 'ROOT-CAUSE WALK', 'read-only until approved',
+      svg,
+      'An OOMKilled alert lands on the pod. The agent walks ownership edges up to the deployment and the scheduling edge out to the node, pulling a telemetry slice at each hop. Hypotheses rank by evidence weight, and the winner still waits behind a human approval gate before any remediation runs.');
+  }
+
+  // ── 07: one artifact rides data, sft, dpo, quantize, serve ─────────────────
+  function ceFinetuneStages(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 230' });
+    svg.appendChild(svgEl('line', { x1: 30, y1: 150, x2: 500, y2: 150, stroke: RULE, 'stroke-width': '1.5' }));
+    var st = [[62, 'data', 'dedup + pii'], [157, 'sft', 'axolotl'], [247, 'dpo', 'trl pairs'], [337, 'quantize', 'awq 4-bit'], [437, 'serve', 'vllm + eagle']];
+    var i;
+    for (i = 0; i < st.length; i++) {
+      svg.appendChild(svgEl('line', { x1: st[i][0], y1: 144, x2: st[i][0], y2: 156, stroke: BP, 'stroke-width': '2' }));
+      svg.appendChild(txt(st[i][0], 172, st[i][1], SOFT, 9));
+      svg.appendChild(txt(st[i][0], 186, st[i][2], MUTE, 7));
+    }
+    // the model block transforms at each station: learns, aligns, shrinks
+    var blk = svgEl('g', {});
+    var outer = svgEl('rect', { x: 40, y: 96, width: 44, height: 36, rx: 4, fill: BG, stroke: BP, 'stroke-width': '2' });
+    outer.appendChild(anim('width', '44;44;26;26', '6s', { keyTimes: '0;0.58;0.68;1' }));
+    blk.appendChild(outer);
+    var tint = svgEl('rect', { x: 42, y: 98, width: 40, height: 32, rx: 3, fill: BP, opacity: '0' });
+    tint.appendChild(anim('opacity', '0;0;0.18;0.18;0.4;0.4', '6s', { keyTimes: '0;0.18;0.3;0.38;0.5;1' }));
+    tint.appendChild(anim('width', '40;40;22;22', '6s', { keyTimes: '0;0.58;0.68;1' }));
+    blk.appendChild(tint);
+    blk.appendChild(txt(62, 117, '8b', INK, 9));
+    blk.appendChild(animT('translate', '0 0;0 0;95 0;95 0;185 0;185 0;275 0;275 0;375 0;375 0', '6s',
+      { keyTimes: '0;0.1;0.18;0.3;0.38;0.5;0.58;0.7;0.78;1' }));
+    blk.appendChild(anim('opacity', '0;1;1;0', '6s', { keyTimes: '0;0.04;0.94;1' }));
+    svg.appendChild(blk);
+    var q = txt(437, 84, '4-bit', WARN, 8);
+    q.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.6;0.68;0.94;1' }));
+    svg.appendChild(q);
+    for (i = 0; i < 3; i++) {
+      var tok = svgEl('circle', { cy: 114, r: 3, fill: BP, opacity: '0' });
+      tok.appendChild(anim('cx', '452;452;506;506', '6s', { keyTimes: '0;' + (0.8 + i * 0.02) + ';' + (0.92 + i * 0.02) + ';1' }));
+      tok.appendChild(anim('opacity', '0;0;1;0', '6s', { keyTimes: '0;' + (0.8 + i * 0.02) + ';' + (0.9 + i * 0.02) + ';1' }));
+      svg.appendChild(tok);
+    }
+    card(host, 'FINE-TUNE ASSEMBLY LINE', 'yaml in, endpoint out',
+      svg,
+      'One artifact rides the whole pipeline. Clean data feeds SFT, which fills the base model with task behavior; DPO deepens the alignment tint; quantization shrinks the block to 4-bit without changing what it learned; and the served endpoint streams tokens with speculative decoding.');
+  }
+
+  // ── 09: recipes fix most files fast, the agent loop churns on the rest ─────
+  function ceMigrationFunnel(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    svg.appendChild(svgEl('rect', { x: 28, y: 96, width: 72, height: 48, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(64, 116, '50 repos', SOFT, 9));
+    svg.appendChild(txt(64, 130, 'java 8', MUTE, 8));
+    svg.appendChild(svgEl('line', { x1: 100, y1: 120, x2: 288, y2: 120, stroke: SURF, 'stroke-width': '10' }));
+    svg.appendChild(txt(194, 102, 'deterministic recipes', MUTE, 9));
+    svg.appendChild(txt(194, 142, '~75% of edits, auditable diffs', SOFT, 8));
+    svg.appendChild(svgEl('rect', { x: 420, y: 74, width: 72, height: 40, rx: 5, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(456, 91, 'ci green', BP, 9));
+    svg.appendChild(txt(456, 105, 'open pr', SOFT, 8));
+    svg.appendChild(svgEl('rect', { x: 420, y: 186, width: 72, height: 40, rx: 5, fill: 'none', stroke: WARN, 'stroke-width': '1.6', 'stroke-dasharray': '4 4' }));
+    svg.appendChild(txt(456, 203, 'failure', WARN, 9));
+    svg.appendChild(txt(456, 217, 'taxonomy', WARN, 8));
+    var i;
+    for (i = 0; i < 3; i++) {
+      var dot = svgEl('circle', { r: 4, fill: BP });
+      dot.appendChild(svgEl('animateMotion', { dur: '3s', repeatCount: 'indefinite', begin: i + 's', path: 'M104 120 L288 120 L420 94' }));
+      svg.appendChild(dot);
+    }
+    // the ambiguous file diverts into the build, classify, fix cycle
+    var hard = svgEl('circle', { r: 4, fill: WARN });
+    hard.appendChild(svgEl('animateMotion', { dur: '6s', repeatCount: 'indefinite', begin: '0.5s', path: 'M104 120 L250 120 C290 124,306 148,316 168', calcMode: 'linear', keyPoints: '0;0.55;0.55;1;1', keyTimes: '0;0.3;0.4;0.55;1' }));
+    svg.appendChild(hard);
+    var loop = svgEl('circle', { cx: 330, cy: 190, r: 26, fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '5 5' });
+    loop.appendChild(animT('rotate', '0 330 190;360 330 190', '4s'));
+    svg.appendChild(loop);
+    svg.appendChild(txt(330, 193, 'agent loop', SOFT, 7));
+    svg.appendChild(txt(330, 232, 'build - classify - fix - rerun', MUTE, 7));
+    var okOut = svgEl('circle', { r: 4, fill: BP });
+    okOut.appendChild(svgEl('animateMotion', { dur: '6s', repeatCount: 'indefinite', path: 'M352 176 C390 150,406 120,436 100', calcMode: 'linear', keyPoints: '0;0;1;1', keyTimes: '0;0.62;0.82;1' }));
+    okOut.appendChild(anim('opacity', '0;0;1;1;0;0', '6s', { keyTimes: '0;0.62;0.66;0.8;0.84;1' }));
+    svg.appendChild(okOut);
+    var failOut = svgEl('circle', { r: 4, fill: WARN });
+    failOut.appendChild(svgEl('animateMotion', { dur: '6s', repeatCount: 'indefinite', path: 'M352 204 C384 216,402 208,432 206', calcMode: 'linear', keyPoints: '0;0;1;1', keyTimes: '0;0.78;0.94;1' }));
+    failOut.appendChild(anim('opacity', '0;0;1;1;0;0', '6s', { keyTimes: '0;0.78;0.82;0.94;0.98;1' }));
+    svg.appendChild(failOut);
+    svg.appendChild(txt(30, 240, 'caps per repo: 30 min, $8, 20 turns', MUTE, 8, 'start'));
+    card(host, 'MIGRATION FUNNEL', 'recipes first, agent second',
+      svg,
+      'Most files flow straight through the deterministic recipes and land in a green-CI branch. The ambiguous minority diverts into the agent loop, which builds, classifies the failure, applies a fix, and reruns under hard caps. What still fails gets filed in the taxonomy with an exemplar diff.');
+  }
+
+  // ── 10: architect fans out to parallel worktrees, handoffs are the risk ────
+  function ceTeamHandoff(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 270' });
+    var arch = svgEl('g', {});
+    arch.appendChild(svgEl('rect', { x: 208, y: 16, width: 104, height: 26, rx: 5, fill: BG, stroke: BP, 'stroke-width': '2' }));
+    arch.appendChild(txt(260, 33, 'architect', INK, 10));
+    entry(arch, 260, 29, '0.1s');
+    svg.appendChild(arch);
+    var feed = svgEl('line', { x1: 260, y1: 42, x2: 260, y2: 58, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '4 3' });
+    feed.appendChild(anim('stroke-dashoffset', '14;0', '1s'));
+    svg.appendChild(feed);
+    svg.appendChild(svgEl('rect', { x: 140, y: 58, width: 240, height: 20, rx: 4, fill: BP, opacity: '0.08', stroke: BP, 'stroke-width': '1.3', 'stroke-dasharray': '4 3' }));
+    svg.appendChild(txt(260, 72, 'task board', BP, 9));
+    // four coders drain the board at different speeds
+    var lanes = [[95, 'coder a', 0.42], [205, 'coder b', 0.58], [315, 'coder c', 0.5], [425, 'coder d', 0.68]];
+    var i;
+    for (i = 0; i < lanes.length; i++) {
+      var L = lanes[i];
+      svg.appendChild(svgEl('line', { x1: L[0], y1: 78, x2: L[0], y2: 96, stroke: RULE, 'stroke-width': '1.3' }));
+      svg.appendChild(svgEl('rect', { x: L[0] - 38, y: 96, width: 76, height: 86, rx: 5, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(L[0], 112, L[1], SOFT, 9));
+      svg.appendChild(txt(L[0], 126, 'worktree', MUTE, 7));
+      svg.appendChild(svgEl('rect', { x: L[0] - 28, y: 152, width: 56, height: 8, rx: 2, fill: SURF }));
+      var fill = svgEl('rect', { x: L[0] - 28, y: 152, width: 0, height: 8, rx: 2, fill: BP });
+      fill.appendChild(anim('width', '0;0;56;56', '6s', { keyTimes: '0;0.08;' + L[2] + ';1' }));
+      svg.appendChild(fill);
+      svg.appendChild(svgEl('line', { x1: L[0], y1: 182, x2: 260, y2: 204, stroke: RULE, 'stroke-width': '1.2', opacity: '0.7' }));
+    }
+    svg.appendChild(svgEl('circle', { cx: 260, cy: 210, r: 7, fill: BP }));
+    svg.appendChild(txt(260, 230, 'merge', MUTE, 8));
+    var clash = svgEl('circle', { cx: 260, cy: 210, r: 12, fill: 'none', stroke: WARN, 'stroke-width': '2', opacity: '0' });
+    clash.appendChild(anim('opacity', '0;0;1;0;1;0;0', '6s', { keyTimes: '0;0.68;0.71;0.74;0.77;0.8;1' }));
+    svg.appendChild(clash);
+    var clashTxt = txt(260, 246, 'conflict: b vs d', WARN, 8);
+    clashTxt.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.68;0.72;0.86;1' }));
+    svg.appendChild(clashTxt);
+    svg.appendChild(svgEl('line', { x1: 267, y1: 210, x2: 320, y2: 210, stroke: RULE, 'stroke-width': '1.3' }));
+    var rev = svgEl('g', {});
+    rev.appendChild(svgEl('rect', { x: 320, y: 197, width: 84, height: 26, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '4 3' }));
+    rev.appendChild(txt(362, 214, 'reviewer', SOFT, 9));
+    rev.appendChild(anim('opacity', '0.35;0.35;1;1', '6s', { keyTimes: '0;0.8;0.86;1' }));
+    svg.appendChild(rev);
+    svg.appendChild(svgEl('line', { x1: 404, y1: 210, x2: 432, y2: 210, stroke: RULE, 'stroke-width': '1.3' }));
+    var tst = svgEl('g', {});
+    tst.appendChild(svgEl('rect', { x: 432, y: 197, width: 76, height: 26, rx: 5, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '1.6' }));
+    tst.appendChild(txt(470, 214, 'tests: pass', BP, 9));
+    tst.appendChild(anim('opacity', '0.25;0.25;1;1', '6s', { keyTimes: '0;0.88;0.94;1' }));
+    svg.appendChild(tst);
+    card(host, 'FACTORY HANDOFFS', 'parallel lanes, one merge',
+      svg,
+      'The architect freezes a plan onto the task board and four coders drain it in parallel worktrees, each finishing at its own pace. The merge is where handoffs fail: two coders touched the same file, the conflict flashes, and only then does the diff pass the reviewer gate and the isolated test run.');
+  }
+
+  // ── 11: span stream in, eval sparkline down, alert inside five minutes ─────
+  function ceOtelDrift(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    var srcs = [['openai sdk', 40], ['anthropic sdk', 76], ['langchain', 112]];
+    var i;
+    for (i = 0; i < srcs.length; i++) {
+      svg.appendChild(svgEl('rect', { x: 24, y: srcs[i][1], width: 86, height: 20, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.3' }));
+      svg.appendChild(txt(67, srcs[i][1] + 13, srcs[i][0], SOFT, 8));
+    }
+    var lanes = ['M110 50 C150 50,150 84,178 86', 'M110 86 L178 88', 'M110 122 C150 122,150 92,178 90'];
+    for (i = 0; i < lanes.length; i++) {
+      svg.appendChild(svgEl('path', { d: lanes[i], fill: 'none', stroke: RULE, 'stroke-width': '1.2' }));
+      var sp = svgEl('circle', { r: 3, fill: BP });
+      sp.appendChild(svgEl('animateMotion', { dur: '2s', repeatCount: 'indefinite', begin: (i * 0.66) + 's', path: lanes[i] }));
+      svg.appendChild(sp);
+    }
+    svg.appendChild(svgEl('rect', { x: 178, y: 72, width: 74, height: 32, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+    svg.appendChild(txt(215, 91, 'otel collector', SOFT, 8));
+    var pipe = svgEl('line', { x1: 252, y1: 88, x2: 288, y2: 88, stroke: BP, 'stroke-width': '1.8', 'stroke-dasharray': '5 4' });
+    pipe.appendChild(anim('stroke-dashoffset', '18;0', '1s'));
+    svg.appendChild(pipe);
+    svg.appendChild(svgEl('rect', { x: 288, y: 74, width: 60, height: 30, fill: BG, stroke: BP, 'stroke-width': '1.5' }));
+    svg.appendChild(svgEl('ellipse', { cx: 318, cy: 74, rx: 30, ry: 7, fill: BG, stroke: BP, 'stroke-width': '1.5' }));
+    svg.appendChild(svgEl('ellipse', { cx: 318, cy: 104, rx: 30, ry: 7, fill: 'none', stroke: BP, 'stroke-width': '1.5' }));
+    svg.appendChild(txt(318, 95, 'clickhouse', SOFT, 8));
+    svg.appendChild(txt(412, 120, 'eval jobs sample traces', MUTE, 8));
+    // the injected regression drops into the eval stream, then the score falls
+    var drop = svgEl('circle', { cx: 318, r: 3.5, fill: WARN, opacity: '0' });
+    drop.appendChild(anim('cy', '112;112;168;168', '6s', { keyTimes: '0;0.32;0.42;1' }));
+    drop.appendChild(anim('opacity', '0;0;1;0;0', '6s', { keyTimes: '0;0.32;0.42;0.5;1' }));
+    svg.appendChild(drop);
+    var reg = txt(310, 168, 'injected regression', WARN, 7, 'end');
+    reg.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.34;0.4;0.6;1' }));
+    svg.appendChild(reg);
+    svg.appendChild(svgEl('line', { x1: 60, y1: 160, x2: 60, y2: 236, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(svgEl('line', { x1: 60, y1: 236, x2: 490, y2: 236, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(66, 158, 'faithfulness', MUTE, 8, 'start'));
+    var spark = svgEl('path', {
+      d: 'M60 176 L100 173 L140 178 L180 174 L220 177 L260 173 L300 176 L316 222 L360 219 L400 223 L440 220 L470 221',
+      fill: 'none', stroke: BP, 'stroke-width': '2', 'stroke-dasharray': '520', 'stroke-dashoffset': '520'
+    });
+    spark.appendChild(anim('stroke-dashoffset', '520;0;0', '6s', { keyTimes: '0;0.7;1' }));
+    svg.appendChild(spark);
+    svg.appendChild(svgEl('line', { x1: 60, y1: 206, x2: 490, y2: 206, stroke: WARN, 'stroke-width': '1.3', 'stroke-dasharray': '5 4' }));
+    svg.appendChild(txt(486, 200, 'alert floor', WARN, 8, 'end'));
+    var alert = svgEl('g', { opacity: '0' });
+    alert.appendChild(svgEl('rect', { x: 336, y: 142, width: 128, height: 22, rx: 4, fill: WARN, 'fill-opacity': '0.12', stroke: WARN, 'stroke-width': '1.6' }));
+    alert.appendChild(txt(400, 157, 'alert fired in < 5 min', WARN, 8));
+    alert.appendChild(anim('opacity', '0;0;1;1;0', '6s', { keyTimes: '0;0.46;0.52;0.95;1' }));
+    alert.appendChild(animT('translate', '0 5;0 5;0 0;0 0;0 5', '6s', { keyTimes: '0;0.46;0.52;0.95;1' }));
+    svg.appendChild(alert);
+    card(host, 'DRIFT TO ALERT', 'semconv spans, sampled evals',
+      svg,
+      'GenAI-semconv spans stream from four SDK families through the collector into ClickHouse, where eval jobs score sampled traces. When the injected regression lands, the faithfulness sparkline steps below the alert floor and the page fires, inside the five-minute detection budget.');
+  }
+
+  LF.register({
+    'ce-agent-loop': ceAgentLoop,
+    'ce-hybrid-retrieval': ceHybridRetrieval,
+    'ce-voice-latency': ceVoiceLatency,
+    'ce-late-interaction': ceLateInteraction,
+    'ce-experiment-tree': ceExperimentTree,
+    'ce-rootcause-walk': ceRootcauseWalk,
+    'ce-finetune-stages': ceFinetuneStages,
+    'ce-migration-funnel': ceMigrationFunnel,
+    'ce-team-handoff': ceTeamHandoff,
+    'ce-otel-drift': ceOtelDrift
+  });
+})();
+
+/* module figures-capstone-f.js (Part 6) */
+/* figures-capstone-f.js - animated lesson figures for Phase 19 capstone
+   projects 12-17 and 20-23 (video scene index, MCP gate, speculative decode,
+   safety stack, issue-to-PR, tutor loop, harness loop contract, tool registry
+   validation, JSON-RPC framing, dispatcher retry). Loads after
+   lesson-figures.js, registers through window.LF. SMIL motion only, ES5,
+   no deps, theme via CSS vars. */
+(function(){'use strict';var LF=window.LF;if(!LF){return;}
+  var el = LF.el, svgEl = LF.svgEl;
+  var EASE = '0.23 1 0.32 1';
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BLUE = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+
+  function svg(h) { return svgEl('svg', { viewBox: '0 0 520 ' + h }); }
+  function shell(host, label, sub, node, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [node])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '10', fill: fill || INK });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function box(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: '4', fill: fill || SURF, stroke: stroke || RULE, 'stroke-width': '1.3' });
+  }
+  function line(x1, y1, x2, y2, stroke, extra) {
+    var a = { x1: x1, y1: y1, x2: x2, y2: y2, stroke: stroke || SOFT, 'stroke-width': '1.3' };
+    if (extra) { for (var k in extra) { a[k] = extra[k]; } }
+    return svgEl('line', a);
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) { for (var k in extra) { a[k] = extra[k]; } }
+    return svgEl('animate', a);
+  }
+  function fade(node, dur, at) {
+    node.appendChild(anim('opacity', '0;1;1', dur, { begin: at, keyTimes: '0;0.12;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1' }));
+    return node;
+  }
+  // fade + grow entrance from 95% about (cx,cy), soft exit at loop end
+  function pop(kids, cx, cy, dur, at) {
+    var inner = svgEl('g', { transform: 'translate(' + (-cx) + ' ' + (-cy) + ')' }, kids);
+    var mid = svgEl('g', {}, [inner]);
+    mid.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'scale', values: '0.95;1;1', dur: dur, begin: at, repeatCount: 'indefinite', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', keyTimes: '0;0.18;1' }));
+    var g = svgEl('g', { transform: 'translate(' + cx + ' ' + cy + ')' }, [mid]);
+    g.appendChild(anim('opacity', '0;1;1;0', dur, { begin: at, keyTimes: '0;0.14;0.94;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1;0.4 0 1 1' }));
+    return g;
+  }
+  function dot(r, fill) { return svgEl('circle', { r: r, fill: fill, cx: '0', cy: '0' }); }
+  function mov(path, dur, extra) {
+    var a = { path: path, dur: dur, repeatCount: 'indefinite' };
+    if (extra) { for (var k in extra) { a[k] = extra[k]; } }
+    return svgEl('animateMotion', a);
+  }
+  function arrows(s, id) {
+    s.appendChild(svgEl('defs', {}, [svgEl('marker', { id: id, viewBox: '0 0 8 8', refX: '7', refY: '4', markerWidth: '6', markerHeight: '6', orient: 'auto' }, [svgEl('path', { d: 'M0 0 L8 4 L0 8 z', fill: SOFT })])]));
+    return 'url(#' + id + ')';
+  }
+
+  // ── cf-scene-index (12): scenes fan into three vectors, query returns a window ─
+  function sceneIndex(host) {
+    var D = '5.5s', s = svg(260), i;
+    var xs = [30, 112, 220, 290, 414], ws = [78, 104, 66, 120, 88];
+    var strip = [txt(30, 22, 'scene segmentation', '9', MUTE, 'start')];
+    for (i = 0; i < 5; i++) {
+      strip.push(fade(box(xs[i], 32, ws[i], 26, i === 2 ? BLUE : SURF, i === 2 ? 'none' : RULE), D, (0.05 + i * 0.09) + 's'));
+    }
+    s.appendChild(pop(strip, 260, 45, D, '0s'));
+    var chips = [], cx = [60, 205, 350], cl = ['caption emb', 'frame emb', 'transcript emb'];
+    for (i = 0; i < 3; i++) {
+      chips.push(line(253, 60, cx[i] + 55, 118, SOFT));
+      chips.push(box(cx[i], 118, 110, 24));
+      chips.push(txt(cx[i] + 55, 133, cl[i], '9'));
+    }
+    s.appendChild(pop(chips, 260, 130, D, '0.5s'));
+    var idx = [box(190, 168, 140, 30), txt(260, 187, 'multi-vector index', '9')];
+    for (i = 0; i < 3; i++) { idx.push(line(cx[i] + 55, 142, 200 + i * 60, 168, SOFT)); }
+    s.appendChild(pop(idx, 260, 183, D, '0.9s'));
+    s.appendChild(box(30, 214, 80, 26, BLUE, 'none'));
+    s.appendChild(txt(70, 231, 'query', '10', BG));
+    var q = dot('5', BLUE);
+    q.appendChild(mov('M114 227 L200 186', D, { calcMode: 'linear', keyPoints: '0;0;1;1', keyTimes: '0;0.55;0.72;1' }));
+    q.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.55;0.6;0.74;1' }));
+    s.appendChild(q);
+    var br = svgEl('path', { d: 'M220 28 L220 20 L286 20 L286 28', fill: 'none', stroke: WARN, 'stroke-width': '1.5' });
+    br.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.76;0.82;0.94;1' }));
+    var bl = txt(253, 14, '(start, end)', '8', WARN);
+    bl.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.76;0.82;0.94;1' }));
+    s.appendChild(br); s.appendChild(bl);
+    shell(host, 'SCENE-LEVEL VIDEO INDEX', 'three vectors per scene', s,
+      'Ingest cuts the video into scenes, and every scene stores three vectors side by side: caption embedding, keyframe embedding, transcript embedding. A query fires against all three at once, results merge, and the answer comes back as a (start, end) window inside the top scene rather than a whole file.');
+  }
+
+  // ── cf-mcp-gate (13): stateless metadata, policy, registry and live discovery ─
+  function mcpGate(host) {
+    var D = '5s', s = svg(250);
+    s.appendChild(pop([box(24, 44, 92, 40), txt(70, 62, 'MCP client', '9'), txt(70, 76, 'version + caps', '8', MUTE)], 70, 64, D, '0s'));
+    s.appendChild(pop([box(404, 44, 92, 40), txt(450, 62, 'MCP server', '9'), txt(450, 76, 'stateless', '8', MUTE)], 450, 64, D, '0.15s'));
+    var pipe = line(116, 64, 404, 64, SOFT, { 'stroke-dasharray': '6 5' });
+    pipe.appendChild(anim('stroke-dashoffset', '22;0', '1.4s'));
+    s.appendChild(pipe);
+    s.appendChild(txt(258, 30, 'one POST per JSON-RPC message', '8', MUTE));
+    var gr = svgEl('rect', { x: 252, y: 42, width: 10, height: 44, rx: 2, fill: WARN });
+    gr.appendChild(anim('opacity', '1;1;0.3;1;1', D, { keyTimes: '0;0.24;0.28;0.34;1' }));
+    s.appendChild(pop([gr, txt(257, 100, 'auth + policy', '8', WARN)], 257, 64, D, '0.3s'));
+    var p1 = dot('5', BLUE);
+    p1.appendChild(mov('M116 58 L404 58', D, { calcMode: 'linear', keyPoints: '0;0.48;0.48;1;1', keyTimes: '0;0.2;0.32;0.5;1' }));
+    p1.appendChild(anim('opacity', '0;1;1;0;0', D, { keyTimes: '0;0.04;0.5;0.56;1' }));
+    s.appendChild(p1);
+    var p2 = dot('5', WARN);
+    p2.setAttribute('opacity', '0');
+    p2.appendChild(mov('M116 70 L257 70 L257 140', D, { begin: '2.4s', calcMode: 'linear', keyPoints: '0;0.668;0.668;1;1', keyTimes: '0;0.15;0.25;0.4;1' }));
+    p2.appendChild(anim('opacity', '0;1;1;1;0;0', D, { begin: '2.4s', keyTimes: '0;0.03;0.3;0.38;0.44;1' }));
+    s.appendChild(p2);
+    var ok = txt(257, 190, 'actor + tool + args + expiry', '8', WARN);
+    ok.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.85;0.9;0.98;1' }));
+    s.appendChild(pop([box(197, 146, 120, 28), txt(257, 163, 'approval record', '9'), ok], 257, 160, D, '0.45s'));
+    var reg = [box(404, 156, 92, 30), txt(450, 170, 'registry', '9'), txt(450, 182, 'server.json', '7', MUTE),
+      line(450, 156, 450, 84, SOFT, { 'stroke-dasharray': '4 3' }),
+      txt(442, 124, 'live server/discover probe', '8', MUTE, 'end')];
+    s.appendChild(pop(reg, 450, 171, D, '0.6s'));
+    var poll = dot('3.5', MUTE);
+    poll.setAttribute('opacity', '0');
+    poll.appendChild(mov('M450 156 L450 86', D, { begin: '0.9s', calcMode: 'linear', keyPoints: '0;1;1', keyTimes: '0;0.22;1' }));
+    poll.appendChild(anim('opacity', '0;1;0;0', D, { begin: '0.9s', keyTimes: '0;0.06;0.24;1' }));
+    s.appendChild(poll);
+    shell(host, 'STATELESS MCP GATE + REGISTRY', 'metadata and authority checked per request', s,
+      'Each JSON-RPC message gets its own POST and carries protocol version plus client capabilities. The gate validates issuer, audience, scope, tool, and arguments; a consequential call also needs an approval record bound to that exact action. The registry indexes server.json publication metadata, while a separate server/discover probe verifies what the live endpoint supports.');
+  }
+
+  // ── cf-spec-decode (14): draft proposes k tokens, one verify pass accepts a prefix ─
+  function specDecode(host) {
+    var D = '5.5s', s = svg(240), i;
+    s.appendChild(pop([box(24, 96, 88, 40), txt(68, 113, 'draft head', '9'), txt(68, 127, 'k tokens', '8', MUTE), line(112, 116, 146, 116, SOFT)], 68, 116, D, '0s'));
+    s.appendChild(pop([box(185, 20, 150, 30), txt(260, 39, 'target verify pass', '9'), line(260, 50, 260, 92, SOFT, { 'stroke-dasharray': '4 3' })], 260, 35, D, '0.15s'));
+    var words = ['def', 'main', '(', ')', ':'], tiles = [];
+    for (i = 0; i < 5; i++) {
+      var tx = 150 + i * 62, rej = i > 2, e1 = 0.06 + i * 0.045, e2 = e1 + 0.05;
+      var g = svgEl('g', {}, [box(tx, 100, 52, 32), txt(tx + 26, 120, words[i], '10')]);
+      g.appendChild(anim('opacity', rej ? '0;0;1;1;0.15;0.15' : '0;0;1;1', D,
+        { keyTimes: rej ? '0;' + e1 + ';' + e2 + ';0.62;0.7;1' : '0;' + e1 + ';' + e2 + ';1', calcMode: 'spline', keySplines: rej ? '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1;0 0 1 1' : '0 0 1 1;' + EASE + ';0 0 1 1' }));
+      tiles.push(g);
+      if (!rej) {
+        var ov = box(tx, 100, 52, 32, 'none', BLUE);
+        ov.setAttribute('stroke-width', '2');
+        ov.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;' + (0.36 + i * 0.06) + ';' + (0.4 + i * 0.06) + ';1' }));
+        tiles.push(ov);
+      }
+    }
+    s.appendChild(pop(tiles, 300, 116, D, '0.25s'));
+    var sweep = box(150, 94, 52, 44, 'none', BLUE);
+    sweep.setAttribute('stroke-width', '1.8');
+    sweep.appendChild(anim('x', '150;150;398;398', D, { keyTimes: '0;0.3;0.55;1' }));
+    sweep.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.28;0.32;0.55;0.6;1' }));
+    s.appendChild(sweep);
+    var rs = svgEl('g', {}, [box(336, 100, 52, 32, WARN, 'none'), txt(362, 120, 'ret', '10', BG)]);
+    rs.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.74;0.8;0.94;1' }));
+    s.appendChild(rs);
+    var rj = txt(438, 158, 'rejected, resampled', '8', WARN);
+    rj.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.66;0.72;0.94;1' }));
+    s.appendChild(rj);
+    var sum = txt(150, 192, '3 of 5 accepted in one target pass', '9', MUTE, 'start');
+    sum.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.5;0.6;1' }));
+    s.appendChild(sum);
+    shell(host, 'SPECULATIVE DECODING', 'draft proposes, target verifies once', s,
+      'The draft head proposes five candidate tokens; the target model scores all of them in a single verify pass. The accepted prefix replaces three sequential decode steps, the rejected suffix is dropped and resampled. Acceptance rate sets the speedup, and the larger verify pass on rejection is exactly why p99 latency needs its own report.');
+  }
+
+  // ── cf-safety-stack (15): five layers, one request passes, one attack deflects ─
+  function safetyStack(host) {
+    var D = '5.5s', s = svg(270), i;
+    var names = ['input sanitize', 'rails / policy', 'classifier gate', 'target model', 'output filter'];
+    var stack = [];
+    for (i = 0; i < 5; i++) {
+      var y = 24 + i * 34, model = i === 3, gate = i === 2;
+      stack.push(fade(box(150, y, 220, 26, model ? BLUE : SURF, model ? 'none' : (gate ? WARN : RULE)), D, (i * 0.08) + 's'));
+      stack.push(fade(txt(162, y + 17, names[i], '9', model ? BG : INK, 'start'), D, (i * 0.08) + 's'));
+    }
+    s.appendChild(pop(stack, 260, 105, D, '0s'));
+    var safe = dot('5', BLUE);
+    safe.appendChild(mov('M280 8 L280 200', D, { calcMode: 'linear', keyPoints: '0;0;1;1', keyTimes: '0;0.1;0.6;1' }));
+    safe.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.1;0.14;0.56;0.62;1' }));
+    s.appendChild(safe);
+    var atk = dot('5', WARN);
+    atk.appendChild(mov('M330 8 L330 105 L430 105', D, { calcMode: 'linear', keyPoints: '0;0;0.447;0.447;1;1', keyTimes: '0;0.3;0.5;0.56;0.72;1' }));
+    atk.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.3;0.34;0.7;0.76;1' }));
+    s.appendChild(atk);
+    var flash = box(150, 92, 220, 26, 'none', WARN);
+    flash.setAttribute('stroke-width', '2');
+    flash.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.48;0.53;0.6;1' }));
+    s.appendChild(flash);
+    var blk = txt(436, 100, 'blocked', '9', WARN, 'start');
+    blk.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.62;0.68;0.9;1' }));
+    s.appendChild(blk);
+    [0, 2, 4].forEach(function (j, n) {
+      var py = 37 + j * 34;
+      var pr = line(470, py, 376, py, WARN, { 'stroke-dasharray': '4 3' });
+      pr.appendChild(anim('opacity', '0.15;1;0.15', '2.2s', { begin: (n * 0.5) + 's' }));
+      s.appendChild(pr);
+    });
+    s.appendChild(txt(496, 228, 'red-team probes: garak · PyRIT', '8', WARN, 'end'));
+    var hitl = [line(340, 186, 352, 196, SOFT, { 'stroke-dasharray': '3 3' }), box(300, 196, 130, 26), txt(365, 213, 'HITL queue', '9')];
+    s.appendChild(pop(hitl, 365, 209, D, '0.55s'));
+    shell(host, 'LAYERED SAFETY HARNESS', 'five layers around one model', s,
+      'A clean request falls straight through: sanitize, rails, classifier gate, model, output filter. A jailbreak makes it two layers deep before the classifier gate catches and deflects it. The red-team range keeps probing every layer from outside, and anything the output filter flags as high risk detours to the human review queue.');
+  }
+
+  // ── cf-issue-to-pr (16): label to review-ready PR through sandbox and CI gate ─
+  function issuePr(host) {
+    var D = '5.5s', s = svg(240);
+    var m = arrows(s, 'cf-a16');
+    s.appendChild(pop([box(24, 60, 88, 40), txt(68, 77, 'issue', '9'), txt(68, 91, '@agent fix', '8', MUTE)], 68, 80, D, '0s'));
+    s.appendChild(pop([box(142, 60, 92, 40), txt(188, 84, 'dispatcher', '9'), txt(188, 50, 'App webhook', '8', MUTE),
+      box(142, 110, 92, 6), svgEl('rect', { x: 142, y: 110, width: 55, height: 6, rx: 2, fill: BLUE }),
+      txt(142, 128, 'budget 3/5 today', '8', MUTE, 'start')], 188, 80, D, '0.12s'));
+    var tb = svgEl('rect', { x: 272, y: 88, width: 0, height: 6, rx: 2, fill: BLUE });
+    tb.appendChild(anim('width', '0;0;80;80', D, { keyTimes: '0;0.35;0.6;1' }));
+    s.appendChild(pop([box(264, 60, 96, 40), txt(312, 78, 'sandbox', '9'), txt(312, 50, 'clone · build · test', '8', MUTE),
+      box(272, 88, 80, 6), tb], 312, 80, D, '0.24s'));
+    s.appendChild(pop([svgEl('path', { d: 'M398 64 L414 80 L398 96 L382 80 z', fill: SURF, stroke: BLUE, 'stroke-width': '1.3' }),
+      txt(398, 84, 'CI', '8')], 398, 80, D, '0.36s'));
+    var pf = box(432, 60, 64, 40, 'none', BLUE);
+    pf.setAttribute('stroke-width', '2');
+    pf.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.88;0.92;0.98;1' }));
+    var pl = txt(464, 118, 'review-ready', '8', BLUE);
+    pl.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.88;0.92;0.98;1' }));
+    s.appendChild(pop([box(432, 60, 64, 40), txt(464, 84, 'PR', '10'), pf, pl], 464, 80, D, '0.48s'));
+    [[112, 142], [234, 264], [360, 382], [414, 432]].forEach(function (c) {
+      s.appendChild(line(c[0], 80, c[1] - 4, 80, SOFT, { 'marker-end': m }));
+    });
+    var pk = dot('5', BLUE);
+    pk.appendChild(mov('M28 80 L462 80', D, { calcMode: 'linear', keyPoints: '0;0.369;0.369;0.654;0.654;0.852;1', keyTimes: '0;0.15;0.22;0.33;0.62;0.75;1' }));
+    pk.appendChild(anim('opacity', '0;1;1;0;0', D, { keyTimes: '0;0.03;0.86;0.92;1' }));
+    s.appendChild(pk);
+    s.appendChild(txt(28, 225, 'branch protection: no direct writes to main · no force-push', '8', MUTE, 'start'));
+    shell(host, 'ISSUE-TO-PR PIPELINE', 'label in, review-ready PR out', s,
+      'A labeled issue fires the GitHub App webhook; the dispatcher checks the per-repo daily budget before enqueueing. The sandbox reproduces the build from scratch and holds the task until the full test suite passes. Only a green CI gate opens the PR, and branch protection, not agent goodwill, forbids force-push.');
+  }
+
+  // ── cf-tutor-loop (17): Socratic exchange feeds mastery bars on the graph ──
+  function tutorLoop(host) {
+    var D = '5.5s', s = svg(250), i;
+    var m = arrows(s, 'cf-a17');
+    s.appendChild(pop([box(30, 44, 92, 36), txt(76, 66, 'learner', '9')], 76, 62, D, '0s'));
+    s.appendChild(pop([box(30, 156, 92, 36), txt(76, 172, 'tutor policy', '9'), txt(76, 186, 'Socratic', '8', MUTE)], 76, 174, D, '0.12s'));
+    s.appendChild(line(60, 84, 60, 148, SOFT, { 'marker-end': m }));
+    s.appendChild(line(92, 152, 92, 92, SOFT, { 'marker-end': m }));
+    s.appendChild(txt(54, 121, 'answer', '7', MUTE, 'end'));
+    s.appendChild(txt(98, 121, 'hint', '7', MUTE, 'start'));
+    var ad = dot('4', BLUE);
+    ad.appendChild(mov('M60 84 L60 148', D, { calcMode: 'linear', keyPoints: '0;1;1', keyTimes: '0;0.14;1' }));
+    ad.appendChild(anim('opacity', '0;1;0;0', D, { keyTimes: '0;0.06;0.16;1' }));
+    s.appendChild(ad);
+    var hd = dot('4', WARN);
+    hd.appendChild(mov('M92 152 L92 88', D, { begin: '1.4s', calcMode: 'linear', keyPoints: '0;1;1', keyTimes: '0;0.14;1' }));
+    hd.appendChild(anim('opacity', '0;1;0;0', D, { begin: '1.4s', keyTimes: '0;0.06;0.16;1' }));
+    s.appendChild(hd);
+    var graph = [line(122, 170, 224, 80, SOFT, { 'stroke-dasharray': '4 3' }), txt(180, 138, 'graph walk', '8', MUTE)];
+    var cxs = [240, 330, 420];
+    for (i = 0; i < 3; i++) {
+      graph.push(svgEl('circle', { cx: cxs[i], cy: 70, r: '16', fill: SURF, stroke: RULE, 'stroke-width': '1.3' }));
+      graph.push(txt(cxs[i], 74, 'c' + (i + 1), '9'));
+      graph.push(box(cxs[i] - 18, 96, 36, 5));
+      if (i < 2) { graph.push(line(cxs[i] + 16, 70, cxs[i + 1] - 20, 70, SOFT, { 'marker-end': m })); }
+    }
+    var mb = svgEl('rect', { x: 222, y: 96, width: 0, height: 5, rx: 2, fill: BLUE });
+    mb.appendChild(anim('width', '0;12;12;24;24;36;36', D, { keyTimes: '0;0.12;0.28;0.4;0.56;0.68;1' }));
+    graph.push(mb);
+    var ring = svgEl('circle', { cx: 330, cy: 70, r: '20', fill: 'none', stroke: BLUE, 'stroke-width': '1.6' });
+    ring.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.7;0.78;1' }));
+    graph.push(ring);
+    var nx = txt(330, 40, 'next concept', '8', BLUE);
+    nx.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.7;0.78;1' }));
+    graph.push(nx);
+    s.appendChild(pop(graph, 330, 90, D, '0.3s'));
+    s.appendChild(txt(28, 232, 'mastery update after every interaction (knowledge tracing)', '8', MUTE, 'start'));
+    shell(host, 'SOCRATIC LOOP + LEARNER MODEL', 'each exchange moves a mastery bar', s,
+      'The tutor never dumps the answer: every learner reply comes back as a leading question or a scaffolded hint. Each exchange updates the mastery probability for the active concept, and when the bar fills, the policy walks the prerequisite edge in the curriculum graph and lights up the next concept.');
+  }
+
+  // ── cf-loop-contract (20): a token walks the six-state machine, events tick out ─
+  function loopContract(host) {
+    var D = '6s', s = svg(260), i;
+    var m = arrows(s, 'cf-a20');
+    var st = [['IDLE', 30, 40, 64], ['PLANNING', 140, 24, 86], ['EXECUTING', 270, 40, 92], ['AWAITING_TOOL', 392, 96, 104], ['REFLECTING', 268, 152, 92], ['DONE', 70, 152, 60]];
+    var pulses = ['0.55s', '1.15s', '1.9s', '2.65s', '3.4s', '5.5s'];
+    var nodes = [];
+    for (i = 0; i < st.length; i++) {
+      var b = st[i], done = i === 5;
+      nodes.push(fade(box(b[1], b[2], b[3], 26, done ? BLUE : SURF, done ? 'none' : RULE), D, (i * 0.07) + 's'));
+      nodes.push(fade(txt(b[1] + b[3] / 2, b[2] + 17, b[0], '9', done ? BG : INK), D, (i * 0.07) + 's'));
+      var ov = box(b[1], b[2], b[3], 26, 'none', BLUE);
+      ov.setAttribute('stroke-width', '2');
+      ov.appendChild(anim('opacity', '0;1;0;0', D, { begin: pulses[i], keyTimes: '0;0.04;0.1;1' }));
+      nodes.push(ov);
+    }
+    [[94, 60, 140, 46], [226, 42, 270, 50], [362, 60, 400, 96], [428, 122, 336, 152], [300, 152, 310, 66], [268, 165, 130, 165]].forEach(function (e) {
+      nodes.push(line(e[0], e[1], e[2], e[3], SOFT, { 'marker-end': m }));
+    });
+    s.appendChild(pop(nodes, 260, 100, D, '0s'));
+    var tk = dot('5', BLUE);
+    tk.appendChild(mov('M62 53 L183 37 L316 53 L444 109 L314 165 L316 53 L444 109 L314 165 L100 165', D));
+    tk.appendChild(anim('opacity', '0;1;1;0', D, { keyTimes: '0;0.04;0.96;1' }));
+    s.appendChild(tk);
+    s.appendChild(line(30, 214, 490, 214, RULE));
+    for (i = 0; i < 8; i++) {
+      var t = 0.1 + i * 0.115;
+      var tick = svgEl('rect', { x: 40 + i * 56, y: 208, width: 4, height: 12, rx: 1, fill: BLUE });
+      tick.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;' + t.toFixed(2) + ';' + (t + 0.03).toFixed(2) + ';1' }));
+      s.appendChild(tick);
+    }
+    s.appendChild(txt(30, 236, 'typed event stream', '8', MUTE, 'start'));
+    s.appendChild(txt(490, 236, 'budget: turns · tool calls · wall-clock', '8', MUTE, 'end'));
+    shell(host, 'HARNESS LOOP CONTRACT', 'six states, one auditable walk', s,
+      'The loop is a deterministic state machine, not a chat while-loop. One run token walks IDLE through PLANNING, EXECUTING, AWAITING_TOOL, and REFLECTING, takes the inner execute-reflect cycle as many turns as the budget allows, and lands in DONE. Every transition emits a typed event on the stream, so UIs and tracers subscribe instead of inspecting the loop.');
+  }
+
+  // ── cf-registry-validate (21): bad args bounce with a json-pointer, good args reach the handler ─
+  function registryValidate(host) {
+    var D = '5.5s', s = svg(240);
+    s.appendChild(pop([box(24, 88, 80, 40), txt(64, 112, 'model', '9')], 64, 108, D, '0s'));
+    var sr = box(194, 92, 132, 24, SURF, BLUE);
+    s.appendChild(pop([box(180, 36, 160, 140, BG, RULE), txt(260, 52, 'tool registry', '9'),
+      box(194, 62, 132, 24), txt(260, 77, 'name', '8'),
+      sr, txt(260, 107, 'schema check', '8'),
+      box(194, 122, 132, 24), txt(260, 137, 'handler ref', '8'),
+      txt(260, 166, 'no silent overwrite', '7', MUTE)], 260, 106, D, '0.15s'));
+    s.appendChild(pop([box(416, 88, 80, 40), txt(456, 112, 'handler', '9')], 456, 108, D, '0.3s'));
+    var c1 = dot('4.5', WARN);
+    c1.appendChild(mov('M104 100 L194 104', D, { calcMode: 'linear', keyPoints: '0;1;1', keyTimes: '0;0.12;1' }));
+    c1.appendChild(anim('opacity', '0;1;1;0;0', D, { keyTimes: '0;0.02;0.12;0.16;1' }));
+    s.appendChild(c1);
+    var f1 = box(194, 92, 132, 24, 'none', WARN);
+    f1.setAttribute('stroke-width', '2');
+    f1.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.13;0.18;0.24;1' }));
+    s.appendChild(f1);
+    var b1 = dot('4.5', WARN);
+    b1.appendChild(mov('M194 104 L104 84', D, { calcMode: 'linear', keyPoints: '0;0;1;1', keyTimes: '0;0.2;0.32;1' }));
+    b1.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.2;0.3;0.34;1' }));
+    s.appendChild(b1);
+    var er = txt(28, 74, '/args/limit: expected integer', '8', WARN, 'start');
+    er.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.24;0.3;0.48;1' }));
+    s.appendChild(er);
+    var c2 = dot('4.5', BLUE);
+    c2.appendChild(mov('M104 112 L416 112', D, { calcMode: 'linear', keyPoints: '0;0;0.288;0.288;1;1', keyTimes: '0;0.5;0.58;0.66;0.8;1' }));
+    c2.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.5;0.53;0.79;0.83;1' }));
+    s.appendChild(c2);
+    var f2 = box(194, 92, 132, 24, 'none', BLUE);
+    f2.setAttribute('stroke-width', '2');
+    f2.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.6;0.66;0.72;1' }));
+    s.appendChild(f2);
+    var hp = box(416, 88, 80, 40, 'none', BLUE);
+    hp.setAttribute('stroke-width', '2');
+    hp.appendChild(anim('opacity', '0;0;1;1;0', D, { keyTimes: '0;0.8;0.85;0.94;1' }));
+    s.appendChild(hp);
+    s.appendChild(txt(28, 220, 'schema is data, handler is code: the validator never touches I/O', '8', MUTE, 'start'));
+    shell(host, 'REGISTRY + SCHEMA GATE', 'validate before any handler runs', s,
+      'The registry pins name to schema to handler once, and the dispatcher trusts it afterwards. A bad call never reaches the handler: the schema check bounces it back with a json-pointer path the model can fix in one round trip. The corrected call passes the same pure validator and only then touches code.');
+  }
+
+  // ── cf-jsonrpc-frames (22): one JSON frame per line, ids pair the traffic ──
+  function jsonrpcFrames(host) {
+    var D = '6s', s = svg(250);
+    s.appendChild(line(80, 36, 80, 224, SOFT));
+    s.appendChild(line(440, 36, 440, 224, SOFT));
+    s.appendChild(txt(80, 26, 'client', '9'));
+    s.appendChild(txt(440, 26, 'server', '9'));
+    s.appendChild(txt(260, 26, 'one frame per \\n line', '8', MUTE));
+    function frame(y, label, stroke, begin, toLeft) {
+      var x0 = toLeft ? 230 : 90;
+      var g = svgEl('g', {}, [box(x0, y, 200, 18, SURF, stroke), txt(x0 + 6, y + 13, label, '8', INK, 'start')]);
+      g.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', values: '0 0;' + (toLeft ? -150 : 150) + ' 0;' + (toLeft ? -150 : 150) + ' 0', dur: D, begin: begin, repeatCount: 'indefinite', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', keyTimes: '0;0.14;1' }));
+      g.appendChild(anim('opacity', '0;1;1;0;0', D, { begin: begin, keyTimes: '0;0.04;0.16;0.2;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1;0.4 0 1 1;0 0 1 1' }));
+      s.appendChild(g);
+    }
+    frame(44, '{"id":7,"method":"tools/call"}', BLUE, '0s', false);
+    frame(74, '{"id":7,"result":{...}}', BLUE, '0.9s', true);
+    frame(104, '{"method":"progress"}', RULE, '1.9s', false);
+    var no = txt(90, 134, 'notification: no id, no reply', '8', MUTE, 'start');
+    no.appendChild(anim('opacity', '0;0;1;1;0', D, { begin: '1.9s', keyTimes: '0;0.1;0.16;0.3;1' }));
+    s.appendChild(no);
+    frame(140, '{"id":9,"met###', WARN, '3.1s', false);
+    frame(170, '{"id":null,"error":{"code":-32700}}', WARN, '3.9s', true);
+    frame(200, '{"id":10,"method":"ping"}', RULE, '4.7s', false);
+    var cont = txt(260, 240, 'one bad line, stream survives', '8', MUTE);
+    cont.appendChild(anim('opacity', '0;0;1;1', D, { begin: '4.7s', keyTimes: '0;0.08;0.14;1' }));
+    s.appendChild(cont);
+    shell(host, 'JSON-RPC OVER STDIO', 'newline-delimited frames', s,
+      'Every message is one JSON object on one line. A request carries an id and gets exactly one response with the same id; a notification carries no id and must get nothing back. A garbled line earns a -32700 parse error with id null, and the very next line parses normally: one bad frame never poisons the stream.');
+  }
+
+  // ── cf-dispatch-retry (23): timeout, backoff with jitter, dedupe, one envelope ─
+  function dispatchRetry(host) {
+    var D = '6s', s = svg(250);
+    var m = arrows(s, 'cf-a23');
+    s.appendChild(pop([box(24, 28, 96, 34), txt(72, 49, 'harness loop', '9')], 72, 45, D, '0s'));
+    s.appendChild(pop([box(150, 20, 240, 50, SURF, BLUE), txt(270, 40, 'dispatcher', '10'), txt(270, 56, 'timeout · retry · dedupe', '8', MUTE)], 270, 45, D, '0.12s'));
+    s.appendChild(pop([box(420, 28, 80, 34), txt(460, 49, 'handler', '9')], 460, 45, D, '0.24s'));
+    s.appendChild(line(120, 45, 146, 45, SOFT, { 'marker-end': m }));
+    s.appendChild(line(390, 45, 416, 45, SOFT, { 'marker-end': m }));
+    s.appendChild(line(60, 168, 490, 168, RULE));
+    s.appendChild(txt(60, 184, 't', '8', MUTE, 'start'));
+    function attempt(x, w, ok, t0, t1, label) {
+      var r = svgEl('rect', { x: x, y: 150, width: 0, height: 14, rx: 2, fill: ok ? BLUE : SURF, stroke: ok ? 'none' : RULE, 'stroke-width': '1.3' });
+      r.appendChild(anim('width', '0;0;' + w + ';' + w, D, { keyTimes: '0;' + t0 + ';' + t1 + ';1' }));
+      s.appendChild(r);
+      s.appendChild(txt(x + w / 2, 144, label, '7', MUTE));
+      if (!ok) {
+        var g = svgEl('g', {}, [line(x + w - 6, 147, x + w + 6, 161, WARN), line(x + w + 6, 147, x + w - 6, 161, WARN)]);
+        g.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;' + (t1 + 0.01) + ';' + (t1 + 0.05) + ';1' }));
+        s.appendChild(g);
+      }
+    }
+    attempt(70, 70, false, 0.05, 0.2, 'attempt 1');
+    attempt(158, 70, false, 0.3, 0.45, 'attempt 2');
+    attempt(264, 56, true, 0.58, 0.7, 'attempt 3');
+    var okc = svgEl('circle', { cx: 334, cy: 157, r: '7', fill: 'none', stroke: BLUE, 'stroke-width': '1.6' });
+    okc.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.71;0.75;1' }));
+    s.appendChild(okc);
+    s.appendChild(txt(149, 184, '1s', '7', MUTE));
+    s.appendChild(txt(246, 184, '2s + jitter', '7', MUTE));
+    var gh = svgEl('g', {}, [box(158, 124, 70, 14, 'none', WARN), txt(193, 120, 'dup, key a1f3', '7', WARN)]);
+    gh.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', values: '0 0;0 0;0 22;0 22', dur: D, keyTimes: '0;0.38;0.47;1', repeatCount: 'indefinite' }));
+    gh.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.32;0.38;0.48;1' }));
+    s.appendChild(gh);
+    s.appendChild(txt(105, 132, 'key a1f3', '7', MUTE));
+    var env = svgEl('g', {}, [box(360, 100, 130, 24, BG, BLUE), txt(425, 116, 'typed result envelope', '8'),
+      line(360, 110, 124, 60, BLUE, { 'stroke-dasharray': '4 3' })]);
+    env.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.76;0.83;1' }));
+    s.appendChild(env);
+    s.appendChild(txt(490, 234, 'parallel dispatch capped: max in-flight', '8', MUTE, 'end'));
+    shell(host, 'DISPATCHER SEAM', 'timeout, backoff, dedupe, one envelope', s,
+      'Attempt one runs to its per-call timeout and returns a typed error instead of hanging the loop. Backoff doubles with jitter before each retry, and a duplicate that races the in-flight attempt collapses into it on the idempotency key. Whatever happens, the loop receives one envelope shape: result or mapped error, never a raw stack trace.');
+  }
+
+  LF.register({
+    'cf-scene-index': sceneIndex,
+    'cf-mcp-gate': mcpGate,
+    'cf-spec-decode': specDecode,
+    'cf-safety-stack': safetyStack,
+    'cf-issue-to-pr': issuePr,
+    'cf-tutor-loop': tutorLoop,
+    'cf-loop-contract': loopContract,
+    'cf-registry-validate': registryValidate,
+    'cf-jsonrpc-frames': jsonrpcFrames,
+    'cf-dispatch-retry': dispatchRetry
+  });
+})();
+
+/* module figures-capstone-g.js (Part 6) */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+  var SPL = '0.23 1 0.32 1';
+  var SPL3 = SPL + ';' + SPL + ';' + SPL;
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [svgEl('tspan', {}, [document.createTextNode(s)])]);
+  }
+  // entry that fades in from opacity 0 and grows from 95% around (cx, cy)
+  function pop(cx, cy, dur, kt, kids) {
+    var inner = svgEl('g', {}, kids);
+    inner.appendChild(animT('scale', '0.95;0.95;1;1', dur, { keyTimes: kt, calcMode: 'spline', keySplines: SPL3 }));
+    inner.appendChild(anim('opacity', '0;0;1;1', dur, { keyTimes: kt }));
+    return svgEl('g', { transform: 'translate(' + cx + ' ' + cy + ')' }, [inner]);
+  }
+
+  // ── 24: plan-execute-replan — a failed step hands the cursor back ──────────
+  function planReplan(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'plan is data · the executor walks it', MUTE, 10));
+    svg.appendChild(svgEl('rect', { x: 30, y: 44, width: 104, height: 44, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(82, 62, 'planner', BP, 10));
+    svg.appendChild(txt(82, 76, 'replan(cursor, err)', MUTE, 7));
+    var steps = ['1 read file', '2 run tests', '3 apply patch', '4 rerun tests', '5 report'];
+    var sx = 200, sw = 128, i;
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(svgEl('rect', { x: sx, y: 36 + i * 36, width: sw, height: 26, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(sx + sw / 2, 53 + i * 36, steps[i], SOFT, 9));
+    }
+    var stale = svgEl('g', {});
+    for (i = 3; i < 5; i++) {
+      stale.appendChild(svgEl('rect', { x: sx, y: 36 + i * 36, width: sw, height: 26, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      stale.appendChild(txt(sx + sw / 2, 53 + i * 36, steps[i], SOFT, 9));
+    }
+    stale.appendChild(anim('opacity', '1;1;0.25;0.25', D, { keyTimes: '0;0.28;0.4;1' }));
+    svg.appendChild(stale);
+    var fail = txt(336, 125, '✗ import error', WARN, 8, 'start');
+    fail.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.24;0.3;0.44;0.49;1' }));
+    svg.appendChild(fail);
+    var arc = svgEl('path', { d: 'M200 121 C 158 121, 158 66, 134 66', fill: 'none', stroke: WARN, 'stroke-width': '1.8', 'stroke-dasharray': '6 5' });
+    arc.appendChild(anim('stroke-dashoffset', '80;80;0;0', D, { keyTimes: '0;0.3;0.44;1', calcMode: 'spline', keySplines: SPL3 }));
+    arc.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.28;0.32;1' }));
+    svg.appendChild(arc);
+    svg.appendChild(pop(432, 132, D, '0;0.5;0.62;1', [
+      svgEl('rect', { x: -64, y: -24, width: sw, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' }),
+      txt(0, -7, "3' fix import", BP, 9),
+      svgEl('rect', { x: -64, y: 12, width: sw, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' }),
+      txt(0, 29, "4' rerun tests", BP, 9),
+      txt(0, -34, 'diff +2 −2', BP, 8)
+    ]));
+    var cur = svgEl('circle', { r: 5, fill: WARN });
+    cur.appendChild(anim('cx', '188;188;188;188;356;356;356;356', D, { keyTimes: '0;0.12;0.24;0.55;0.62;0.78;0.9;1' }));
+    cur.appendChild(anim('cy', '49;85;121;121;121;157;157;157', D, { keyTimes: '0;0.12;0.24;0.55;0.62;0.78;0.9;1' }));
+    svg.appendChild(cur);
+    svg.appendChild(txt(260, 240, 'budgets: steps 7/8 · replans 1/2 · abort past either ceiling', MUTE, 8));
+    card(host, 'PLAN / EXECUTE / REPLAN', 'fail hands back to planner',
+      svg,
+      'The plan is an ordered list of typed steps the executor can walk, not prose the loop has to parse. When step 3 fails, the executor does not improvise: it hands the cursor and the error back to the planner, which returns a fresh tail from that position. The revision arrives as a diff a tracer can display, and two hard ceilings, one on steps and one on replans, keep the loop from planning forever.');
+  }
+
+  // ── 25: verification gate chain — first DENY wins, ledger meters the rest ──
+  function gateChain(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var D = '5.5s';
+    svg.appendChild(txt(260, 16, 'every tool call walks the chain · first DENY wins', MUTE, 10));
+    var names = ['budget', 'recency', 'whitelist', 'regex'];
+    var subs = ['tokens left?', 'stale reads?', 'tool known?', 'argv clean?'];
+    var gx = [64, 172, 280, 388], gy = 56, gw = 92, gh = 56, i;
+    svg.appendChild(svgEl('line', { x1: 24, y1: gy + gh / 2, x2: 504, y2: gy + gh / 2, stroke: RULE, 'stroke-width': '1.2', 'stroke-dasharray': '3 4' }));
+    for (i = 0; i < 4; i++) {
+      var r = svgEl('rect', { x: gx[i], y: gy, width: gw, height: gh, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.6', opacity: '0.55' });
+      r.appendChild(anim('opacity', '0.55;1;0.55', D, { begin: (0.3 + i * 0.25) + 's' }));
+      svg.appendChild(r);
+      svg.appendChild(txt(gx[i] + gw / 2, gy + 16, names[i], BP, 10));
+      svg.appendChild(txt(gx[i] + gw / 2, gy + 48, subs[i], MUTE, 7));
+    }
+    svg.appendChild(txt(24, gy - 10, 'call: read_file', SOFT, 8, 'start'));
+    svg.appendChild(txt(504, gy - 10, 'ALLOW', BP, 9, 'end'));
+    var pa = svgEl('rect', { x: 24, y: gy + gh / 2 - 6, width: 16, height: 12, rx: 2, fill: BP });
+    pa.appendChild(animT('translate', '0 0;86 0;194 0;302 0;410 0;464 0;464 0', D, { keyTimes: '0;0.09;0.18;0.27;0.36;0.44;1', calcMode: 'spline', keySplines: SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL }));
+    pa.appendChild(anim('opacity', '1;1;1;1;1;1;0;0', D, { keyTimes: '0;0.09;0.18;0.27;0.36;0.5;0.56;1' }));
+    svg.appendChild(pa);
+    var pb = svgEl('rect', { x: 24, y: gy + gh / 2 - 6, width: 16, height: 12, rx: 2, fill: WARN });
+    pb.appendChild(animT('translate', '0 0;0 0;86 0;194 0;302 0;302 0;302 0;302 68;302 68', D, { keyTimes: '0;0.5;0.58;0.66;0.74;0.76;0.8;0.9;1', calcMode: 'spline', keySplines: SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL + ';' + SPL }));
+    pb.appendChild(anim('opacity', '0;0;1;1;1;0;0', D, { keyTimes: '0;0.48;0.52;0.85;0.9;0.97;1' }));
+    svg.appendChild(pb);
+    var deny = txt(364, 176, '✗ DENY unknown tool "shell"', WARN, 8, 'end');
+    deny.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.78;0.84;0.94;0.98;1' }));
+    svg.appendChild(deny);
+    var route = svgEl('path', { d: 'M488 84 V 140 H 372 V 192', fill: 'none', stroke: BP, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    route.appendChild(anim('stroke-dashoffset', '60;60;0;0', D, { keyTimes: '0;0.42;0.52;1', calcMode: 'spline', keySplines: SPL3 }));
+    route.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.4;0.44;1' }));
+    svg.appendChild(route);
+    var ly = 192;
+    svg.appendChild(txt(140, ly - 8, 'observation ledger', MUTE, 8, 'start'));
+    svg.appendChild(svgEl('rect', { x: 140, y: ly, width: 240, height: 14, rx: 2, fill: 'none', stroke: MUTE, 'stroke-width': '1.4' }));
+    var lfill = svgEl('rect', { x: 141, y: ly + 1, width: 96, height: 12, rx: 2, fill: BP, opacity: '0.5' });
+    lfill.appendChild(anim('width', '96;96;150;150', D, { keyTimes: '0;0.44;0.54;1', calcMode: 'spline', keySplines: SPL3 }));
+    svg.appendChild(lfill);
+    svg.appendChild(txt(388, ly + 11, '5.1K / 8K tokens shown', SOFT, 8, 'start'));
+    card(host, 'GATE CHAIN + LEDGER', 'deny fast · meter the rest',
+      svg,
+      'The chain is four deterministic gates with short-circuit semantics: the first DENY ends the walk and the reason is logged for the model to read. An allowed call is not free either. Its output is metered into the observation ledger, and once the cumulative tokens shown to the model would cross the budget, the budget gate at the front of the chain starts refusing calls on its own.');
+  }
+
+  // ── 26: sandbox path jail — traversal bounces off the root fence ───────────
+  function pathJail(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'realpath every argument · assert the prefix', MUTE, 10));
+    svg.appendChild(svgEl('rect', { x: 28, y: 64, width: 104, height: 44, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(80, 82, 'sandbox', BP, 10));
+    svg.appendChild(txt(80, 96, 'subprocess.run', MUTE, 7));
+    svg.appendChild(svgEl('rect', { x: 250, y: 40, width: 180, height: 110, rx: 6, fill: 'none', stroke: BP, 'stroke-width': '1.8', 'stroke-dasharray': '7 5' }));
+    svg.appendChild(txt(340, 32, 'project root jail', BP, 9));
+    svg.appendChild(svgEl('rect', { x: 268, y: 56, width: 78, height: 20, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(307, 69, 'src/main.py', SOFT, 8));
+    svg.appendChild(svgEl('rect', { x: 268, y: 118, width: 78, height: 20, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1' }));
+    svg.appendChild(txt(307, 131, 'tests/', SOFT, 8));
+    var okp = svgEl('path', { d: 'M132 78 C 190 78, 210 66, 264 66', fill: 'none', stroke: BP, 'stroke-width': '1.8', 'stroke-dasharray': '6 5' });
+    okp.appendChild(anim('stroke-dashoffset', '80;80;0;0', D, { keyTimes: '0;0.06;0.22;1', calcMode: 'spline', keySplines: SPL3 }));
+    okp.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.05;0.1;1' }));
+    svg.appendChild(okp);
+    var ok = txt(352, 69, '✓ inside root', BP, 8, 'start');
+    ok.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.2;0.28;1' }));
+    svg.appendChild(ok);
+    var esc = svgEl('circle', { r: 5, fill: WARN });
+    var mo = svgEl('animateMotion', {
+      dur: D, repeatCount: 'indefinite', path: 'M132 100 L 430 100',
+      keyPoints: '0;0;1;0.55;0.55', keyTimes: '0;0.3;0.55;0.8;1', calcMode: 'linear'
+    });
+    esc.appendChild(mo);
+    svg.appendChild(esc);
+    svg.appendChild(txt(180, 118, '../../etc/passwd', WARN, 8));
+    var flash = svgEl('line', { x1: 430, y1: 84, x2: 430, y2: 120, stroke: WARN, 'stroke-width': '2.5' });
+    flash.appendChild(anim('opacity', '0;0;1;0;0', D, { keyTimes: '0;0.52;0.56;0.68;1' }));
+    svg.appendChild(flash);
+    var no = txt(444, 104, '✗ escapes root', WARN, 8, 'start');
+    no.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.54;0.6;1' }));
+    svg.appendChild(no);
+    var chips = ['sudo', 'rm -rf', 'python3 -c'], cx = [116, 216, 316], i;
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(pop(cx[i] + 40, 197, D, '0;' + (0.6 + i * 0.08).toFixed(2) + ';' + (0.7 + i * 0.08).toFixed(2) + ';1', [
+        svgEl('rect', { x: -40, y: -11, width: 80, height: 22, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }),
+        txt(0, 4, chips[i], SOFT, 9),
+        svgEl('line', { x1: -34, y1: 0, x2: 34, y2: 0, stroke: WARN, 'stroke-width': '1.8' })
+      ]));
+    }
+    svg.appendChild(txt(104, 200, 'denylist', MUTE, 8, 'end'));
+    svg.appendChild(txt(256, 228, 'by name and argv shape', MUTE, 8, 'middle'));
+    card(host, 'PATH JAIL + DENYLIST', 'refuse by prefix, name, shape',
+      svg,
+      'Two refusal surfaces sit between the model and the operating system. Every path argument resolves through realpath and must keep the project root as a prefix, so a ../../ traversal bounces off the jail wall instead of reaching /etc. Alongside it, a denylist refuses executables by name and an argv inspector catches interpreters smuggling shell through -c flags. Output is truncated and a wall-clock timeout kills whatever runs away.');
+  }
+
+  // ── 29: end-to-end harness — one run token weaving through four strata ─────
+  function harnessWeave(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    var D = '5.5s';
+    var bands = ['gate chain', 'sandbox', 'otel span', 'eval harness'], i;
+    for (i = 0; i < 4; i++) {
+      var b = svgEl('rect', { x: 30, y: 40 + i * 44, width: 380, height: 34, rx: 4, fill: SURF, stroke: RULE, 'stroke-width': '1', opacity: '0.5' });
+      b.appendChild(anim('opacity', '0.5;0.9;0.5', D, { begin: (i * 0.22) + 's' }));
+      svg.appendChild(b);
+      svg.appendChild(txt(38, 61 + i * 44, bands[i], SOFT, 9, 'start'));
+    }
+    var labels = ['read', 'tests', 'write', 'tests'], lx = [130, 210, 290, 370];
+    for (i = 0; i < 4; i++) {
+      var t = txt(lx[i], 30, labels[i], BP, 9);
+      t.appendChild(anim('opacity', '0.3;1;0.3', D, { begin: (i * 1.3) + 's' }));
+      svg.appendChild(t);
+    }
+    var dot = svgEl('circle', { r: 5, fill: WARN });
+    dot.appendChild(svgEl('animateMotion', {
+      dur: D, repeatCount: 'indefinite',
+      path: 'M130 44 V 206 L 210 44 V 206 L 290 44 V 206 L 370 44 V 206'
+    }));
+    svg.appendChild(dot);
+    svg.appendChild(pop(462, 130, D, '0;0.78;0.9;1', [
+      svgEl('rect', { x: -40, y: -36, width: 80, height: 72, rx: 5, fill: BG, stroke: BP, 'stroke-width': '2' }),
+      txt(0, -16, 'run report', BP, 9),
+      txt(0, 6, 'PASS', INK, 13),
+      txt(0, 24, '9 steps · 0 trips', MUTE, 7)
+    ]));
+    svg.appendChild(txt(220, 246, 'global budgets: 12 steps · 8K observation tokens', MUTE, 8));
+    card(host, 'HARNESS END TO END', 'every step crosses four layers',
+      svg,
+      'The end-to-end run is one token weaving through four strata on every step: the gate chain rules on the call, the sandbox executes it, a span wraps the whole exchange, and the eval harness scores the finished trajectory. The components stop disagreeing because the budgets live in one place and every layer reads the same ledger. The fixture bug falls in nine steps, under the twelve-step ceiling, with zero gate trips on legal tools.');
+  }
+
+  // ── 41: eval pipeline — four gauges fold into one report ───────────────────
+  function evalQuadrant(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    var D = '4.5s';
+    svg.appendChild(txt(196, 16, 'four evals · four blind spots covered', MUTE, 10));
+    var tiles = [
+      ['perplexity', 'held-out LM', '31.4', 0.55],
+      ['exact match', 'short factual', '0.45', 0.45],
+      ['token F1', 'open form', '0.62', 0.62],
+      ['judge (mock)', '1-5 rubric', '3.8 / 5', 0.76]
+    ];
+    var px = [36, 206, 36, 206], py = [36, 36, 148, 148], w = 150, h = 92, i;
+    for (i = 0; i < 4; i++) {
+      var x = px[i], y = py[i];
+      svg.appendChild(svgEl('rect', { x: x, y: y, width: w, height: h, rx: 5, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(x + w / 2, y + 18, tiles[i][0], BP, 10));
+      svg.appendChild(txt(x + w / 2, y + 31, tiles[i][1], MUTE, 7));
+      svg.appendChild(txt(x + w / 2, y + 56, tiles[i][2], INK, 13));
+      svg.appendChild(svgEl('rect', { x: x + 14, y: y + 68, width: w - 28, height: 8, rx: 2, fill: 'none', stroke: RULE, 'stroke-width': '1' }));
+      var fw = Math.round(tiles[i][3] * (w - 30));
+      var f = svgEl('rect', { x: x + 15, y: y + 69, width: 0, height: 6, rx: 2, fill: BP, opacity: '0.6' });
+      f.appendChild(anim('width', '0;0;' + fw + ';' + fw, D, {
+        keyTimes: '0;' + (0.08 + i * 0.06).toFixed(2) + ';' + (0.34 + i * 0.06).toFixed(2) + ';1',
+        calcMode: 'spline', keySplines: SPL3
+      }));
+      svg.appendChild(f);
+      var a = svgEl('path', { d: 'M' + (x + w) + ' ' + (y + h / 2) + ' C 372 ' + (y + h / 2) + ', 372 130, 392 130', fill: 'none', stroke: BP, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+      a.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;' + (0.4 + i * 0.04).toFixed(2) + ';' + (0.48 + i * 0.04).toFixed(2) + ';1' }));
+      svg.appendChild(a);
+    }
+    svg.appendChild(pop(452, 130, D, '0;0.58;0.72;1', [
+      svgEl('rect', { x: -56, y: -60, width: 112, height: 120, rx: 6, fill: BG, stroke: BP, 'stroke-width': '2' }),
+      txt(0, -40, 'report', BP, 10),
+      txt(0, -18, 'ppl 31.4', SOFT, 8),
+      txt(0, -4, 'em 0.45', SOFT, 8),
+      txt(0, 10, 'f1 0.62', SOFT, 8),
+      txt(0, 24, 'judge 3.8', SOFT, 8),
+      txt(0, 46, 'agg 0.61', INK, 11)
+    ]));
+    card(host, 'EVAL PIPELINE', 'ppl · em · f1 · judge',
+      svg,
+      'Perplexity tracks fit to the language distribution but never asks a question. Exact match scores facts and punishes paraphrase; token F1 forgives paraphrase and is fooled by overlap; the mock judge scores open answers on a rubric without a network call. No single number describes a language model, so the pipeline runs all four on shaped held-out subsets and folds them into one weighted report a reviewer can read at a glance.');
+  }
+
+  // ── 48: DDP collectives — gradients meet in the middle, mean returns ───────
+  function allreduceRing(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'broadcast once · all-reduce every step', MUTE, 10));
+    var rx = [40, 164, 288, 412], i;
+    for (i = 0; i < 4; i++) {
+      svg.appendChild(svgEl('rect', { x: rx[i], y: 44, width: 96, height: 40, rx: 5, fill: BG, stroke: i === 0 ? BP : RULE, 'stroke-width': i === 0 ? '2' : '1.4' }));
+      svg.appendChild(txt(rx[i] + 48, 61, 'rank ' + i, i === 0 ? BP : SOFT, 10));
+      svg.appendChild(txt(rx[i] + 48, 75, i === 0 ? 'seed model' : 'replica', MUTE, 7));
+    }
+    for (i = 1; i < 4; i++) {
+      var bc = svgEl('path', { d: 'M96 44 C ' + (96 + (rx[i] - 48)) / 2 + ' 24, ' + (96 + (rx[i] - 48)) / 2 + ' 24, ' + (rx[i] + 40) + ' 44', fill: 'none', stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '6 5' });
+      bc.appendChild(anim('opacity', '0;1;1;0;0', D, { begin: (i * 0.1) + 's', keyTimes: '0;0.06;0.2;0.26;1' }));
+      svg.appendChild(bc);
+    }
+    var bl = txt(260, 30, 'broadcast θ from rank 0', BP, 8);
+    bl.appendChild(anim('opacity', '0;1;1;0;0', D, { keyTimes: '0;0.06;0.2;0.26;1' }));
+    svg.appendChild(bl);
+    svg.appendChild(svgEl('circle', { cx: 260, cy: 160, r: 22, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    var sum = txt(260, 164, 'Σ/N', BP, 10);
+    svg.appendChild(sum);
+    for (i = 0; i < 4; i++) {
+      var g = svgEl('rect', { x: -6, y: -5, width: 12, height: 10, rx: 2, fill: WARN });
+      g.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;' + (0.3 + i * 0.04).toFixed(2) + ';' + (0.38 + i * 0.04).toFixed(2) + ';0.58;0.64;1' }));
+      g.appendChild(svgEl('animateMotion', {
+        dur: D, repeatCount: 'indefinite', path: 'M' + (rx[i] + 48) + ' 100 L 260 160',
+        keyPoints: '0;0;1;1', keyTimes: '0;' + (0.42 + i * 0.04).toFixed(2) + ';' + (0.58 + i * 0.04).toFixed(2) + ';1', calcMode: 'linear'
+      }));
+      svg.appendChild(g);
+      var m = svgEl('rect', { x: -6, y: -5, width: 12, height: 10, rx: 2, fill: BP });
+      m.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.7;0.74;0.9;0.96;1' }));
+      m.appendChild(svgEl('animateMotion', {
+        dur: D, repeatCount: 'indefinite', path: 'M260 160 L ' + (rx[i] + 48) + ' 100',
+        keyPoints: '0;0;1;1', keyTimes: '0;0.72;0.88;1', calcMode: 'linear'
+      }));
+      svg.appendChild(m);
+    }
+    svg.appendChild(txt(352, 152, 'all-reduce mean', MUTE, 8, 'start'));
+    svg.appendChild(txt(260, 232, 'every rank steps with the same averaged gradient · step 42 everywhere', MUTE, 8));
+    card(host, 'DDP COLLECTIVES', 'grads meet · mean returns',
+      svg,
+      'Data parallel is two collectives and a rule. Parameters broadcast from rank 0 once at construction so every replica starts identical. After each backward pass the per-rank gradients meet in an all-reduce and every rank receives the same mean, so the optimizer steps can never disagree. FSDP extends the same discipline to memory: each rank keeps only a shard of every parameter and gathers the full tensor just long enough for the layer that needs it.');
+  }
+
+  // ── 50: hypothesis generator — ramp the temperature, reject the cluster ────
+  function noveltyRamp(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'raise T each pass · reject inside the cluster', MUTE, 10));
+    var th = [22, 44, 66], tt = ['0.7', '1.0', '1.3'], i;
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(svgEl('rect', { x: 36 + i * 48, y: 190 - th[i], width: 44, height: th[i], rx: 2, fill: BP, opacity: (0.18 + i * 0.14).toFixed(2) }));
+      svg.appendChild(txt(58 + i * 48, 204, 'T ' + tt[i], MUTE, 8));
+    }
+    var mk = svgEl('circle', { r: 5, fill: WARN });
+    mk.appendChild(anim('cx', '58;58;106;106;154;154', D, { keyTimes: '0;0.3;0.36;0.62;0.68;1' }));
+    mk.appendChild(anim('cy', '162;162;140;140;118;118', D, { keyTimes: '0;0.3;0.36;0.62;0.68;1' }));
+    svg.appendChild(mk);
+    svg.appendChild(txt(104, 224, 'temperature ramp', MUTE, 8));
+    var ring = svgEl('circle', { cx: 300, cy: 110, r: 34, fill: 'none', stroke: RULE, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    ring.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.1;0.16;1' }));
+    svg.appendChild(ring);
+    svg.appendChild(txt(300, 62, 'cosine radius', MUTE, 7));
+    svg.appendChild(pop(300, 110, D, '0;0.06;0.14;1', [svgEl('circle', { r: 6, fill: BP })]));
+    var dup = svgEl('circle', { cx: 322, cy: 122, r: 6, fill: WARN });
+    dup.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.38;0.44;0.52;0.58;1' }));
+    svg.appendChild(dup);
+    var dx = txt(338, 126, '✗ near-dup', WARN, 8, 'start');
+    dx.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.4;0.46;0.54;0.6;1' }));
+    svg.appendChild(dx);
+    svg.appendChild(pop(396, 88, D, '0;0.62;0.72;1', [svgEl('circle', { r: 6, fill: BP })]));
+    svg.appendChild(pop(444, 152, D, '0;0.8;0.9;1', [svgEl('circle', { r: 6, fill: BP })]));
+    var qx = [300, 360, 420], ql = ['h1 .91', 'h2 .84', 'h3 .77'], qk = ['0;0.16;0.26;1', '0;0.72;0.82;1', '0;0.9;0.98;1'];
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(pop(qx[i], 216, D, qk[i], [
+        svgEl('rect', { x: -26, y: -10, width: 52, height: 20, rx: 3, fill: BG, stroke: BP, 'stroke-width': '1.4' }),
+        txt(0, 4, ql[i], BP, 8)
+      ]));
+    }
+    svg.appendChild(txt(262, 220, 'queue', MUTE, 8, 'end'));
+    card(host, 'HYPOTHESIS GENERATOR', 'ramp · filter · rank',
+      svg,
+      'One pass through the sampler yields one hypothesis; the loop wants a ranked queue with depth. Each pass raises the temperature a notch so the next draft wanders further from the last, and an embedding filter rejects anything that lands inside the cosine radius of a survivor. What remains is scored on novelty, specificity, and testability, and because every step is seeded, the same seed always rebuilds the same queue.');
+  }
+
+  // ── 51: literature retrieval — lexical hits plus citation hops, one union ──
+  function citationHops(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 260' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'lexical pass + graph pass · union deduped by id', MUTE, 10));
+    svg.appendChild(svgEl('rect', { x: 32, y: 30, width: 130, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(97, 47, '"sparse attention"', BP, 8));
+    svg.appendChild(txt(32, 74, 'BM25 over abstracts', MUTE, 8, 'start'));
+    var hits = ['p003 · 0.81', 'p007 · 0.66', 'p011 · 0.54'], i;
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(pop(97, 95 + i * 32, D, '0;' + (0.08 + i * 0.07).toFixed(2) + ';' + (0.2 + i * 0.07).toFixed(2) + ';1', [
+        svgEl('rect', { x: -65, y: -12, width: 130, height: 24, rx: 3, fill: SURF, stroke: RULE, 'stroke-width': '1.2' }),
+        txt(0, 4, hits[i], SOFT, 8)
+      ]));
+    }
+    svg.appendChild(txt(390, 40, 'seed from known anchor', MUTE, 8));
+    var nodes = [[350, 74, 'p007', BP], [296, 132, 'p015', SOFT], [412, 126, 'p019', SOFT], [452, 180, 'p021', SOFT]];
+    var edges = [[350, 74, 296, 132, 0.3], [350, 74, 412, 126, 0.36], [412, 126, 452, 180, 0.48]];
+    for (i = 0; i < 3; i++) {
+      var e = svgEl('line', { x1: edges[i][0], y1: edges[i][1], x2: edges[i][2], y2: edges[i][3], stroke: BP, 'stroke-width': '1.4', 'stroke-dasharray': '4 4' });
+      e.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;' + edges[i][4] + ';' + (edges[i][4] + 0.08).toFixed(2) + ';1' }));
+      svg.appendChild(e);
+    }
+    for (i = 0; i < 4; i++) {
+      var kt = i === 0 ? '0;0.22;0.32;1' : '0;' + (0.3 + i * 0.09).toFixed(2) + ';' + (0.42 + i * 0.09).toFixed(2) + ';1';
+      svg.appendChild(pop(nodes[i][0], nodes[i][1], D, kt, [
+        svgEl('circle', { r: 15, fill: BG, stroke: nodes[i][3] === BP ? BP : RULE, 'stroke-width': nodes[i][3] === BP ? '2' : '1.4' }),
+        txt(0, 3, nodes[i][2], nodes[i][3], 8)
+      ]));
+    }
+    svg.appendChild(txt(268, 152, 'hop 1', MUTE, 7));
+    svg.appendChild(txt(448, 150, 'hop 2', MUTE, 7));
+    var f1 = svgEl('path', { d: 'M97 200 V 216 H 180', fill: 'none', stroke: RULE, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    f1.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.56;0.62;1' }));
+    svg.appendChild(f1);
+    var f2 = svgEl('path', { d: 'M390 200 V 216 H 344', fill: 'none', stroke: RULE, 'stroke-width': '1.4', 'stroke-dasharray': '5 4' });
+    f2.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.56;0.62;1' }));
+    svg.appendChild(f2);
+    svg.appendChild(pop(262, 227, D, '0;0.64;0.76;1', [
+      svgEl('rect', { x: -110, y: -13, width: 220, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.8' }),
+      txt(0, 4, 'ranked: p007 p003 p019 p015 p011 p021', BP, 7)
+    ]));
+    var dd = txt(384, 231, 'p007 kept once', SOFT, 8, 'start');
+    dd.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: '0;0.78;0.86;1' }));
+    svg.appendChild(dd);
+    card(host, 'LITERATURE RETRIEVAL', 'BM25 + citation walk',
+      svg,
+      'BM25 over abstracts returns the papers that share vocabulary with the query, and misses the foundational work that named the idea differently. The second pass starts from a known anchor and walks the citation graph a hop or two in each direction, surfacing follow-ups no keyword would catch. The two hit sets union, deduplicate on stable paper id, and rank, so the anchor that appeared in both passes is counted once.');
+  }
+
+  // ── 52: experiment runner — two meters on the child, one kill path ─────────
+  function runnerLimits(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var D = '6s';
+    svg.appendChild(txt(260, 16, 'run A completes · run B trips the cap', MUTE, 10));
+    var spec = svgEl('g', {});
+    spec.appendChild(svgEl('rect', { x: 28, y: 96, width: 100, height: 40, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    spec.appendChild(txt(78, 112, 'ExperimentSpec', BP, 8));
+    spec.appendChild(txt(78, 126, 'seed 1234', MUTE, 7));
+    spec.appendChild(animT('translate', '-24 0;0 0;0 0', D, { keyTimes: '0;0.08;1', calcMode: 'spline', keySplines: SPL + ';' + SPL }));
+    spec.appendChild(anim('opacity', '0;1;1', D, { keyTimes: '0;0.08;1' }));
+    svg.appendChild(spec);
+    svg.appendChild(svgEl('rect', { x: 190, y: 80, width: 150, height: 80, rx: 6, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(265, 108, 'subprocess', BP, 10));
+    svg.appendChild(txt(265, 122, 'own address space', MUTE, 7));
+    svg.appendChild(txt(190, 54, 'wall clock', MUTE, 7, 'start'));
+    svg.appendChild(svgEl('rect', { x: 190, y: 60, width: 150, height: 10, rx: 2, fill: 'none', stroke: MUTE, 'stroke-width': '1.2' }));
+    var clk = svgEl('rect', { x: 191, y: 61, width: 0, height: 8, rx: 2, fill: BP, opacity: '0.6' });
+    clk.appendChild(anim('width', '0;0;100;100;0;0;120;120', D, { keyTimes: '0;0.06;0.36;0.44;0.5;0.52;0.82;1' }));
+    svg.appendChild(clk);
+    svg.appendChild(svgEl('rect', { x: 352, y: 80, width: 12, height: 80, rx: 2, fill: 'none', stroke: MUTE, 'stroke-width': '1.2' }));
+    var mem = svgEl('rect', { x: 353, y: 160, width: 10, height: 0, fill: WARN, opacity: '0.55' });
+    mem.appendChild(anim('height', '0;0;24;24;0;0;76;76', D, { keyTimes: '0;0.06;0.36;0.44;0.5;0.52;0.82;1' }));
+    mem.appendChild(anim('y', '160;160;136;136;160;160;84;84', D, { keyTimes: '0;0.06;0.36;0.44;0.5;0.52;0.82;1' }));
+    svg.appendChild(mem);
+    svg.appendChild(svgEl('line', { x1: 348, y1: 104, x2: 370, y2: 104, stroke: WARN, 'stroke-width': '1.6', 'stroke-dasharray': '3 3' }));
+    svg.appendChild(txt(374, 107, 'mem cap', MUTE, 7, 'start'));
+    var kill = txt(265, 144, 'SIGKILL · mem cap', WARN, 9);
+    kill.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.8;0.84;0.94;0.98;1' }));
+    svg.appendChild(kill);
+    var blob = svgEl('g', { transform: 'translate(432 100)' });
+    var bi = svgEl('g', {}, [
+      svgEl('rect', { x: -44, y: -16, width: 88, height: 32, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' }),
+      txt(0, -2, 'metrics blob', BP, 8),
+      txt(0, 11, '{"ppl": 31.4}', SOFT, 7)
+    ]);
+    bi.appendChild(anim('opacity', '0;0;1;1;0;0', D, { keyTimes: '0;0.36;0.44;0.52;0.58;1' }));
+    bi.appendChild(animT('scale', '0.95;0.95;1;1;1;1', D, { keyTimes: '0;0.36;0.44;0.52;0.58;1', calcMode: 'spline', keySplines: SPL3 + ';' + SPL + ';' + SPL }));
+    blob.appendChild(bi);
+    svg.appendChild(blob);
+    svg.appendChild(pop(212, 209, D, '0;0.4;0.5;1', [
+      svgEl('rect', { x: -62, y: -13, width: 124, height: 26, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6' }),
+      txt(0, 4, 'exp_001 · ok · 3.1s', BP, 8)
+    ]));
+    svg.appendChild(pop(360, 209, D, '0;0.86;0.96;1', [
+      svgEl('rect', { x: -62, y: -13, width: 124, height: 26, rx: 4, fill: BG, stroke: WARN, 'stroke-width': '1.6' }),
+      txt(0, 4, 'exp_002 · oom-kill', WARN, 8)
+    ]));
+    svg.appendChild(txt(142, 213, 'results', MUTE, 8, 'end'));
+    card(host, 'EXPERIMENT RUNNER', 'timeout · mem cap · blob',
+      svg,
+      'The runner serialises the spec to a child process and watches two meters: a hard wall-clock timeout and a polled memory cap. Run A stays under both, exits cleanly, and its stdout carries a structured metrics blob into the result record. Run B grows past the cap and takes the kill path; the record says oom instead of pretending a number exists. Same seed, same spec, same numbers on every rerun.');
+  }
+
+  // ── 53: result evaluator — per-seed differences carry the verdict ──────────
+  function pairedVerdict(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var D = '5s';
+    svg.appendChild(txt(260, 16, 'pair each seed with itself · test the differences', MUTE, 10));
+    var baseH = [64, 58, 70, 61], candH = [52, 49, 60, 50], i;
+    for (i = 0; i < 4; i++) {
+      var x = 44 + i * 58, kt = '0;' + (0.06 + i * 0.05).toFixed(2) + ';' + (0.22 + i * 0.05).toFixed(2) + ';1';
+      var b = svgEl('rect', { x: x, y: 170, width: 14, height: 0, fill: MUTE, opacity: '0.55' });
+      b.appendChild(anim('height', '0;0;' + baseH[i] + ';' + baseH[i], D, { keyTimes: kt, calcMode: 'spline', keySplines: SPL3 }));
+      b.appendChild(anim('y', '170;170;' + (170 - baseH[i]) + ';' + (170 - baseH[i]), D, { keyTimes: kt, calcMode: 'spline', keySplines: SPL3 }));
+      svg.appendChild(b);
+      var c = svgEl('rect', { x: x + 17, y: 170, width: 14, height: 0, fill: BP, opacity: '0.75' });
+      c.appendChild(anim('height', '0;0;' + candH[i] + ';' + candH[i], D, { keyTimes: kt, calcMode: 'spline', keySplines: SPL3 }));
+      c.appendChild(anim('y', '170;170;' + (170 - candH[i]) + ';' + (170 - candH[i]), D, { keyTimes: kt, calcMode: 'spline', keySplines: SPL3 }));
+      svg.appendChild(c);
+      svg.appendChild(txt(x + 15, 184, 's' + i, MUTE, 8));
+    }
+    svg.appendChild(txt(60, 200, 'grey base · blue candidate ppl', MUTE, 7, 'start'));
+    svg.appendChild(svgEl('line', { x1: 300, y1: 150, x2: 494, y2: 150, stroke: SOFT, 'stroke-width': '1.4' }));
+    svg.appendChild(svgEl('line', { x1: 330, y1: 144, x2: 330, y2: 156, stroke: SOFT, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(330, 168, '0', MUTE, 8));
+    svg.appendChild(txt(494, 168, 'Δ ppl', MUTE, 7, 'end'));
+    var band = svgEl('rect', { x: 316, y: 122, width: 28, height: 44, fill: WARN });
+    band.appendChild(anim('opacity', '0;0;0.15;0.15', D, { keyTimes: '0;0.58;0.68;1' }));
+    svg.appendChild(band);
+    svg.appendChild(txt(330, 116, 'noise floor', MUTE, 7));
+    var dxv = [426, 402, 410, 418], dyv = [144, 136, 140, 132];
+    for (i = 0; i < 4; i++) {
+      var dot = svgEl('circle', { r: 4, fill: BP });
+      var kt2 = '0;' + (0.3 + i * 0.06).toFixed(2) + ';' + (0.45 + i * 0.06).toFixed(2) + ';1';
+      dot.appendChild(anim('cx', (61 + i * 58) + ';' + (61 + i * 58) + ';' + dxv[i] + ';' + dxv[i], D, { keyTimes: kt2, calcMode: 'spline', keySplines: SPL3 }));
+      dot.appendChild(anim('cy', (166 - candH[i]) + ';' + (166 - candH[i]) + ';' + dyv[i] + ';' + dyv[i], D, { keyTimes: kt2, calcMode: 'spline', keySplines: SPL3 }));
+      dot.appendChild(anim('opacity', '0;0;1;1', D, { keyTimes: kt2 }));
+      svg.appendChild(dot);
+    }
+    svg.appendChild(pop(414, 122, D, '0;0.68;0.78;1', [
+      svgEl('polygon', { points: '0,-6 6,0 0,6 -6,0', fill: BP }),
+      txt(0, -12, 'mean Δ', BP, 8)
+    ]));
+    svg.appendChild(pop(396, 216, D, '0;0.8;0.9;1', [
+      svgEl('rect', { x: -100, y: -15, width: 200, height: 30, rx: 5, fill: BG, stroke: BP, 'stroke-width': '2' }),
+      txt(0, 4, 'improvement · t 5.9 · p < 0.01', BP, 9)
+    ]));
+    card(host, 'RESULT EVALUATOR', 'paired diffs · t test · verdict',
+      svg,
+      'One run per configuration proves nothing; the same spec with a new seed lands on a different number. The evaluator pairs each seed with itself, candidate against baseline, and lets the per-seed differences testify. Their mean is the effect, their spread is the noise floor, and a from-scratch paired t test says whether the mean stands clear of it. The verdict attaches back to the hypothesis queue, and identical inputs always produce the identical verdict.');
+  }
+
+  LF.register({
+    'cg-plan-replan': planReplan,
+    'cg-gate-chain': gateChain,
+    'cg-path-jail': pathJail,
+    'cg-harness-weave': harnessWeave,
+    'cg-eval-quadrant': evalQuadrant,
+    'cg-allreduce-ring': allreduceRing,
+    'cg-novelty-ramp': noveltyRamp,
+    'cg-citation-hops': citationHops,
+    'cg-runner-limits': runnerLimits,
+    'cg-paired-verdict': pairedVerdict
+  });
+})();
+
+/* module figures-capstone-h.js (Part 6) */
+/* figures-capstone-h.js - animated lesson figures for Phase 19 capstone
+   projects (paper writer, critic loop, iteration scheduler, research demo,
+   vision patches, ViT encoder, projection alignment, cross-attention,
+   vision-language pretraining, multimodal eval).
+   Loads after lesson-figures.js, registers through window.LF. SMIL motion
+   only - no JS loops, no rAF. ES5, no deps, theme via CSS vars. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var svgEl = LF.svgEl, el = LF.el;
+
+  var EASE = '0.23 1 0.32 1';
+  var SPL4 = '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1';
+
+  function svg(h) { return svgEl('svg', { viewBox: '0 0 520 ' + h }); }
+  function shell(host, label, sub, node, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [node])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '11', fill: fill || 'var(--ink,#1a1a1a)' });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function rect(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: '4', fill: fill || 'var(--bg-surface,#eee)', stroke: stroke || 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' });
+  }
+  // fade+grow entry from opacity 0 and 95% size; a..b is the entry phase
+  // window, exit runs 0.94..1 which is faster than any entry window here.
+  function entry(cx, cy, dur, begin, a, b) {
+    a = a || 0.02; b = b || 0.12;
+    var kt = '0;' + a + ';' + b + ';0.94;1';
+    var g = svgEl('g', { transform: 'translate(' + cx + ' ' + cy + ')', opacity: '0' });
+    g.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'scale', additive: 'sum', values: '0.95;0.95;1;1;0.97', keyTimes: kt, calcMode: 'spline', keySplines: SPL4, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' }));
+    g.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: kt, calcMode: 'spline', keySplines: SPL4, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' }));
+    return g;
+  }
+
+  // ── ch-paper-skeleton (54): slots declared as data, prose ink arrives later ──
+  function chPaper(host) {
+    var s = svg(250), px = 40, py = 24, pw = 170;
+    s.appendChild(svgEl('rect', { x: px, y: py, width: pw, height: 208, rx: '3', fill: 'var(--bg,#fafaf5)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4' }));
+    var slots = [
+      [py + 12, 22, 'abstract'],
+      [py + 42, 26, 'sec: intro'],
+      [py + 76, 26, 'sec: method'],
+      [py + 110, 38, 'fig slot: results.png'],
+      [py + 156, 24, 'bib: 3 keys']
+    ];
+    var i;
+    for (i = 0; i < slots.length; i++) {
+      var sy = slots[i][0], sh = slots[i][1];
+      s.appendChild(svgEl('rect', { x: px + 10, y: sy, width: pw - 20, height: sh, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+      s.appendChild(txt(px + 16, sy + 12, slots[i][2], '8', 'var(--ink-mute,#777)', 'start'));
+      var g = entry(px + pw / 2, sy + sh - 7, '5s', (1.6 + i * 0.25).toFixed(2) + 's');
+      g.appendChild(svgEl('rect', { x: -(pw / 2 - 14), y: -3.5, width: pw - 28, height: 7, rx: '2', fill: 'var(--blueprint,#3553ff)', opacity: '0.55' }));
+      s.appendChild(g);
+    }
+    var vx = 262;
+    s.appendChild(txt(vx, 44, 'validate before prose:', '10', 'var(--ink-soft,#555)', 'start'));
+    var checks = ['every figure has a slot', 'every cite has an entry', 'every section in TOC'];
+    for (i = 0; i < checks.length; i++) {
+      var cg = entry(vx + 110, 66 + i * 24, '5s', (0.2 + i * 0.2).toFixed(2) + 's');
+      cg.appendChild(txt(-110, 3, 'ok', '9', 'var(--blueprint,#3553ff)', 'start'));
+      cg.appendChild(txt(-86, 3, checks[i], '9', 'var(--ink,#1a1a1a)', 'start'));
+      s.appendChild(cg);
+    }
+    s.appendChild(txt(vx, 168, 'then prose fills the slots,', '9', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(vx, 182, 'one section at a time', '9', 'var(--ink-mute,#777)', 'start'));
+    shell(host, 'PAPER SKELETON', 'structure first, prose second', s,
+      'The skeleton declares sections, figure slots, and bibliography keys as data before any prose exists. The harness validates that contract first: every referenced figure has a slot, every citation has an entry, every section lands in the table of contents. Only then does the generator write prose into each slot, so structural debt never accumulates.');
+  }
+
+  // ── ch-critic-converge (55): five score trajectories settle into the target band ─
+  function chCritic(host) {
+    var s = svg(250), Y0 = 200, X = [110, 210, 310, 410];
+    s.appendChild(svgEl('line', { x1: 70, y1: 40, x2: 70, y2: Y0, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    s.appendChild(svgEl('line', { x1: 70, y1: Y0, x2: 452, y2: Y0, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    s.appendChild(svgEl('rect', { x: 70, y: 65, width: 382, height: 16, fill: 'var(--blueprint,#3553ff)', opacity: '0.08' }));
+    s.appendChild(txt(448, 61, 'target 8+', '8', 'var(--blueprint,#3553ff)', 'end'));
+    var i;
+    for (i = 0; i < 4; i++) {
+      s.appendChild(svgEl('line', { x1: X[i], y1: 48, x2: X[i], y2: Y0, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '0.6' }));
+      s.appendChild(txt(X[i], Y0 + 16, 'round ' + (i + 1), '8', 'var(--ink-mute,#777)'));
+    }
+    var dims = [
+      ['clarity', [4, 6, 8, 8.4]],
+      ['novelty', [3, 5, 7, 8.2]],
+      ['evidence', [5, 6.5, 7.8, 8.3]],
+      ['methodology', [4.5, 7, 8.1, 8.3]],
+      ['related-work', [2.5, 5, 7.4, 8.1]]
+    ];
+    for (i = 0; i < dims.length; i++) {
+      var sc = dims[i][1], ys = [];
+      for (var j = 0; j < 4; j++) { ys.push(Y0 - sc[j] * 15); }
+      var dot = svgEl('circle', { cx: X[0], cy: ys[0], r: '4.5', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+      dot.appendChild(svgEl('animate', { attributeName: 'cx', values: X[0] + ';' + X[1] + ';' + X[2] + ';' + X[3] + ';' + X[3], keyTimes: '0;0.26;0.52;0.78;1', calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';0 0 1 1', dur: '5.2s', begin: (i * 0.1).toFixed(1) + 's', repeatCount: 'indefinite' }));
+      dot.appendChild(svgEl('animate', { attributeName: 'cy', values: ys[0] + ';' + ys[1] + ';' + ys[2] + ';' + ys[3] + ';' + ys[3], keyTimes: '0;0.26;0.52;0.78;1', calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';0 0 1 1', dur: '5.2s', begin: (i * 0.1).toFixed(1) + 's', repeatCount: 'indefinite' }));
+      dot.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.07;0.96;1', dur: '5.2s', begin: (i * 0.1).toFixed(1) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(dot);
+      s.appendChild(txt(100, ys[0] + 3, dims[i][0], '8', 'var(--ink-mute,#777)', 'end'));
+    }
+    var badge = txt(260, 34, 'plateau detected: stop', '9', 'var(--warn,#b8870f)');
+    badge.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: '0;0.78;0.84;0.96;1', dur: '5.2s', repeatCount: 'indefinite' }));
+    s.appendChild(badge);
+    shell(host, 'CRITIC LOOP', 'five dimensions converge or stop', s,
+      'Each round the critic returns a five-dimension score vector, the revision applies as a structured diff, and the trajectories climb toward the target band. Convergence is engineered, not hoped for: the loop stops on plateau, on target met, or on budget exhausted, and a dimension that regresses is caught because the score is a vector, not a paragraph.');
+  }
+
+  // ── ch-ucb-scheduler (56): hypothesis queue feeds slots, results loop back, low UCB pruned ─
+  function chScheduler(host) {
+    var s = svg(250), qx = 36, qw = 110, sx = 220, sw = 100, ys = [58, 104, 150];
+    s.appendChild(txt(qx, 44, 'hypothesis queue', '9', 'var(--ink-soft,#555)', 'start'));
+    s.appendChild(txt(sx, 44, 'slots (parallel)', '9', 'var(--ink-soft,#555)', 'start'));
+    var chips = [['h0', 'ucb 1.9'], ['h1', 'ucb 1.4'], ['h2', 'ucb 0.6']];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var cg = svgEl('g', {});
+      cg.appendChild(rect(qx, ys[i], qw, 32, 'var(--bg-surface,#eee)', i === 2 ? 'var(--rule-soft,#ddd)' : 'var(--blueprint,#3553ff)'));
+      cg.appendChild(txt(qx + 12, ys[i] + 20, chips[i][0], '10', 'var(--ink,#1a1a1a)', 'start'));
+      cg.appendChild(txt(qx + qw - 10, ys[i] + 20, chips[i][1], '8', i === 2 ? 'var(--warn,#b8870f)' : 'var(--blueprint,#3553ff)', 'end'));
+      if (i === 2) {
+        cg.appendChild(svgEl('animate', { attributeName: 'opacity', values: '1;1;0.15;0.15', keyTimes: '0;0.55;0.61;1', calcMode: 'spline', keySplines: '0 0 1 1;0.4 0 1 1;0 0 1 1', dur: '4.8s', repeatCount: 'indefinite' }));
+      }
+      s.appendChild(cg);
+      s.appendChild(rect(sx, ys[i], sw, 32, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(sx + sw / 2, ys[i] + 20, 'slot ' + i, '9', 'var(--ink-mute,#777)'));
+    }
+    var pr = txt(qx + qw + 8, ys[2] + 20, 'pruned', '8', 'var(--warn,#b8870f)', 'start');
+    pr.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1', keyTimes: '0;0.58;0.64;1', dur: '4.8s', repeatCount: 'indefinite' }));
+    s.appendChild(pr);
+    s.appendChild(svgEl('line', { x1: 392, y1: 58, x2: 392, y2: 182, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.4' }));
+    s.appendChild(txt(392, 200, 'result bus', '9', 'var(--ink-soft,#555)'));
+    var arc = 'M 392 58 C 392 16, 140 16, 140 54';
+    s.appendChild(svgEl('path', { d: arc, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2', 'stroke-dasharray': '4 4' }));
+    for (i = 0; i < 2; i++) {
+      var d = svgEl('circle', { cx: qx + qw, cy: ys[i] + 16, r: '4', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+      d.appendChild(svgEl('animate', { attributeName: 'cx', values: (qx + qw) + ';' + (qx + qw) + ';' + sx + ';' + sx, keyTimes: '0;0.04;0.24;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4.8s', begin: (i * 0.3).toFixed(1) + 's', repeatCount: 'indefinite' }));
+      d.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0;0', keyTimes: '0;0.06;0.24;0.3;1', dur: '4.8s', begin: (i * 0.3).toFixed(1) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(d);
+    }
+    var res = svgEl('circle', { r: '4', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    res.appendChild(svgEl('animateMotion', { path: 'M 320 74 L 392 74 L 392 58 C 392 16, 140 16, 140 54', keyPoints: '0;0;1;1', keyTimes: '0;0.4;0.8;1', calcMode: 'linear', dur: '4.8s', repeatCount: 'indefinite' }));
+    res.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0;0', keyTimes: '0;0.4;0.46;0.78;0.82;1', dur: '4.8s', repeatCount: 'indefinite' }));
+    s.appendChild(res);
+    s.appendChild(txt(240, 232, 'result updates UCB, reorders the queue', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'UCB SCHEDULER', 'explore, exploit, prune', s,
+      'The queue holds hypotheses scored by upper confidence bound. When a slot frees, the scheduler dispatches the highest-UCB branch; finished experiments fan onto the result bus and loop back to update the statistics, so a finding from one experiment reorders everything behind it. A branch whose bound collapses is pruned instead of burning a slot.');
+  }
+
+  // ── ch-research-pipeline (57): a baton crosses five stages through contract gates ─
+  function chPipeline(host) {
+    var s = svg(220), names = ['seed', 'scheduler', 'runner', 'critic', 'writer'];
+    var i, bx = [20, 124, 228, 332, 436], cy = 120;
+    for (i = 0; i < 5; i++) {
+      s.appendChild(rect(bx[i], 86, 76, 44, 'var(--bg-surface,#eee)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(bx[i] + 38, 103, names[i], '10', 'var(--ink,#1a1a1a)'));
+    }
+    s.appendChild(svgEl('line', { x1: 58, y1: cy, x2: 474, y2: cy, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '0.6' }));
+    for (i = 0; i < 4; i++) {
+      var gx = 110 + i * 104;
+      var gate = svgEl('rect', { x: gx - 5, y: cy - 5, width: 10, height: 10, fill: 'var(--bg,#fafaf5)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4', transform: 'rotate(45 ' + gx + ' ' + cy + ')', opacity: '0.3' });
+      var p = (0.14 + i * 0.22).toFixed(2), p2 = (0.18 + i * 0.22).toFixed(2);
+      gate.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.3;0.3;1;1', keyTimes: '0;' + p + ';' + p2 + ';1', dur: '5.2s', repeatCount: 'indefinite' }));
+      s.appendChild(gate);
+    }
+    s.appendChild(txt(110, 148, 'contract gates: broken input stops the run', '8', 'var(--ink-mute,#777)', 'start'));
+    var baton = svgEl('circle', { cx: 58, cy: cy, r: '5', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    baton.appendChild(svgEl('animate', { attributeName: 'cx', values: '58;162;266;370;474;474', keyTimes: '0;0.22;0.44;0.66;0.88;1', calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';' + EASE + ';0 0 1 1', dur: '5.2s', repeatCount: 'indefinite' }));
+    baton.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.04;0.95;1', dur: '5.2s', repeatCount: 'indefinite' }));
+    s.appendChild(baton);
+    var rep = entry(474, 52, '5.2s', '0s', 0.86, 0.92);
+    rep.appendChild(svgEl('rect', { x: -34, y: -16, width: 68, height: 30, rx: '3', fill: 'var(--bg,#fafaf5)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4' }));
+    rep.appendChild(txt(0, 3, 'report', '9', 'var(--blueprint,#3553ff)'));
+    s.appendChild(rep);
+    s.appendChild(txt(20, 40, 'plain Python imports, no framework', '9', 'var(--ink-soft,#555)', 'start'));
+    shell(host, 'RESEARCH DEMO', 'five contracts must compose', s,
+      'The demo threads one run through every stage built in the earlier Track D lessons: seed hypotheses, the UCB scheduler, the experiment runner, the critic loop, the paper writer. Each hand-off passes a contract gate that validates the shape before the next stage runs, and the loop self-terminates into a single demo report. If any contract leaks, this is the lesson that catches it.');
+  }
+
+  // ── ch-patch-tokenizer (58): a pixel grid is cut into a strip of tokens ──────
+  function chPatches(host) {
+    var s = svg(250), gx = 40, gy = 54, c = 24, p = 26;
+    s.appendChild(txt(gx, 40, '224x224 image, 16x16 patches', '9', 'var(--ink-soft,#555)', 'start'));
+    var i, j;
+    for (i = 0; i < 4; i++) {
+      for (j = 0; j < 4; j++) {
+        var hot = (i === 1 && j === 2);
+        s.appendChild(svgEl('rect', { x: gx + j * p, y: gy + i * p, width: c, height: c, fill: hot ? 'var(--bg-surface,#eee)' : 'var(--bg,#fafaf5)', stroke: hot ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ddd)', 'stroke-width': hot ? '1.6' : '1' }));
+      }
+    }
+    var fx = gx + 2 * p, fy = gy + p, tx = 250 + 2 * 24, ty = 186;
+    var fly = svgEl('rect', { x: fx, y: fy, width: c, height: c, fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6', opacity: '0' });
+    fly.appendChild(svgEl('animate', { attributeName: 'x', values: fx + ';' + fx + ';' + tx + ';' + tx, keyTimes: '0;0.1;0.5;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4s', repeatCount: 'indefinite' }));
+    fly.appendChild(svgEl('animate', { attributeName: 'y', values: fy + ';' + fy + ';' + (ty - 2) + ';' + (ty - 2), keyTimes: '0;0.1;0.5;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4s', repeatCount: 'indefinite' }));
+    fly.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0;0', keyTimes: '0;0.1;0.52;0.58;1', dur: '4s', repeatCount: 'indefinite' }));
+    s.appendChild(fly);
+    s.appendChild(txt(232, 130, 'flatten (768) + one linear layer', '9', 'var(--ink-soft,#555)', 'start'));
+    s.appendChild(txt(228, 178, '+CLS', '8', 'var(--ink-mute,#777)', 'end'));
+    for (i = 0; i < 8; i++) {
+      var sq = svgEl('rect', { x: 250 + i * 24, y: ty, width: 20, height: 20, fill: 'var(--bg-surface,#eee)', stroke: i === 2 ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ddd)', 'stroke-width': '1.2', opacity: '0.3' });
+      var q = (0.5 + i * 0.05).toFixed(2), q2 = (0.55 + i * 0.05).toFixed(2);
+      sq.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.3;0.3;1;1', keyTimes: '0;' + q + ';' + q2 + ';1', dur: '4s', repeatCount: 'indefinite' }));
+      s.appendChild(sq);
+    }
+    s.appendChild(txt(345, 168, '196 tokens of dim 768', '9', 'var(--ink,#1a1a1a)'));
+    s.appendChild(svgEl('path', { d: 'M 250 226 q 12 -10 24 0 t 24 0 t 24 0 t 24 0 t 24 0 t 24 0 t 24 0 t 24 0', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.2', opacity: '0.6' }));
+    s.appendChild(txt(345, 244, '+ 2D sinusoidal position', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'PATCH EMBEDDING', 'a tokenizer for pixels', s,
+      'Reading every pixel as a token gives a 150,528-token sequence no 12-layer transformer can afford. Cutting the image into 16x16 squares gives 196 patches; each is flattened to 768 values and projected through one linear layer into the hidden dimension, and a 2D sinusoidal signal restores where each square sat. The transformer sees a short sequence it can chew on.');
+  }
+
+  // ── ch-cls-funnel (59): patch pulses rise through the block stack into CLS ───
+  function chVit(host) {
+    var s = svg(260), cx = 260, cy = 62;
+    var bands = [[160, 'block 1'], [124, '...'], [88, 'block 12']];
+    var i;
+    for (i = 0; i < 3; i++) {
+      s.appendChild(svgEl('rect', { x: 110, y: bands[i][0], width: 300, height: 26, rx: '3', fill: 'var(--bg-surface,#eee)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1', opacity: '0.55' }));
+      s.appendChild(txt(420, bands[i][0] + 17, bands[i][1], '8', 'var(--ink-mute,#777)', 'start'));
+    }
+    var toks = [136, 180, 224, 268, 312, 356];
+    for (i = 0; i < 6; i++) {
+      s.appendChild(svgEl('rect', { x: toks[i], y: 212, width: 18, height: 18, rx: '2', fill: 'var(--bg,#fafaf5)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2' }));
+      s.appendChild(svgEl('line', { x1: toks[i] + 9, y1: 212, x2: cx, y2: cy + 12, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '0.6' }));
+    }
+    var send = [0, 2, 3, 5];
+    for (i = 0; i < 4; i++) {
+      var sx = toks[send[i]] + 9;
+      var d = svgEl('circle', { cx: sx, cy: 212, r: '3.5', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+      d.appendChild(svgEl('animate', { attributeName: 'cx', values: sx + ';' + cx, keyTimes: '0;1', calcMode: 'spline', keySplines: EASE, dur: '3.4s', begin: (i * 0.15).toFixed(2) + 's', repeatCount: 'indefinite' }));
+      d.appendChild(svgEl('animate', { attributeName: 'cy', values: '212;' + (cy + 14), keyTimes: '0;1', calcMode: 'spline', keySplines: EASE, dur: '3.4s', begin: (i * 0.15).toFixed(2) + 's', repeatCount: 'indefinite' }));
+      d.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;0', keyTimes: '0;0.12;0.9;1', dur: '3.4s', begin: (i * 0.15).toFixed(2) + 's', repeatCount: 'indefinite' }));
+      s.appendChild(d);
+    }
+    s.appendChild(svgEl('circle', { cx: cx, cy: cy, r: '13', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6' }));
+    s.appendChild(txt(cx, cy + 3, 'CLS', '9', 'var(--blueprint,#3553ff)'));
+    var ring = svgEl('circle', { cx: cx, cy: cy, r: '13', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6' });
+    ring.appendChild(svgEl('animate', { attributeName: 'r', values: '13;26', keyTimes: '0;1', calcMode: 'spline', keySplines: EASE, dur: '3.4s', begin: '0.7s', repeatCount: 'indefinite' }));
+    ring.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.6;0', keyTimes: '0;1', dur: '3.4s', begin: '0.7s', repeatCount: 'indefinite' }));
+    s.appendChild(ring);
+    s.appendChild(txt(cx, 32, 'CLS pools the whole image', '9', 'var(--ink-soft,#555)'));
+    s.appendChild(txt(cx, 250, '12 pre-LN blocks x 12 heads, GELU, 4x FFN', '9', 'var(--ink-mute,#777)'));
+    shell(host, 'ViT ENCODER', 'attention builds awareness', s,
+      'Patch tokens enter with no awareness of each other. Twelve pre-LN blocks of multi-head self-attention let every patch exchange information with every other, and the CLS token accumulates whole-image features layer by layer; its final hidden state is the pooled summary the rest of the stack reads. This block recipe is the spine of CLIP, SigLIP, and DINOv2.');
+  }
+
+  // ── ch-projection-bridge (60): an image vector crosses the MLP into text space ─
+  function chProjection(host) {
+    var s = svg(250);
+    s.appendChild(svgEl('ellipse', { cx: 110, cy: 122, rx: 80, ry: 66, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2', 'stroke-dasharray': '4 4' }));
+    s.appendChild(svgEl('ellipse', { cx: 410, cy: 122, rx: 80, ry: 66, fill: 'none', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2', 'stroke-dasharray': '4 4' }));
+    s.appendChild(txt(110, 40, 'vision space (768d)', '9', 'var(--ink-soft,#555)'));
+    s.appendChild(txt(410, 40, 'text space (512d)', '9', 'var(--ink-soft,#555)'));
+    s.appendChild(txt(110, 202, 'frozen', '8', 'var(--ink-mute,#777)'));
+    s.appendChild(txt(410, 202, 'frozen', '8', 'var(--ink-mute,#777)'));
+    var pts = [[78, 96], [132, 88], [120, 152], [388, 150], [442, 140], [396, 96]];
+    var i;
+    for (i = 0; i < 6; i++) {
+      s.appendChild(svgEl('circle', { cx: pts[i][0], cy: pts[i][1], r: '3', fill: 'var(--ink-mute,#777)', opacity: '0.5' }));
+    }
+    s.appendChild(svgEl('circle', { cx: 86, cy: 128, r: '5', fill: 'var(--blueprint,#3553ff)' }));
+    s.appendChild(txt(86, 116, 'image CLS', '8', 'var(--ink,#1a1a1a)'));
+    s.appendChild(svgEl('circle', { cx: 434, cy: 102, r: '5', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6' }));
+    s.appendChild(txt(434, 84, 'caption', '8', 'var(--ink,#1a1a1a)'));
+    s.appendChild(rect(226, 92, 68, 74, 'var(--bg-surface,#eee)', 'var(--blueprint,#3553ff)'));
+    s.appendChild(txt(260, 108, 'linear', '8', 'var(--ink,#1a1a1a)'));
+    s.appendChild(txt(260, 122, 'GELU', '8', 'var(--ink,#1a1a1a)'));
+    s.appendChild(txt(260, 136, 'linear', '8', 'var(--ink,#1a1a1a)'));
+    s.appendChild(txt(260, 184, 'trains (1.3M params)', '8', 'var(--blueprint,#3553ff)'));
+    var mv = svgEl('circle', { cx: 86, cy: 128, r: '5', fill: 'var(--blueprint,#3553ff)', opacity: '0' });
+    mv.appendChild(svgEl('animate', { attributeName: 'cx', values: '86;86;260;424;424', keyTimes: '0;0.08;0.42;0.72;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';' + EASE + ';0 0 1 1', dur: '4.6s', repeatCount: 'indefinite' }));
+    mv.appendChild(svgEl('animate', { attributeName: 'cy', values: '128;128;152;106;106', keyTimes: '0;0.08;0.42;0.72;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';' + EASE + ';0 0 1 1', dur: '4.6s', repeatCount: 'indefinite' }));
+    mv.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;1;1;1;0', keyTimes: '0;0.08;0.72;0.95;1', dur: '4.6s', repeatCount: 'indefinite' }));
+    s.appendChild(mv);
+    var hit = svgEl('circle', { cx: 434, cy: 102, r: '5', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.4' });
+    hit.appendChild(svgEl('animate', { attributeName: 'r', values: '5;5;16', keyTimes: '0;0.72;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE, dur: '4.6s', repeatCount: 'indefinite' }));
+    hit.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0.5;0', keyTimes: '0;0.72;1', dur: '4.6s', repeatCount: 'indefinite' }));
+    s.appendChild(hit);
+    var cl = txt(410, 232, 'cosine loss pulls the pair together', '9', 'var(--warn,#b8870f)');
+    cl.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: '0;0.72;0.8;0.95;1', dur: '4.6s', repeatCount: 'indefinite' }));
+    s.appendChild(cl);
+    shell(host, 'MODALITY PROJECTION', 'a bridge between two spaces', s,
+      'The vision encoder and the text table live in unrelated bases. A two-layer MLP, about 1.3M parameters, carries the pooled image vector across into the text embedding space, and a cosine alignment loss against the paired caption pulls the projected point onto its partner. Encoder and text table stay frozen; the bridge is the only piece that learns.');
+  }
+
+  // ── ch-crossattn-fan (61): one text token fans queries across the image memory ─
+  function chCross(host) {
+    var s = svg(260), mts = [130, 176, 222, 268, 314, 360], my = 48;
+    s.appendChild(txt(260, 34, 'image memory tokens (computed once per image)', '9', 'var(--ink-soft,#555)'));
+    var i;
+    for (i = 0; i < 6; i++) {
+      s.appendChild(svgEl('rect', { x: mts[i], y: my, width: 26, height: 26, rx: '3', fill: 'var(--bg-surface,#eee)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1.2' }));
+    }
+    var words = ['a', 'cat', 'on', 'the', 'mat'], txs = [120, 176, 232, 288, 344], ty = 196;
+    for (i = 0; i < 5; i++) {
+      s.appendChild(rect(txs[i], ty, 44, 26, 'var(--bg,#fafaf5)', i === 2 ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(txs[i] + 22, ty + 17, words[i], '10', i === 2 ? 'var(--blueprint,#3553ff)' : 'var(--ink,#1a1a1a)'));
+      if (i < 4) {
+        s.appendChild(svgEl('line', { x1: txs[i] + 44, y1: ty + 13, x2: txs[i + 1], y2: ty + 13, stroke: 'var(--ink-mute,#777)', 'stroke-width': '1.2' }));
+      }
+    }
+    s.appendChild(txt(260, 244, 'causal self-attention: left to right only', '9', 'var(--ink-mute,#777)'));
+    var ax = txs[2] + 22;
+    for (i = 0; i < 6; i++) {
+      var fan = svgEl('line', { x1: ax, y1: ty, x2: mts[i] + 13, y2: my + 26, stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.2', opacity: '0' });
+      var f0 = (0.08 + i * 0.06).toFixed(2), f1 = (0.16 + i * 0.06).toFixed(2);
+      fan.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;0.75;0.75;0;0', keyTimes: '0;' + f0 + ';' + f1 + ';0.56;0.6;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1;0 0 1 1', dur: '3.8s', repeatCount: 'indefinite' }));
+      s.appendChild(fan);
+    }
+    s.appendChild(txt(392, 130, 'queries: no mask', '8', 'var(--blueprint,#3553ff)', 'start'));
+    var ans = svgEl('circle', { cx: mts[3] + 13, cy: my + 26, r: '4', fill: 'var(--warn,#b8870f)', opacity: '0' });
+    ans.appendChild(svgEl('animate', { attributeName: 'cx', values: (mts[3] + 13) + ';' + (mts[3] + 13) + ';' + ax + ';' + ax, keyTimes: '0;0.62;0.84;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '3.8s', repeatCount: 'indefinite' }));
+    ans.appendChild(svgEl('animate', { attributeName: 'cy', values: (my + 26) + ';' + (my + 26) + ';' + (ty - 4) + ';' + (ty - 4), keyTimes: '0;0.62;0.84;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '3.8s', repeatCount: 'indefinite' }));
+    ans.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: '0;0.6;0.66;0.86;1', dur: '3.8s', repeatCount: 'indefinite' }));
+    s.appendChild(ans);
+    shell(host, 'CROSS-ATTENTION', 'text asks, the image answers', s,
+      'In late fusion the decoder runs on text-only tokens and reaches into the image stream at every layer: the highlighted token sends a query to every memory token, unmasked, and the weighted answer flows back into its residual stream. Self-attention along the bottom row stays causal. The image side is encoded once and reused for every decode step, so long captions stay cheap.');
+  }
+
+  // ── ch-infonce-diagonal (62): matching pairs light the diagonal, both losses fall ─
+  function chInfoNCE(host) {
+    var s = svg(250), mx = 70, my = 60, pitch = 36;
+    s.appendChild(txt(mx + 2 * pitch, 46, 'captions', '9', 'var(--ink-soft,#555)'));
+    var lab = svgEl('text', { x: mx - 16, y: my + 2 * pitch, 'text-anchor': 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': '9', fill: 'var(--ink-soft,#555)', transform: 'rotate(-90 ' + (mx - 16) + ' ' + (my + 2 * pitch) + ')' });
+    lab.appendChild(document.createTextNode('images'));
+    s.appendChild(lab);
+    var off = svgEl('g', {});
+    var i, j;
+    for (i = 0; i < 4; i++) {
+      for (j = 0; j < 4; j++) {
+        if (i !== j) {
+          off.appendChild(svgEl('rect', { x: mx + j * pitch, y: my + i * pitch, width: 34, height: 34, rx: '2', fill: 'var(--bg-surface,#eee)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+        }
+      }
+    }
+    off.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0.9;0.9;0.3;0.3', keyTimes: '0;0.2;0.6;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4.4s', repeatCount: 'indefinite' }));
+    s.appendChild(off);
+    for (i = 0; i < 4; i++) {
+      var g = entry(mx + i * pitch + 17, my + i * pitch + 17, '4.4s', (0.2 + i * 0.18).toFixed(2) + 's', 0.02, 0.14);
+      g.appendChild(svgEl('rect', { x: -17, y: -17, width: 34, height: 34, rx: '2', fill: 'var(--blueprint,#3553ff)', opacity: '0.85' }));
+      s.appendChild(g);
+    }
+    s.appendChild(txt(mx + 2 * pitch, my + 4 * pitch + 18, 'N positives, N*N - N negatives', '8', 'var(--ink-mute,#777)'));
+    var x0 = 290, y1 = 190;
+    s.appendChild(svgEl('line', { x1: x0, y1: 70, x2: x0, y2: y1, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    s.appendChild(svgEl('line', { x1: x0, y1: y1, x2: 470, y2: y1, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    var c1 = svgEl('path', { d: 'M 292 88 Q 340 150 468 166', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.8', 'stroke-dasharray': '260', 'stroke-dashoffset': '260' });
+    c1.appendChild(svgEl('animate', { attributeName: 'stroke-dashoffset', values: '260;0;0', keyTimes: '0;0.7;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', dur: '4.4s', repeatCount: 'indefinite' }));
+    s.appendChild(c1);
+    var c2 = svgEl('path', { d: 'M 292 108 Q 350 158 468 178', fill: 'none', stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.8', 'stroke-dasharray': '260', 'stroke-dashoffset': '260' });
+    c2.appendChild(svgEl('animate', { attributeName: 'stroke-dashoffset', values: '260;260;0;0', keyTimes: '0;0.1;0.75;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4.4s', repeatCount: 'indefinite' }));
+    s.appendChild(c2);
+    s.appendChild(txt(322, 82, 'InfoNCE', '9', 'var(--blueprint,#3553ff)', 'start'));
+    s.appendChild(txt(340, 116, 'LM loss', '9', 'var(--warn,#b8870f)', 'start'));
+    s.appendChild(txt(380, 208, '50 demo steps, shared weights', '8', 'var(--ink-mute,#777)'));
+    shell(host, 'DUAL-OBJECTIVE PRETRAINING', 'rank and generate in one pass', s,
+      'For a batch of N image-caption pairs the similarity matrix has N matching cells on the diagonal and N squared minus N mismatches off it; InfoNCE runs cross-entropy over each row and column so the diagonal brightens while everything else dims. The LM loss trains the same weights to caption each image, and both curves fall together in the 50-step demo loop.');
+  }
+
+  // ── ch-recall-window (63): the matching image climbs into the R@K window ─────
+  function chEval(host) {
+    var s = svg(260), rx = 56, rw = 150;
+    host.setAttribute('data-static-time', '4');
+    s.appendChild(txt(rx, 34, 'retrieval: rank every image', '9', 'var(--ink-soft,#555)', 'start'));
+    var i;
+    for (i = 0; i < 6; i++) {
+      s.appendChild(rect(rx, 48 + i * 30, rw, 24, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+      s.appendChild(txt(rx - 10, 65 + i * 30, String(i + 1), '9', 'var(--ink-mute,#777)', 'end'));
+    }
+    s.appendChild(svgEl('rect', { x: rx - 4, y: 44, width: rw + 8, height: 152, rx: '4', fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.2', 'stroke-dasharray': '5 4', opacity: '0.5' }));
+    s.appendChild(txt(rx + rw + 12, 56, 'R@5 window', '8', 'var(--blueprint,#3553ff)', 'start'));
+    s.appendChild(txt(rx + rw + 12, 70, 'R@1: row 1 only', '8', 'var(--ink-mute,#777)', 'start'));
+    var tg = svgEl('g', { transform: 'translate(' + rx + ' 198)' });
+    tg.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'translate', values: rx + ' 198;' + rx + ' 198;' + rx + ' 78;' + rx + ' 78', keyTimes: '0;0.16;0.52;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4.8s', repeatCount: 'indefinite' }));
+    tg.appendChild(svgEl('rect', { x: 3, y: 2, width: rw - 6, height: 20, rx: '4', fill: 'var(--bg-surface,#eee)', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '1.6' }));
+    tg.appendChild(txt(rw / 2, 16, 'matching image', '9', 'var(--blueprint,#3553ff)'));
+    s.appendChild(tg);
+    var hit = txt(rx + rw + 12, 92, 'R@1 miss, R@5 hit', '9', 'var(--warn,#b8870f)', 'start');
+    hit.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: '0;0.52;0.6;0.95;1', dur: '4.8s', repeatCount: 'indefinite' }));
+    s.appendChild(hit);
+    s.appendChild(txt(330, 34, 'two more surfaces', '9', 'var(--ink-soft,#555)', 'start'));
+    s.appendChild(rect(330, 48, 168, 44, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+    s.appendChild(txt(340, 66, 'VQA exact match', '9', 'var(--ink,#1a1a1a)', 'start'));
+    var em = entry(414, 80, '4.8s', '0s', 0.3, 0.4);
+    em.appendChild(txt(-74, 3, 'pred == ref: 1 bit per sample', '8', 'var(--blueprint,#3553ff)', 'start'));
+    s.appendChild(em);
+    s.appendChild(rect(330, 112, 168, 44, 'var(--bg,#fafaf5)', 'var(--rule-soft,#ddd)'));
+    s.appendChild(txt(340, 130, 'captioning BLEU-4', '9', 'var(--ink,#1a1a1a)', 'start'));
+    s.appendChild(svgEl('rect', { x: 340, y: 138, width: 120, height: 8, rx: '2', fill: 'var(--bg-surface,#eee)', stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1' }));
+    var bar = svgEl('rect', { x: 340, y: 138, width: 0, height: 8, rx: '2', fill: 'var(--blueprint,#3553ff)' });
+    bar.appendChild(svgEl('animate', { attributeName: 'width', values: '0;0;86;86', keyTimes: '0;0.35;0.65;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1', dur: '4.8s', repeatCount: 'indefinite' }));
+    s.appendChild(bar);
+    s.appendChild(txt(330, 186, '1-4 gram precisions,', '8', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(330, 200, 'geometric mean + brevity penalty', '8', 'var(--ink-mute,#777)', 'start'));
+    s.appendChild(txt(rx, 240, 'training loss plateauing is not one of the three', '9', 'var(--ink-mute,#777)', 'start'));
+    shell(host, 'MULTIMODAL EVAL', 'R@K, exact match, BLEU-4', s,
+      'Three surfaces measure what training loss cannot. Retrieval ranks every image by cosine against a query caption and asks whether the match lands in the top 1, 5, or 10; here it climbs to rank 2, an R@1 miss but an R@5 hit. VQA scores one bit per sample on exact answer match, and captioning takes BLEU-4 over generated tokens with a brevity penalty.');
+  }
+
+  LF.register({
+    'ch-paper-skeleton': chPaper,
+    'ch-critic-converge': chCritic,
+    'ch-ucb-scheduler': chScheduler,
+    'ch-research-pipeline': chPipeline,
+    'ch-patch-tokenizer': chPatches,
+    'ch-cls-funnel': chVit,
+    'ch-projection-bridge': chProjection,
+    'ch-crossattn-fan': chCross,
+    'ch-infonce-diagonal': chInfoNCE,
+    'ch-recall-window': chEval
+  });
+})();
+
+/* module figures-capstone-i.js (Part 6) */
+/* figures-capstone-i.js: animated figures for Phase 19 capstone lessons
+   64, 68, 70, 74, 76, 77, 80, 81, 84. SMIL only, no deps, theme via CSS vars. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+
+  var el = LF.el, svgEl = LF.svgEl;
+  var INK = 'var(--ink,#1a1a1a)', SOFT = 'var(--ink-soft,#555)', MUTE = 'var(--ink-mute,#777)';
+  var BP = 'var(--blueprint,#3553ff)', BG = 'var(--bg,#fafaf5)', SURF = 'var(--bg-surface,#eee)';
+  var RULE = 'var(--rule-soft,#ddd)', WARN = 'var(--warn,#b8870f)';
+  var EASE = '0.23 1 0.32 1';
+
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function animT(type, vals, dur, extra) {
+    var a = { attributeName: 'transform', type: type, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animateTransform', a);
+  }
+  function card(host, label, hint, svg, caption) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [hint])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [caption])
+    ]));
+  }
+  function txt(x, y, s, fill, size, anchor) {
+    return svgEl('text', {
+      x: x, y: y, fill: fill || SOFT, 'font-size': size || 11,
+      'font-family': 'var(--font-mono,monospace)', 'text-anchor': anchor || 'middle'
+    }, [svgEl('tspan', {}, [document.createTextNode(s)])]);
+  }
+  // Entry: fade in from opacity 0 at ~95% size, ease out, hold for the loop.
+  function popIn(g, cx, cy, dur, begin) {
+    var b = begin || '0s', kt = '0;0.16;1', sp = EASE + ';0 0 1 1';
+    g.setAttribute('opacity', '0');
+    g.appendChild(animT('translate', (cx * 0.05).toFixed(1) + ' ' + (cy * 0.05).toFixed(1) + ';0 0;0 0', dur,
+      { keyTimes: kt, calcMode: 'spline', keySplines: sp, begin: b, additive: 'sum' }));
+    g.appendChild(animT('scale', '0.95;1;1', dur,
+      { keyTimes: kt, calcMode: 'spline', keySplines: sp, begin: b, additive: 'sum' }));
+    g.appendChild(anim('opacity', '0;1;1', dur, { keyTimes: kt, calcMode: 'spline', keySplines: sp, begin: b }));
+  }
+
+  // ── 64: same document, three cut plans; one slices the gold answer span ────
+  function chunkBoundaries(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var x0 = 100, w = 380;
+    svg.appendChild(txt(92, 50, 'document', MUTE, 10, 'end'));
+    svg.appendChild(svgEl('rect', { x: x0, y: 34, width: w, height: 26, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.5' }));
+    svg.appendChild(svgEl('rect', { x: 255, y: 34, width: 80, height: 26, rx: 4, fill: BP, opacity: '0.16', stroke: BP, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(295, 26, 'gold answer span', BP, 9));
+    var rows = [
+      { y: 100, label: 'fixed 512', cuts: [195, 290, 385], bad: 290 },
+      { y: 150, label: 'sentence', cuts: [178, 255, 335, 412], bad: -1 },
+      { y: 200, label: 'markdown', cuts: [222, 358], bad: -1 }
+    ];
+    var i, j;
+    for (i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      svg.appendChild(txt(92, r.y + 15, r.label, SOFT, 10, 'end'));
+      svg.appendChild(svgEl('rect', { x: x0, y: r.y, width: w, height: 22, rx: 3, fill: BG, stroke: RULE, 'stroke-width': '1' }));
+      svg.appendChild(svgEl('rect', { x: 255, y: r.y, width: 80, height: 22, rx: 3, fill: BP, opacity: '0.08' }));
+      var cg = svgEl('g', {});
+      for (j = 0; j < r.cuts.length; j++) {
+        var cx = r.cuts[j], bad = cx === r.bad;
+        var ln = svgEl('line', { x1: cx, y1: r.y - 4, x2: cx, y2: r.y + 26, stroke: bad ? WARN : BP, 'stroke-width': bad ? '2.4' : '1.6' });
+        if (bad) ln.appendChild(anim('opacity', '1;0.35;1', '2.6s'));
+        cg.appendChild(ln);
+      }
+      popIn(cg, 260, r.y + 10, '5s', (0.3 + i * 0.35) + 's');
+      svg.appendChild(cg);
+    }
+    svg.appendChild(txt(290, 244, 'fixed-window slices the span; markdown keeps it whole', MUTE, 9));
+    card(host, 'CHUNK BOUNDARIES', 'same doc · three cut plans',
+      svg,
+      'Every strategy cuts the same document at different offsets. The fixed 512-token window slices straight through the gold answer span, so the two halves embed into different clusters and recall drops before the retriever even runs. Sentence and structural markdown splitters respect the boundaries the text already carries.');
+  }
+
+  // ── 68: sweep descends the ranked list, gold hits light the metric panel ───
+  function ragMetricLadder(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var x0 = 70, y0 = 42, rh = 34, gold = { 0: 1, 3: 1 };
+    var i;
+    svg.appendChild(txt(x0, 28, 'retrieved top-5', MUTE, 10, 'start'));
+    for (i = 0; i < 5; i++) {
+      var y = y0 + i * rh, g = gold[i];
+      svg.appendChild(txt(x0 - 14, y + 17, String(i + 1), MUTE, 10, 'end'));
+      if (g) {
+        svg.appendChild(svgEl('rect', { x: x0, y: y, width: 170, height: 26, rx: 4, fill: BG }));
+        svg.appendChild(svgEl('rect', { x: x0, y: y, width: 170, height: 26, rx: 4, fill: BP, 'fill-opacity': '0.14' }));
+      }
+      svg.appendChild(svgEl('rect', { x: x0, y: y, width: 170, height: 26, rx: 4, fill: g ? 'none' : BG, stroke: g ? BP : RULE, 'stroke-width': g ? '1.8' : '1' }));
+      svg.appendChild(txt(x0 + 85, y + 17, g ? 'gold doc' : 'doc', g ? BP : MUTE, 10));
+    }
+    var sweep = svgEl('rect', { x: x0 - 4, y: y0 - 4, width: 178, height: 34, rx: 5, fill: 'none', stroke: BP, 'stroke-width': '2.2', opacity: '0.9' });
+    sweep.appendChild(animT('translate', '0 0;0 ' + rh + ';0 ' + (2 * rh) + ';0 ' + (3 * rh) + ';0 ' + (4 * rh) + ';0 0', '5s',
+      { calcMode: 'discrete', keyTimes: '0;0.18;0.36;0.54;0.72;0.9' }));
+    svg.appendChild(sweep);
+    var metrics = [
+      ['precision@5 = 2/5', 0.2], ['recall@5    = 2/3', 0.4],
+      ['MRR         = 1.0', 0.6], ['nDCG@5      = 0.86', 0.8]
+    ];
+    svg.appendChild(txt(310, 28, 'metric panel', MUTE, 10, 'start'));
+    for (i = 0; i < metrics.length; i++) {
+      var m = txt(310, 58 + i * 26, metrics[i][0], i < 2 ? SOFT : BP, 11, 'start');
+      m.appendChild(anim('opacity', '0;0;1;1', '5s',
+        { keyTimes: '0;' + (metrics[i][1] - 0.06) + ';' + metrics[i][1] + ';1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1' }));
+      svg.appendChild(m);
+    }
+    svg.appendChild(txt(310, 190, 'faithfulness + relevance', MUTE, 9, 'start'));
+    svg.appendChild(txt(310, 204, 'grade the answer, not the rank', MUTE, 9, 'start'));
+    card(host, 'RAG EVAL SWEEP', 'rank by rank · six metrics',
+      svg,
+      'The evaluator walks the ranked list once. Each gold document it passes updates precision and recall; the position of the first gold hit fixes MRR; the discounted positions fix nDCG. Faithfulness and answer relevance are computed afterwards on the generated answer, which is why a perfect retrieval score can still ship a wrong response.');
+  }
+
+  // ── 70: JSONL records stream through the validator gate; a bad line drops ──
+  function taskSpecGate(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    svg.appendChild(txt(62, 66, 'tasks.jsonl', MUTE, 10));
+    var i;
+    for (i = 0; i < 3; i++) {
+      svg.appendChild(svgEl('rect', { x: 34, y: 78 + i * 14, width: 56, height: 9, rx: 2, fill: SURF, stroke: RULE, 'stroke-width': '1' }));
+    }
+    var gate = svgEl('rect', { x: 244, y: 56, width: 14, height: 88, rx: 4, fill: BP });
+    gate.appendChild(anim('opacity', '0.7;1;0.7', '2.6s'));
+    svg.appendChild(gate);
+    svg.appendChild(txt(251, 44, 'validator', BP, 10));
+    svg.appendChild(txt(251, 160, 'schema · metric vocab · types', MUTE, 8));
+    svg.appendChild(svgEl('rect', { x: 396, y: 78, width: 92, height: 44, rx: 5, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '1.8' }));
+    svg.appendChild(txt(442, 104, 'runner', BP, 11));
+    svg.appendChild(svgEl('path', { d: 'M300 176 H360', stroke: WARN, 'stroke-width': '1.4', fill: 'none' }));
+    svg.appendChild(txt(330, 192, 'bad line aborts the record, not the run', WARN, 8.5));
+    var passPath = 'M100 100 H396';
+    for (i = 0; i < 2; i++) {
+      var ok = svgEl('rect', { x: -9, y: -6, width: 18, height: 12, rx: 2, fill: BG, stroke: BP, 'stroke-width': '1.6' });
+      ok.appendChild(svgEl('animateMotion', { dur: '4.8s', repeatCount: 'indefinite', path: passPath, begin: (i * -1.6) + 's', calcMode: 'spline', keySplines: '0.4 0 0.6 1', keyTimes: '0;1', keyPoints: '0;1' }));
+      svg.appendChild(ok);
+    }
+    var badRec = svgEl('rect', { x: -9, y: -6, width: 18, height: 12, rx: 2, fill: BG, stroke: WARN, 'stroke-width': '1.8' });
+    badRec.appendChild(svgEl('animateMotion', { dur: '4.8s', repeatCount: 'indefinite', path: 'M100 100 H240 L300 172', begin: '-3.2s', calcMode: 'spline', keySplines: '0.4 0 0.6 1;' + EASE, keyTimes: '0;0.6;1', keyPoints: '0;0.66;1' }));
+    badRec.appendChild(anim('opacity', '1;1;0.15', '4.8s', { keyTimes: '0;0.8;1', begin: '-3.2s' }));
+    svg.appendChild(badRec);
+    card(host, 'TASK SPEC GATE', 'validate · dispatch · reject',
+      svg,
+      'Every line of tasks.jsonl is validated independently before it reaches the runner: required fields present, metric_name inside the closed vocabulary, targets typed correctly. A malformed record is diverted and logged; the run continues. Freezing this gate is what lets lessons 71 through 75 dispatch on a single field.');
+  }
+
+  // ── 74: mean bars grow, bootstrap whiskers pop in, two CIs overlap ─────────
+  function leaderboardCI(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 220' });
+    var x0 = 140, dur = '5s';
+    svg.appendChild(svgEl('line', { x1: x0, y1: 36, x2: x0, y2: 186, stroke: RULE, 'stroke-width': '1.4' }));
+    svg.appendChild(txt(480, 200, 'mean score, bootstrap 95% CI', MUTE, 9, 'end'));
+    var models = [
+      { y: 56, label: 'model A', w: 280, lo: -34, hi: 30 },
+      { y: 104, label: 'model B', w: 258, lo: -30, hi: 36 },
+      { y: 152, label: 'model C', w: 156, lo: -22, hi: 22 }
+    ];
+    var i;
+    for (i = 0; i < models.length; i++) {
+      var m = models[i], bx = x0 + m.w;
+      svg.appendChild(txt(x0 - 10, m.y + 14, m.label, SOFT, 11, 'end'));
+      var bar = svgEl('rect', { x: x0, y: m.y, width: (m.w * 0.4).toFixed(0), height: 20, rx: 3, fill: BP, opacity: i === 2 ? '0.35' : '0.75' });
+      bar.appendChild(anim('width', (m.w * 0.4).toFixed(0) + ';' + m.w + ';' + m.w, dur,
+        { keyTimes: '0;0.28;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', begin: (i * 0.2) + 's' }));
+      svg.appendChild(bar);
+      var wg = svgEl('g', {});
+      wg.appendChild(svgEl('line', { x1: bx + m.lo, y1: m.y + 10, x2: bx + m.hi, y2: m.y + 10, stroke: INK, 'stroke-width': '1.8' }));
+      wg.appendChild(svgEl('line', { x1: bx + m.lo, y1: m.y + 3, x2: bx + m.lo, y2: m.y + 17, stroke: INK, 'stroke-width': '1.8' }));
+      wg.appendChild(svgEl('line', { x1: bx + m.hi, y1: m.y + 3, x2: bx + m.hi, y2: m.y + 17, stroke: INK, 'stroke-width': '1.8' }));
+      popIn(wg, bx, m.y + 10, dur, (1.5 + i * 0.25) + 's');
+      svg.appendChild(wg);
+    }
+    var ovA = models[0], ovB = models[1];
+    var oLo = x0 + ovB.w + ovB.lo, oHi = x0 + ovA.w + ovA.hi;
+    var band = svgEl('g', {});
+    band.appendChild(svgEl('rect', { x: oLo, y: 44, width: oHi - oLo, height: 90, fill: WARN, opacity: '0.12', stroke: WARN, 'stroke-width': '1', 'stroke-dasharray': '4 4' }));
+    band.appendChild(txt((oLo + oHi) / 2, 38, 'CIs overlap: gap may be noise', WARN, 9));
+    band.appendChild(anim('opacity', '0;0;1;1', dur, { keyTimes: '0;0.55;0.68;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1' }));
+    svg.appendChild(band);
+    card(host, 'LEADERBOARD + BOOTSTRAP CI', 'rank · then doubt the rank',
+      svg,
+      'The aggregator turns per-task EvalRun records into per-model means, then resamples tasks with replacement to put a bootstrap confidence interval on each mean. Model A leads model B on the point estimate, but the intervals overlap, so the pairwise difference CI is the number that decides whether the ranking is real or sampling noise.');
+  }
+
+  // ── 76: four ranks on a ring, chunks rotate; two passes alternate ──────────
+  function ringAllreduce(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var cx = 170, cy = 128, r = 76;
+    svg.appendChild(svgEl('circle', { cx: cx, cy: cy, r: r, fill: 'none', stroke: RULE, 'stroke-width': '1.5', 'stroke-dasharray': '5 5' }));
+    var pos = [[cx, cy - r], [cx + r, cy], [cx, cy + r], [cx - r, cy]];
+    var lbl = [[cx, cy - r - 12], [cx + r + 30, cy + 4], [cx, cy + r + 18], [cx - r - 30, cy + 4]];
+    var i;
+    for (i = 0; i < 4; i++) {
+      svg.appendChild(svgEl('circle', { cx: pos[i][0], cy: pos[i][1], r: 13, fill: BG, stroke: BP, 'stroke-width': '2' }));
+      svg.appendChild(txt(pos[i][0], pos[i][1] + 4, String(i), INK, 11));
+      svg.appendChild(txt(lbl[i][0], lbl[i][1], 'rank ' + i, MUTE, 9));
+    }
+    var ringPath = 'M' + cx + ' ' + (cy - r) + ' A ' + r + ' ' + r + ' 0 1 1 ' + (cx - 0.01) + ' ' + (cy - r);
+    for (i = 0; i < 4; i++) {
+      var chunk = svgEl('rect', { x: -5, y: -5, width: 10, height: 10, rx: 2, fill: i === 0 ? WARN : BP, opacity: '0.9' });
+      chunk.appendChild(svgEl('animateMotion', { dur: '4s', repeatCount: 'indefinite', path: ringPath, begin: (i * -1) + 's' }));
+      svg.appendChild(chunk);
+    }
+    var p1 = txt(390, 84, 'pass 1 · reduce-scatter', BP, 11);
+    p1.appendChild(anim('opacity', '1;1;0.2;0.2;1', '8s', { keyTimes: '0;0.42;0.5;0.92;1' }));
+    svg.appendChild(p1);
+    svg.appendChild(txt(390, 100, 'N-1 hops, sums build up', MUTE, 9));
+    var p2 = txt(390, 132, 'pass 2 · allgather', BP, 11);
+    p2.appendChild(anim('opacity', '0.2;0.2;1;1;0.2', '8s', { keyTimes: '0;0.42;0.5;0.92;1' }));
+    svg.appendChild(p2);
+    svg.appendChild(txt(390, 148, 'N-1 hops, sums fan out', MUTE, 9));
+    svg.appendChild(txt(390, 190, '2T(N-1)/N bytes per rank', SOFT, 10));
+    svg.appendChild(txt(390, 205, 'independent of cluster size', MUTE, 9));
+    card(host, 'RING ALLREDUCE', 'reduce-scatter · allgather',
+      svg,
+      'Each rank owns one chunk of the tensor and only ever talks to its ring neighbour. In the reduce-scatter pass a chunk accumulates partial sums as it hops N-1 times; in the allgather pass the finished sums rotate back around. No root, no bottleneck: per-rank traffic stays at 2T(N-1)/N bytes no matter how many ranks join.');
+  }
+
+  // ── 77: backward sweeps right to left, buckets fill, allreduce overlaps ────
+  function ddpGradSync(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var lw = 88, gap = 18, x0 = 60, y0 = 50, dur = '5s';
+    var i;
+    svg.appendChild(txt(x0, 34, 'backward pass', MUTE, 10, 'start'));
+    svg.appendChild(txt(470, 34, 'grads flow this way', MUTE, 9, 'end'));
+    for (i = 0; i < 4; i++) {
+      var lx = x0 + i * (lw + gap);
+      svg.appendChild(svgEl('rect', { x: lx, y: y0, width: lw, height: 34, rx: 4, fill: BG, stroke: RULE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(lx + lw / 2, y0 + 22, 'layer ' + (i + 1), SOFT, 11));
+    }
+    var hl = svgEl('rect', { x: x0 + 3 * (lw + gap) - 3, y: y0 - 3, width: lw + 6, height: 40, rx: 5, fill: BP, opacity: '0.16', stroke: BP, 'stroke-width': '2' });
+    hl.appendChild(animT('translate', '0 0;' + (-(lw + gap)) + ' 0;' + (-2 * (lw + gap)) + ' 0;' + (-3 * (lw + gap)) + ' 0;0 0', dur,
+      { calcMode: 'discrete', keyTimes: '0;0.22;0.44;0.66;0.92' }));
+    svg.appendChild(hl);
+    var buckets = [
+      { x: x0 + 2 * (lw + gap) + 30, label: 'bucket 1', fillKT: '0;0.05;0.4;1', fillV: '4;4;26;26' },
+      { x: x0 + 30, label: 'bucket 0', fillKT: '0;0.45;0.85;1', fillV: '4;4;26;26' }
+    ];
+    for (i = 0; i < 2; i++) {
+      var b = buckets[i];
+      svg.appendChild(svgEl('rect', { x: b.x, y: 118, width: lw + gap, height: 30, rx: 3, fill: 'none', stroke: MUTE, 'stroke-width': '1.4' }));
+      svg.appendChild(txt(b.x + (lw + gap) / 2, 164, b.label, MUTE, 9));
+      var lvl = svgEl('rect', { x: b.x + 2, y: 144, width: lw + gap - 4, height: 4, fill: BP, opacity: '0.55' });
+      lvl.appendChild(anim('height', b.fillV, dur, { keyTimes: b.fillKT }));
+      lvl.appendChild(anim('y', '144;144;122;122', dur, { keyTimes: b.fillKT }));
+      svg.appendChild(lvl);
+    }
+    svg.appendChild(svgEl('line', { x1: x0, y1: 200, x2: 470, y2: 200, stroke: RULE, 'stroke-width': '5' }));
+    svg.appendChild(txt(x0, 222, 'allreduce wire, runs while backward continues', MUTE, 9, 'start'));
+    var pulse = svgEl('circle', { r: 5, fill: WARN });
+    pulse.appendChild(svgEl('animateMotion', { dur: dur, repeatCount: 'indefinite', path: 'M' + (buckets[0].x + 50) + ' 200 H' + x0, keyPoints: '0;0;1;1', keyTimes: '0;0.4;0.8;1', calcMode: 'linear' }));
+    pulse.appendChild(anim('opacity', '0;0;1;1;0', dur, { keyTimes: '0;0.38;0.42;0.8;1' }));
+    svg.appendChild(pulse);
+    card(host, 'DDP GRADIENT SYNC', 'hook · bucket · overlap',
+      svg,
+      'A backward hook on every parameter drops its gradient into a bucket. The moment bucket 1 fills, its allreduce launches on the wire while layers 2 and 1 are still backpropagating, so communication hides behind compute. One broadcast at construction made all replicas identical; the summed gradients keep them identical every step.');
+  }
+
+  // ── 80: four ranks write tmp shards in parallel, then one atomic rename ────
+  function shardedCheckpoint(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var dur = '6s', i;
+    var gTmp = svgEl('g', {}), gFin = svgEl('g', {});
+    for (i = 0; i < 4; i++) {
+      var y = 34 + i * 42;
+      svg.appendChild(svgEl('rect', { x: 40, y: y, width: 74, height: 28, rx: 4, fill: BG, stroke: BP, 'stroke-width': '1.6' }));
+      svg.appendChild(txt(77, y + 18, 'rank ' + i, INK, 10));
+      var dot = svgEl('circle', { cx: '120', cy: y + 14, r: 4, fill: BP });
+      dot.appendChild(anim('cx', '120;240;240', dur, { keyTimes: '0;0.3;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1' }));
+      svg.appendChild(dot);
+      gTmp.appendChild(svgEl('rect', { x: 250, y: y, width: 128, height: 28, rx: 4, fill: 'none', stroke: WARN, 'stroke-width': '1.6', 'stroke-dasharray': '5 4' }));
+      gTmp.appendChild(txt(314, y + 18, 'rank' + i + '.bin.tmp', WARN, 9.5));
+      gFin.appendChild(svgEl('rect', { x: 250, y: y, width: 128, height: 28, rx: 4, fill: BP, opacity: '0.12', stroke: BP, 'stroke-width': '2' }));
+      gFin.appendChild(txt(314, y + 18, 'rank' + i + '.bin', BP, 9.5));
+    }
+    gTmp.appendChild(anim('opacity', '1;1;0;0', dur, { keyTimes: '0;0.55;0.65;1' }));
+    gFin.appendChild(anim('opacity', '0;0;1;1', dur, { keyTimes: '0;0.55;0.65;1' }));
+    svg.appendChild(gTmp);
+    svg.appendChild(gFin);
+    var stamp = txt(314, 22, 'rename: all shards flip at once', SOFT, 9.5);
+    stamp.appendChild(anim('opacity', '0;0;1;1', dur, { keyTimes: '0;0.55;0.62;1' }));
+    svg.appendChild(stamp);
+    var man = svgEl('g', {});
+    man.appendChild(svgEl('rect', { x: 410, y: 84, width: 86, height: 62, rx: 5, fill: BG, stroke: INK, 'stroke-width': '1.6' }));
+    man.appendChild(txt(453, 108, 'manifest', INK, 10));
+    man.appendChild(txt(453, 126, 'world=4 · sha256', MUTE, 8.5));
+    man.appendChild(anim('opacity', '0;0;1;1', dur, { keyTimes: '0;0.72;0.82;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1' }));
+    svg.appendChild(man);
+    card(host, 'SHARDED CHECKPOINT', 'parallel write · atomic rename',
+      svg,
+      'Every rank streams its own shard to a temp file at the same time, so write bandwidth scales with the cluster instead of one gather bottleneck. Only after all shards land does the rename flip the temp files and the manifest live. Resume reads the manifest first, checks world size and hashes, and fails loudly on any mismatch.');
+  }
+
+  // ── 81: three proven pieces slot into one loop; a run rides 20 steps ───────
+  function distributedAssembly(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 240' });
+    var dur = '5.5s', pieces = [
+      ['DDP broadcast', 'lesson 77'], ['ZeRO-1 step', 'lesson 78'], ['sharded ckpt', 'lesson 80']
+    ];
+    var i;
+    for (i = 0; i < 3; i++) {
+      var y = 36 + i * 52;
+      var pg = svgEl('g', {});
+      pg.appendChild(svgEl('rect', { x: 36, y: y, width: 130, height: 38, rx: 5, fill: BG, stroke: BP, 'stroke-width': '1.8' }));
+      pg.appendChild(txt(101, y + 17, pieces[i][0], INK, 10));
+      pg.appendChild(txt(101, y + 31, pieces[i][1], MUTE, 8.5));
+      popIn(pg, 101, y + 19, dur, (0.2 + i * 0.3) + 's');
+      svg.appendChild(pg);
+      svg.appendChild(svgEl('path', { d: 'M166 ' + (y + 19) + ' C 200 ' + (y + 19) + ', 200 106, 226 106', fill: 'none', stroke: MUTE, 'stroke-width': '1.2', opacity: '0.6' }));
+    }
+    svg.appendChild(svgEl('rect', { x: 226, y: 74, width: 258, height: 64, rx: 6, fill: BP, opacity: '0.1', stroke: BP, 'stroke-width': '2' }));
+    svg.appendChild(txt(355, 100, 'for step in 1..20', BP, 12));
+    svg.appendChild(txt(355, 118, '4 ranks · tiny GPT · gloo CPU', SOFT, 9));
+    var tx0 = 240, tx1 = 470, ty = 182;
+    svg.appendChild(svgEl('line', { x1: tx0, y1: ty, x2: tx1, y2: ty, stroke: RULE, 'stroke-width': '2' }));
+    svg.appendChild(txt(tx0, ty + 16, 'step 0', MUTE, 8.5));
+    svg.appendChild(txt(tx1, ty + 16, '20 · exit 0', MUTE, 8.5));
+    var mid = (tx0 + tx1) / 2;
+    svg.appendChild(svgEl('line', { x1: mid, y1: ty - 14, x2: mid, y2: ty + 6, stroke: WARN, 'stroke-width': '1.8' }));
+    var flag = txt(mid, ty - 20, 'ckpt @ step 10', WARN, 8.5);
+    flag.appendChild(anim('opacity', '0.4;0.4;1;1;0.4', dur, { keyTimes: '0;0.45;0.52;0.7;1' }));
+    svg.appendChild(flag);
+    var runner = svgEl('circle', { cy: ty, r: 6, fill: BP });
+    runner.appendChild(anim('cx', tx0 + ';' + tx1 + ';' + tx1, dur, { keyTimes: '0;0.9;1', calcMode: 'spline', keySplines: '0.4 0 0.6 1;0 0 1 1' }));
+    svg.appendChild(runner);
+    svg.appendChild(txt(260, 222, 'invariants: loss falls · ranks agree · 12P/N optimiser bytes · resume byte-equal', MUTE, 8.5));
+    card(host, 'DISTRIBUTED ASSEMBLY', 'compose · run 20 steps',
+      svg,
+      'Each piece was built and tested alone; the capstone proves they compose. DDP broadcast syncs the initial weights once, the ZeRO-1 step replaces optimiser.step every iteration, and the sharded checkpoint fires at step 10. The run self-terminates after 20 steps only if all four invariants hold on every rank.');
+  }
+
+  // ── 84: prompts fall into a 2x2 quadrant; the off-diagonal cells are bugs ──
+  function refusalQuadrant(host) {
+    var svg = svgEl('svg', { viewBox: '0 0 520 250' });
+    var gx = 160, gy = 56, cw = 130, ch = 74, dur = '5s';
+    svg.appendChild(txt(gx + cw / 2, 42, 'answered', SOFT, 10));
+    svg.appendChild(txt(gx + cw + cw / 2, 42, 'refused', SOFT, 10));
+    svg.appendChild(txt(gx - 12, gy + ch / 2 + 4, 'safe', SOFT, 10, 'end'));
+    svg.appendChild(txt(gx - 12, gy + ch + ch / 2 + 4, 'unsafe', SOFT, 10, 'end'));
+    var cells = [
+      { x: gx, y: gy, ok: 1, label: 'correct' },
+      { x: gx + cw, y: gy, ok: 0, label: 'over-refusal' },
+      { x: gx, y: gy + ch, ok: 0, label: 'under-refusal' },
+      { x: gx + cw, y: gy + ch, ok: 1, label: 'correct' }
+    ];
+    var i;
+    for (i = 0; i < 4; i++) {
+      var c = cells[i];
+      var cr = svgEl('rect', { x: c.x, y: c.y, width: cw, height: ch, fill: c.ok ? BP : WARN, opacity: c.ok ? '0.08' : '0.14', stroke: c.ok ? BP : WARN, 'stroke-width': c.ok ? '1.2' : '2' });
+      if (!c.ok) cr.appendChild(anim('opacity', '0.14;0.3;0.14', '3s', { begin: (i * 0.4) + 's' }));
+      svg.appendChild(cr);
+      svg.appendChild(txt(c.x + cw / 2, c.y + ch - 8, c.label, c.ok ? BP : WARN, 9));
+    }
+    svg.appendChild(txt(290, 20, 'labeled prompt set', MUTE, 10));
+    var drops = [
+      { tx: gx + 40, ty: gy + 32, safe: 1 }, { tx: gx + cw + 66, ty: gy + ch + 30, safe: 0 },
+      { tx: gx + cw + 44, ty: gy + 30, safe: 1 }, { tx: gx + 62, ty: gy + ch + 34, safe: 0 }
+    ];
+    for (i = 0; i < 4; i++) {
+      var d = drops[i];
+      var dot = svgEl('circle', { cx: 290, cy: 26, r: 5, fill: d.safe ? BP : INK });
+      dot.appendChild(anim('cx', '290;' + d.tx + ';' + d.tx, dur, { keyTimes: '0;0.22;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', begin: (i * 0.45) + 's' }));
+      dot.appendChild(anim('cy', '26;' + d.ty + ';' + d.ty, dur, { keyTimes: '0;0.22;1', calcMode: 'spline', keySplines: EASE + ';0 0 1 1', begin: (i * 0.45) + 's' }));
+      dot.appendChild(anim('opacity', '0;1;1;0', dur, { keyTimes: '0;0.06;0.9;1', begin: (i * 0.45) + 's' }));
+      svg.appendChild(dot);
+    }
+    svg.appendChild(txt(290, 232, 'plus ECE: does stated confidence match accuracy per bin', MUTE, 9));
+    card(host, 'REFUSAL QUADRANT', 'two failure modes · not one',
+      svg,
+      'The evaluator treats the assistant as a binary classifier on prompt safety. Safe prompts that get refused land in the over-refusal cell; unsafe prompts that get answered land in the under-refusal cell. Both off-diagonal cells are bugs, measured separately per taxonomy category, with ECE tracking whether the model knows when it is right.');
+  }
+
+
+  LF.register({
+    'ci-chunk-boundaries': chunkBoundaries,
+    'ci-rag-metric-ladder': ragMetricLadder,
+    'ci-task-spec-gate': taskSpecGate,
+    'ci-leaderboard-ci': leaderboardCI,
+    'ci-ring-allreduce': ringAllreduce,
+    'ci-ddp-grad-sync': ddpGradSync,
+    'ci-sharded-checkpoint': shardedCheckpoint,
+    'ci-distributed-assembly': distributedAssembly,
+    'ci-refusal-quadrant': refusalQuadrant
+  });
+})();
+
+/* module figures-demo.js (Part 6) */
+/* figures-demo.js - interactive lesson figure for Phase 17 lesson 29 (model
+   demo interfaces): a per-client token bucket in front of a public demo.
+   Loads after lesson-figures.js, registers through window.LF. Vanilla ES5,
+   no deps, theme via CSS vars. Authoring is the same fenced block:
+       ```figure
+       demo-token-bucket
+       ``` */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var el = LF.el, svgEl = LF.svgEl, slider = LF.slider;
+
+  var BP = 'var(--blueprint,#3553ff)';
+  var WARN = 'var(--warn,#b8870f)';
+  var SOFT = 'var(--rule-soft,#ddd)';
+  var MUTE = 'var(--ink-mute,#777)';
+  var INKS = 'var(--ink-soft,#555)';
+
+  var W = 520, H = 220, X0 = 60, X1 = 500, SECONDS = 12;
+  var LEVEL_TOP = 28, LEVEL_BOTTOM = 118, LEVEL_MAX = 10;
+  var TICK_BASE = 172, TICK_FULL = 22, TICK_SHORT = 10;
+
+  function arrivals() {
+    var out = [], i;
+    for (i = 0; i < 8; i++) { out.push({ t: i * 0.15, group: 0 }); }
+    for (i = 0; i < 8; i++) { out.push({ t: 2 + i, group: 1 }); }
+    for (i = 0; i < 8; i++) { out.push({ t: 10 + i * 0.15, group: 2 }); }
+    return out;
+  }
+  var TRAFFIC = arrivals();
+
+  function simulate(capacity, refill) {
+    var tokens = capacity, last = 0, points = [[0, capacity]], decisions = [], i;
+    function refillTo(t) {
+      var full = tokens + (t - last) * refill;
+      if (full > capacity && tokens < capacity) {
+        points.push([last + (capacity - tokens) / refill, capacity]);
+      }
+      tokens = Math.min(capacity, full);
+      last = t;
+      points.push([t, tokens]);
+    }
+    for (i = 0; i < TRAFFIC.length; i++) {
+      refillTo(TRAFFIC[i].t);
+      var ok = tokens >= 1;
+      if (ok) { tokens -= 1; points.push([TRAFFIC[i].t, tokens]); }
+      decisions.push(ok);
+    }
+    refillTo(SECONDS);
+    return { points: points, decisions: decisions };
+  }
+
+  function px(t) { return X0 + (X1 - X0) * t / SECONDS; }
+  function py(level) { return LEVEL_BOTTOM - (LEVEL_BOTTOM - LEVEL_TOP) * level / LEVEL_MAX; }
+
+  function txt(x, y, s, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': '9', fill: fill || INKS });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+
+  function tokenBucket(host) {
+    var state = { capacity: 4, refill: 1 };
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+
+    state._render = function () {
+      var run = simulate(state.capacity, state.refill);
+      var i, accepted = 0, perGroup = [0, 0, 0];
+      while (svg.firstChild) { svg.removeChild(svg.firstChild); }
+
+      svg.appendChild(txt(X0 - 8, LEVEL_TOP - 12, 'tokens', MUTE, 'end'));
+      svg.appendChild(svgEl('line', { x1: X0, y1: LEVEL_BOTTOM, x2: X1, y2: LEVEL_BOTTOM, stroke: SOFT, 'stroke-width': '1' }));
+      var capY = py(state.capacity).toFixed(1);
+      svg.appendChild(svgEl('line', { x1: X0, y1: capY, x2: X1, y2: capY, stroke: MUTE, 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+      svg.appendChild(txt(X0 - 8, Number(capY) + 3, 'cap ' + state.capacity, MUTE, 'end'));
+      var d = '';
+      for (i = 0; i < run.points.length; i++) {
+        d += (i ? ' L' : 'M') + px(run.points[i][0]).toFixed(1) + ' ' + py(run.points[i][1]).toFixed(1);
+      }
+      svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: BP, 'stroke-width': '1.6', 'stroke-linejoin': 'round' }));
+
+      svg.appendChild(txt(X0 - 8, TICK_BASE - 8, 'requests', MUTE, 'end'));
+      svg.appendChild(svgEl('line', { x1: X0, y1: TICK_BASE, x2: X1, y2: TICK_BASE, stroke: SOFT, 'stroke-width': '1' }));
+      for (i = 0; i < TRAFFIC.length; i++) {
+        var ok = run.decisions[i];
+        var h = ok ? TICK_FULL : TICK_SHORT;
+        if (ok) { accepted += 1; perGroup[TRAFFIC[i].group] += 1; }
+        svg.appendChild(svgEl('rect', { x: (px(TRAFFIC[i].t) - 2).toFixed(1), y: TICK_BASE - h, width: '4', height: h, fill: ok ? BP : WARN, opacity: ok ? '0.9' : '0.75' }));
+      }
+      svg.appendChild(txt(px(0), TICK_BASE + 14, '0 s', MUTE));
+      svg.appendChild(txt(px(6), TICK_BASE + 14, '6 s', MUTE));
+      svg.appendChild(txt(px(12), TICK_BASE + 14, '12 s', MUTE));
+
+      svg.appendChild(svgEl('rect', { x: X0, y: H - 18, width: '4', height: '12', fill: BP }));
+      svg.appendChild(txt(X0 + 10, H - 8, 'accepted: model runs', INKS, 'start'));
+      svg.appendChild(svgEl('rect', { x: X0 + 190, y: H - 12, width: '4', height: '6', fill: WARN }));
+      svg.appendChild(txt(X0 + 200, H - 8, 'rejected: 429 + Retry-After', INKS, 'start'));
+
+      var rejected = TRAFFIC.length - accepted;
+      num.innerHTML = accepted + ' <small>of ' + TRAFFIC.length + ' requests accepted</small>';
+      meta.textContent = rejected + ' rejected  ·  first burst ' + perGroup[0] + '/8  ·  steady ' + perGroup[1] + '/8  ·  last burst ' + perGroup[2] + '/8';
+      formula.textContent = 'tokens = min(' + state.capacity + ', tokens + ' + state.refill + ' x seconds since last request)  ·  accept when tokens >= 1, then take 1';
+    };
+
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'capacity', 'bucket capacity (burst size)', 1, 10, 1),
+      slider(state, 'refill', 'refill rate (tokens per second)', 0.5, 4, 0.5)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['TOKEN BUCKET']), el('span', {}, ['one client, 24 requests in 12 seconds'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Each request takes one token from the bucket of its client. The bucket refills at a fixed rate and never holds more than its capacity. The capacity sets the largest burst that the demo accepts. The refill rate sets the steady request rate. A rejected request gets HTTP 429 with a Retry-After header, and the model does not run.'])
+    ]));
+    state._render();
+  }
+
+  LF.register({
+    'demo-token-bucket': tokenBucket
+  });
+})();
+
+/* module figures-infra.js (Part 6) */
+/* figures-infra.js: interactive lesson figures for Phase 17 (infrastructure and
+   production). Loads after lesson-figures.js and registers through window.LF.register.
+   Vanilla ES5, no deps, theme via CSS vars. Authoring is the same fenced block:
+       ```figure
+       data-parallel
+       ``` */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var el = LF.el, svgEl = LF.svgEl, slider = LF.slider, select = LF.select, fmtInt = LF.fmtInt;
+
+  // ── data-parallel: split the global batch into per-GPU shards, all-reduce ──
+  function dataParallel(host) {
+    var state = { gpus: 4, batch: 256 };
+    var W = 520, H = 210, PAD = 24;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    state._render = function () {
+      var g = state.gpus, B = state.batch;
+      var shard = Math.ceil(B / g);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var colW = (W - 2 * PAD) / g, boxW = Math.min(colW - 10, 84), top = 34, boxH = 64;
+      var i;
+      for (i = 0; i < g; i++) {
+        var cx = PAD + i * colW + (colW - boxW) / 2;
+        svg.appendChild(svgEl('rect', { x: cx.toFixed(1), y: top, width: boxW.toFixed(1), height: boxH, rx: '3',
+          fill: 'var(--bg-surface,#eee)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.2' }));
+        var lab = svgEl('text', { x: (cx + boxW / 2).toFixed(1), y: (top + 26).toFixed(1), 'text-anchor': 'middle',
+          'font-family': 'monospace', 'font-size': '10', fill: 'var(--ink,#1a1a1a)' });
+        lab.appendChild(document.createTextNode('GPU ' + (i + 1)));
+        svg.appendChild(lab);
+        var cp = svgEl('text', { x: (cx + boxW / 2).toFixed(1), y: (top + 44).toFixed(1), 'text-anchor': 'middle',
+          'font-family': 'monospace', 'font-size': '9', fill: 'var(--ink-mute,#777)' });
+        cp.appendChild(document.createTextNode('full copy'));
+        svg.appendChild(cp);
+        var shB = svgEl('rect', { x: cx.toFixed(1), y: (top + boxH + 10).toFixed(1), width: boxW.toFixed(1), height: '20', rx: '2',
+          fill: 'var(--blueprint,#3553ff)', opacity: '0.85' });
+        svg.appendChild(shB);
+        var sl = svgEl('text', { x: (cx + boxW / 2).toFixed(1), y: (top + boxH + 24).toFixed(1), 'text-anchor': 'middle',
+          'font-family': 'monospace', 'font-size': '9', fill: 'var(--bg,#fafaf5)' });
+        sl.appendChild(document.createTextNode(shard + ' rows'));
+        svg.appendChild(sl);
+      }
+      var ry = top + boxH + 48;
+      svg.appendChild(svgEl('line', { x1: PAD, y1: ry, x2: W - PAD, y2: ry, stroke: 'var(--warn,#b8870f)', 'stroke-width': '2' }));
+      var rl = svgEl('text', { x: (W / 2).toFixed(1), y: (ry + 16).toFixed(1), 'text-anchor': 'middle',
+        'font-family': 'monospace', 'font-size': '10', fill: 'var(--warn,#b8870f)' });
+      rl.appendChild(document.createTextNode('all-reduce gradients across ' + g + ' GPUs'));
+      svg.appendChild(rl);
+      num.innerHTML = g + 'x <small>throughput (ideal)</small>';
+      meta.textContent = 'global batch ' + B + ' split into ' + g + ' shards of ' + shard + '  ·  each GPU holds a full model copy';
+      formula.textContent = 'per-GPU batch = ceil(' + B + ' / ' + g + ') = ' + shard + '  ·  gradients summed by all-reduce, weights stay in sync';
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'gpus', 'number of GPUs', 1, 8, 1),
+      slider(state, 'batch', 'global batch size', 8, 1024, 8)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['DATA PARALLELISM']), el('span', {}, ['drag the GPU count'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Each GPU holds a complete copy of the model and processes a different slice of the global batch. After the backward pass an all-reduce sums every GPU’s gradients so the copies stay identical. Throughput scales close to linearly with GPU count, but memory does not drop because every device still stores the whole model.'])
+    ]));
+    state._render();
+  }
+
+  // ── tensor-parallel: split a matmul column-wise, gather partial outputs ────
+  function tensorParallel(host) {
+    var state = { gpus: 4, dim: 4096 };
+    var W = 520, H = 200, PAD = 24;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    state._render = function () {
+      var g = state.gpus, d = state.dim;
+      var colsEach = Math.ceil(d / g);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var mx = PAD, my = 40, mw = W - 2 * PAD, mh = 90;
+      svg.appendChild(svgEl('rect', { x: mx, y: my, width: mw, height: mh, fill: 'none',
+        stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.4' }));
+      var i;
+      for (i = 0; i < g; i++) {
+        var sx = mx + i * mw / g;
+        svg.appendChild(svgEl('rect', { x: sx.toFixed(1), y: my, width: (mw / g - 2).toFixed(1), height: mh, rx: '2',
+          fill: 'var(--blueprint,#3553ff)', opacity: (0.4 + 0.5 * (i % 2)).toFixed(2) }));
+        var lab = svgEl('text', { x: (sx + mw / g / 2).toFixed(1), y: (my + mh / 2 + 4).toFixed(1), 'text-anchor': 'middle',
+          'font-family': 'monospace', 'font-size': '10', fill: 'var(--bg,#fafaf5)' });
+        lab.appendChild(document.createTextNode('GPU ' + (i + 1)));
+        svg.appendChild(lab);
+      }
+      var gy = my + mh + 28;
+      svg.appendChild(svgEl('line', { x1: PAD, y1: gy, x2: W - PAD, y2: gy, stroke: 'var(--warn,#b8870f)', 'stroke-width': '2' }));
+      var gl = svgEl('text', { x: (W / 2).toFixed(1), y: (gy + 16).toFixed(1), 'text-anchor': 'middle',
+        'font-family': 'monospace', 'font-size': '10', fill: 'var(--warn,#b8870f)' });
+      gl.appendChild(document.createTextNode('all-gather partial outputs into the full result'));
+      svg.appendChild(gl);
+      num.innerHTML = colsEach + ' <small>columns / GPU</small>';
+      meta.textContent = 'weight matrix W is split column-wise across ' + g + ' GPUs  ·  each holds 1/' + g + ' of the parameters';
+      formula.textContent = 'Y = X·W  with W = [W₁ | … | W' + (g > 1 ? 'ₙ' : '₁') + '],  each GPU computes X·Wᵢ then all-gather  ·  mem/GPU ≈ d/' + g + ' cols = ' + colsEach;
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'gpus', 'number of GPUs', 1, 8, 1),
+      slider(state, 'dim', 'output width (columns)', 512, 8192, 256)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['TENSOR PARALLELISM']), el('span', {}, ['drag the GPU count'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['A single large matmul is split across GPUs by partitioning the weight matrix into column blocks. Each GPU multiplies the full input by its slice, producing a partial output, then an all-gather stitches the slices into the complete result. The parameters per GPU drop by the GPU count, which is how one layer too big for a single device gets served.'])
+    ]));
+    state._render();
+  }
+
+  // ── pipeline-parallel: bubble fraction shrinks as micro-batches rise ───────
+  function pipelineParallel(host) {
+    var state = { micro: 4, stages: 4 };
+    var W = 520, H = 210, PAD = 24;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var bar = el('i');
+    var barWrap = el('div', { class: 'lf-bar' }, [bar]);
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    state._render = function () {
+      var m = state.micro, s = state.stages;
+      var totalSlots = m + s - 1;
+      var bubbleFrac = (s - 1) / (m + s - 1);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var rowH = (H - 2 * PAD) / s, cw = (W - 2 * PAD) / totalSlots;
+      var r, c;
+      for (r = 0; r < s; r++) {
+        var y = PAD + r * rowH + 2;
+        for (c = 0; c < totalSlots; c++) {
+          var x = PAD + c * cw;
+          // stage r processes micro-batch (c - r); busy when 0 <= c-r < m
+          var mb = c - r;
+          var busy = mb >= 0 && mb < m;
+          svg.appendChild(svgEl('rect', { x: x.toFixed(1), y: y.toFixed(1), width: (cw - 2).toFixed(1), height: (rowH - 4).toFixed(1), rx: '2',
+            fill: busy ? 'var(--blueprint,#3553ff)' : 'var(--rule-soft,#ccc)',
+            opacity: busy ? '0.85' : '0.6' }));
+        }
+        var sl = svgEl('text', { x: (PAD - 4).toFixed(1), y: (y + rowH / 2).toFixed(1), 'text-anchor': 'end',
+          'font-family': 'monospace', 'font-size': '9', fill: 'var(--ink-mute,#777)' });
+        sl.appendChild(document.createTextNode('S' + (r + 1)));
+        svg.appendChild(sl);
+      }
+      num.innerHTML = (bubbleFrac * 100).toFixed(1) + ' <small>% bubble (idle)</small>';
+      bar.style.width = (bubbleFrac * 100).toFixed(1) + '%';
+      barWrap.classList.toggle('over', bubbleFrac > 0.4);
+      meta.textContent = m + ' micro-batches across ' + s + ' stages  ·  grey cells are idle pipeline bubble at fill and drain';
+      formula.textContent = 'bubble fraction = (stages − 1) / (micro-batches + stages − 1) = ' + (s - 1) + ' / ' + (m + s - 1) + ' = ' + (bubbleFrac * 100).toFixed(1) + '%';
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'micro', 'micro-batches', 1, 16, 1),
+      slider(state, 'stages', 'pipeline stages', 2, 8, 1)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['PIPELINE PARALLELISM']), el('span', {}, ['drag the micro-batch count'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, barWrap, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['The model is split into stages, one per GPU, and micro-batches flow through them like an assembly line. While the pipeline fills and drains some stages sit idle, the grey bubble. The bubble fraction is (stages minus one) over (micro-batches plus stages minus one), so feeding more micro-batches amortizes the fixed fill-and-drain cost toward zero.'])
+    ]));
+    state._render();
+  }
+
+  // ── zero-sharding: ZeRO stages shard optimizer, gradients, then params ─────
+  function zeroSharding(host) {
+    var state = { stage: '2', gpus: 8 };
+    var num = el('span', { class: 'lf-num' });
+    var rows = el('div', {});
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    // per-parameter bytes in mixed precision Adam: params 2, grads 2, opt states 12
+    var COMPONENTS = [
+      { key: 'params', label: 'parameters (fp16)', bytes: 2, shardAt: 3 },
+      { key: 'grads', label: 'gradients (fp16)', bytes: 2, shardAt: 2 },
+      { key: 'opt', label: 'optimizer states (Adam)', bytes: 12, shardAt: 1 }
+    ];
+    state._render = function () {
+      var stage = Number(state.stage), g = state.gpus;
+      var total = 0, i;
+      while (rows.firstChild) rows.removeChild(rows.firstChild);
+      var maxBytes = 16; // full per-param footprint, for bar scale
+      for (i = 0; i < COMPONENTS.length; i++) {
+        var c = COMPONENTS[i];
+        var sharded = stage >= c.shardAt;
+        var perGpu = sharded ? c.bytes / g : c.bytes;
+        total += perGpu;
+        var bw = el('i'); bw.style.width = Math.min(100, perGpu / maxBytes * 100).toFixed(1) + '%';
+        if (sharded) bw.style.background = 'var(--warn,#b8870f)';
+        var lab = el('label', {}, [c.label + (sharded ? ' ÷ ' + g : ''),
+          el('b', {}, [perGpu.toFixed(2) + ' B/param'])]);
+        rows.appendChild(el('div', { class: 'lf-ctrl' }, [lab, el('div', { class: 'lf-bar' }, [bw])]));
+      }
+      num.innerHTML = total.toFixed(2) + ' <small>bytes / param / GPU</small>';
+      meta.textContent = 'ZeRO stage ' + stage + '  ·  ' + g + ' GPUs  ·  '
+        + (stage === 0 ? 'nothing sharded (plain data parallel)'
+          : stage === 1 ? 'optimizer states sharded'
+            : stage === 2 ? 'optimizer states + gradients sharded'
+              : 'optimizer states + gradients + parameters sharded');
+      formula.textContent = 'full footprint 16 B/param  →  sharded components divided across ' + g + ' GPUs  →  ' + total.toFixed(2) + ' B/param per GPU';
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      select(state, 'stage', 'ZeRO stage', [['stage 0', '0'], ['stage 1', '1'], ['stage 2', '2'], ['stage 3', '3']]),
+      slider(state, 'gpus', 'data-parallel GPUs', 2, 64, 1)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['ZERO SHARDING']), el('span', {}, ['pick the ZeRO stage'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [num, rows, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Plain data parallelism replicates the full optimizer state, gradients, and parameters on every GPU. ZeRO removes that redundancy in stages: stage 1 shards the heavy Adam optimizer states, stage 2 adds gradients, stage 3 adds the parameters themselves. Each stage cuts the per-GPU memory further, trading a little communication for the ability to train far larger models.'])
+    ]));
+    state._render();
+  }
+
+  // ── gpu-memory-breakdown: stacked training memory vs GPU capacity ──────────
+  function gpuMemoryBreakdown(host) {
+    var state = { params: 7, batch: 8 };
+    var GB = 1e9, REF = 80; // one 80 GB GPU
+    var num = el('span', { class: 'lf-num' });
+    var rows = el('div', {});
+    var bar = el('i');
+    var barWrap = el('div', { class: 'lf-bar' }, [bar]);
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    state._render = function () {
+      var N = state.params * 1e9; // params in billions
+      var weights = N * 2 / GB;
+      var grads = N * 2 / GB;
+      var opt = N * 12 / GB;
+      // activations: rough per-sample cost grows with batch, here a simple linear model
+      var acts = state.batch * state.params * 0.6;
+      var total = weights + grads + opt + acts;
+      var parts = [
+        { label: 'weights (2 B)', v: weights },
+        { label: 'gradients (2 B)', v: grads },
+        { label: 'optimizer states (Adam ~12 B)', v: opt },
+        { label: 'activations (batch ' + state.batch + ')', v: acts }
+      ];
+      while (rows.firstChild) rows.removeChild(rows.firstChild);
+      parts.forEach(function (p) {
+        var bw = el('i'); bw.style.width = Math.min(100, p.v / REF * 100).toFixed(1) + '%';
+        rows.appendChild(el('div', { class: 'lf-ctrl' }, [
+          el('label', {}, [p.label, el('b', {}, [p.v.toFixed(1) + ' GB'])]),
+          el('div', { class: 'lf-bar' }, [bw])
+        ]));
+      });
+      num.innerHTML = total.toFixed(total < 100 ? 1 : 0) + ' <small>GB total</small>';
+      var pct = Math.min(100, total / REF * 100);
+      bar.style.width = pct + '%';
+      barWrap.classList.toggle('over', total > REF);
+      meta.textContent = (total > REF ? '⚠ exceeds ' : '') + Math.round(total / REF * 100) + '% of one ' + REF + ' GB GPU  ·  optimizer states dominate at training time';
+      formula.textContent = state.params + 'B params × (2 + 2 + 12) B = ' + (weights + grads + opt).toFixed(0) + ' GB fixed, + ' + acts.toFixed(1) + ' GB activations';
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'params', 'model params (billions)', 1, 70, 1),
+      slider(state, 'batch', 'batch size', 1, 64, 1)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['TRAINING MEMORY']), el('span', {}, ['drag params and batch'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [num, rows, barWrap, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Training memory is more than the weights. In mixed-precision Adam each parameter costs two bytes for the fp16 weight, two for the gradient, and about twelve for the optimizer states, so the fixed cost is roughly sixteen bytes per parameter before a single activation. Activations then scale with batch size. This is why a model that fits for inference can be far too large to train on one GPU.'])
+    ]));
+    state._render();
+  }
+
+  // ── throughput-latency: batch size lifts throughput and per-request latency ─
+  function throughputLatency(host) {
+    var state = { batch: 16 };
+    var W = 520, H = 220, PAD = 36, BMAX = 128;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    // throughput saturates (Amdahl-ish); latency rises with batch (queueing + compute)
+    function thru(b) { return 4000 * b / (b + 24); } // tokens/sec, saturating
+    function lat(b) { return 20 + 0.9 * b; }          // ms per request, linear
+    var TMAX = thru(BMAX), LMAX = lat(BMAX);
+    // knee: where marginal throughput per unit latency drops most; here near saturation onset
+    var knee = 24;
+    function px(b) { return PAD + b / BMAX * (W - 2 * PAD); }
+    function pyT(t) { return H - PAD - t / TMAX * (H - 2 * PAD); }
+    function pyL(l) { return H - PAD - l / LMAX * (H - 2 * PAD); }
+    state._render = function () {
+      var b = state.batch;
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var d = '', i, x;
+      for (i = 0; i <= 100; i++) { x = 1 + (BMAX - 1) * i / 100; d += (i ? 'L' : 'M') + px(x).toFixed(1) + ' ' + pyT(thru(x)).toFixed(1) + ' '; }
+      svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '2' }));
+      var d2 = '';
+      for (i = 0; i <= 100; i++) { x = 1 + (BMAX - 1) * i / 100; d2 += (i ? 'L' : 'M') + px(x).toFixed(1) + ' ' + pyL(lat(x)).toFixed(1) + ' '; }
+      svg.appendChild(svgEl('path', { d: d2, fill: 'none', stroke: 'var(--ink-mute,#999)', 'stroke-width': '2', 'stroke-dasharray': '4 3' }));
+      var kx = px(knee);
+      svg.appendChild(svgEl('line', { x1: kx, y1: PAD, x2: kx, y2: H - PAD, stroke: 'var(--warn,#b8870f)', 'stroke-width': '1.5', 'stroke-dasharray': '3 3' }));
+      svg.appendChild(svgEl('circle', { cx: px(b), cy: pyT(thru(b)), r: '5', fill: 'var(--blueprint,#3553ff)' }));
+      svg.appendChild(svgEl('circle', { cx: px(b), cy: pyL(lat(b)), r: '4', fill: 'var(--ink-mute,#999)' }));
+      num.innerHTML = fmtInt(Math.round(thru(b))) + ' <small>tokens/sec</small>';
+      meta.textContent = 'batch ' + b + '  ·  per-request latency ' + lat(b).toFixed(0) + ' ms  ·  knee near batch ' + knee + ' (orange)';
+      formula.textContent = 'larger batch → throughput rises toward saturation, latency rises linearly  ·  pick batch at the knee for the best of both';
+    };
+    var grid = el('div', {}, [slider(state, 'batch', 'batch size', 1, BMAX, 1)]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['THROUGHPUT / LATENCY']), el('span', {}, ['drag the batch size'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Blue is throughput, the dashed grey line is per-request latency. Bigger batches keep the GPU busier so total tokens per second climbs, but each individual request waits longer behind the others, so latency rises too. The knee (orange) is where throughput stops growing much while latency keeps climbing, which is the batch size most serving systems aim for.'])
+    ]));
+    state._render();
+  }
+
+  // ── autoscaling: replicas track incoming QPS to hold latency under target ──
+  function autoscaling(host) {
+    var state = { qps: 120, cap: 40 };
+    var W = 520, H = 200, PAD = 26;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    var RMAX = 12;
+    state._render = function () {
+      var qps = state.qps, cap = state.cap;
+      var replicas = Math.max(1, Math.ceil(qps / cap));
+      var shown = Math.min(RMAX, replicas);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var perRow = 6, bw = 56, bh = 30, gx = 14, gy = 18, ox = PAD, oy = 36;
+      var i;
+      for (i = 0; i < shown; i++) {
+        var col = i % perRow, row = Math.floor(i / perRow);
+        var x = ox + col * (bw + gx), y = oy + row * (bh + gy);
+        // load on this replica
+        var thisLoad = Math.min(cap, qps - i * cap);
+        var fillFrac = Math.max(0, thisLoad) / cap;
+        svg.appendChild(svgEl('rect', { x: x.toFixed(1), y: y.toFixed(1), width: bw, height: bh, rx: '3',
+          fill: 'var(--bg-surface,#eee)', stroke: 'var(--ink-soft,#555)', 'stroke-width': '1.1' }));
+        svg.appendChild(svgEl('rect', { x: x.toFixed(1), y: (y + bh - bh * fillFrac).toFixed(1), width: bw, height: (bh * fillFrac).toFixed(1), rx: '3',
+          fill: 'var(--blueprint,#3553ff)', opacity: '0.85' }));
+      }
+      if (replicas > RMAX) {
+        var more = svgEl('text', { x: (ox + 5 * (bw + gx)).toFixed(1), y: (oy + 2 * (bh + gy) + 14).toFixed(1),
+          'font-family': 'monospace', 'font-size': '11', fill: 'var(--ink-mute,#777)' });
+        more.appendChild(document.createTextNode('+ ' + (replicas - RMAX) + ' more'));
+        svg.appendChild(more);
+      }
+      var headroom = replicas * cap - qps;
+      num.innerHTML = replicas + ' <small>replicas</small>';
+      meta.textContent = qps + ' QPS  ·  ' + cap + ' QPS per replica  ·  headroom ' + headroom + ' QPS keeps latency under target';
+      formula.textContent = 'replicas = ceil(QPS / per-replica capacity) = ceil(' + qps + ' / ' + cap + ') = ' + replicas;
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'qps', 'incoming load (QPS)', 0, 480, 10),
+      slider(state, 'cap', 'per-replica capacity (QPS)', 10, 80, 5)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['AUTOSCALING']), el('span', {}, ['drag the incoming load'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['An autoscaler adds and removes replicas so that the offered load stays within capacity and latency holds under its target. The replica count is the load divided by what one replica can serve, rounded up. Raise the QPS and replicas spin up; lower it and they scale back down, which is what keeps both latency and cost in check.'])
+    ]));
+    state._render();
+  }
+
+  // ── cost-per-token: GPU price and throughput set the cost per 1M tokens ────
+  function costPerToken(host) {
+    var state = { price: 2.5, tps: 2000 };
+    var num = el('span', { class: 'lf-num' });
+    var bar = el('i');
+    var barWrap = el('div', { class: 'lf-bar' }, [bar]);
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    var REF = 5; // $5 / 1M tokens as a visual reference
+    state._render = function () {
+      var price = state.price, tps = state.tps;
+      var tokensPerHr = tps * 3600;
+      var costPerMillion = price / tokensPerHr * 1e6;
+      num.innerHTML = '$' + costPerMillion.toFixed(costPerMillion < 1 ? 3 : 2) + ' <small>/ 1M tokens</small>';
+      bar.style.width = Math.min(100, costPerMillion / REF * 100).toFixed(1) + '%';
+      barWrap.classList.toggle('over', costPerMillion > REF);
+      meta.textContent = '$' + price.toFixed(2) + '/hr GPU  ·  ' + fmtInt(tps) + ' tokens/sec  ·  ' + (tokensPerHr / 1e6).toFixed(1) + 'M tokens/hr served';
+      formula.textContent = 'cost/1M = (price/hr) / (tokens/sec × 3600) × 10⁶ = (' + price.toFixed(2) + ' / ' + fmtInt(tokensPerHr) + ') × 10⁶ = $' + costPerMillion.toFixed(3);
+    };
+    var grid = el('div', { class: 'lf-grid' }, [
+      slider(state, 'price', 'GPU price ($/hr)', 0.5, 12, 0.1),
+      slider(state, 'tps', 'throughput (tokens/sec)', 100, 8000, 100)
+    ]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['COST PER TOKEN']), el('span', {}, ['drag price and throughput'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [num, barWrap, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Serving economics reduce to two numbers: what the GPU costs per hour and how many tokens it produces in that hour. Cost per million tokens is the hourly price divided by the tokens served per hour, scaled to a million. Doubling throughput halves the unit cost, which is why batching, quantization, and faster kernels all translate directly into a lower price per token.'])
+    ]));
+    state._render();
+  }
+
+  // ── roofline: arithmetic intensity sets memory-bound vs compute-bound ──────
+  function roofline(host) {
+    var state = { logAI: 1.2 };
+    var W = 520, H = 230, PAD = 40;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var num = el('span', { class: 'lf-num' });
+    var meta = el('div', { class: 'lf-meta' });
+    var formula = el('div', { class: 'lf-formula' });
+    var PEAK = 1000;      // peak compute, GFLOP/s (arbitrary units)
+    var BW = 8;           // memory bandwidth, GB/s units -> attainable = BW * AI
+    var ridge = PEAK / BW; // arithmetic intensity where the two regimes meet
+    var AIMIN = 0.5, AIMAX = 1000;
+    function lx(ai) { return PAD + (Math.log10(ai) - Math.log10(AIMIN)) / (Math.log10(AIMAX) - Math.log10(AIMIN)) * (W - 2 * PAD); }
+    function ly(perf) { return H - PAD - (Math.log10(perf) - Math.log10(8)) / (Math.log10(PEAK) - Math.log10(8)) * (H - 2 * PAD); }
+    function attainable(ai) { return Math.min(PEAK, BW * ai); }
+    state._render = function () {
+      var ai = Math.pow(10, state.logAI);
+      var perf = attainable(ai);
+      var bound = ai < ridge ? 'memory-bound' : 'compute-bound';
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      // roofline: slanted memory roof then flat compute roof
+      var d = '', i, a;
+      for (i = 0; i <= 100; i++) {
+        a = Math.pow(10, Math.log10(AIMIN) + (Math.log10(AIMAX) - Math.log10(AIMIN)) * i / 100);
+        d += (i ? 'L' : 'M') + lx(a).toFixed(1) + ' ' + ly(attainable(a)).toFixed(1) + ' ';
+      }
+      svg.appendChild(svgEl('path', { d: d, fill: 'none', stroke: 'var(--blueprint,#3553ff)', 'stroke-width': '2' }));
+      // ridge line
+      var rx = lx(ridge);
+      svg.appendChild(svgEl('line', { x1: rx, y1: PAD, x2: rx, y2: H - PAD, stroke: 'var(--rule-soft,#ddd)', 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+      // kernel marker
+      svg.appendChild(svgEl('circle', { cx: lx(ai), cy: ly(perf), r: '5', fill: 'var(--warn,#b8870f)' }));
+      var rl = svgEl('text', { x: (rx + 4).toFixed(1), y: (PAD + 12).toFixed(1), 'font-family': 'monospace', 'font-size': '9', fill: 'var(--ink-mute,#777)' });
+      rl.appendChild(document.createTextNode('ridge ' + ridge.toFixed(0) + ' FLOP/B'));
+      svg.appendChild(rl);
+      num.innerHTML = bound + ' <small>at AI ' + ai.toFixed(ai < 10 ? 1 : 0) + ' FLOP/B</small>';
+      meta.textContent = 'attainable ' + perf.toFixed(0) + ' GFLOP/s  ·  ' + (ai < ridge ? 'starved on memory bandwidth: feed it more reuse' : 'saturating the compute units: near peak');
+      formula.textContent = 'attainable = min(peak compute, bandwidth × AI)  ·  ridge at AI = peak/BW = ' + ridge.toFixed(0) + ' FLOP/byte';
+    };
+    var grid = el('div', {}, [slider(state, 'logAI', 'arithmetic intensity (10^x FLOP/byte)', -0.3, 3, 0.05)]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['ROOFLINE']), el('span', {}, ['drag the arithmetic intensity'])]),
+      el('div', { class: 'lf-body' }, [grid, el('div', { class: 'lf-out' }, [svg, num, meta, formula])]),
+      el('div', { class: 'lf-cap' }, ['Arithmetic intensity is the FLOPs a kernel does per byte it moves. On the left the slanted roof means performance is capped by memory bandwidth; on the right the flat roof means it is capped by raw compute. The ridge is where the two meet. A kernel below and left of the ridge (orange) is memory-bound, and the fix is more data reuse, not a faster chip.'])
+    ]));
+    state._render();
+  }
+
+  LF.register({
+    'data-parallel': dataParallel,
+    'tensor-parallel': tensorParallel,
+    'pipeline-parallel': pipelineParallel,
+    'zero-sharding': zeroSharding,
+    'gpu-memory-breakdown': gpuMemoryBreakdown,
+    'throughput-latency': throughputLatency,
+    'autoscaling': autoscaling,
+    'cost-per-token': costPerToken,
+    'roofline': roofline
+  });
+})();
+
+/* module figures-infra2.js (Part 6) */
+/* figures-infra2.js: animated lesson figures for Phase 17 (Infrastructure and
+   Production) — serving, routing, caching, autoscaling. Loads after
+   lesson-figures.js and registers through window.LF.register. Vanilla ES5, no
+   deps, theme via CSS vars. Animation is SMIL only (animate / animateMotion /
+   animateTransform). Authoring is the same fenced block:
+       ```figure
+       cache-aware-router
+       ``` */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var el = LF.el, svgEl = LF.svgEl, select = LF.select;
+
+  var BP = 'var(--blueprint,#3553ff)';
+  var SOFT = 'var(--rule-soft,#ccc)';
+  var MUTE = 'var(--ink-mute,#999)';
+  var WARN = 'var(--warn,#b8870f)';
+  var INK = 'var(--ink,#1a1a1a)';
+  var BG = 'var(--bg,#fafaf5)';
+
+  function shell(host, label, sub, svg, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) for (var k in extra) a[k] = extra[k];
+    return svgEl('animate', a);
+  }
+  function motion(path, dur, begin) {
+    return svgEl('animateMotion', { path: path, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' });
+  }
+  function hold(node, dur, begin, op) {
+    node.setAttribute('opacity', 0);
+    node.appendChild(anim('opacity', op + ';' + op, dur, { begin: begin || '0s' }));
+    return node;
+  }
+  function box(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: 4, fill: fill || 'none', stroke: stroke || SOFT, 'stroke-width': 1.4 });
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    return svgEl('text', { x: x, y: y, 'font-family': 'var(--font-mono,monospace)', 'font-size': size || 11, fill: fill || MUTE, 'text-anchor': anchor || 'middle' }, [document.createTextNode(s)]);
+  }
+
+  // ── cache-aware-router: round-robin scatter vs prefix-hash routing ─────────
+  // 11-multi-region-kv-locality
+  function cacheAwareRouter(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var src = { x: 60, y: 120 };
+    var reps = [{ x: 430, y: 50 }, { x: 430, y: 120 }, { x: 430, y: 190 }];
+    svg.appendChild(box(30, 100, 60, 40, BG, INK));
+    svg.appendChild(txt(60, 124, 'router', 10, INK));
+    reps.forEach(function (r, i) {
+      svg.appendChild(box(r.x - 38, r.y - 18, 76, 36, BG, i === 1 ? BP : SOFT));
+      svg.appendChild(txt(r.x, r.y - 2, 'replica ' + (i + 1), 9, i === 1 ? BP : MUTE));
+      svg.appendChild(txt(r.x, r.y + 11, i === 1 ? 'cache: P' : 'cold', 8, MUTE));
+    });
+    // hot path to replica 2 (holds prefix P) — dashed active link
+    var hot = svgEl('path', { d: 'M90 120 L392 120', fill: 'none', stroke: BP, 'stroke-width': 2, 'stroke-dasharray': '6 5' });
+    hot.appendChild(anim('stroke-dashoffset', '22;0', '0.9s'));
+    svg.appendChild(hot);
+    svg.appendChild(svgEl('path', { d: 'M90 110 L392 60', fill: 'none', stroke: SOFT, 'stroke-width': 1, 'stroke-dasharray': '3 4' }));
+    svg.appendChild(svgEl('path', { d: 'M90 130 L392 188', fill: 'none', stroke: SOFT, 'stroke-width': 1, 'stroke-dasharray': '3 4' }));
+    // requests carrying prefix P flow in and get routed to the hot replica
+    var i;
+    for (i = 0; i < 3; i++) {
+      var g = svgEl('g', {}, [
+        svgEl('circle', { cx: 0, cy: 0, r: 6, fill: BP }),
+        txt(0, 3, 'P', 8, BG)
+      ]);
+      g.appendChild(motion('M36 120 L60 120 L430 120', '2.4s', (i * 0.8) + 's'));
+      svg.appendChild(hold(g, '2.4s', (i * 0.8) + 's', 1));
+    }
+    svg.appendChild(txt(60, 175, 'route on prefix-hash', 9, MUTE));
+    svg.appendChild(txt(430, 225, 'P-requests reuse the warm cache', 9, BP));
+    shell(host, 'CACHE-AWARE ROUTER', 'requests routed to the replica holding their prefix', svg,
+      'Round-robin scatters requests blind, so most miss the cache and pay full prefill. A cache-aware router hashes the prompt prefix and sends every matching request to the replica that already holds those KV blocks — the warm path stays warm and TTFT collapses from prefill-bound to a cache hit.');
+  }
+
+  // ── cold-start-layers: weights stream NVMe→DRAM→HBM, replica goes warm ─────
+  // 10-cold-start-mitigation
+  function coldStartLayers(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var tiers = [
+      { x: 30, t: 'NVMe', s: 'weights at rest' },
+      { x: 180, t: 'DRAM', s: 'staged' },
+      { x: 330, t: 'HBM', s: 'on GPU' }
+    ];
+    tiers.forEach(function (ti) {
+      svg.appendChild(box(ti.x, 70, 100, 90, BG, MUTE));
+      svg.appendChild(txt(ti.x + 50, 60, ti.t, 9, MUTE));
+      svg.appendChild(txt(ti.x + 50, 175, ti.s, 8, MUTE));
+    });
+    // the cold→warm replica on the far right
+    svg.appendChild(box(450, 90, 60, 50, BG, SOFT));
+    svg.appendChild(svgEl('circle', { cx: 480, cy: 115, r: 9, fill: SOFT }));
+    var lamp = svgEl('circle', { cx: 480, cy: 115, r: 9, fill: BP, opacity: 0 });
+    lamp.appendChild(anim('opacity', '0;0;1;1', '5s'));
+    svg.appendChild(lamp);
+    var lampTxt = txt(480, 160, 'cold', 8, MUTE);
+    svg.appendChild(lampTxt);
+    var warmTxt = txt(480, 75, 'serving', 8, BP);
+    warmTxt.appendChild(anim('opacity', '0;0;0;1;1', '5s'));
+    svg.appendChild(warmTxt);
+    // links between tiers, active dashes
+    [[130, 180], [280, 330], [430, 450]].forEach(function (seg) {
+      var p = svgEl('path', { d: 'M' + seg[0] + ' 115 L' + seg[1] + ' 115', fill: 'none', stroke: INK, 'stroke-width': 1.4, 'stroke-dasharray': '4 4' });
+      p.appendChild(anim('stroke-dashoffset', '16;0', '0.7s'));
+      svg.appendChild(p);
+    });
+    // weight blocks streaming through the tiered pipeline
+    var i;
+    for (i = 0; i < 4; i++) {
+      var blk = svgEl('rect', { x: -9, y: -7, width: 18, height: 14, rx: 2, fill: BP });
+      blk.appendChild(motion('M80 115 L130 115 L180 115 L280 115 L330 115 L430 115 L480 115', '5s', (i * 1.0) + 's'));
+      svg.appendChild(hold(blk, '5s', (i * 1.0) + 's', 0.85));
+    }
+    svg.appendChild(txt(255, 215, 'tiered load: NVMe → DRAM → HBM, then the replica serves', 9, MUTE));
+    shell(host, 'COLD-START PIPELINE', 'weights stream through tiers until a cold replica goes warm', svg,
+      'A scaled-to-zero replica cannot answer until its weights are resident in HBM. The cold-start budget is the sum of node provision, weights download, load into HBM, and engine init — minutes for a 70B model against a two-second SLA. Tiered loading streams weights NVMe→DRAM→HBM and warm pools keep min_workers>0, trading idle GPU cost for a vanished cold-start tail.');
+  }
+
+  // ── model-cascade-router: cheap-first, escalate on low confidence ──────────
+  // 16-model-routing
+  function modelCascadeRouter(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(box(30, 90, 56, 56, BG, INK));
+    svg.appendChild(txt(58, 104, 'broker', 9, INK));
+    svg.appendChild(txt(58, 117, 'conf?', 8, MUTE));
+    // cheap model (top, most traffic) and frontier (bottom, escalations)
+    svg.appendChild(box(380, 40, 110, 44, BG, BP));
+    svg.appendChild(txt(435, 58, 'cheap model', 9, BP));
+    svg.appendChild(txt(435, 72, '70% · $0.25/M', 8, MUTE));
+    svg.appendChild(box(380, 150, 110, 44, BG, WARN));
+    svg.appendChild(txt(435, 168, 'frontier model', 9, WARN));
+    svg.appendChild(txt(435, 182, '30% · $10/M', 8, MUTE));
+    svg.appendChild(svgEl('path', { d: 'M86 126 L376 62', fill: 'none', stroke: BP, 'stroke-width': 1.6 }));
+    var esc = svgEl('path', { d: 'M86 135.5 L376 172', fill: 'none', stroke: WARN, 'stroke-width': 1.4, 'stroke-dasharray': '5 4' });
+    esc.appendChild(anim('stroke-dashoffset', '18;0', '1s'));
+    svg.appendChild(esc);
+    // 7 requests in, most go cheap (blue), some escalate (warn)
+    var i;
+    for (i = 0; i < 7; i++) {
+      var esc2 = i % 3 === 0;
+      var g = svgEl('g', {}, [svgEl('circle', { cx: 0, cy: 0, r: 5, fill: esc2 ? WARN : BP })]);
+      var path = esc2 ? 'M34 132 L58 132 L376 172' : 'M34 132 L58 132 L376 62';
+      g.appendChild(motion(path, '2.6s', (i * 0.34) + 's'));
+      svg.appendChild(hold(g, '2.6s', (i * 0.34) + 's', 1));
+    }
+    svg.appendChild(txt(260, 220, 'blended cost ≈ 0.7·cheap + 0.3·frontier', 9, MUTE));
+    shell(host, 'MODEL CASCADE ROUTER', 'cheap-first, escalate the hard ones', svg,
+      'A broker scores each request — task type, length, confidence — and sends the easy majority to a cheap model. Only low-confidence requests escalate down the dashed lane to the frontier model. Most traffic costs cents; the blended bill drops 20-60% at iso-quality. The hazard is silent cheap-model drift, caught only by an online quality gate.');
+  }
+
+  // ── prefill-decode-split: two pools, KV cache handed off via NIXL ──────────
+  // 17-disaggregated-prefill-decode
+  function prefillDecodeSplit(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(box(60, 50, 130, 130, BG, BP));
+    svg.appendChild(txt(125, 40, 'PREFILL POOL', 9, BP));
+    svg.appendChild(txt(125, 70, 'compute-bound', 8, MUTE));
+    svg.appendChild(box(330, 50, 130, 130, BG, WARN));
+    svg.appendChild(txt(395, 40, 'DECODE POOL', 9, WARN));
+    svg.appendChild(txt(395, 70, 'memory-bound', 8, MUTE));
+    // prefill GPUs grinding (pulsing fill), decode GPUs streaming
+    var i, gx, gy;
+    for (i = 0; i < 4; i++) {
+      gx = 80 + (i % 2) * 55; gy = 95 + Math.floor(i / 2) * 45;
+      var pg = svgEl('rect', { x: gx, y: gy, width: 40, height: 30, rx: 3, fill: BP, opacity: 0.25 });
+      pg.appendChild(anim('opacity', '0.2;0.7;0.2', '1.3s', { begin: (i * 0.2) + 's' }));
+      svg.appendChild(pg);
+    }
+    for (i = 0; i < 4; i++) {
+      gx = 350 + (i % 2) * 55; gy = 95 + Math.floor(i / 2) * 45;
+      svg.appendChild(svgEl('rect', { x: gx, y: gy, width: 40, height: 30, rx: 3, fill: WARN, opacity: 0.22 }));
+    }
+    // KV cache block transfers over NIXL link
+    var link = svgEl('path', { d: 'M190 115 L330 115', fill: 'none', stroke: INK, 'stroke-width': 1.4, 'stroke-dasharray': '4 4' });
+    link.appendChild(anim('stroke-dashoffset', '16;0', '0.7s'));
+    svg.appendChild(link);
+    svg.appendChild(txt(260, 108, 'NIXL', 8, INK));
+    for (i = 0; i < 3; i++) {
+      var kv = svgEl('rect', { x: -10, y: -7, width: 16, height: 14, rx: 2, fill: INK });
+      kv.appendChild(motion('M190 115 L330 115', '1.6s', (i * 0.55) + 's'));
+      svg.appendChild(hold(kv, '1.6s', (i * 0.55) + 's', 1));
+    }
+    svg.appendChild(txt(260, 200, 'KV cache transfers prefill → decode', 9, INK));
+    svg.appendChild(txt(260, 216, 'each pool sized for its own bottleneck', 9, MUTE));
+    shell(host, 'PREFILL / DECODE SPLIT', 'two pools, KV cache handed off between them', svg,
+      'Prefill is compute-bound; decode is memory-bound. Colocating both on one GPU wastes whichever resource the current phase is not using. Disaggregation runs separate pools sized for each bottleneck and ships the KV cache across a high-bandwidth NIXL link. It pays off on long prompts; short prompts do not justify the transfer cost.');
+  }
+
+  // ── batch-lane-triage: workloads sorted into lanes, batch drains overnight ──
+  // 15-batch-apis
+  function batchLaneTriage(host) {
+    var W = 520, H = 240;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var lanes = [
+      { y: 45, t: 'interactive', s: 'sync · full price', c: WARN },
+      { y: 110, t: 'semi', s: 'async queue', c: MUTE },
+      { y: 175, t: 'batch', s: '50% off · ~24h', c: BP }
+    ];
+    lanes.forEach(function (ln) {
+      svg.appendChild(svgEl('line', { x1: 150, y1: ln.y, x2: 470, y2: ln.y, stroke: ln.c, 'stroke-width': 1, 'stroke-dasharray': '3 3', opacity: 0.6 }));
+      svg.appendChild(txt(95, ln.y - 4, ln.t, 9, ln.c));
+      svg.appendChild(txt(95, ln.y + 9, ln.s, 7, MUTE));
+    });
+    svg.appendChild(box(140, 100, 30, 50, BG, INK));
+    svg.appendChild(txt(176, 97, 'triage', 8, INK, 'start'));
+    // jobs enter, most fall into the batch lane (blue), few interactive (warn)
+    var spec = [
+      { c: WARN, y: 45, b: '0s' }, { c: BP, y: 175, b: '0.5s' }, { c: BP, y: 175, b: '1.0s' },
+      { c: MUTE, y: 110, b: '1.5s' }, { c: BP, y: 175, b: '2.0s' }, { c: BP, y: 175, b: '2.6s' }
+    ];
+    spec.forEach(function (s) {
+      var g = svgEl('g', {}, [svgEl('rect', { x: -6, y: -6, width: 12, height: 12, rx: 2, fill: s.c })]);
+      g.appendChild(motion('M12 145 L155 145 L155 ' + s.y + ' L460 ' + s.y, '3.4s', s.b));
+      svg.appendChild(hold(g, '3.4s', s.b, 1));
+    });
+    // batch lane drains overnight: a fill bar sweeping right then resetting
+    var drain = svgEl('rect', { x: 150, y: 188, width: 0, height: 4, fill: BP, opacity: 0.5 });
+    drain.appendChild(anim('width', '0;320;320;0', '5s'));
+    svg.appendChild(drain);
+    svg.appendChild(txt(310, 215, 'if it is not interactive, it belongs on batch', 9, BP));
+    shell(host, 'BATCH LANE TRIAGE', 'workloads sorted into lanes; the batch lane drains overnight', svg,
+      'Every new LLM workload triages into three lanes. Interactive stays synchronous at full price; semi-interactive goes on an async queue; everything tolerant of 24-hour latency drops into the batch lane at a 50% discount, stacked with cached input toward ~10% of synchronous cost. Most jobs that pretend to be real-time actually just need an answer by morning.');
+  }
+
+  // ── semantic-cache-hit: similar prompts served from cache vs cold LLM ───────
+  // 14-prompt-semantic-caching
+  function semanticCacheHit(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    svg.appendChild(box(150, 90, 70, 60, BG, INK));
+    svg.appendChild(txt(185, 106, 'cache', 9, INK));
+    svg.appendChild(txt(185, 120, 'embeds', 8, MUTE));
+    svg.appendChild(box(390, 40, 100, 40, BG, WARN));
+    svg.appendChild(txt(440, 58, 'LLM (cold)', 9, WARN));
+    svg.appendChild(txt(440, 72, 'slow · $$$', 8, MUTE));
+    svg.appendChild(box(390, 150, 100, 40, BG, BP));
+    svg.appendChild(txt(440, 168, 'cache hit', 9, BP));
+    svg.appendChild(txt(440, 182, 'fast · ~$0', 8, MUTE));
+    // hit path (near, fast) vs miss path (far, to LLM)
+    var hit = svgEl('path', { d: 'M220 142 L388 170', fill: 'none', stroke: BP, 'stroke-width': 2, 'stroke-dasharray': '6 4' });
+    hit.appendChild(anim('stroke-dashoffset', '20;0', '0.6s'));
+    svg.appendChild(hit);
+    svg.appendChild(svgEl('path', { d: 'M220 123 L388 60', fill: 'none', stroke: SOFT, 'stroke-width': 1.4, 'stroke-dasharray': '4 4' }));
+    // queries flow in; similar ones (blue) hit, novel one (warn) misses to LLM
+    var spec = [{ c: BP, p: 'M12 136 L185 136 L388 170', b: '0s' }, { c: BP, p: 'M12 136 L185 136 L388 170', b: '0.9s' }, { c: WARN, p: 'M12 136 L185 136 L388 60', b: '1.8s' }, { c: BP, p: 'M12 136 L185 136 L388 170', b: '2.7s' }];
+    spec.forEach(function (s) {
+      var g = svgEl('g', {}, [svgEl('circle', { cx: 0, cy: 0, r: 5, fill: s.c })]);
+      g.appendChild(motion(s.p, '3.6s', s.b));
+      svg.appendChild(hold(g, '3.6s', s.b, 1));
+    });
+    svg.appendChild(txt(260, 215, 'similarity ≥ threshold → serve from cache, skip the LLM', 9, MUTE));
+    shell(host, 'SEMANTIC CACHE', 'similar prompts served from cache, novel ones reach the LLM', svg,
+      'L1 semantic caching embeds each prompt and checks similarity against past entries. A near-duplicate query (blue) is served straight from the cache — fast and nearly free. Only a genuinely novel prompt (orange) misses through to the cold LLM. Hit rates run 10% on open chat up to 70% on structured FAQ; dynamic text in the prefix collapses them to near zero.');
+  }
+
+  // ── edge-bandwidth-pipe: tokens through a narrow mobile pipe vs wide HBM ────
+  // 12-edge-inference
+  function edgeBandwidthPipe(host) {
+    var W = 520, H = 230;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    // datacenter: wide pipe, many tokens
+    svg.appendChild(txt(120, 36, 'datacenter HBM3 · ~3 TB/s', 9, BP));
+    svg.appendChild(svgEl('rect', { x: 40, y: 50, width: 160, height: 44, rx: 4, fill: 'none', stroke: BP, 'stroke-width': 2 }));
+    svg.appendChild(txt(245, 75, '→ ~830 tok/s', 9, BP, 'start'));
+    var i;
+    for (i = 0; i < 8; i++) {
+      var d = svgEl('circle', { cx: 0, cy: 0, r: 4, fill: BP });
+      d.appendChild(motion('M40 72 L200 72', '0.9s', (i * 0.11) + 's'));
+      svg.appendChild(d);
+    }
+    // edge: narrow pipe, few tokens trickle
+    svg.appendChild(txt(120, 130, 'mobile DRAM · ~50-90 GB/s', 9, WARN));
+    svg.appendChild(svgEl('rect', { x: 90, y: 150, width: 60, height: 14, rx: 3, fill: 'none', stroke: WARN, 'stroke-width': 2 }));
+    svg.appendChild(txt(245, 162, '→ ~14-25 tok/s', 9, WARN, 'start'));
+    for (i = 0; i < 3; i++) {
+      var s = svgEl('circle', { cx: 0, cy: 0, r: 4, fill: WARN });
+      s.appendChild(motion('M90 157 L150 157', '1.6s', (i * 0.6) + 's'));
+      svg.appendChild(s);
+    }
+    svg.appendChild(txt(260, 205, 'decode reads every weight per token — bandwidth sets the ceiling', 9, MUTE));
+    svg.appendChild(txt(260, 221, 'compute is secondary; the pipe width decides tok/s', 9, MUTE));
+    shell(host, 'EDGE BANDWIDTH CEILING', 'tokens stream through a wide datacenter pipe vs a narrow mobile one', svg,
+      'Decode reads the full set of weights for every token, so memory bandwidth — not compute — is the ceiling. Datacenter HBM3 near 3 TB/s flushes the weights in around a millisecond, clearing hundreds of tokens per second. Mobile DRAM at 50-90 GB/s is a 30-50x narrower pipe, so the same model trickles out at 14-25 tok/s no matter how much NPU compute sits idle.');
+  }
+
+  // ── load-pattern-waves: steady / ramp / spike / soak request waves ─────────
+  // 22-load-testing-llm-apis
+  function loadPatternWaves(host) {
+    var state = { pat: 'spike' };
+    var W = 520, H = 230, PAD = 36;
+    var svg = svgEl('svg', { viewBox: '0 0 ' + W + ' ' + H });
+    var dur = 6;
+    function shape(pat) {
+      // values for bar height (0..1) sampled across the cycle, and a server label
+      if (pat === 'steady') return { h: '0.55;0.55;0.55;0.55;0.55', note: 'constant rate — baseline throughput' };
+      if (pat === 'ramp') return { h: '0.1;0.35;0.6;0.85;1', note: 'climbing load — finds the breaking point' };
+      if (pat === 'spike') return { h: '0.2;0.2;1;1;0.2', note: 'sudden surge — tests autoscaling reaction' };
+      return { h: '0.6;0.6;0.6;0.6;0.6', note: 'sustained hours — surfaces memory leaks (soak)' };
+    }
+    var note = txt(260, 215, '', 9, MUTE);
+    var bars = svgEl('g', {});
+    var sat = txt(260, 36, '', 10, BP);
+    function build() {
+      while (bars.firstChild) bars.removeChild(bars.firstChild);
+      var sp = shape(state.pat);
+      var hv = sp.h.split(';');
+      var n = 14, i;
+      for (i = 0; i < n; i++) {
+        var bx = PAD + i * ((W - 2 * PAD) / n) + 3;
+        var bw = (W - 2 * PAD) / n - 6;
+        // per-bar phase offset so the wave travels left to right
+        var off = (i / n) * dur;
+        var b = svgEl('rect', { x: bx, y: H - PAD, width: bw, height: 4, fill: i % 2 ? BP : MUTE, opacity: 0.85 });
+        // scale heights to pixels (max ~140)
+        var hpx = hv.map(function (v) { return (Number(v) * 140).toFixed(0); }).join(';');
+        var ypx = hv.map(function (v) { return (H - PAD - Number(v) * 140).toFixed(0); }).join(';');
+        b.appendChild(svgEl('animate', { attributeName: 'height', values: hpx, dur: dur + 's', repeatCount: 'indefinite', begin: (-off) + 's' }));
+        b.appendChild(svgEl('animate', { attributeName: 'y', values: ypx, dur: dur + 's', repeatCount: 'indefinite', begin: (-off) + 's' }));
+        bars.appendChild(b);
+      }
+      note.textContent = sp.note;
+      sat.textContent = state.pat.toUpperCase() + ' pattern';
+    }
+    svg.appendChild(svgEl('line', { x1: PAD, y1: H - PAD, x2: W - PAD, y2: H - PAD, stroke: SOFT, 'stroke-width': 1 }));
+    svg.appendChild(bars);
+    svg.appendChild(sat);
+    svg.appendChild(note);
+    state._render = build;
+    var ctrl = select(state, 'pat', 'load pattern', [['spike', 'spike'], ['steady-state', 'steady'], ['ramp', 'ramp'], ['soak', 'soak']]);
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, ['LOAD PATTERNS']), el('span', {}, ['pick a pattern'])]),
+      el('div', { class: 'lf-body' }, [el('div', {}, [ctrl]), el('div', { class: 'lf-out' }, [svg])]),
+      el('div', { class: 'lf-cap' }, ['Four load shapes catch four failures. Steady-state measures baseline throughput; ramp climbs until the breaking point; spike surges suddenly to test how fast autoscaling reacts; soak holds load for hours to surface memory leaks. Generic testers also lie when every request is identical — real traffic needs variable input length and diverse prefixes.'])
+    ]));
+    build();
+  }
+
+  LF.register({
+    'cache-aware-router': cacheAwareRouter,
+    'cold-start-pipeline': coldStartLayers,
+    'model-cascade-router': modelCascadeRouter,
+    'prefill-decode-split': prefillDecodeSplit,
+    'batch-lane-triage': batchLaneTriage,
+    'semantic-cache-hit': semanticCacheHit,
+    'edge-bandwidth-pipe': edgeBandwidthPipe,
+    'load-pattern-waves': loadPatternWaves
+  });
+})();
+
+/* module figures-infra4.js (Part 6) */
+/* figures-infra4.js - animated lesson figures for Phase 17 (Infrastructure and
+   Production): managed platforms, observability wiring, canary rollout,
+   AI SRE, chaos guardrails, secrets rotation, compliance mapping, FinOps.
+   Loads after lesson-figures.js, registers through window.LF. SMIL motion
+   only - no JS loops, no rAF. ES5, no deps, theme via CSS vars. */
+(function () {
+  'use strict';
+  var LF = window.LF;
+  if (!LF) { return; }
+  var el = LF.el, svgEl = LF.svgEl;
+
+  var BP = 'var(--blueprint,#3553ff)';
+  var SOFT = 'var(--rule-soft,#ddd)';
+  var MUTE = 'var(--ink-mute,#777)';
+  var INKS = 'var(--ink-soft,#555)';
+  var WARN = 'var(--warn,#b8870f)';
+  var INK = 'var(--ink,#1a1a1a)';
+  var BG = 'var(--bg,#fafaf5)';
+  var SURF = 'var(--bg-surface,#eee)';
+  var EASE = '0.23 1 0.32 1';
+  var SPL4 = '0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1';
+
+  function svg(h) { return svgEl('svg', { viewBox: '0 0 520 ' + h }); }
+  function shell(host, label, sub, node, cap) {
+    host.appendChild(el('div', { class: 'lf' }, [
+      el('div', { class: 'lf-head' }, [el('span', { class: 'lf-label' }, [label]), el('span', {}, [sub])]),
+      el('div', { class: 'lf-body' }, [el('div', { class: 'lf-out' }, [node])]),
+      el('div', { class: 'lf-cap' }, [cap])
+    ]));
+  }
+  function txt(x, y, s, size, fill, anchor) {
+    var t = svgEl('text', { x: x, y: y, 'text-anchor': anchor || 'middle', 'font-family': 'var(--font-mono,monospace)', 'font-size': size || '10', fill: fill || INK });
+    t.appendChild(document.createTextNode(s));
+    return t;
+  }
+  function rect(x, y, w, h, fill, stroke) {
+    return svgEl('rect', { x: x, y: y, width: w, height: h, rx: '4', fill: fill || BG, stroke: stroke || SOFT, 'stroke-width': '1.4' });
+  }
+  function anim(attr, vals, dur, extra) {
+    var a = { attributeName: attr, values: vals, dur: dur, repeatCount: 'indefinite' };
+    if (extra) { for (var k in extra) { a[k] = extra[k]; } }
+    return svgEl('animate', a);
+  }
+  function motion(path, dur, begin) {
+    return svgEl('animateMotion', { path: path, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' });
+  }
+  // fade+grow entry: opacity 0 and 95% size in over the a..b phase window,
+  // faster exit at 0.94..1. Contents draw relative to (cx, cy).
+  function entry(cx, cy, dur, begin, a, b) {
+    a = a || 0.02; b = b || 0.12;
+    var kt = '0;' + a + ';' + b + ';0.94;1';
+    var g = svgEl('g', { transform: 'translate(' + cx + ' ' + cy + ')', opacity: '0' });
+    g.appendChild(svgEl('animateTransform', { attributeName: 'transform', type: 'scale', additive: 'sum', values: '0.95;0.95;1;1;0.97', keyTimes: kt, calcMode: 'spline', keySplines: SPL4, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' }));
+    g.appendChild(svgEl('animate', { attributeName: 'opacity', values: '0;0;1;1;0', keyTimes: kt, calcMode: 'spline', keySplines: SPL4, dur: dur, begin: begin || '0s', repeatCount: 'indefinite' }));
+    return g;
+  }
+
+  // ── i4-platform-lanes: PTU reserved lane vs shared on-demand lane ──────────
+  // 01-managed-llm-platforms
+  function platformLanes(host) {
+    var s = svg(230);
+    s.appendChild(txt(40, 40, 'PTU reserved lane', '9', BP, 'start'));
+    s.appendChild(svgEl('rect', { x: 40, y: 50, width: 330, height: 34, rx: '4', fill: 'none', stroke: BP, 'stroke-width': '1.6' }));
+    s.appendChild(rect(390, 44, 100, 46, BG, BP));
+    s.appendChild(txt(440, 63, 'dedicated', '9', BP));
+    s.appendChild(txt(440, 77, '~50 ms median', '8', MUTE));
+    var i;
+    for (i = 0; i < 4; i++) {
+      var d = svgEl('circle', { cx: 0, cy: 0, r: 5, fill: BP, opacity: '0' });
+      d.appendChild(motion('M20 67 L440 67', '1.6s', (i * 0.4) + 's'));
+      d.appendChild(anim('opacity', '1;1', '1.6s', { begin: (i * 0.4) + 's' }));
+      s.appendChild(d);
+    }
+    s.appendChild(txt(40, 128, 'on-demand shared lane', '9', WARN, 'start'));
+    s.appendChild(svgEl('rect', { x: 40, y: 138, width: 330, height: 34, rx: '4', fill: 'none', stroke: WARN, 'stroke-width': '1.6' }));
+    s.appendChild(rect(390, 132, 100, 46, BG, WARN));
+    s.appendChild(txt(440, 151, 'shared pool', '9', WARN));
+    s.appendChild(txt(440, 165, '~75 ms median', '8', MUTE));
+    // shared lane: other tenants' grey traffic crowds the pipe, ours waits
+    for (i = 0; i < 3; i++) {
+      var o = svgEl('rect', { x: -5, y: -5, width: 10, height: 10, rx: '2', fill: MUTE, opacity: '0' });
+      o.appendChild(motion('M60 155 L440 155', '2.6s', (i * 0.85) + 's'));
+      o.appendChild(anim('opacity', '0.5;0.5', '2.6s', { begin: (i * 0.85) + 's' }));
+      s.appendChild(o);
+    }
+    for (i = 0; i < 2; i++) {
+      var m = svgEl('circle', { cx: 0, cy: 0, r: 5, fill: WARN, opacity: '0' });
+      m.appendChild(motion('M20 155 L120 155 L120 155 L440 155', '3.2s', (i * 1.6) + 's'));
+      m.appendChild(anim('opacity', '1;1', '3.2s', { begin: (i * 1.6) + 's' }));
+      s.appendChild(m);
+    }
+    var q = entry(150, 155, '3.2s', '0.3s', 0.05, 0.2);
+    q.appendChild(txt(0, 31, 'queued behind neighbors', '8', MUTE));
+    s.appendChild(q);
+    s.appendChild(txt(260, 208, 'same model, different capacity contract: reserved beats shared by ~25 ms', '9', MUTE));
+    shell(host, 'PLATFORM LANES', 'reserved PTU capacity vs shared on-demand', s,
+      'The hyperscaler latency gap is a capacity story, not a model story. Azure PTUs reserve throughput, so requests ride a dedicated lane at ~50 ms median. Bedrock on-demand shares a pool with every other tenant, and the same-scale model reads ~75 ms because your tokens queue behind theirs. Pick the platform for its catalog and FinOps surface, then decide which workloads deserve the reserved lane.');
+  }
+
+  // ── i4-otel-glue: gateway spans fan out through OTel to two backends ───────
+  // 13-llm-observability
+  function otelGlue(host) {
+    var s = svg(240);
+    s.appendChild(rect(30, 96, 74, 44, BG, INK));
+    s.appendChild(txt(67, 114, 'app', '10', INK));
+    s.appendChild(txt(67, 128, 'LLM calls', '8', MUTE));
+    s.appendChild(rect(170, 96, 84, 44, BG, INKS));
+    s.appendChild(txt(212, 114, 'gateway', '10', INKS));
+    s.appendChild(txt(212, 128, 'Helicone', '8', MUTE));
+    s.appendChild(rect(300, 96, 70, 44, SURF, BP));
+    s.appendChild(txt(335, 114, 'OTel', '10', BP));
+    s.appendChild(txt(335, 128, 'collector', '8', MUTE));
+    s.appendChild(rect(410, 34, 96, 44, BG, BP));
+    s.appendChild(txt(458, 52, 'telemetry', '9', BP));
+    s.appendChild(txt(458, 66, 'traces + cost', '8', MUTE));
+    s.appendChild(rect(410, 158, 96, 44, BG, WARN));
+    s.appendChild(txt(458, 176, 'eval platform', '9', WARN));
+    s.appendChild(txt(458, 190, 'drift + RAG', '8', MUTE));
+    s.appendChild(svgEl('path', { d: 'M104 118 L170 118', fill: 'none', stroke: SOFT, 'stroke-width': '1.2' }));
+    s.appendChild(svgEl('path', { d: 'M254 118 L300 118', fill: 'none', stroke: SOFT, 'stroke-width': '1.2' }));
+    var up = svgEl('path', { d: 'M370 108 L408 62', fill: 'none', stroke: BP, 'stroke-width': '1.4', 'stroke-dasharray': '4 4' });
+    up.appendChild(anim('stroke-dashoffset', '16;0', '0.8s'));
+    s.appendChild(up);
+    var dn = svgEl('path', { d: 'M370 128 L408 174', fill: 'none', stroke: WARN, 'stroke-width': '1.4', 'stroke-dasharray': '4 4' });
+    dn.appendChild(anim('stroke-dashoffset', '16;0', '0.8s'));
+    s.appendChild(dn);
+    // one request becomes a span; the collector clones it to both sinks
+    var i;
+    for (i = 0; i < 3; i++) {
+      var b = (i * 1.4) + 's';
+      var c = svgEl('circle', { cx: 0, cy: 0, r: 5, fill: INKS, opacity: '0' });
+      c.appendChild(motion('M36 118 L67 118 L212 118 L335 118', '4.2s', b));
+      c.appendChild(anim('opacity', '1;1;0;0', '4.2s', { keyTimes: '0;0.6;0.62;1', begin: b }));
+      s.appendChild(c);
+      var t1 = svgEl('rect', { x: -5, y: -4, width: 10, height: 8, rx: '2', fill: BP, opacity: '0' });
+      t1.appendChild(motion('M335 118 L335 118 L458 56', '4.2s', b));
+      t1.appendChild(anim('opacity', '0;0;1;1;0', '4.2s', { keyTimes: '0;0.6;0.66;0.9;1', begin: b }));
+      s.appendChild(t1);
+      var t2 = svgEl('rect', { x: -5, y: -4, width: 10, height: 8, rx: '2', fill: WARN, opacity: '0' });
+      t2.appendChild(motion('M335 118 L335 118 L458 180', '4.2s', b));
+      t2.appendChild(anim('opacity', '0;0;1;1;0', '4.2s', { keyTimes: '0;0.6;0.66;0.9;1', begin: b }));
+      s.appendChild(t2);
+    }
+    s.appendChild(txt(260, 228, 'one span, two sinks: no tool has to do both jobs', '9', MUTE));
+    shell(host, 'OTEL GLUE PATTERN', 'gateway telemetry cloned to a metrics sink and an eval sink', s,
+      'No single observability tool wins both jobs, so the production pattern splits them. The gateway captures every LLM call as an OpenTelemetry span; the collector clones each span to two sinks: a telemetry backend for traces, latency, and cost, and an eval platform for drift and RAG quality. Swapping either side later is a config change, not a re-instrumentation.');
+  }
+
+  // ── i4-canary-ramp: shadow mirror first, then gated traffic steps ──────────
+  // 20-shadow-canary-progressive
+  function canaryRamp(host) {
+    var s = svg(250);
+    s.appendChild(rect(30, 24, 70, 56, BG, INK));
+    s.appendChild(txt(65, 40, 'traffic', '9', INK));
+    s.appendChild(txt(65, 53, 'splitter', '8', MUTE));
+    s.appendChild(rect(150, 20, 90, 36, BG, INKS));
+    s.appendChild(txt(195, 35, 'prod model', '9', INKS));
+    s.appendChild(txt(195, 48, 'serves users', '7.5', MUTE));
+    s.appendChild(rect(150, 74, 90, 36, BG, BP));
+    s.appendChild(txt(195, 89, 'candidate', '9', BP));
+    s.appendChild(txt(195, 102, 'shadow: log only', '7.5', MUTE));
+    s.appendChild(svgEl('path', { d: 'M100 64 L150 38', fill: 'none', stroke: SOFT, 'stroke-width': '1.2' }));
+    var mir = svgEl('path', { d: 'M100 72 L150 88', fill: 'none', stroke: BP, 'stroke-width': '1.2', 'stroke-dasharray': '3 4' });
+    mir.appendChild(anim('stroke-dashoffset', '14;0', '0.9s'));
+    s.appendChild(mir);
+    var i;
+    for (i = 0; i < 3; i++) {
+      var r1 = svgEl('circle', { cx: 0, cy: 0, r: 4, fill: INKS });
+      r1.appendChild(motion('M10 68 L100 68 L150 38', '2s', (i * 0.7) + 's'));
+      s.appendChild(r1);
+      var r2 = svgEl('circle', { cx: 0, cy: 0, r: 4, fill: BP, opacity: '0.55' });
+      r2.appendChild(motion('M10 68 L100 68 L150 88', '2s', (i * 0.7) + 's'));
+      s.appendChild(r2);
+    }
+    s.appendChild(txt(30, 128, 'mirrored copy is discarded, never returned', '8', MUTE, 'start'));
+    // canary share meter: steps 10 -> 25 -> 50 -> 100 with gates between
+    var mx = 300, mw = 190, my = 40, mh = 130;
+    s.appendChild(txt(mx + mw / 2, 28, 'canary share of live traffic', '9', INKS));
+    s.appendChild(svgEl('rect', { x: mx, y: my, width: mw, height: mh, rx: '3', fill: 'none', stroke: SOFT, 'stroke-width': '1.2' }));
+    var fill = svgEl('rect', { x: mx, y: my + mh, width: mw, height: 0, fill: BP, opacity: '0.3' });
+    fill.appendChild(anim('height', '13;13;33;33;65;65;130;130;13', '6s', { keyTimes: '0;0.16;0.24;0.4;0.48;0.64;0.72;0.94;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+    fill.appendChild(anim('y', (my + mh - 13) + ';' + (my + mh - 13) + ';' + (my + mh - 33) + ';' + (my + mh - 33) + ';' + (my + mh - 65) + ';' + (my + mh - 65) + ';' + (my + mh - 130) + ';' + (my + mh - 130) + ';' + (my + mh - 13), '6s', { keyTimes: '0;0.16;0.24;0.4;0.48;0.64;0.72;0.94;1', calcMode: 'spline', keySplines: '0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+    s.appendChild(fill);
+    var steps = [[13, '10%'], [33, '25%'], [65, '50%'], [130, '100%']];
+    for (i = 0; i < steps.length; i++) {
+      s.appendChild(svgEl('line', { x1: mx, y1: my + mh - steps[i][0], x2: mx + mw, y2: my + mh - steps[i][0], stroke: SOFT, 'stroke-width': '0.7', 'stroke-dasharray': '2 3' }));
+      s.appendChild(txt(mx + mw + 6, my + mh - steps[i][0] + 3, steps[i][1], '8', MUTE, 'start'));
+    }
+    var gate = entry(mx + mw / 2, my + mh + 20, '6s', '0s', 0.16, 0.22);
+    gate.appendChild(txt(0, 3, 'gate: latency, cost, refusals, length, feedback', '8', WARN));
+    s.appendChild(gate);
+    s.appendChild(txt(260, 238, 'each step holds until the metric gate passes; rollback is a policy flip', '9', MUTE));
+    shell(host, 'SHADOW THEN CANARY', 'mirror first, then step live traffic through metric gates', s,
+      'Shadow mode duplicates production requests to the candidate and discards its answers, catching cost spikes and distribution shifts at zero user risk. Only then does the canary ramp start: 10, 25, 50, 100 percent, each step gated on latency percentiles, cost per request, refusal rate, output-length distribution, and user feedback. Rollback is a policy flip measured in seconds, never a redeploy.');
+  }
+
+  // ── i4-incident-agents: supervisor fans out to agents, human gate acts ─────
+  // 23-sre-for-ai
+  function incidentAgents(host) {
+    var s = svg(250);
+    var agents = [[52, 'logs'], [118, 'metrics'], [184, 'runbooks']];
+    s.appendChild(rect(30, 96, 80, 44, BG, INK));
+    s.appendChild(txt(70, 114, 'supervisor', '9', INK));
+    s.appendChild(txt(70, 128, 'triage', '8', MUTE));
+    var alert = svgEl('g', {}, [svgEl('circle', { cx: 0, cy: 0, r: 6, fill: WARN }), txt(0, 3, '!', '9', BG)]);
+    alert.appendChild(motion('M-20 118 L30 118', '5.4s', '0s'));
+    alert.appendChild(anim('opacity', '1;1;0;0', '5.4s', { keyTimes: '0;0.09;0.11;1' }));
+    s.appendChild(alert);
+    var i;
+    for (i = 0; i < agents.length; i++) {
+      var ax = 220, ay = agents[i][0];
+      s.appendChild(rect(ax, ay - 16, 86, 34, BG, BP));
+      s.appendChild(txt(ax + 43, ay + 4, agents[i][1] + ' agent', '8.5', BP));
+      s.appendChild(svgEl('path', { d: 'M110 112 L' + ax + ' ' + ay, fill: 'none', stroke: SOFT, 'stroke-width': '1', 'stroke-dasharray': '3 4' }));
+      // query out, evidence back
+      var qd = svgEl('circle', { cx: 0, cy: 0, r: 4, fill: BP });
+      qd.appendChild(motion('M70 118 L' + (ax + 43) + ' ' + ay + ' L70 118', '5.4s', (0.6 + i * 0.25) + 's'));
+      qd.appendChild(anim('opacity', '0;1;1;0;0', '5.4s', { keyTimes: '0;0.12;0.5;0.55;1', begin: (0.6 + i * 0.25) + 's' }));
+      s.appendChild(qd);
+    }
+    var hyp = entry(70, 178, '5.4s', '0s', 0.55, 0.64);
+    hyp.appendChild(svgEl('rect', { x: -55, y: -14, width: 110, height: 28, rx: '4', fill: SURF, stroke: BP, 'stroke-width': '1.2' }));
+    hyp.appendChild(txt(0, -1, 'hypothesis:', '8', BP));
+    hyp.appendChild(txt(0, 10, 'vLLM OOM, KV spike', '8', INKS));
+    s.appendChild(hyp);
+    s.appendChild(rect(350, 96, 66, 44, BG, WARN));
+    s.appendChild(txt(383, 114, 'human', '9', WARN));
+    s.appendChild(txt(383, 128, 'approve?', '8', MUTE));
+    s.appendChild(rect(440, 96, 66, 44, BG, INKS));
+    s.appendChild(txt(473, 114, 'action', '9', INKS));
+    s.appendChild(txt(473, 128, 'restart pod', '7.5', MUTE));
+    var toGate = svgEl('circle', { cx: 0, cy: 0, r: 4.5, fill: BP });
+    toGate.appendChild(motion('M125 178 L383 178 L383 118 L383 118 L473 118', '5.4s', '0s'));
+    toGate.appendChild(anim('opacity', '0;0;1;1;1;0', '5.4s', { keyTimes: '0;0.66;0.7;0.82;0.95;1' }));
+    s.appendChild(toGate);
+    var ok = entry(383, 78, '5.4s', '0s', 0.8, 0.86);
+    ok.appendChild(txt(0, 3, 'approved', '8', WARN));
+    s.appendChild(ok);
+    s.appendChild(txt(260, 238, 'agents gather evidence in parallel; judgment stays human', '9', MUTE));
+    shell(host, 'AI SRE TRIAGE', 'supervisor fans out, evidence converges, a human gates the fix', s,
+      'The page lands on a supervisor agent that fans queries to specialists: one greps logs, one correlates metrics to deploys, one matches runbooks. Their evidence converges into a hypothesis before anyone opens a dashboard. The remediation still crosses a human approval gate, and the autonomous set stays narrow: restart a pod, revert a deploy, nothing that re-architects the service at 3 a.m.');
+  }
+
+  // ── i4-chaos-guard: fault injections land until the burn-rate guard aborts ─
+  // 24-chaos-engineering-llm
+  function chaosGuard(host) {
+    var s = svg(240);
+    s.appendChild(rect(40, 40, 110, 44, BG, INKS));
+    s.appendChild(txt(95, 58, 'control plane', '9', INKS));
+    s.appendChild(txt(95, 72, 'scheduler', '8', MUTE));
+    s.appendChild(rect(230, 90, 130, 60, BG, INK));
+    s.appendChild(txt(295, 112, 'target: LLM service', '9', INK));
+    s.appendChild(txt(295, 128, 'KV cache, gateway', '8', MUTE));
+    // three faults fire into the target: two land, the third gets aborted
+    var faults = [['429 storm', '0s', BP], ['KV evict', '1.8s', BP], ['net loss', '3.6s', WARN]];
+    var i;
+    for (i = 0; i < faults.length; i++) {
+      var g = svgEl('g', { opacity: '0' }, [
+        svgEl('rect', { x: -26, y: -9, width: 52, height: 18, rx: '3', fill: BG, stroke: faults[i][2], 'stroke-width': '1.2' }),
+        txt(0, 3, faults[i][0], '7.5', faults[i][2])
+      ]);
+      var land = i < 2;
+      g.appendChild(motion(land ? 'M95 84 L95 120 L226 120' : 'M95 84 L95 120 L180 120 L180 120', '5.4s', faults[i][1]));
+      g.appendChild(anim('opacity', land ? '0;1;1;0;0' : '0;1;1;1;0;0', '5.4s',
+        { keyTimes: land ? '0;0.05;0.3;0.34;1' : '0;0.05;0.28;0.32;0.36;1', begin: faults[i][1] }));
+      s.appendChild(g);
+    }
+    // safety plane: error-budget burn meter fills, crosses 2x, abort drops
+    var bx = 410, by = 40, bh = 110;
+    s.appendChild(txt(bx + 20, 30, 'budget burn', '8.5', INKS));
+    s.appendChild(svgEl('rect', { x: bx, y: by, width: 40, height: bh, rx: '3', fill: 'none', stroke: SOFT, 'stroke-width': '1.2' }));
+    s.appendChild(svgEl('line', { x1: bx - 4, y1: by + 36, x2: bx + 44, y2: by + 36, stroke: WARN, 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+    s.appendChild(txt(bx + 58, by + 39, '2x', '8', WARN, 'start'));
+    var burn = svgEl('g', { opacity: '0.45' });
+    var calm = svgEl('rect', { x: bx + 3, y: by + bh - 3, width: 34, height: 0, fill: BP });
+    var hot = svgEl('rect', { x: bx + 3, y: by + bh - 3, width: 34, height: 0, fill: WARN, opacity: '0' });
+    var burnSpline = { keyTimes: '0;0.2;0.45;0.68;0.94;1', calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';0 0 1 1;0.4 0 1 1' };
+    [calm, hot].forEach(function (bar) {
+      bar.appendChild(anim('height', '0;20;44;80;80;0', '5.4s', burnSpline));
+      bar.appendChild(anim('y', (by + bh - 3) + ';' + (by + bh - 23) + ';' + (by + bh - 47) + ';' + (by + bh - 83) + ';' + (by + bh - 83) + ';' + (by + bh - 3), '5.4s', burnSpline));
+      burn.appendChild(bar);
+    });
+    hot.appendChild(anim('opacity', '0;0;0;1;1;0', '5.4s', { keyTimes: '0;0.2;0.45;0.68;0.94;1' }));
+    s.appendChild(burn);
+    var abort = entry(260, 190, '5.4s', '0s', 0.66, 0.72);
+    abort.appendChild(svgEl('rect', { x: -92, y: -13, width: 184, height: 26, rx: '4', fill: SURF, stroke: WARN, 'stroke-width': '1.4' }));
+    abort.appendChild(txt(0, 4, 'guard: burn > 2x, experiment paused', '8.5', WARN));
+    s.appendChild(abort);
+    s.appendChild(txt(260, 228, 'faults are scheduled, never loose: the safety plane can always abort', '9', MUTE));
+    shell(host, 'CHAOS WITH A LEASH', 'injected faults run until the burn-rate guard pulls the plug', s,
+      'The control plane schedules faults against the target: a 429 storm, a KV cache eviction, a network drop. The safety plane watches the error-budget burn meter the whole time. When daily burn crosses twice the expected rate, the guard aborts the experiment mid-flight and the last fault never lands. Chaos without that leash is just an outage you signed up for.');
+  }
+
+  // ── i4-vault-rotation: key rotates in the vault, gateway picks it up live ──
+  // 25-security-secrets-audit
+  function vaultRotation(host) {
+    var s = svg(240);
+    s.appendChild(rect(40, 80, 90, 70, BG, INK));
+    s.appendChild(txt(85, 72, 'vault', '9', INK));
+    // the stored key chip: old key fades out, new key grows in, in place
+    var oldKey = svgEl('g', { transform: 'translate(85 115)' }, [
+      svgEl('rect', { x: -30, y: -10, width: 60, height: 20, rx: '3', fill: WARN, opacity: '0.8' }),
+      txt(0, 4, 'key v1', '8.5', BG)
+    ]);
+    oldKey.appendChild(anim('opacity', '1;1;0;0;1', '5.6s', { keyTimes: '0;0.3;0.36;0.96;1' }));
+    s.appendChild(oldKey);
+    var newKey = entry(85, 115, '5.6s', '0s', 0.36, 0.46);
+    newKey.appendChild(svgEl('rect', { x: -30, y: -10, width: 60, height: 20, rx: '3', fill: BP }));
+    newKey.appendChild(txt(0, 4, 'key v2', '8.5', BG));
+    s.appendChild(newKey);
+    var rot = entry(85, 166, '5.6s', '0s', 0.3, 0.38);
+    rot.appendChild(txt(0, 3, 'rotated, <=90 days', '8', MUTE));
+    s.appendChild(rot);
+    s.appendChild(rect(220, 85, 100, 60, BG, INKS));
+    s.appendChild(txt(270, 107, 'AI gateway', '9', INKS));
+    s.appendChild(txt(270, 122, 'pulls at runtime', '7.5', MUTE));
+    var pull = svgEl('path', { d: 'M130 115 L220 115', fill: 'none', stroke: BP, 'stroke-width': '1.4', 'stroke-dasharray': '4 4' });
+    pull.appendChild(anim('stroke-dashoffset', '16;0', '0.8s'));
+    s.appendChild(pull);
+    // key material travels vault -> gateway only; color flips after rotation
+    var kd = svgEl('g', {}, [svgEl('rect', { x: -7, y: -5, width: 14, height: 10, rx: '2', fill: WARN })]);
+    var kdNew = svgEl('rect', { x: -7, y: -5, width: 14, height: 10, rx: '2', fill: BP, opacity: '0' });
+    kdNew.appendChild(anim('opacity', '0;0;1;1', '5.6s', { keyTimes: '0;0.35;0.44;1' }));
+    kd.appendChild(kdNew);
+    kd.appendChild(motion('M115 115 L215 115', '2.8s', '0s'));
+    s.appendChild(kd);
+    // apps call through the gateway and never hold a credential
+    var apps = [[55, 'app A'], [115, 'app B'], [175, 'app C']];
+    var i;
+    for (i = 0; i < apps.length; i++) {
+      s.appendChild(rect(400, apps[i][0] - 14, 76, 30, BG, SOFT));
+      s.appendChild(txt(438, apps[i][0] + 5, apps[i][1], '8.5', MUTE));
+      s.appendChild(svgEl('path', { d: 'M400 ' + apps[i][0] + ' L324 ' + (100 + i * 12), fill: 'none', stroke: SOFT, 'stroke-width': '1' }));
+      var rq = svgEl('circle', { cx: 0, cy: 0, r: 3.5, fill: INKS });
+      rq.appendChild(motion('M438 ' + (apps[i][0] + 12) + ' L270 130', '2.2s', (i * 0.7) + 's'));
+      s.appendChild(rq);
+    }
+    s.appendChild(txt(438, 206, 'no keys in env files or VCS', '8', MUTE));
+    s.appendChild(txt(260, 228, 'rotate once in the vault; every app is current in minutes, zero redeploys', '9', MUTE));
+    shell(host, 'VAULT-BACKED ROTATION', 'the key changes in one place and the gateway picks it up live', s,
+      'Credentials live in the vault and nowhere else. Apps call the AI gateway, which pulls the current key at runtime, so no service ever holds a static secret. When key v1 rotates to v2, the swap happens in one place and every caller is current within minutes: no redeploys, no 40 config files, no message asking who has the new key. The 90-day rotation policy stops being a migration and becomes a non-event.');
+  }
+
+  // ── i4-control-matrix: one control lights its cells across framework rows ──
+  // 26-compliance-frameworks
+  function controlMatrix(host) {
+    var s = svg(250);
+    var rows = [['SOC 2 II', 1], ['GDPR', 1], ['HIPAA', 1], ['EU AI Act', 0], ['ISO 42001', 0]];
+    var cols = [['access ctl', 140], ['PII redact', 250], ['audit log', 360]];
+    // which controls satisfy which frameworks (1 = cell lights up)
+    var map = [[1, 1, 1], [1, 1, 1], [1, 1, 1], [0, 1, 1], [1, 0, 1]];
+    var i, j;
+    for (j = 0; j < cols.length; j++) { s.appendChild(txt(cols[j][1] + 40, 43, cols[j][0], '8.5', INKS)); }
+    for (i = 0; i < rows.length; i++) {
+      var ry = 54 + i * 34;
+      s.appendChild(txt(126, ry + 15, rows[i][0], '8.5', MUTE, 'end'));
+      for (j = 0; j < cols.length; j++) {
+        s.appendChild(svgEl('rect', { x: cols[j][1], y: ry, width: 80, height: 24, rx: '2', fill: 'none', stroke: SOFT, 'stroke-width': '1' }));
+        if (map[i][j]) {
+          var c = svgEl('rect', { x: cols[j][1] + 2, y: ry + 2, width: 76, height: 20, rx: '2', fill: BP, opacity: '0' });
+          c.appendChild(anim('opacity', '0;0;0.35;0.35;0', '5.2s', { keyTimes: '0;' + (0.1 + j * 0.22).toFixed(2) + ';' + (0.16 + j * 0.22).toFixed(2) + ';0.94;1', calcMode: 'spline', keySplines: SPL4, begin: (i * 0.05).toFixed(2) + 's' }));
+          s.appendChild(c);
+        }
+      }
+    }
+    // one implemented control sweeps its column, lighting every row it maps to
+    var chip = svgEl('g', {}, [
+      svgEl('rect', { x: -38, y: -10, width: 76, height: 20, rx: '3', fill: BG, stroke: BP, 'stroke-width': '1.4' }),
+      txt(0, 4, 'built once', '8', BP)
+    ]);
+    chip.appendChild(motion('M180 18 L180 18 L290 18 L290 18 L400 18 L400 18', '5.2s', '0s'));
+    s.appendChild(chip);
+    s.appendChild(txt(260, 238, 'one control, many cells: the matrix fills faster than the framework count grows', '9', MUTE));
+    shell(host, 'CONTROL CROSS-MAPPING', 'each control lights every framework cell it satisfies', s,
+      'Procurement wants a matrix with a row per framework, and the way to survive it is cross-mapping. One access-control implementation lights cells in SOC 2, GDPR Article 32, HIPAA 164.312(a), and ISO alike; PII redaction and audit logging sweep their own columns. You build each control once and claim it many times, so five frameworks cost far less than five audits, and the gaps that remain are visibly framework-specific, not everywhere.');
+  }
+
+  // ── i4-spend-ladder: tenant meters fill, one trips the cap and kill switch ─
+  // 27-finops-llms
+  function spendLadder(host) {
+    var s = svg(250);
+    s.appendChild(txt(40, 34, 'tokens in, stamped tenant_id at the call site', '9', INKS, 'start'));
+    var tens = [
+      { x: 70, name: 'tenant A', fills: '0;44;56;62;62;0', ok: true },
+      { x: 220, name: 'tenant B', fills: '0;30;38;44;44;0', ok: true },
+      { x: 370, name: 'tenant C', fills: '0;60;104;118;118;0', ok: false }
+    ];
+    var by = 60, bh = 120, i;
+    for (i = 0; i < tens.length; i++) {
+      var t = tens[i];
+      s.appendChild(svgEl('rect', { x: t.x, y: by, width: 56, height: bh, rx: '3', fill: 'none', stroke: t.ok ? SOFT : WARN, 'stroke-width': '1.2' }));
+      s.appendChild(svgEl('line', { x1: t.x - 4, y1: by + 24, x2: t.x + 60, y2: by + 24, stroke: WARN, 'stroke-width': '1', 'stroke-dasharray': '3 3' }));
+      s.appendChild(txt(t.x + 28, by + bh + 16, t.name, '8.5', t.ok ? MUTE : WARN));
+      var kt = '0;0.25;0.5;0.72;0.94;1';
+      var f = svgEl('rect', { x: t.x + 3, y: by + bh - 3, width: 50, height: 0, fill: t.ok ? BP : WARN, opacity: '0.45' });
+      f.appendChild(anim('height', t.fills, '5.6s', { keyTimes: kt, calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+      f.appendChild(anim('y', t.fills.split(';').map(function (v) { return by + bh - 3 - Number(v); }).join(';'), '5.6s', { keyTimes: kt, calcMode: 'spline', keySplines: EASE + ';' + EASE + ';' + EASE + ';0 0 1 1;0.4 0 1 1' }));
+      s.appendChild(f);
+      // token drops feeding each meter
+      var d = svgEl('circle', { cx: 0, cy: 0, r: 3.5, fill: t.ok ? BP : WARN });
+      d.appendChild(motion('M' + (t.x + 28) + ' 40 L' + (t.x + 28) + ' ' + (by + 20), '1.1s', (i * 0.3) + 's'));
+      s.appendChild(d);
+    }
+    s.appendChild(txt(36, by + 27, 'cap', '8', WARN, 'start'));
+    // tenant C crosses the daily cap: kill switch trips, feed gets cut
+    var kill = entry(398, 44, '5.6s', '0s', 0.52, 0.6);
+    kill.appendChild(svgEl('rect', { x: -62, y: -12, width: 124, height: 24, rx: '4', fill: SURF, stroke: WARN, 'stroke-width': '1.4' }));
+    kill.appendChild(txt(0, 4, 'z > 4: kill switch, 429', '8', WARN));
+    s.appendChild(kill);
+    s.appendChild(txt(260, 238, 'rate limit, then spend cap, then kill switch: A and B never notice C', '9', MUTE));
+    shell(host, 'TENANT SPEND METERS', 'per-tenant meters fill until one trips the enforcement ladder', s,
+      'Every call is stamped with tenant_id at creation, so spend lands in the right meter as it happens, not in a retroactive tagging pass. Tenants A and B fill normally under their daily caps. Tenant C spikes past the cap line, its spend z-score crosses 4, and the kill switch answers with 429s while the on-call gets paged. The ladder runs rate limit, spend cap, kill switch, and the blast radius stays inside one meter.');
+  }
+
+  LF.register({
+    'i4-platform-lanes': platformLanes,
+    'i4-otel-glue': otelGlue,
+    'i4-canary-ramp': canaryRamp,
+    'i4-incident-agents': incidentAgents,
+    'i4-chaos-guard': chaosGuard,
+    'i4-vault-rotation': vaultRotation,
+    'i4-control-matrix': controlMatrix,
+    'i4-spend-ladder': spendLadder
+  });
+})();

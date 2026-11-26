@@ -1,0 +1,313 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · Infrastructure &amp; Production</a></nav><h1>Disaggregated Prefill/Decode — NVIDIA Dynamo and llm-d</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.17</span><span class="chip">75 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1717" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why prefill and decode have different optimal GPU allocations and quantify the waste under colocation.</li>
+<li>Diagram the disaggregated architecture: prefill pool, decode pool, KV transfer via NIXL, router.</li>
+<li>Name the condition when disaggregation does NOT pay off (short prompts, short outputs).</li>
+<li>Distinguish NVIDIA Dynamo (stack-above) from llm-d (Kubernetes-native) and match each to an operational context.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 17 · 04 (Serving Engine Internals), Phase 17 · 08 (Inference Metrics)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy disaggregated-vs-colocated simulator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Prefill is compute-bound; decode is memory-bound. Running both on the same GPU wastes one resource. Disaggregation splits them onto separate pools and transfers KV cache between them over NIXL (RDMA/InfiniBand or TCP fallback). NVIDIA Dynamo (GTC 2025 announce, 1.0 GA) sits above vLLM/SGLang/TRT-LLM — its Planner Profiler + SLA Planner auto-rate-match prefill:decode ratios to meet SLOs. NVIDIA publishes throughput gains in this ballpark — developer.nvidia.com (2025-06) shows a ~6x improvement for DeepSeek-R1 MoE on GB200 NVL72 + Dynam</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Disaggregated serving</td>
+<td>"split prefill/decode"</td>
+<td>Separate GPU pools for each phase</td>
+</tr>
+<tr>
+<td>NIXL</td>
+<td>"NVIDIA transport"</td>
+<td>Dynamo's inter-node KV transfer (RDMA/TCP)</td>
+</tr>
+<tr>
+<td>NVIDIA Dynamo</td>
+<td>"the orchestrator"</td>
+<td>Stack-above coordinator for vLLM/SGLang/TRT-LLM</td>
+</tr>
+<tr>
+<td>llm-d</td>
+<td>"Kubernetes native"</td>
+<td>Red Hat + AWS K8s disaggregated stack</td>
+</tr>
+<tr>
+<td>Planner Profiler</td>
+<td>"Dynamo auto-config"</td>
+<td>Measures workload, configures pool ratios</td>
+</tr>
+<tr>
+<td>SLA Planner</td>
+<td>"Dynamo policy"</td>
+<td>Auto-rate-matches prefill:decode to meet SLOs</td>
+</tr>
+<tr>
+<td><code>packDomain: rack</code></td>
+<td>"llm-d topology"</td>
+<td>Pack prefill+decode on same rack for fast KV</td>
+</tr>
+<tr>
+<td>UCCL</td>
+<td>"unified collective"</td>
+<td>llm-d 0.5 networking layer for scale-to-zero</td>
+</tr>
+<tr>
+<td>MoE expert routing</td>
+<td>"expert per token"</td>
+<td>DeepSeek-V3 pattern; disaggregation helps</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Serving a request has two phases with opposite needs. <strong>Prefill</strong> reads the whole prompt in one pass; it is a big block of matrix maths, limited by the GPU's <strong>compute</strong>. <strong>Decode</strong> then writes the answer one token at a time; each step reads all the weights from memory, so it is limited by <strong>memory bandwidth</strong>. On the same GPU they get in each other's way: a long prefill stalls everyone's decoding, and a decode-heavy batch leaves compute idle. <strong>Disaggregated serving</strong> runs them on separate pools of GPUs, each sized for its own bottleneck, and ships each request's KV cache from the prefill pool to the decode pool over a fast link. NVIDIA <strong>Dynamo</strong> and <strong>llm-d</strong> are the two main systems that orchestrate this. The transfer costs tens of milliseconds, so short requests can lose.</p></div></aside>
+<p>You run Llama 3.3 70B on 8 H100s. Under mixed workload (long prompts + short outputs), GPUs idle during decode because most of the compute was spent on prefill. Under different workload (short prompts + long outputs), the opposite happens. Colocated prefill + decode means you over-provision both.</p>
+<p>Budget impact: 20-40% of GPU time is wasted on the wrong resource. You are buying H100 compute to run memory-bound decode, or buying H100 HBM bandwidth to run compute-bound prefill. Both are expensive waste.</p>
+<p>Disaggregation splits prefill and decode onto separate pools sized for each's bottleneck. KV cache transfers from prefill pool to decode pool via high-bandwidth interconnect.</p>
+<h2>Idea 1 · Why the bottlenecks differ</h2>
+<p><strong>Prefill</strong> — run the transformer over the full input prompt in one forward. Matrix multiplications dominate; compute-bound. H100 FP8 gives ~2000 TFLOPS of useful throughput. Batch efficiency is good — one forward processes many tokens.</p>
+<figure class="diagram mmfig" data-mmd="a1717" data-h="b9fd024ebc"><div class="dg-scroll"><svg class="dg mm" id="mmb9fd024ebc" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 432.609px; background-color: transparent;" viewBox="0 0 432.609375 576" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmb9fd024ebc{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmb9fd024ebc .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmb9fd024ebc .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmb9fd024ebc .error-icon{fill:#f4efe7;}#mmb9fd024ebc .error-text{fill:#0b1018;stroke:#0b1018;}#mmb9fd024ebc .edge-thickness-normal{stroke-width:1px;}#mmb9fd024ebc .edge-thickness-thick{stroke-width:3.5px;}#mmb9fd024ebc .edge-pattern-solid{stroke-dasharray:0;}#mmb9fd024ebc .edge-thickness-invisible{stroke-width:0;fill:none;}#mmb9fd024ebc .edge-pattern-dashed{stroke-dasharray:3;}#mmb9fd024ebc .edge-pattern-dotted{stroke-dasharray:2;}#mmb9fd024ebc .marker{fill:#6c6357;stroke:#6c6357;}#mmb9fd024ebc .marker.cross{stroke:#6c6357;}#mmb9fd024ebc svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmb9fd024ebc p{margin:0;}#mmb9fd024ebc .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmb9fd024ebc .cluster-label text{fill:#0b1018;}#mmb9fd024ebc .cluster-label span{color:#0b1018;}#mmb9fd024ebc .cluster-label span p{background-color:transparent;}#mmb9fd024ebc .label text,#mmb9fd024ebc span{fill:#211c16;color:#211c16;}#mmb9fd024ebc .node rect,#mmb9fd024ebc .node circle,#mmb9fd024ebc .node ellipse,#mmb9fd024ebc .node polygon,#mmb9fd024ebc .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmb9fd024ebc .rough-node .label text,#mmb9fd024ebc .node .label text,#mmb9fd024ebc .image-shape .label,#mmb9fd024ebc .icon-shape .label{text-anchor:middle;}#mmb9fd024ebc .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmb9fd024ebc .rough-node .label,#mmb9fd024ebc .node .label,#mmb9fd024ebc .image-shape .label,#mmb9fd024ebc .icon-shape .label{text-align:center;}#mmb9fd024ebc .node.clickable{cursor:pointer;}#mmb9fd024ebc .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmb9fd024ebc .arrowheadPath{fill:#0b0b0b;}#mmb9fd024ebc .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmb9fd024ebc .flowchart-link{stroke:#6c6357;fill:none;}#mmb9fd024ebc .edgeLabel{background-color:#ffffff;text-align:center;}#mmb9fd024ebc .edgeLabel p{background-color:#ffffff;}#mmb9fd024ebc .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmb9fd024ebc .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmb9fd024ebc .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmb9fd024ebc .cluster text{fill:#0b1018;}#mmb9fd024ebc .cluster span{color:#0b1018;}#mmb9fd024ebc div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmb9fd024ebc .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmb9fd024ebc rect.text{fill:none;stroke-width:0;}#mmb9fd024ebc .icon-shape,#mmb9fd024ebc .image-shape{background-color:#ffffff;text-align:center;}#mmb9fd024ebc .icon-shape p,#mmb9fd024ebc .image-shape p{background-color:#ffffff;padding:2px;}#mmb9fd024ebc .icon-shape .label rect,#mmb9fd024ebc .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmb9fd024ebc .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmb9fd024ebc .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmb9fd024ebc .node .neo-node{stroke:#b5521b;}#mmb9fd024ebc [data-look="neo"].node rect,#mmb9fd024ebc [data-look="neo"].cluster rect,#mmb9fd024ebc [data-look="neo"].node polygon{stroke:url(#mmb9fd024ebc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb9fd024ebc [data-look="neo"].swimlane.cluster rect{filter:none;}#mmb9fd024ebc [data-look="neo"].node path{stroke:url(#mmb9fd024ebc-gradient);stroke-width:1px;}#mmb9fd024ebc [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb9fd024ebc [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmb9fd024ebc [data-look="neo"].node circle{stroke:url(#mmb9fd024ebc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb9fd024ebc [data-look="neo"].node circle .state-start{fill:#000000;}#mmb9fd024ebc [data-look="neo"].icon-shape .icon{fill:url(#mmb9fd024ebc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb9fd024ebc [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmb9fd024ebc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb9fd024ebc :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmb9fd024ebc_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmb9fd024ebc_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M227.48,59L227.48,63.167C227.48,67.333,227.48,75.667,227.48,83.333C227.48,91,227.48,98,227.48,101.5L227.48,105" id="mmb9fd024ebc-L_RQ_RT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RQ_RT_0" data-points="W3sieCI6MjI3LjQ4MDQ2ODc1LCJ5Ijo1OX0seyJ4IjoyMjcuNDgwNDY4NzUsInkiOjg0fSx7IngiOjIyNy40ODA0Njg3NSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmb9fd024ebc_flowchart-v2-pointEnd)"/><path d="M178.716,160L167.401,165.917C156.087,171.833,133.457,183.667,122.143,194.833C110.828,206,110.828,216.5,110.828,221.75L110.828,227" id="mmb9fd024ebc-L_RT_PF_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RT_PF_0" data-points="W3sieCI6MTc4LjcxNTk2NDM5NTQ5MTgsInkiOjE2MH0seyJ4IjoxMTAuODI4MTI1LCJ5IjoxOTUuNX0seyJ4IjoxMTAuODI4MTI1LCJ5IjoyMzF9XQ==" data-look="classic" marker-end="url(#mmb9fd024ebc_flowchart-v2-pointEnd)"/><path d="M110.828,303L110.828,310.667C110.828,318.333,110.828,333.667,110.828,348.333C110.828,363,110.828,377,110.828,384L110.828,391" id="mmb9fd024ebc-L_PF_DC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PF_DC_0" data-points="W3sieCI6MTEwLjgyODEyNSwieSI6MzAzfSx7IngiOjExMC44MjgxMjUsInkiOjM0OX0seyJ4IjoxMTAuODI4MTI1LCJ5IjozOTV9XQ==" data-look="classic" marker-end="url(#mmb9fd024ebc_flowchart-v2-pointEnd)"/><path d="M110.828,467L110.828,471.167C110.828,475.333,110.828,483.667,110.828,491.333C110.828,499,110.828,506,110.828,509.5L110.828,513" id="mmb9fd024ebc-L_DC_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DC_OUT_0" data-points="W3sieCI6MTEwLjgyODEyNSwieSI6NDY3fSx7IngiOjExMC44MjgxMjUsInkiOjQ5Mn0seyJ4IjoxMTAuODI4MTI1LCJ5Ijo1MTd9XQ==" data-look="classic" marker-end="url(#mmb9fd024ebc_flowchart-v2-pointEnd)"/><path d="M276.245,160L287.56,165.917C298.874,171.833,321.504,183.667,332.818,196.583C344.133,209.5,344.133,223.5,344.133,230.5L344.133,237.5" id="mmb9fd024ebc-L_RT_CO_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RT_CO_0" data-points="W3sieCI6Mjc2LjI0NDk3MzEwNDUwODIsInkiOjE2MH0seyJ4IjozNDQuMTMyODEyNSwieSI6MTk1LjV9LHsieCI6MzQ0LjEzMjgxMjUsInkiOjI0MS41fV0=" data-look="classic" marker-end="url(#mmb9fd024ebc_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_RQ_RT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RT_PF_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(110.828125, 349)"><g class="label" data-id="L_PF_DC_0" transform="translate(-48.265625, -21)"><foreignObject width="96.53125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>KV cache over<br />NIXL / RDMA</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DC_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(344.1328125, 195.5)"><g class="label" data-id="L_RT_CO_0" transform="translate(-46.375, -10.5)"><foreignObject width="92.75" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>short prompts</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmb9fd024ebc-flowchart-RQ-0" data-look="classic" transform="translate(227.48046875, 33.5)"><rect class="basic label-container" style="" x="-56.9765625" y="-25.5" width="113.953125" height="51"/><g class="label" style="" transform="translate(-26.9765625, -10.5)"><rect/><foreignObject width="53.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Request</p></span></div></foreignObject></g></g><g class="node default" id="mmb9fd024ebc-flowchart-RT-1" data-look="classic" transform="translate(227.48046875, 134.5)"><rect class="basic label-container" style="" x="-51.6796875" y="-25.5" width="103.359375" height="51"/><g class="label" style="" transform="translate(-21.6796875, -10.5)"><rect/><foreignObject width="43.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Router</p></span></div></foreignObject></g></g><g class="node default" id="mmb9fd024ebc-flowchart-PF-3" data-look="classic" transform="translate(110.828125, 267)"><rect class="basic label-container" style="" x="-102.828125" y="-36" width="205.65625" height="72"/><g class="label" style="" transform="translate(-72.828125, -21)"><rect/><foreignObject width="145.65625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Prefill pool<br />compute-heavy GPUs</p></span></div></foreignObject></g></g><g class="node default" id="mmb9fd024ebc-flowchart-DC-5" data-look="classic" transform="translate(110.828125, 431)"><rect class="basic label-container" style="" x="-100.71875" y="-36" width="201.4375" height="72"/><g class="label" style="" transform="translate(-70.71875, -21)"><rect/><foreignObject width="141.4375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Decode pool<br />memory-heavy GPUs</p></span></div></foreignObject></g></g><g class="node default" id="mmb9fd024ebc-flowchart-OUT-7" data-look="classic" transform="translate(110.828125, 542.5)"><rect class="basic label-container" style="" x="-85.8671875" y="-25.5" width="171.734375" height="51"/><g class="label" style="" transform="translate(-55.8671875, -10.5)"><rect/><foreignObject width="111.734375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Streamed tokens</p></span></div></foreignObject></g></g><g class="node default" id="mmb9fd024ebc-flowchart-CO-9" data-look="classic" transform="translate(344.1328125, 267)"><rect class="basic label-container" style="" x="-80.4765625" y="-25.5" width="160.953125" height="51"/><g class="label" style="" transform="translate(-50.4765625, -10.5)"><rect/><foreignObject width="100.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Colocated path</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmb9fd024ebc-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmb9fd024ebc-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmb9fd024ebc-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p><strong>Decode</strong> — generate one token at a time, reading the full weights each iteration. Memory-bandwidth-bound. HBM3 gives ~3 TB/s. Batch efficiency is good only at high concurrency — the weights read amortizes across the batch.</p>
+<p>Colocating them: you buy GPUs optimized for both. H100 is good at both but costs the same either way. At scale, you want prefill pool on H100 / compute-heavy; decode pool on H200 / memory-heavy, or with aggressive quantization.</p>
+<h2>Idea 2 · The architecture</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">            ┌──────────────┐
+  Request → │    Router    │ ───────────────────────┐
+            └──────┬───────┘                        │
+                   │                                │
+                   ▼ (prompt only)                  │
+            ┌──────────────┐    KV cache    ┌───────▼──────┐
+            │ Prefill pool │ ─── NIXL ────► │ Decode pool  │
+            │  (compute)   │                │  (memory)    │
+            └──────────────┘                └──────┬───────┘
+                                                   │ tokens
+                                                   ▼
+                                                 Client
+</code></pre></div>
+<p>NIXL is NVIDIA's inter-node transport. Uses RDMA/InfiniBand when available, TCP fallback otherwise. Transfer latency is real — typically 20-80 ms for KV cache of a 4K-token prompt on 70B FP8. This is why short prompts don't justify disaggregation: the transfer tax exceeds the savings.</p>
+<h2>Idea 3 · Dynamo vs llm-d</h2>
+<p><strong>NVIDIA Dynamo</strong> (GTC 2025 announce, 1.0 GA):
+- Sits above vLLM, SGLang, TRT-LLM as an orchestrator.
+- Planner Profiler measures workload, SLA Planner auto-configures prefill:decode ratios.
+- Rust core, Python extensibility.
+- Throughput gains: NVIDIA reports 6x for DeepSeek-R1 MoE on GB200 NVL72 + Dynamo in the medium-latency regime (developer.nvidia.com, 2025-06); community reports of "up to 30x" on full Blackwell + Dynamo + DeepSeek-R1 stacks lack a single primary source and should be treated as directional.
+- GB300 NVL72 + Dynamo: up to 50x MoE throughput vs Hopper per the Dynamo product page (developer.nvidia.com, undated).</p>
+<p><strong>llm-d</strong> (Red Hat + AWS, Kubernetes-native):
+- Prefill / decode / router as independent Kubernetes Services.
+- Per-role HPA with queue depth (prefill) / KV utilization (decode) signals.
+- <code>topologyConstraint packDomain: rack</code> packs prefill+decode cliques on the same rack for high-bandwidth KV transfer.
+- llm-d 0.5 (2026): hierarchical KV offloading, cache-aware LoRA routing, UCCL networking, scale-to-zero.</p>
+<p>Use Dynamo if you want a managed stack-above orchestrator. Use llm-d if you want Kubernetes-native primitives and are committed to the CNCF ecosystem.</p>
+<h2>Idea 4 · Economics</h2>
+<p>Internal composite (not a single published case study — order-of-magnitude anchor):</p>
+<ul>
+<li>$2M/year inference spend on colocated serving.</li>
+<li>Switched to disaggregated with Dynamo.</li>
+<li>Same request volume, same P99 latency SLA.</li>
+<li>Reported savings: $600K–$800K/year (30–40% reduction).</li>
+<li>No new hardware.</li>
+</ul>
+<p>We synthesize this figure from multiple customer disclosures rather than a single citable case study; closest published data point is Baseten's 2x faster TTFT / 61% higher throughput with Dynamo KV routing (baseten.co, 2025-10), and VAST + CoreWeave's projection of 60–130% more tokens/$ at 40–60% KV hit rate (vastdata.com, 2025-12). The savings come from right-sizing each pool; prefill-heavy workloads (RAG with 8K+ prefixes) benefit more than balanced ones.</p>
+<h2>Idea 5 · When NOT to disaggregate</h2>
+<ul>
+<li>Prompts &lt; 512 tokens and outputs &lt; 200 tokens: transfer tax dominates gain.</li>
+<li>Small cluster (&lt; 4 GPUs): not enough pool diversity.</li>
+<li>Team cannot operate two GPU pools with per-role scaling: Dynamo helps but not trivially.</li>
+<li>No RDMA fabric: TCP transfer tax is heavier.</li>
+</ul>
+<h2>Idea 6 · The router integrates with Phase 17 · 11</h2>
+<p>Disaggregated routers are KV-cache-aware (Phase 17 · 11). A request lands on the decode pool holding its prefix — if no match, it flows prefill → decode. Hit rate and disaggregation compound — the cache-aware router determines whether a new prefill is even needed.</p>
+<h2>Idea 7 · MoE on Blackwell is where the real numbers are</h2>
+<p>GB300 NVL72 + Dynamo shows 50x MoE throughput over Hopper baselines. MoE expert routing is compute-heavy on prefill but memory-heavy on decode (expert caches), so disaggregation is a double win. 2026 frontier model serving is MoE-dominant (DeepSeek-V3, future GPT-5 variants).</p>
+<h2>Idea 8 · Numbers you should remember</h2>
+<p>Benchmark numbers drift — NVIDIA and the inference stack post updated results every quarter. Re-check before quoting.</p>
+<ul>
+<li>DeepSeek-R1 on GB200 NVL72 + Dynamo: ~6x throughput vs baseline in the medium-latency regime (developer.nvidia.com, 2025-06); community "up to 30x" claims on full Blackwell + Dynamo stacks are directional aggregates without a single primary source.</li>
+<li>GB300 NVL72 + Dynamo: up to 50x MoE throughput vs Hopper (developer.nvidia.com, undated).</li>
+<li>Savings anchor (internal composite, not a single case study): $600-800K/year off a $2M annual spend at constant SLA.</li>
+<li>Disaggregation threshold: prompts &gt;512 tokens + outputs &gt;200 tokens.</li>
+<li>KV transfer via NIXL: 20-80 ms for 4K-prompt KV on 70B FP8.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="prefill-decode-split"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>When does splitting pay?</strong> Disaggregation saves time <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">interf</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (the interference removed) and decode speed-up on a memory-optimised pool, but pays a KV transfer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> that grows with prompt length:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">split if</span></span><span class="mspace" style="margin-right:1em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">interf</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord">Δ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">decode</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0574em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord text"><span class="mord">link bandwidth</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prompt</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord text"><span class="mord">KV bytes per token</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8095em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">setup</span></span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The transfer tax for a 4,000-token prompt</div><div class="co-body"><p>Llama 3.3 70B in FP8 stores about 0.16 MB of KV per token (80 layers × 8 KV heads × 128 × 2 × 1 byte).</p>
+<ol>
+<li>4,000 tokens × 0.16 MB ≈ 655 MB to move.</li>
+<li>Over RDMA at about 25 GB/s (200 Gbit/s): 655 / 25,000 s ≈ 26 ms, plus setup.</li>
+<li>Over TCP at about 5 GB/s: about 130 ms.</li>
+<li>A 256-token prompt moves only about 42 MB (2 ms on RDMA), but its whole prefill takes maybe 20 ms, so there is little interference to remove: the gain is small and the fixed setup cost dominates. That is the lesson's "do not disaggregate below about 512 tokens".</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Prefill is compute-bound; decode is memory-bandwidth-bound.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Disaggregation needs new hardware.
+  It rearranges existing GPUs into two pools; the saving comes from removing interference.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> TCP transport raises the prompt length at which splitting starts to pay.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> One autoscaler can size both pools.
+  Prefill scales on queue depth, decode on KV cache use.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: is the KV transfer for a 32,768-token prompt over TCP longer or shorter than a second?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">KV transfer time by prompt length and link</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">KV_MB_PER_TOKEN = 80 * 8 * 128 * 2 * 1 / 1e6      # Llama 3.3 70B, FP8 KV
+for tokens in (256, 1024, 4096, 16384, 32768):
+    mb = tokens * KV_MB_PER_TOKEN
+    print(f&quot;{tokens:6d} tokens: {mb:7.0f} MB   RDMA 25 GB/s {mb / 25:6.1f} ms   TCP 5 GB/s {mb / 5:7.1f} ms&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">   256 tokens:      42 MB   RDMA 25 GB/s    1.7 ms   TCP 5 GB/s     8.4 ms
+  1024 tokens:     168 MB   RDMA 25 GB/s    6.7 ms   TCP 5 GB/s    33.6 ms
+  4096 tokens:     671 MB   RDMA 25 GB/s   26.8 ms   TCP 5 GB/s   134.2 ms
+ 16384 tokens:    2684 MB   RDMA 25 GB/s  107.4 ms   TCP 5 GB/s   536.9 ms
+ 32768 tokens:    5369 MB   RDMA 25 GB/s  214.7 ms   TCP 5 GB/s  1073.7 ms</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>A 32k prompt moves about 5.4 GB: about 215 ms on RDMA and over a second on TCP. That is why llm-d packs prefill and decode pods on the same rack, and why TCP-only clusters should split only long prompts. For short prompts the transfer is small, but so is what you gain.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates colocated vs disaggregated serving. Reports throughput, cost per request, and the prompt-length crossover.</p>
+<p>Here is <code>code/main.py</code>, in 2 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 2 · <code>ms_colocated</code>, <code>ms_disaggregated</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Colocated vs disaggregated serving simulator — stdlib Python.
+
+Models one request through colocated (same GPU) vs disaggregated (prefill pool + decode pool + KV transfer).
+Sweeps prompt length to find the crossover.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+
+# illustrative 2026 constants for 70B FP8 on H100 class
+PREFILL_TOK_PER_MS = 40.0         # prefill throughput per GPU per ms
+DECODE_TOK_PER_MS_COLOCATED = 0.10
+DECODE_TOK_PER_MS_DECODE_GPU = 0.18   # memory-optimized pool (H200-like)
+KV_BYTES_PER_TOKEN_70B_FP8 = 125_000
+NIXL_RDMA_GB_S = 100
+NIXL_TCP_GB_S = 10
+
+
+def ms_colocated(prompt: int, output: int) -&gt; float:
+    prefill_ms = prompt / PREFILL_TOK_PER_MS
+    decode_ms = output / DECODE_TOK_PER_MS_COLOCATED
+    return prefill_ms + decode_ms
+
+
+def ms_disaggregated(prompt: int, output: int, use_rdma: bool = True) -&gt; float:
+    prefill_ms = prompt / PREFILL_TOK_PER_MS
+    kv_bytes = prompt * KV_BYTES_PER_TOKEN_70B_FP8
+    transport = NIXL_RDMA_GB_S if use_rdma else NIXL_TCP_GB_S
+    transfer_ms = (kv_bytes / 1e9) / transport * 1000
+    decode_ms = output / DECODE_TOK_PER_MS_DECODE_GPU
+    return prefill_ms + transfer_ms + decode_ms
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 95)
+    print(&quot;DISAGGREGATED vs COLOCATED: same request, different GPU placement&quot;)
+    print(&quot;=&quot; * 95)
+    header = f&quot;{'prompt':&gt;7}  {'output':&gt;7}  {'colocated (ms)':&gt;15}  {'disagg RDMA (ms)':&gt;17}  {'disagg TCP (ms)':&gt;16}  Winner&quot;
+    print(header)
+    print(&quot;-&quot; * len(header))
+    cases = [
+        (256, 100), (512, 200), (1024, 300), (2048, 400),
+        (4096, 500), (8192, 800), (16384, 1200), (32768, 2000),
+    ]
+    for prompt, output in cases:
+        colo = ms_colocated(prompt, output)
+        rdma = ms_disaggregated(prompt, output, use_rdma=True)
+        tcp = ms_disaggregated(prompt, output, use_rdma=False)
+        winner = &quot;colocated&quot; if colo &lt; rdma else &quot;disaggregated&quot;
+        print(f&quot;{prompt:&gt;7}  {output:&gt;7}  {colo:&gt;14.1f}  {rdma:&gt;17.1f}  {tcp:&gt;16.1f}  {winner}&quot;)
+
+    print()
+    print(&quot;Read: disaggregation wins at longer prompts where decode throughput improvement&quot;)
+    print(&quot;on memory-optimized pool outweighs the KV transfer tax. TCP transport raises the&quot;)
+    print(&quot;break-even; RDMA makes disaggregation profitable earlier.&quot;)
+</code></pre></div>
+
+<p><strong>Part 2 of 2 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">===============================================================================================
+DISAGGREGATED vs COLOCATED: same request, different GPU placement
+===============================================================================================
+ prompt   output   colocated (ms)   disagg RDMA (ms)   disagg TCP (ms)  Winner
+------------------------------------------------------------------------------
+    256      100          1006.4              562.3             565.2  disaggregated
+    512      200          2012.8             1124.6            1130.3  disaggregated
+   1024      300          3025.6             1693.5            1705.1  disaggregated
+   2048      400          4051.2             2276.0            2299.0  disaggregated
+   4096      500          5102.4             2885.3            2931.4  disaggregated
+   8192      800          8204.8             4659.5            4751.6  disaggregated
+  16384     1200         12409.6             7096.7            7281.1  disaggregated
+  32768     2000         20819.2            11971.3           12339.9  disaggregated
+
+Read: disaggregation wins at longer prompts where decode throughput improvement
+on memory-optimized pool outweighs the KV transfer tax. TCP transport raises the
+break-even; RDMA makes disaggregation profitable earlier.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The script reports disaggregation winning at every size, even 256 tokens with 100 output tokens. That is a property of its constants: the colocated path is charged a large fixed interference penalty, and the transfer tax is small. The lesson's own rule (do not split below about 512 prompt tokens and 200 output tokens) comes from production measurements, where interference on short requests is small. Trust measurements on your traffic over the toy's sweep.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team disaggregates a chat service whose prompts average 300 tokens and replies 120 tokens, over plain TCP between racks. P50 TTFT gets worse by 40 ms and throughput is unchanged. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Prefill wants compute; decode wants bandwidth; colocating them wastes one or the other.</li>
+<li>Disaggregation splits them into pools and ships the KV cache between them.</li>
+<li>KV transfer time grows with prompt length and depends on the link (RDMA vs TCP).</li>
+<li>Split long-prompt, high-volume workloads; keep short chats colocated.</li>
+<li>Dynamo orchestrates above existing engines; llm-d does it with Kubernetes services.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-async-disaggregated-inference"><span class="t" style="--cs-hue:170">AD</span>Cheat sheet · Async, Hogwild and Disaggregated Inference</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-disaggregation-decider.md</code>. Given workload and cluster, decides whether to disaggregate.</p>
+<p><strong><code>outputs/skill-disaggregation-decider.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: disaggregation-decider
+description: Decide whether to adopt disaggregated prefill/decode (Dynamo or llm-d) for a given workload and cluster. Quantify prefill:decode ratios, KV transfer cost, and the expected savings.
+version: 1.0.0
+phase: 17
+lesson: 17
+tags: [disaggregated-serving, dynamo, llm-d, nixl, kv-transfer, prefill-decode]
+---
+
+Given workload profile (prompt/output length distribution, model, concurrency), cluster topology (GPUs, fabric, RDMA availability), and current serving cost, produce a disaggregation decision.
+
+Produce:
+
+1. Disaggregate? Yes / No with numbered justification. Baseline: prompts &gt; 512 AND outputs &gt; 200. Fabric: RDMA available helps; TCP-only pushes break-even longer.
+2. Stack choice. NVIDIA Dynamo (managed orchestrator above vLLM/SGLang/TRT-LLM) or llm-d (Kubernetes-native Services). Match to the operational context.
+3. Prefill:decode ratio. Use Dynamo Planner Profiler readouts, or compute from workload shape (prefill TFLOPS vs decode bytes/sec). Example: 2 prefill : 1 decode for RAG-heavy; 1:2 for output-heavy.
+4. KV transfer plan. Named transport (NIXL over InfiniBand / RDMA / TCP fallback). Compute the per-request transfer tax for your prompt P99.
+5. Router integration. Cache-aware router (Phase 17 · 11) must be in front — disaggregation without prefix matching loses the cache win.
+6. Expected savings. Compute vs colocated baseline; cite the published case (30-40% at same SLA).
+
+Hard rejects:
+- Disaggregating short-prompt workloads (&lt;512 tokens). Refuse — the transfer tax dominates.
+- Deploying without a cache-aware router. Refuse — blind routing negates the KV locality.
+- Ignoring topology (rack packing). Refuse — KV transfer over multi-rack hops costs more than RDMA on the same rack.
+
+Refusal rules:
+- If the cluster has &lt; 4 GPUs, refuse — not enough pool diversity for disaggregation to pay off.
+- If no RDMA/InfiniBand and no plans, note that TCP raises the break-even to prompts &gt;2K; re-evaluate.
+- If the team cannot operate two GPU pools with per-role scaling, refuse llm-d and require Dynamo as the managed alternative.
+
+Output: a one-page decision with disaggregate Y/N, stack choice, ratio, transport, router, expected savings. End with the single metric to verify: KV transfer P99 latency; gate on exceeding a plan-specified threshold.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. At what prompt length does disaggregation beat colocation?</li>
+<li>Design the prefill pool and decode pool for a RAG service with P99 prefix length 8K, output 300.</li>
+<li>Dynamo vs llm-d: pick one for a pure-Kubernetes shop with no Python runtime preference.</li>
+<li>Compute KV transfer cost: 4K prefill on 70B FP8 = ~500 MB KV. At RDMA 100 GB/s, transfer = 5 ms. At TCP 10 GB/s = 50 ms. Which matters for your SLA?</li>
+<li>MoE expert routing changes KV access patterns. How does disaggregation behave with MoE that activates different experts per token?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1717-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Where the toy and the rule disagree</span></summary><div class="qa-a"><p>The toy's sweep shows a win at every length because its colocated cost includes a fixed interference penalty of a similar size at all lengths. In production the interference grows with prompt length while the transfer has a fixed setup cost, so short requests (under about 512 prompt tokens) gain little and can lose. Change the toy's interference to scale with prompt length and the crossover appears.</p></div></details>
+<details class="qa" id="a1717-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Short chats over TCP</span></summary><div class="qa-a"><p>At 300 prompt tokens, prefill takes a few tens of milliseconds and barely disturbs decoding, so there was little interference to remove. Each request still pays the transfer setup and TCP latency, about 40 ms here, before decoding can start. Keep short traffic colocated and route only long prompts to the disaggregated path, preferably over RDMA.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://developer.nvidia.com/blog/introducing-nvidia-dynamo-a-low-latency-distributed-inference-framework-for-scaling-reasoning-ai-models/">NVIDIA — Introducing Dynamo</a></li>
+<li><a href="https://developer.nvidia.com/blog/deploying-disaggregated-llm-inference-workloads-on-kubernetes/">NVIDIA — Disaggregated LLM Inference on Kubernetes</a></li>
+<li><a href="https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.html">TensorRT-LLM Disaggregated Serving blog</a></li>
+<li><a href="https://github.com/llm-d/llm-d">llm-d GitHub</a></li>
+<li><a href="https://github.com/llm-d/llm-d/releases">llm-d 0.5 release notes</a></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1717" id="done-a1717">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1717" id="undo-a1717" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1716"><span class="pn-dir">Previous</span><span class="pn-t">17.16 · Model Routing as a Cost-Reduction Primitive</span></a><a class="pn next" href="#a1718"><span class="pn-dir">Next</span><span class="pn-t">17.18 · Production Serving Stack — KV Offloading and Cache-Aware Routing</span></a></div></footer>

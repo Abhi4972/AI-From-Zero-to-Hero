@@ -1,20 +1,21 @@
 # AI from Scratch
 
-A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams: **787 lessons in 17 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
+A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams: **948 lessons in 20 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
 
 **Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero/
 
-Everything is on one site: one menu for all 17 phases, one search across every lesson, one progress tracker. No account and no install are needed.
+Everything is on one site: one menu for all 20 phases, one search across every lesson, one progress tracker. No account and no install are needed.
 
 ## What's inside
 
 | Part | Phases | Lessons |
 |---|---|---|
-| 1 · Foundations | 0 Setup & Tooling · 1 Math Foundations · 2 ML Fundamentals · 3 Deep Learning Core | 130 |
-| 2 · Perception | 4 Computer Vision · 5 NLP · 6 Speech & Audio | 126 |
-| 3 · Models | 7 Transformers · 8 Generative AI · 9 Reinforcement Learning · 10 LLMs from Scratch | 127 |
+| 1 · Foundations | 0 Setup & Tooling · 1 Math Foundations · 2 ML Fundamentals · 3 Deep Learning Core | 129 |
+| 2 · Perception | 4 Computer Vision · 5 NLP, Foundations to Advanced · 6 Speech & Audio | 126 |
+| 3 · Models | 7 Transformers Deep Dive · 8 Generative AI · 9 Reinforcement Learning · 10 LLMs from Scratch | 127 |
 | 4 · Building with LLMs | 11 LLM Engineering · 12 Multimodal AI · 13 Tools & Protocols | 145 |
-| 5 · Agents | 14 Agent Engineering · 15 Autonomous Systems · 16 Multi-Agent & Swarms | 259 |
+| 5 · Agents | 14 Agent Engineering · 15 Autonomous Systems · 16 Multi-Agent & Swarms | 260 |
+| 6 · Serving, Safety & Capstones | 17 Infrastructure & Production · 18 Ethics, Safety & Alignment · 19 Capstone Projects | 161 |
 
 Each phase has up to three sections: its own lessons, **Cheat sheets** (one-page references) and companion lessons marked **From Zero to Agents**, grouped by topic and numbered after the phase's own lessons. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
 
