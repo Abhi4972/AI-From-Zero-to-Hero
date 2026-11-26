@@ -14,7 +14,7 @@ Usage: python3 build_p6.py [phase ...]      (default: 17 18 19)"""
 import sys, os, re, json, html, hashlib, pathlib, subprocess, shutil, concurrent.futures as cf
 import markdown
 sys.path.insert(0, "/home/claude/aifs")
-import conv, interviews, extras
+import conv, interviews, extras, conv_px
 
 REPO = pathlib.Path("/home/claude/upstream")
 SITE = pathlib.Path("/home/claude/ai-from-zero-to-hero")
@@ -31,14 +31,23 @@ PHASES = {
     19: ("19-capstone-projects", "Capstone Projects",
          "Put it all together: full projects, from a coding agent and a production RAG system to a GPT, a training stack and a safety gate built step by step."),
 }
-ONLY = [int(x) for x in sys.argv[1:]] or list(PHASES)
+PHASES.update({
+    20: ("projects", "Hands-On Projects",
+         "Small, complete tools built one tested step at a time: search, evaluation, agents, gateways, sandboxes and more, in Python, TypeScript, Go and Rust."),
+    21: ("interviews/scenarios", "Interview Case Files",
+         "Real measured incidents to debug the way an interview round asks you to: read the evidence one listing at a time, find the cause, then design the fix."),
+})
+PART_OF = {17: PART, 18: PART, 19: PART, 20: "Projects and Case Files", 21: "Projects and Case Files"}
+LEVEL_NAMES = {1: "Starter", 2: "Builder", 3: "Engineer", 4: "Systems", 5: "Frontier"}
+DEMOS = json.loads((pathlib.Path("/home/claude/aifs/px/demos.json")).read_text()) if pathlib.Path("/home/claude/aifs/px/demos.json").exists() else {}
+ONLY = [int(x) for x in sys.argv[1:]] or [17, 18, 19]
 LABELS = {"goals": "Lesson goals", "run": "What you should see", "terms": "Terms you'll hear", "prereq": "Before you start",
           "plain": "In plain words first", "checked": "Sources and further reading", "warn": "Watch out", "tip": "Tip",
           "worked": "Worked example", "predict": "Predict before you run", "broken": "Break it on purpose",
           "debugx": "Debugging exercise", "modify": "Make it your own", "read": "Reading this output", "check": "Check your mental model",
           "deeper": "Go deeper (optional)", "math": "The same idea as a formula", "recap": "Recap", "connect": "How this connects",
           "why": "Why this came about", "visual": "See it drawn", "prod": "In production", "practice": "Industry practice"}
-QLVL = {"sol": "Solution", "explain": "Explain the mechanism", "debug": "Debug a failure", "defend": "Defend a design",
+QLVL = {"tests": "Checks", "code": "Code", "sol": "Solution", "explain": "Explain the mechanism", "debug": "Debug a failure", "defend": "Defend a design",
         "tradeoff": "Weigh a trade-off", "coderead": "Read the code", "estimate": "Estimate it", "takehome": "Take-home"}
 
 def md(t): return markdown.markdown(t, extensions=["fenced_code", "tables", "sane_lists", "attr_list"])
@@ -47,9 +56,51 @@ def inline(t): return re.sub(r"^<p>(.*)</p>$", r"\1", md(t).strip(), flags=re.S)
 # ---------------------------------------------------------------- gather and convert
 store = {"mermaid": {}, "math": {}, "figcfg": {}}
 lessons, chapters = [], []
+def _demo(pid):                         # the reference demo's output: run here, or the source's own recording if it fails here
+    d = DEMOS.get(pid)
+    if d and d.get("code") == 0: return d
+    rec = REPO / "projects" / pid / "media" / "output.json"
+    if rec.exists():
+        r = (json.loads(rec.read_text()).get("records") or [{}])[0]
+        if r.get("exitCode") == 0:
+            out = re.sub(r"/(?:var/folders|private/var/folders|tmp)/\S*?/(tmp\w+)", r"<tmp>", r.get("output", ""))
+            return {"code": 0, "out": out, "recorded": True}
+    return None
 for pno, (ph, title, desc) in PHASES.items():
-    pdir = REPO / "phases" / ph
+    if pno not in ONLY and pno >= 20: continue
     ch = {"id": f"ph-{pno}", "code": f"{pno}", "title": title, "desc": desc, "lessons": [], "pno": pno}
+    if pno == 20:
+        projs = [json.loads(f.read_text()) for f in sorted((REPO / "projects").glob("*/project.json"))]
+        projs = sorted((j for j in projs if j.get("status") == "ready"), key=lambda j: (j.get("level", 9), j["title"].lower()))
+        for n, j in enumerate(projs, 1):
+            lstore = {"mermaid": store["mermaid"], "math": store["math"], "figcfg": store["figcfg"], "blocks": []}
+            c = conv_px.convert_project(REPO / "projects" / j["id"], f"{pno}.{n}", lstore, _demo(j["id"]))
+            c.update(id=f"a{pno:02d}{n:02d}", blocks=lstore["blocks"], dir=str(REPO / "projects" / j["id"]), phase=ph,
+                     group=f"Level {j.get('level')} · {LEVEL_NAMES.get(j.get('level'), '')}")
+            lessons.append(c); ch["lessons"].append(c)
+        chapters.append(ch); continue
+    if pno == 21:
+        loop = (REPO / "interviews" / "loops" / "inference-engineer.md").read_text()
+        lb = re.sub(r"^---\n.*?\n---\n", "", loop, flags=re.S)
+        lstore = {"mermaid": store["mermaid"], "math": store["math"], "figcfg": store["figcfg"], "blocks": []}
+        fx = conv.body_fixer(REPO / "interviews" / "loops", f"{pno}.1", lstore)
+        c = {"title": "Inference engineer loop", "minutes": 20, "type": "Guide", "num": f"{pno}.1", "slug": "loop",
+             "src": "## How a loop is put together\n\n" + fx(lb.strip()), "key": "interviews/loops/inference-engineer"}
+        c.update(id=f"a{pno:02d}01", blocks=lstore["blocks"], dir=str(REPO / "interviews" / "loops"), phase=ph)
+        lessons.append(c); ch["lessons"].append(c)
+        scen = []
+        for sd in sorted((REPO / "interviews" / "scenarios").iterdir()):
+            if not (sd / "README.md").exists(): continue
+            mt, _ = conv_px._front((sd / "README.md").read_text())
+            scen.append((int(mt.get("level", 2) or 2), int(mt.get("minutes", 20) or 20), mt.get("title", sd.name).lower(), sd))
+        for n, (lv, _, _, sd) in enumerate(sorted(scen), 2):
+            lstore = {"mermaid": store["mermaid"], "math": store["math"], "figcfg": store["figcfg"], "blocks": []}
+            c = conv_px.convert_scenario(sd, f"{pno}.{n}", lstore)
+            c.update(id=f"a{pno:02d}{n:02d}", blocks=lstore["blocks"], dir=str(sd), phase=ph,
+                     group=f"Level {lv} · {conv_px.LEVELS.get(str(lv), '')}")
+            lessons.append(c); ch["lessons"].append(c)
+        chapters.append(ch); continue
+    pdir = REPO / "phases" / ph
     for ld in sorted(x for x in pdir.iterdir() if x.is_dir() and re.match(r"\d\d-", x.name)):
         ln = int(ld.name[:2])
         lstore = {"mermaid": store["mermaid"], "math": store["math"], "figcfg": store["figcfg"], "blocks": []}
@@ -164,9 +215,11 @@ print("voice overlays", len(ZXT_ADD), "of", len(lessons))
 # ---------------------------------------------------------------- cheat sheets and practice problems
 from collections import defaultdict
 extras.MATH_HOOK = lambda t: interviews._math(t, store)
-BY_DIR = {f"phases/{c['phase']}/{pathlib.Path(c['dir']).name}": c for c in lessons}
+BY_DIR = {c.get("key") or f"phases/{c['phase']}/{pathlib.Path(c['dir']).name}": c for c in lessons}
 COURSE = json.load(open(SITE / "data" / "course.json"))
-COURSE = [p for p in COURSE if p["title"] != PART]
+PARTS_BUILT = sorted({PART_OF[p] for p in ONLY})
+OLD_PARTS = {p["title"]: p for p in COURSE}
+COURSE = [p for p in COURSE if p["title"] not in PARTS_BUILT]
 SITE_IDS = {l["id"] for p in COURSE for ch in p["chapters"] for l in ch["lessons"]}
 SITE_NUM = {l["id"]: l.get("num", "") for p in COURSE for ch in p["chapters"] for l in ch["lessons"]}
 def site_lesson(p):                       # "phases/14-agent-engineering/01-the-agent-loop" -> "a1401" if it is in the site
@@ -191,7 +244,7 @@ for _f in sorted((REPO / "cheatsheets").glob("*.md")):
     _home = min(_covers, key=lambda c: c["id"])
     e = {"id": "cs-" + _meta["id"], "num": "Cheat sheet", "title": _meta["title"], "minutes": 5, "sheet": _meta["id"],
          "covers": [c["id"] for c in sorted(_covers, key=lambda c: c["id"])], "code": _meta.get("code", ""), "hue": _meta.get("hue", "200"),
-         "html": extras.sheet_html(_meta["id"], {p: f"{c['num']} {c['title']}" for p, c in BY_DIR.items()}), "chapter": f"ph-{int(_home['phase'][:2])}"}
+         "html": extras.sheet_html(_meta["id"], {p: f"{c['num']} {c['title']}" for p, c in BY_DIR.items()}), "chapter": "ph-" + _home["id"][1:3]}
     SHEET_PAGES.append(e)
     for _c in _covers: SHEETS_OF[_c["id"]].append(e)
 for e in SHEET_PAGES:
@@ -204,7 +257,7 @@ for c in lessons:
 print("practice problems", sum(len(v) for v in PRACTICE.values()), "| new cheat sheets", len(SHEET_PAGES))
 
 # ---------------------------------------------------------------- interview questions (only those no earlier lesson already carries)
-LDIR = {f"phases/{c['phase']}/{pathlib.Path(c['dir']).name}": c for c in lessons}
+LDIR = {c.get("key") or f"phases/{c['phase']}/{pathlib.Path(c['dir']).name}": c for c in lessons}
 interviews.EXCLUDE = lambda p: bool(site_lesson(p.rstrip("/")))
 QA = interviews.load(lambda p: p.rstrip("/") in LDIR, lambda p: LDIR[p.rstrip("/")]["id"], store)
 for c in lessons:
@@ -411,23 +464,46 @@ for ch in chapters:
 print("lesson files written", written)
 
 # ---------------------------------------------------------------- course data, takeaways, figure modules
-part = {"title": PART, "chapters": [{"id": ch["id"], "code": ch["code"], "title": ch["title"], "desc": ch["desc"], "lessons":
-        [{"id": l["id"], "num": l["num"], "title": l["title"], "min": l["minutes"], "depth": "Cheat sheet" if l.get("sheet") else "", "paths": ["A"],
-          **({"group": "Cheat sheets"} if l.get("sheet") else {})} for l in ch["lessons"]]} for ch in chapters if ch["pno"] in ONLY]}
-old_part = [p for p in json.load(open(SITE / "data" / "course.json")) if p["title"] == PART]
-if old_part:                               # phases not rebuilt this time keep what they had
-    keep = [c for c in old_part[0]["chapters"] if int(c["code"]) not in ONLY]
-    part["chapters"] = sorted(keep + part["chapters"], key=lambda c: int(c["code"]))
-COURSE.append(part)
+def _lesson_entry(l):
+    e = {"id": l["id"], "num": l["num"], "title": l["title"], "min": l["minutes"], "depth": "Cheat sheet" if l.get("sheet") else "", "paths": ["A"]}
+    if l.get("sheet"): e["group"] = "Cheat sheets"
+    elif l.get("group"): e["group"] = l["group"]
+    return e
+for ptitle in PARTS_BUILT:
+    part = {"title": ptitle, "chapters": [{"id": ch["id"], "code": ch["code"], "title": ch["title"], "desc": ch["desc"],
+            "lessons": [_lesson_entry(l) for l in ch["lessons"]]} for ch in chapters if ch["pno"] in ONLY and PART_OF[ch["pno"]] == ptitle]}
+    if ptitle in OLD_PARTS:                    # phases not rebuilt this time keep what they had
+        keep = [c for c in OLD_PARTS[ptitle]["chapters"] if int(c["code"]) not in ONLY]
+        part["chapters"] = sorted(keep + part["chapters"], key=lambda c: int(c["code"]))
+    COURSE.append(part)
+COURSE.sort(key=lambda p: min(int(c["code"]) for c in p["chapters"]) if p["chapters"] and all(c["code"].isdigit() for c in p["chapters"]) else 99)
 json.dump(COURSE, open(SITE / "data" / "course.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 zxt = json.load(open(SITE / "data" / "zxt.json")); zxt.update({k: v for k, v in ZXT_ADD.items() if int(k[1:3]) in ONLY})
 json.dump(zxt, open(SITE / "data" / "zxt.json", "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
 F = SITE / "engine" / "figs.js"; figs = F.read_text(); added = []
-have = lambda n: re.search(r"['\"]%s['\"]\s*:" % re.escape(n), figs)
+KEYS = lambda t: set(re.findall(r"['\"]([\w-]+)['\"]\s*[:,)]", t))   # every quoted name a module defines or registers
+DEFINED = KEYS(figs)
+have = lambda n: n in DEFINED
 for f in sorted((REPO / "site").glob("figures*.js")):
-    t = f.read_text()
-    if any(not have(n) and re.search(r"['\"]%s['\"]\s*:" % re.escape(n), t) for n in FIGS_USED):
+    t = f.read_text(); tk = KEYS(t)
+    if any(not have(n) and n in tk for n in FIGS_USED if not n.startswith("pj-")):
+        DEFINED |= tk
         figs += f"\n/* module {f.name} (Part 6) */\n" + t; added.append(f.name)
+pj = sorted({n for n in FIGS_USED if n.startswith("pj-")})
+if pj:                                     # guided-project labs: their runtime once, then each project's module
+    if "window.AIFSProjectFigures" not in figs:
+        figs += "\n/* module figures/projects/runtime.js (Part 7) */\n" + (REPO / "site" / "figures" / "projects" / "runtime.js").read_text(); added.append("projects/runtime.js")
+    for pid in sorted({re.sub(r"-\d+$", "", n[3:]) for n in pj}):
+        f = REPO / "site" / "figures" / "projects" / f"{pid}.js"
+        if f.exists() and f"/* module figures/projects/{pid}.js" not in figs:
+            figs += f"\n/* module figures/projects/{pid}.js (Part 7) */\n" + f.read_text(); added.append(f"projects/{pid}.js")
+    DEFINED = KEYS(figs)
+    for n in pj:                           # a project whose figures use a short prefix (pj-rra-* is research-report-agent)
+        if n in DEFINED: continue
+        for f in sorted((REPO / "site" / "figures" / "projects").glob("*.js")):
+            if f"/* module figures/projects/{f.name}" not in figs and re.search(r"['\"]%s['\"]" % re.escape(n), f.read_text()):
+                figs += f"\n/* module figures/projects/{f.name} (Part 7) */\n" + f.read_text(); added.append(f"projects/{f.name}"); DEFINED = KEYS(figs); break
 if added: F.write_text(figs)
 figs = F.read_text()
+DEFINED = KEYS(figs); have = lambda n: n in DEFINED
 print("figure modules added", added, "| figures still missing", sorted(n for n in FIGS_USED if not have(n)))

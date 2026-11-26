@@ -33,35 +33,23 @@ def split_h(text, level):
 REPO_URL = "https://github.com/rohitg00/ai-engineering-from-scratch/blob/main/"
 XLINKS = {}   # lesson id -> GitHub URL, for links to lessons that may live in another volume
 
-def convert(lesson_dir, num, store):
-    d = pathlib.Path(lesson_dir)
+def body_fixer(base_dir, num, store):
+    """fix_body for markdown whose relative links are relative to base_dir: fences -> placeholders, maths, lesson links."""
     import os
+    blocks = store.setdefault("blocks", []); py_i = [0]
 
     def rel_link(mm):
         """A relative link to another file of the repo: a lesson becomes #aPPLL (the build turns ids outside this volume
         into GitHub links); any other file links to GitHub."""
         target = mm.group(1)
-        path = os.path.normpath(os.path.join(str(d / "docs"), target.split("#")[0]))
+        path = os.path.normpath(os.path.join(str(base_dir), target.split("#")[0]))
         rm = re.search(r"/(phases/(\d{2})-[^/]+/(\d{2})-[^/]+)(?:/|$)", path)
         if rm and (path.endswith("/docs/en.md") or path.rstrip("/").endswith(rm.group(1))):
             lid = f"a{rm.group(2)}{rm.group(3)}"
             XLINKS[lid] = REPO_URL + rm.group(1) + "/docs/en.md"
             return f"](#{lid})"
-        rr = re.search(r"/((?:phases|interviews|docs|site)/.*)$", path)
+        rr = re.search(r"/((?:phases|interviews|docs|site|manuals|projects|cheatsheets|practice|glossary)/.*)$", path)
         return f"]({REPO_URL + rr.group(1)})" if rr else mm.group(0)
-    raw = (d / "docs" / "en.md").read_text()
-    m = re.match(r"#\s+(.+)\n", raw)
-    title = m.group(1).strip() if m else d.name
-    mq = re.search(r"(?:^>.*\n?)+", raw[:4000], re.M)      # the first block quote, whole (it can be long)
-    motto = " ".join(x[1:].strip() for x in mq.group(0).splitlines()) if mq else ""
-    meta = dict(re.findall(r"^\*\*(Type|Languages|Prerequisites|Time):\*\*\s*(.+)$", raw, re.M))
-    minutes = int((re.search(r"(\d+)", meta.get("Time", "45")) or [0, 45])[1])
-    body = raw[m.end():] if m else raw
-    secs = split_h(body, 2)
-    goals, terms, reading, out, notes = [], "", "", [], []
-    blocks = store.setdefault("blocks", [])
-    py_i = [0]
-
     def fix_body(t):
         # fenced blocks first, so inline math inside code is left alone
         def fence(mm):
@@ -95,6 +83,22 @@ def convert(lesson_dir, num, store):
             pieces[i] = re.sub(r"\bLesson (\d{2})\b(?![.\d])", lambda mm: f"[Lesson {pno}.{int(mm.group(1))}](#a{pno:02d}{int(mm.group(1)):02d})", pieces[i])
             pieces[i] = re.sub(r"(?<![\\$\w])\$(?!\s)([^$\n]{1,200}?)(?<!\s)\$(?![\w$])", im, pieces[i])
         return "".join(pieces)
+
+    return fix_body
+
+def convert(lesson_dir, num, store):
+    d = pathlib.Path(lesson_dir)
+    raw = (d / "docs" / "en.md").read_text()
+    m = re.match(r"#\s+(.+)\n", raw)
+    title = m.group(1).strip() if m else d.name
+    mq = re.search(r"(?:^>.*\n?)+", raw[:4000], re.M)      # the first block quote, whole (it can be long)
+    motto = " ".join(x[1:].strip() for x in mq.group(0).splitlines()) if mq else ""
+    meta = dict(re.findall(r"^\*\*(Type|Languages|Prerequisites|Time):\*\*\s*(.+)$", raw, re.M))
+    minutes = int((re.search(r"(\d+)", meta.get("Time", "45")) or [0, 45])[1])
+    body = raw[m.end():] if m else raw
+    secs = split_h(body, 2)
+    goals, terms, reading, out, notes = [], "", "", [], []
+    fix_body = body_fixer(d / "docs", num, store)
 
     idea_n = 0
     for st, sb in secs:
