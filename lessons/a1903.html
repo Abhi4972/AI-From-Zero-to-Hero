@@ -51,6 +51,7 @@
 </tbody>
 </table></div></div></aside>
 <h2>Problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A <strong>voice assistant</strong> listens, understands, answers and speaks, and it feels natural only if the whole round trip is short (well under a second) and it takes turns politely. That needs a <strong>streaming pipeline</strong>: speech recognition (<strong>ASR</strong>) produces partial transcripts while the person is still talking; <strong>voice activity detection (VAD)</strong> and a small <strong>turn detector</strong> decide when they have finished; the language model starts answering immediately; and text-to-speech (<strong>TTS</strong>) starts playing audio as soon as the first words arrive. Two behaviours matter as much as speed: <strong>barge-in</strong> (if the user starts talking, the assistant stops at once) and not <strong>cutting the user off</strong> when they merely pause. Model and product names in the brief are a 2026 snapshot.</p></div></aside>
 <p>Voice has been the fastest-moving AI UX category of 2025-2026. The technical ceiling dropped each quarter. OpenAI Realtime API, Gemini 2.5 Live, Cartesia Sonic-2, ElevenLabs Flash v3, LiveKit Agents 1.0, and Pipecat 0.0.70 all put sub-800ms first-audio-out within reach. The bar is not latency alone. It is the interaction feel: not cutting the user off, not getting cut off, recovering from a mid-sentence interruption, calling a tool mid-conversation without stalling the audio, surviving jittery mobile networks.</p>
 <p>You cannot get there by stitching three REST calls. The architecture is pipelined streaming end to end. Build it and the failure modes become visible: a VAD tuned for phone audio firing on background TV, a turn-detector waiting for punctuation that never comes, a TTS that buffers 400ms before emitting. The capstone is to fix these one at a time under load and publish a latency-and-quality report.</p>
 <h2>Concept</h2>
@@ -132,6 +133,32 @@
 <p><strong>Load test.</strong> Drive 50 concurrent calls on a single g5.xlarge with a synthetic caller. Measure sustained first-audio-out p95.</p>
 </li>
 </ol>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A latency budget under 800 ms</div><div class="co-body"><p>Measure from the moment the user stops speaking to the first audio the assistant plays.</p>
+<ol>
+<li>Turn detection: the VAD waits for 300–500 ms of silence before the turn detector is even asked. Say 400 ms.</li>
+<li>Model: time to first token, say 250 ms for a fast streaming model.</li>
+<li>TTS: time from first token to first audio chunk, say 150 ms.</li>
+<li>Total: 400 + 250 + 150 = 800 ms, already at the limit. The biggest single item is the silence wait, which is why a turn detector that reads the transcript ("…in Tokyo tomorrow" sounds finished; "…a long story about" does not) lets you use a shorter silence wait safely.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Every stage streams, so later stages start before earlier ones finish.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A longer silence threshold is always better.
+  It reduces cut-offs but adds directly to every turn's latency.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Barge-in cancels the speech output and re-arms recognition immediately.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A slow tool call must block the audio until it returns.
+  The agent can say a short filler while the tool runs on a side channel.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with a fixed 400 ms first-token and TTS time, what is the turn latency at silence thresholds of 300, 500 and 800 ms, and which ones meet an 800 ms target?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Silence threshold against latency</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">LLM_FIRST_TOKEN, TTS_FIRST_AUDIO = 250, 150
+for silence in (300, 500, 800):
+    total = silence + LLM_FIRST_TOKEN + TTS_FIRST_AUDIO
+    print(f&quot;silence wait {silence} ms  -&gt;  first audio {total} ms  {'meets' if total &lt;= 800 else 'misses'} the 800 ms target&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">silence wait 300 ms  -&gt;  first audio 700 ms  meets the 800 ms target
+silence wait 500 ms  -&gt;  first audio 900 ms  misses the 800 ms target
+silence wait 800 ms  -&gt;  first audio 1200 ms  misses the 800 ms target</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Only the 300 ms wait (700 ms total) meets the target; 500 ms is already 100 ms over, and 800 ms misses badly. Shortening the wait is cheap in latency but raises false cut-offs when people pause mid-sentence, so the real tuning is joint: a short silence wait plus a turn detector confident enough to commit only when the sentence sounds complete.</p></div></aside>
 <h2>Use it: the same idea with real libraries</h2>
 <div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">caller: &quot;what is the weather in tokyo tomorrow&quot;
 [asr  ] partial @280ms: &quot;what is the&quot;
@@ -143,6 +170,283 @@
 [tts  ] first audio-out @1040ms: &quot;Tokyo tomorrow will be partly cloudy...&quot;
 turn latency: 1040ms user-stop -&gt; audio-out
 </code></pre></div>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>Frame</code>, <code>synth_call</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Real-time voice pipeline — VAD + turn-detection + barge-in scheduler.
+
+The hard architectural primitive in a 2026 voice agent is not the ASR or the
+TTS. It is the streaming scheduler that arbitrates between VAD events, ASR
+partials, turn-completion scores, LLM streaming, TTS streaming, and user
+barge-in, all with bounded latency. This scaffold simulates audio frames and
+implements the scheduler in full: state machine, barge-in cancellation, tool
+side-channel with filler injection, latency accounting.
+
+Run:  python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import random
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+
+
+# ---------------------------------------------------------------------------
+# frame stream  --  simulated 20ms audio frames
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Frame:
+    t_ms: int              # timestamp ms since session start
+    is_speech: bool        # VAD verdict (Silero v5 stand-in)
+    partial: str = &quot;&quot;      # ASR cumulative partial (Deepgram Nova-3 stand-in)
+
+
+def synth_call(script: str, start_ms: int = 0, noise: float = 0.0) -&gt; list[Frame]:
+    &quot;&quot;&quot;Generate a frame stream for a simulated caller utterance.&quot;&quot;&quot;
+    words = script.split()
+    frames: list[Frame] = []
+    t = start_ms
+    # 120ms silence before speech
+    for _ in range(6):
+        frames.append(Frame(t_ms=t, is_speech=random.random() &lt; noise))
+        t += 20
+    partial = &quot;&quot;
+    for w in words:
+        partial = (partial + &quot; &quot; + w).strip()
+        # each word ~320ms of speech
+        for _ in range(16):
+            frames.append(Frame(t_ms=t, is_speech=True, partial=partial))
+            t += 20
+    # trailing silence, 2200ms (enough to cover tool + LLM + TTS)
+    for _ in range(110):
+        frames.append(Frame(t_ms=t, is_speech=False, partial=partial))
+        t += 20
+    return frames
+
+
+# ---------------------------------------------------------------------------
+# turn detector  --  combines VAD silence duration and completion score
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>turn_completion_score</code>, <code>State</code>, <code>Metrics</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def turn_completion_score(partial: str) -&gt; float:
+    &quot;&quot;&quot;Tiny stand-in for the LiveKit turn-detector model.&quot;&quot;&quot;
+    if not partial:
+        return 0.0
+    if partial.rstrip().endswith((&quot;?&quot;, &quot;.&quot;, &quot;!&quot;)):
+        return 0.95
+    # heuristic: more words, more confidence the turn is done
+    n = len(partial.split())
+    if n &lt; 3:
+        return 0.2
+    if n &lt; 6:
+        return 0.55
+    return 0.75
+
+
+# ---------------------------------------------------------------------------
+# state machine  --  IDLE -&gt; LISTENING -&gt; THINKING -&gt; SPEAKING -&gt; (barge-in)
+# ---------------------------------------------------------------------------
+
+class State(Enum):
+    IDLE = auto()
+    LISTENING = auto()   # user is mid-utterance
+    WAITING = auto()     # VAD says silence, checking turn score
+    THINKING = auto()    # LLM streaming but no TTS yet
+    SPEAKING = auto()    # TTS streaming out
+    TOOL = auto()        # side-channel tool in flight
+
+
+@dataclass
+class Metrics:
+    events: list[str] = field(default_factory=list)
+    turn_complete_ms: int = 0
+    first_llm_token_ms: int = 0
+    first_audio_out_ms: int = 0
+    false_cutoffs: int = 0
+    barge_ins: int = 0
+
+    def log(self, msg: str) -&gt; None:
+        self.events.append(msg)
+
+    def latency_ms(self) -&gt; int:
+        if self.turn_complete_ms and self.first_audio_out_ms:
+            return self.first_audio_out_ms - self.turn_complete_ms
+        return -1
+
+
+# ---------------------------------------------------------------------------
+# tool side channel  --  async weather/calendar with filler injection
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>Tool</code>, <code>run_session</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class Tool:
+    name: str
+    latency_ms: int
+    result: str
+
+
+WEATHER = Tool(&quot;weather.tokyo_tomorrow&quot;, latency_ms=420, result=&quot;68/52 partly cloudy&quot;)
+
+
+# ---------------------------------------------------------------------------
+# scheduler  --  the full pipeline, streamed frame by frame
+# ---------------------------------------------------------------------------
+
+def run_session(frames: list[Frame], use_tool: bool = True,
+                barge_in_at_ms: int | None = None) -&gt; Metrics:
+    m = Metrics()
+    state = State.IDLE
+    silence_run_ms = 0
+    final_partial = &quot;&quot;
+    llm_stream_started_at = -1
+    tts_stream_started_at = -1
+    tool_started_at = -1
+    tool_done_at = -1
+    filler_emitted = False
+
+    for f in frames:
+        # barge-in: user starts speaking while we are SPEAKING or THINKING
+        if (barge_in_at_ms is not None and f.t_ms &gt;= barge_in_at_ms
+                and state in (State.SPEAKING, State.THINKING)
+                and f.is_speech):
+            m.barge_ins += 1
+            m.log(f&quot;{f.t_ms}ms BARGE-IN: cancel TTS, re-arm ASR&quot;)
+            state = State.LISTENING
+            tts_stream_started_at = -1
+            llm_stream_started_at = -1
+            continue
+
+        if state == State.IDLE:
+            if f.is_speech:
+                state = State.LISTENING
+                m.log(f&quot;{f.t_ms}ms LISTENING&quot;)
+
+        elif state == State.LISTENING:
+            if f.is_speech:
+                silence_run_ms = 0
+                final_partial = f.partial or final_partial
+            else:
+                silence_run_ms += 20
+                if silence_run_ms &gt;= 500:
+                    score = turn_completion_score(final_partial)
+                    if score &gt;= 0.6:
+                        state = State.WAITING
+                        m.turn_complete_ms = f.t_ms
+                        m.log(f&quot;{f.t_ms}ms TURN COMPLETE (score={score:.2f})&quot;
+                              f&quot; partial='{final_partial}'&quot;)
+                    else:
+                        m.log(f&quot;{f.t_ms}ms SILENCE but score={score:.2f}, waiting&quot;)
+
+        if state == State.WAITING:
+            # kick off LLM
+            llm_stream_started_at = f.t_ms + 140  # simulated time-to-first-token
+            state = State.THINKING
+            m.log(f&quot;{f.t_ms}ms LLM call fired&quot;)
+            if use_tool:
+                tool_started_at = f.t_ms
+                state = State.TOOL
+
+        elif state == State.TOOL:
+            if tool_started_at &gt;= 0 and not filler_emitted:
+                if f.t_ms - tool_started_at &gt;= 300:
+                    filler_emitted = True
+                    m.log(f&quot;{f.t_ms}ms filler 'one second, let me check'&quot;)
+            if tool_started_at &gt;= 0 and f.t_ms - tool_started_at &gt;= WEATHER.latency_ms:
+                tool_done_at = f.t_ms
+                m.log(f&quot;{f.t_ms}ms tool result: {WEATHER.result}&quot;)
+                llm_stream_started_at = f.t_ms + 140
+                state = State.THINKING
+
+        elif state == State.THINKING:
+            if llm_stream_started_at &gt; 0 and f.t_ms &gt;= llm_stream_started_at:
+                if m.first_llm_token_ms == 0:
+                    m.first_llm_token_ms = f.t_ms
+                    m.log(f&quot;{f.t_ms}ms LLM first token&quot;)
+                tts_stream_started_at = f.t_ms + 180
+                state = State.SPEAKING
+
+        elif state == State.SPEAKING:
+            if tts_stream_started_at &gt; 0 and f.t_ms &gt;= tts_stream_started_at:
+                if m.first_audio_out_ms == 0:
+                    m.first_audio_out_ms = f.t_ms
+                    m.log(f&quot;{f.t_ms}ms TTS first audio-out&quot;)
+
+    return m
+
+
+# ---------------------------------------------------------------------------
+# demo  --  runs two sessions, one clean, one with a barge-in
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    random.seed(0)
+    print(&quot;=== session 1: clean call with tool (weather) ===&quot;)
+    frames = synth_call(&quot;what is the weather in tokyo tomorrow&quot;, start_ms=0)
+    m = run_session(frames, use_tool=True, barge_in_at_ms=None)
+    for line in m.events:
+        print(&quot; &quot;, line)
+    print(f&quot;  turn_complete  @ {m.turn_complete_ms}ms&quot;)
+    print(f&quot;  first_llm_tok  @ {m.first_llm_token_ms}ms&quot;)
+    print(f&quot;  first_audio_out @ {m.first_audio_out_ms}ms&quot;)
+    print(f&quot;  turn latency   = {m.latency_ms()}ms&quot;)
+
+    print()
+    print(&quot;=== session 2: user barges in mid-response ===&quot;)
+    frames = synth_call(&quot;tell me a long story about&quot;, start_ms=0)
+    # add a few synthetic speech frames late in the trailing silence
+    for i in range(8):
+        idx = len(frames) - 20 + i
+        if 0 &lt;= idx &lt; len(frames):
+            frames[idx] = Frame(t_ms=frames[idx].t_ms, is_speech=True,
+                                partial=frames[idx].partial)
+    m = run_session(frames, use_tool=False,
+                    barge_in_at_ms=frames[-20].t_ms - 60)
+    for line in m.events:
+        print(&quot; &quot;, line)
+    print(f&quot;  barge_ins = {m.barge_ins}&quot;)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== session 1: clean call with tool (weather) ===
+  120ms LISTENING
+  2840ms TURN COMPLETE (score=0.75) partial=&#x27;what is the weather in tokyo tomorrow&#x27;
+  2840ms LLM call fired
+  3140ms filler &#x27;one second, let me check&#x27;
+  3260ms tool result: 68/52 partly cloudy
+  3400ms LLM first token
+  3580ms TTS first audio-out
+  turn_complete  @ 2840ms
+  first_llm_tok  @ 3400ms
+  first_audio_out @ 3580ms
+  turn latency   = 740ms
+
+=== session 2: user barges in mid-response ===
+  120ms LISTENING
+  2520ms TURN COMPLETE (score=0.75) partial=&#x27;tell me a long story about&#x27;
+  2520ms LLM call fired
+  2660ms LLM first token
+  2840ms TTS first audio-out
+  3840ms BARGE-IN: cancel TTS, re-arm ASR
+  barge_ins = 1</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Session 1 behaves well: the turn commits, a filler covers the weather lookup, and first audio comes 740 ms after the turn ended. Session 2 is more interesting than its label. The turn detector committed at a partial transcript of <em>"tell me a long story about"</em>, with a score of 0.75, but that sentence is obviously unfinished. That is a <strong>false cut-off</strong>, the failure the rubric asks you to keep under 3%, and the barge-in a second later is the user taking the turn back. The toy's detector does not read completion cues; yours should.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team tunes their assistant on recordings from a quiet office. In customers' homes, it keeps answering while people are still talking, and sometimes reacts to the television. Which two components need retuning, and with what data? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Stream every stage: ASR partials, model tokens, TTS audio.</li>
+<li>Turn detection combines VAD silence with a model that reads completion cues.</li>
+<li>Barge-in cancels speech and re-arms recognition at once.</li>
+<li>Cover slow tools with a short filler on a side channel.</li>
+<li>Measure first-audio latency, false cut-offs, WER and MOS on real conditions.</li>
+</ul></div></aside>
 <h2>Practice and reference</h2>
 <p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-voice-assistants-realtime"><span class="t" style="--cs-hue:285">RT</span>Cheat sheet · Real-Time Voice Assistants</a></div>
 <h2>Ship it</h2>
@@ -254,6 +558,9 @@ Output: a repo containing the LiveKit agent worker, the PSTN gateway config, the
 <p>Add voice activity detection for non-English languages (Japanese, Spanish). Measure the Silero VAD v5 false-trigger rate versus language-specific fine-tunes.</p>
 </li>
 </ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1903-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P3 · Long pauses mid-sentence</span></summary><div class="qa-a"><p>Raising the silence threshold alone pushes latency past budget. Instead, keep a short silence wait (about 300 ms) and raise the turn detector's commit threshold, so it commits only when the transcript sounds complete; when the score is uncertain, wait a little longer. Measure false cut-offs and latency on recordings with long pauses, and pick the pair of thresholds that keeps cut-offs under 3% and latency under 900 ms.</p></div></details>
+<details class="qa" id="a1903-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Quiet-room tuning</span></summary><div class="qa-a"><p>The VAD's speech threshold is too low for noisy rooms, so it fires on the TV; and the turn detector commits on pauses that are normal in relaxed speech. Retune both on recordings from real homes with background noise at realistic signal-to-noise ratios, including mid-sentence pauses, and measure false cut-offs and false triggers separately.</p></div></details>
 <aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
 <li><a href="https://github.com/livekit/agents">LiveKit Agents 1.0</a> — reference WebRTC agent framework</li>
 <li><a href="https://github.com/pipecat-ai/pipecat">Pipecat</a> — alternate Python-first streaming agent framework</li>
@@ -263,4 +570,4 @@ Output: a repo containing the LiveKit agent worker, the PSTN gateway config, the
 <li><a href="https://docs.cartesia.ai">Cartesia Sonic-2</a> — low-latency TTS reference</li>
 <li><a href="https://docs.retellai.com">Retell AI architecture</a> — production voice agent architecture</li>
 <li><a href="https://docs.vapi.ai">Vapi.ai production stack</a> — alternate production reference</li>
-</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1903" id="done-a1903">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1903" id="undo-a1903" hidden>Mark as not done</button></div><div class="pn-row"></div></footer>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1903" id="done-a1903">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1903" id="undo-a1903" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1902"><span class="pn-dir">Previous</span><span class="pn-t">19.2 · Capstone 02 — RAG over Codebase (Cross-Repo Semantic Search)</span></a><a class="pn next" href="#a1904"><span class="pn-dir">Next</span><span class="pn-t">19.4 · Capstone 04 — Multimodal Document QA (Vision-First PDF, Tables, Charts)</span></a></div></footer>

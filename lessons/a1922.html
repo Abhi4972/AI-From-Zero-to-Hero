@@ -12,6 +12,7 @@
 </ul></div></aside>
 <aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>The transport between a model client and a tool server is JSON-RPC over stdio. Hand-rolling it once teaches you what every framing layer is paying for.</p></div></aside>
 <h2>Why JSON-RPC stays the lingua franca</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A harness talks to tool servers by sending small messages and getting replies. <strong>JSON-RPC 2.0</strong> is the simple, long-standing format for that: a <strong>request</strong> has an <code>id</code>, a <code>method</code> name and <code>params</code>; the <strong>response</strong> carries the same <code>id</code> with either a <code>result</code> or an <code>error</code>; a <strong>notification</strong> has no <code>id</code> and gets no reply (used for progress and logs); and a <strong>batch</strong> is a list of these. Over <strong>stdio</strong>, each message is one line of JSON ended by a newline. This lesson builds that transport by hand, including the five standard error codes, so that a broken line produces an error reply and the stream carries on instead of dying. MCP uses the same envelope, so this is what every tool call rides on.</p></div></aside>
 <p>A coding agent in 2026 talks to maybe twelve tool servers in a single session. Each server is a separate process or a remote endpoint. The wire format has been the same since 2013. JSON-RPC 2.0 is two-page spec. It survives because the alternatives (gRPC, HTTP per call, custom binary) all impose a tradeoff JSON-RPC does not: they pick either streaming or batching or transport-coupling. JSON-RPC is symmetric across stdio, sockets, websockets, and HTTP, and a client can drive a server it has never seen if both honor the spec.</p>
 <p>This lesson builds the stdio variant. Newline-delimited JSON. Each request is one line. Each response is one line. The transport boundary is <code>\n</code>.</p>
 <h2>The wire shape</h2>
@@ -50,10 +51,332 @@ Anything else  -&gt; -32603 with exception name in data
 <h2>Notifications and asymmetric flows</h2>
 <p>A notification is fire-and-forget. The harness uses notifications for progress events, cancellation signals, and log lines. Notifications are how a long-running tool can stream status updates without round-tripping for each one.</p>
 <p>The lesson implements one outbound notification helper, <code>write_notification</code>. The server uses it to emit progress while a request is in flight. The demo shows the pattern: a request comes in, the handler emits two progress notifications, then writes the final response.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Four lines, four outcomes</div><div class="co-body"><p>The client writes four lines to the server's input.</p>
+<ol>
+<li><code>{"jsonrpc":"2.0","id":1,"method":"add","params":{"a":2,"b":3}}</code> → <code>{"id":1,"result":5}</code>.</li>
+<li><code>{"jsonrpc":"2.0","id":2,"method":"add","params":{"a":2}}</code> → <code>{"id":2,"error":{"code":-32602,...}}</code>: invalid params.</li>
+<li><code>{"jsonrpc":"2.0", "id":3, "method":</code> (cut off) → <code>{"id":null,"error":{"code":-32700,...}}</code>: a parse error, so no id could be read.</li>
+<li><code>{"jsonrpc":"2.0","method":"log","params":{"msg":"hi"}}</code> → nothing: a notification.</li>
+<li>After line 3 the server keeps reading; the client matches replies to calls by <code>id</code>, which is why replies can arrive in any order.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A parse error is answered with <code>"id": null</code>.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> The server should reply to notifications so the client knows they arrived.
+  Notifications have no id; a reply could not be matched to anything.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> An exception in a handler becomes error -32603 and the loop continues.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> One malformed line means the stream is corrupt and must be closed.
+  Newline framing lets the next line be parsed fresh.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a batch contains two requests and one notification. How many responses come back?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A minimal line-by-line server</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import io, json
+def handle(method, params):
+    if method == &quot;add&quot;: return params[&quot;a&quot;] + params[&quot;b&quot;]
+    raise KeyError(method)
+
+def serve(inp, out):
+    def one(msg):
+        if not isinstance(msg, dict) or msg.get(&quot;jsonrpc&quot;) != &quot;2.0&quot; or &quot;method&quot; not in msg:
+            return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: msg.get(&quot;id&quot;) if isinstance(msg, dict) else None, &quot;error&quot;: {&quot;code&quot;: -32600, &quot;message&quot;: &quot;invalid request&quot;}}
+        try: result = handle(msg[&quot;method&quot;], msg.get(&quot;params&quot;, {}))
+        except KeyError: result = None; err = {&quot;code&quot;: -32601, &quot;message&quot;: &quot;method not found&quot;}
+        else: err = None
+        if &quot;id&quot; not in msg: return None                         # notification: never answered
+        return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: msg[&quot;id&quot;], **({&quot;error&quot;: err} if err else {&quot;result&quot;: result})}
+    for line in inp:
+        try: msg = json.loads(line)
+        except json.JSONDecodeError:
+            out.write(json.dumps({&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: None, &quot;error&quot;: {&quot;code&quot;: -32700, &quot;message&quot;: &quot;parse error&quot;}}) + &quot;\n&quot;); continue
+        reply = [r for r in map(one, msg) if r] if isinstance(msg, list) else one(msg)
+        if reply: out.write(json.dumps(reply) + &quot;\n&quot;)
+
+lines = ['{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:1,&quot;method&quot;:&quot;add&quot;,&quot;params&quot;:{&quot;a&quot;:2,&quot;b&quot;:3}}',
+         '{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:2,&quot;method&quot;:',
+         '[{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:3,&quot;method&quot;:&quot;add&quot;,&quot;params&quot;:{&quot;a&quot;:1,&quot;b&quot;:1}},{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;method&quot;:&quot;log&quot;},{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:4,&quot;method&quot;:&quot;nope&quot;}]']
+out = io.StringIO(); serve(io.StringIO(&quot;\n&quot;.join(lines) + &quot;\n&quot;), out)
+print(out.getvalue())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 1, &quot;result&quot;: 5}
+{&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: null, &quot;error&quot;: {&quot;code&quot;: -32700, &quot;message&quot;: &quot;parse error&quot;}}
+[{&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 3, &quot;result&quot;: 2}, {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 4, &quot;error&quot;: {&quot;code&quot;: -32601, &quot;message&quot;: &quot;method not found&quot;}}]</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Three input lines give three output lines: the sum, a parse error with <code>id: null</code> for the cut-off line, and a batch reply with two entries, because the notification in the batch is silently dropped while the unknown method gets its own error. The stream survives the broken line in the middle, which is the property the whole framing scheme exists to guarantee.</p></div></aside>
 <h2>How to read the code</h2>
 <p><code>code/main.py</code> defines <code>StdioTransport</code>, the parse helper (<code>parse_request</code>), the three write helpers (<code>write_response</code>, <code>write_error</code>, <code>write_notification</code>), and the dispatch loop <code>serve</code>. The error code constants live at module scope.</p>
 <p><code>code/tests/test_transport.py</code> covers the five error codes, notifications (no response written), batches (array in, array out, notifications skipped), broken JSON (parse error then continue), and the asymmetric flow where a handler writes a notification mid-call.</p>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 5 · <code>JsonRpcError</code>, <code>MethodNotFound</code>, <code>InvalidParams</code>, <code>Request</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;JSON-RPC 2.0 over newline-delimited stdio.
+
+Conceptual references:
+- ./docs/en.md (this lesson)
+- JSON-RPC 2.0 specification (https://www.jsonrpc.org/specification)
+- RFC 8259 (JSON)
+
+Stdlib only. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import io
+import json
+import sys
+from dataclasses import dataclass
+from typing import Any, BinaryIO, Callable, Iterable
+
+
+ERR_PARSE = -32700
+ERR_INVALID_REQUEST = -32600
+ERR_METHOD_NOT_FOUND = -32601
+ERR_INVALID_PARAMS = -32602
+ERR_INTERNAL = -32603
+
+
+class JsonRpcError(Exception):
+    code: int = ERR_INTERNAL
+
+    def __init__(self, message: str, data: Any | None = None) -&gt; None:
+        super().__init__(message)
+        self.message = message
+        self.data = data
+
+
+class MethodNotFound(JsonRpcError):
+    code = ERR_METHOD_NOT_FOUND
+
+
+class InvalidParams(JsonRpcError):
+    code = ERR_INVALID_PARAMS
+
+
+@dataclass
+class Request:
+    method: str
+    params: Any
+    id: int | str | None
+    is_notification: bool
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>_is_valid_envelope</code>, <code>parse_request</code>, <code>_err_envelope</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _is_valid_envelope(msg: Any) -&gt; bool:
+    if not isinstance(msg, dict):
+        return False
+    if msg.get(&quot;jsonrpc&quot;) != &quot;2.0&quot;:
+        return False
+    if not isinstance(msg.get(&quot;method&quot;), str):
+        return False
+    if &quot;params&quot; in msg and not isinstance(msg[&quot;params&quot;], (dict, list)):
+        return False
+    if &quot;id&quot; in msg:
+        rid = msg[&quot;id&quot;]
+        if isinstance(rid, bool):
+            return False
+        if not isinstance(rid, (int, str, type(None))):
+            return False
+    return True
+
+
+def parse_request(raw: str) -&gt; tuple[Request | None, dict | None]:
+    &quot;&quot;&quot;Parse one JSON line. Returns (Request, None) on success or (None, error_dict).
+
+    error_dict is a JSON-RPC error response ready to write out.
+    &quot;&quot;&quot;
+    try:
+        msg = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return None, _err_envelope(None, ERR_PARSE, f&quot;parse error: {exc}&quot;)
+    if not _is_valid_envelope(msg):
+        rid = msg.get(&quot;id&quot;) if isinstance(msg, dict) else None
+        return None, _err_envelope(rid, ERR_INVALID_REQUEST, &quot;invalid request envelope&quot;)
+    is_notif = &quot;id&quot; not in msg
+    return Request(
+        method=msg[&quot;method&quot;],
+        params=msg.get(&quot;params&quot;),
+        id=msg.get(&quot;id&quot;),
+        is_notification=is_notif,
+    ), None
+
+
+def _err_envelope(rid: int | str | None, code: int, message: str, data: Any | None = None) -&gt; dict:
+    err: dict[str, Any] = {&quot;code&quot;: code, &quot;message&quot;: message}
+    if data is not None:
+        err[&quot;data&quot;] = data
+    return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;error&quot;: err}
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>_ok_envelope</code>, <code>_notification_envelope</code>, <code>StdioTransport</code>, <code>_handle_one</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _ok_envelope(rid: int | str | None, result: Any) -&gt; dict:
+    return {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: rid, &quot;result&quot;: result}
+
+
+def _notification_envelope(method: str, params: Any | None) -&gt; dict:
+    env: dict[str, Any] = {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: method}
+    if params is not None:
+        env[&quot;params&quot;] = params
+    return env
+
+
+class StdioTransport:
+    &quot;&quot;&quot;Newline-delimited JSON-RPC 2.0 over a pair of byte streams.&quot;&quot;&quot;
+
+    def __init__(self, stdin: BinaryIO, stdout: BinaryIO) -&gt; None:
+        self._in: BinaryIO = stdin
+        self._out: BinaryIO = stdout
+
+    def read_line(self) -&gt; bytes | None:
+        line = self._in.readline()
+        if not line:
+            return None
+        return line
+
+    def write_response(self, rid: int | str | None, result: Any) -&gt; None:
+        self._write(_ok_envelope(rid, result))
+
+    def write_error(self, rid: int | str | None, code: int, message: str, data: Any | None = None) -&gt; None:
+        self._write(_err_envelope(rid, code, message, data))
+
+    def write_notification(self, method: str, params: Any | None = None) -&gt; None:
+        self._write(_notification_envelope(method, params))
+
+    def _write(self, obj: dict) -&gt; None:
+        encoded = json.dumps(obj, separators=(&quot;,&quot;, &quot;:&quot;))
+        self._out.write((encoded + &quot;\n&quot;).encode(&quot;utf-8&quot;))
+        self._out.flush()
+
+
+Handler = Callable[[str, Any], Any]
+
+
+def _handle_one(handler: Handler, transport: StdioTransport, req: Request) -&gt; dict | None:
+    &quot;&quot;&quot;Dispatch a single Request. Returns the response envelope (or None for notification).&quot;&quot;&quot;
+    try:
+        result = handler(req.method, req.params)
+    except MethodNotFound as exc:
+        return None if req.is_notification else _err_envelope(req.id, exc.code, exc.message, exc.data)
+    except InvalidParams as exc:
+        return None if req.is_notification else _err_envelope(req.id, exc.code, exc.message, exc.data)
+    except JsonRpcError as exc:
+        return None if req.is_notification else _err_envelope(req.id, exc.code, exc.message, exc.data)
+    except Exception as exc:
+        return None if req.is_notification else _err_envelope(
+            req.id, ERR_INTERNAL, &quot;internal error&quot;,
+            {&quot;exception&quot;: type(exc).__name__, &quot;detail&quot;: str(exc)},
+        )
+    if req.is_notification:
+        return None
+    return _ok_envelope(req.id, result)
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>_process_batch</code>, <code>_write_raw</code>, <code>serve</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _process_batch(handler: Handler, transport: StdioTransport, items: list) -&gt; list | None:
+    out: list = []
+    for raw in items:
+        if not isinstance(raw, dict) or not _is_valid_envelope(raw):
+            rid = raw.get(&quot;id&quot;) if isinstance(raw, dict) else None
+            out.append(_err_envelope(rid, ERR_INVALID_REQUEST, &quot;invalid request envelope&quot;))
+            continue
+        is_notif = &quot;id&quot; not in raw
+        req = Request(
+            method=raw[&quot;method&quot;], params=raw.get(&quot;params&quot;),
+            id=raw.get(&quot;id&quot;), is_notification=is_notif,
+        )
+        resp = _handle_one(handler, transport, req)
+        if resp is not None:
+            out.append(resp)
+    if not out:
+        return None
+    return out
+
+
+def _write_raw(transport: StdioTransport, obj: Any) -&gt; None:
+    encoded = json.dumps(obj, separators=(&quot;,&quot;, &quot;:&quot;))
+    transport._out.write((encoded + &quot;\n&quot;).encode(&quot;utf-8&quot;))
+    transport._out.flush()
+
+
+def serve(handler: Handler, transport: StdioTransport) -&gt; None:
+    &quot;&quot;&quot;Read requests from transport until EOF. Dispatch each through handler.&quot;&quot;&quot;
+    while True:
+        line = transport.read_line()
+        if line is None:
+            return
+        text = line.decode(&quot;utf-8&quot;).rstrip(&quot;\n&quot;).strip()
+        if not text:
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            transport.write_error(None, ERR_PARSE, f&quot;parse error: {exc}&quot;)
+            continue
+        if isinstance(parsed, list):
+            if not parsed:
+                transport.write_error(None, ERR_INVALID_REQUEST, &quot;empty batch&quot;)
+                continue
+            batch_out = _process_batch(handler, transport, parsed)
+            if batch_out is not None:
+                _write_raw(transport, batch_out)
+            continue
+        req, err = parse_request(text)
+        if err is not None:
+            _write_raw(transport, err)
+            continue
+        resp = _handle_one(handler, transport, req)
+        if resp is not None:
+            _write_raw(transport, resp)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · <code>_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _demo() -&gt; None:
+    &quot;&quot;&quot;Self-terminating demo using io.BytesIO. No process spawn.&quot;&quot;&quot;
+
+    def handler(method: str, params: Any) -&gt; Any:
+        if method == &quot;math.add&quot;:
+            if not isinstance(params, dict) or &quot;a&quot; not in params or &quot;b&quot; not in params:
+                raise InvalidParams(&quot;a and b required&quot;)
+            return params[&quot;a&quot;] + params[&quot;b&quot;]
+        if method == &quot;echo&quot;:
+            return params
+        if method == &quot;boom&quot;:
+            raise RuntimeError(&quot;intentional&quot;)
+        raise MethodNotFound(f&quot;method {method!r}&quot;)
+
+    requests = [
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 1, &quot;method&quot;: &quot;math.add&quot;, &quot;params&quot;: {&quot;a&quot;: 2, &quot;b&quot;: 3}},
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 2, &quot;method&quot;: &quot;math.add&quot;, &quot;params&quot;: {&quot;a&quot;: 5}},
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 3, &quot;method&quot;: &quot;missing&quot;},
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 4, &quot;method&quot;: &quot;boom&quot;},
+        {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;log&quot;, &quot;params&quot;: {&quot;level&quot;: &quot;info&quot;}},
+        [
+            {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 10, &quot;method&quot;: &quot;echo&quot;, &quot;params&quot;: {&quot;text&quot;: &quot;hi&quot;}},
+            {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;method&quot;: &quot;log&quot;, &quot;params&quot;: {&quot;msg&quot;: &quot;skip-me&quot;}},
+            {&quot;jsonrpc&quot;: &quot;2.0&quot;, &quot;id&quot;: 11, &quot;method&quot;: &quot;math.add&quot;, &quot;params&quot;: {&quot;a&quot;: 1, &quot;b&quot;: 1}},
+        ],
+    ]
+
+    stdin = io.BytesIO()
+    for r in requests:
+        stdin.write((json.dumps(r) + &quot;\n&quot;).encode(&quot;utf-8&quot;))
+    stdin.write(b&quot;{not json\n&quot;)
+    stdin.seek(0)
+    stdout = io.BytesIO()
+    transport = StdioTransport(stdin, stdout)
+    serve(handler, transport)
+    stdout.seek(0)
+    lines = [json.loads(line) for line in stdout.read().decode(&quot;utf-8&quot;).splitlines() if line]
+    print(json.dumps({&quot;server_responses&quot;: lines}, indent=2))
+</code></pre></div>
+
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The demo feeds a scripted sequence through in-memory streams and prints every reply: a result, then invalid params (-32602), method not found (-32601), an internal error (-32603) that carries the exception class in <code>data</code>, a batch reply with two results, and finally a parse error with <code>id: null</code> for a malformed line. Every code from the table appears, and the server reached the end of the input without stopping.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A server reads stdin with <code>sys.stdin.read()</code> and parses the whole input as one JSON value. It works in tests with a single request. Under a real client, nothing is ever answered. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Requests have ids; responses echo them; notifications have none and get no reply.</li>
+<li>Five standard error codes; parse errors reply with a null id.</li>
+<li>One message per line; a bad line never poisons the stream.</li>
+<li>Batches reply with one entry per request, none for notifications.</li>
+<li>The transport knows nothing about tools; a handler does the dispatch.</li>
+</ul></div></aside>
 <h2>Going further</h2>
 <p>This transport is enough for the lessons that follow. Production transports add three things. A correlation id field that survives forwarding (your <code>id</code> is already this, but in a mesh you need an outer trace id too). A cancellation channel (a notification like <code>$/cancelRequest</code> with the id of the in-flight call). And a content-type negotiation handshake so the same socket can speak JSON-RPC and Streamable HTTP. None of those change the wire. They add metadata.</p>
+<h2>Solutions</h2>
+<details class="qa" id="a1922-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Waiting for the end of a stream that never ends</span></summary><div class="qa-a"><p><code>read()</code> waits for end of input, but a client keeps the pipe open for the whole session, so the server never gets to parse anything. Read line by line (<code>for line in sys.stdin</code> or <code>readline()</code>), handle each message as it arrives, and flush the output after each reply.</p></div></details>
 <h2>Practice and reference</h2>
-<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-client-transports"><span class="t" style="--cs-hue:190">MP</span>Cheat sheet · MCP Clients and Transports</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1922" id="done-a1922">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1922" id="undo-a1922" hidden>Mark as not done</button></div><div class="pn-row"></div></footer>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-client-transports"><span class="t" style="--cs-hue:190">MP</span>Cheat sheet · MCP Clients and Transports</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1922" id="done-a1922">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1922" id="undo-a1922" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1921"><span class="pn-dir">Previous</span><span class="pn-t">19.21 · Tool Registry with Schema Validation</span></a><a class="pn next" href="#a1923"><span class="pn-dir">Next</span><span class="pn-t">19.23 · Function Call Dispatcher</span></a></div></footer>

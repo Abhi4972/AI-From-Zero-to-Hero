@@ -22,7 +22,10 @@ signal.signal(signal.SIGALRM, alarm)
 IN, OUT = sys.argv[1], sys.argv[2]
 sys.path.insert(0, os.getcwd())
 blocks = json.load(open(IN))
-ns = {"__name__": "__main__"}
+ns = {"__name__": "__main__", "__file__": os.path.join(os.getcwd(), "main.py")}
+def scrub(t):   # keep this machine's folders out of the published output
+    t = re.sub(r"(/home/claude/upstream/phases|/home/claude/aifs/run|/tmp/claude-0/z2/aiefs/repo/phases)/[^/\s]+/[^/\s\"']+", ".", t)
+    return re.sub(r"/(home/claude|tmp/claude-0)(/[^\s\"']*)?", "/path/to/project", t)
 res = []
 for code in blocks:
     if SKIP.search(code) and not code.startswith("#!run\n"):
@@ -33,12 +36,12 @@ for code in blocks:
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
             exec(compile(code, "<lesson>", "exec"), ns)
         signal.alarm(0)
-        res.append({"status": "ok", "out": buf.getvalue()})
+        res.append({"status": "ok", "out": scrub(buf.getvalue())})
     except TO:
-        res.append({"status": "timeout", "out": buf.getvalue()})
+        res.append({"status": "timeout", "out": scrub(buf.getvalue())})
     except SystemExit:
-        signal.alarm(0); res.append({"status": "ok", "out": buf.getvalue()})
+        signal.alarm(0); res.append({"status": "ok", "out": scrub(buf.getvalue())})
     except BaseException as e:
         signal.alarm(0)
-        res.append({"status": "error", "out": buf.getvalue(), "err": f"{type(e).__name__}: {str(e)[:200]}"})
+        res.append({"status": "error", "out": scrub(buf.getvalue()), "err": f"{type(e).__name__}: {str(e)[:200]}"})
 json.dump(res, open(OUT, "w"))
