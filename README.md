@@ -10,13 +10,13 @@ Everything is on one site: one menu for all 22 phases, one search across every l
 
 | Part | Phases | Lessons |
 |---|---|---|
-| 1 · Foundations | 0 Your Workbench · 1 The Maths You Need · 2 How Machines Learn · 3 Neural Networks, Inside Out | 129 |
-| 2 · Perception | 4 Teaching Machines to See · 5 Working with Language · 6 Sound and Speech | 126 |
-| 3 · Models | 7 Inside the Transformer · 8 Models That Create · 9 Learning from Reward · 10 Build Your Own Language Model | 127 |
-| 4 · Building with LLMs | 11 Putting LLMs to Work · 12 Text, Images, Audio and Beyond · 13 Connecting Models to Tools | 145 |
-| 5 · Agents | 14 Building Agents · 15 Agents That Run on Their Own · 16 Agents in Teams | 260 |
-| 6 · Serving, Safety & Capstones | 17 Serving and Scaling · 18 Safe and Responsible AI · 19 Capstone Builds | 161 |
-| 7 · Projects and Case Files | 20 Hands-On Projects · 21 Interview Case Files | 144 |
+| 1 · Foundations | 0 Dev Environment and AI Tooling · 1 Mathematics for Machine Learning · 2 Machine Learning Algorithms · 3 Deep Learning and Neural Networks | 129 |
+| 2 · Perception | 4 Computer Vision and Image Models · 5 Natural Language Processing (NLP) · 6 Speech and Audio AI | 126 |
+| 3 · Models | 7 Transformer Architecture and Attention · 8 Generative AI Models · 9 Reinforcement Learning (RL) · 10 Build an LLM from Scratch | 127 |
+| 4 · Building with LLMs | 11 LLM Engineering and Applications · 12 Multimodal Models · 13 Tool Use, MCP and Agent Protocols | 145 |
+| 5 · Agents | 14 AI Agents: Design and Engineering · 15 Autonomous Agents and Self-Improvement · 16 Multi-Agent Systems and Swarms | 260 |
+| 6 · Serving, Safety & Capstones | 17 LLM Inference, Infrastructure and LLMOps · 18 AI Safety, Alignment and Ethics · 19 Capstone Builds | 161 |
+| 7 · Projects and Case Files | 20 Hands-On AI Projects · 21 Interview Case Files: Debugging AI Systems | 144 |
 
 Each phase has up to three sections: its own lessons, **Cheat sheets** (one-page references) and companion lessons marked **From Zero to Agents**, grouped by topic and numbered after the phase's own lessons. Phase 20 builds 79 small, tested projects stage by stage, from a starter level to frontier systems. Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
 

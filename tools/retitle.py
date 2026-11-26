@@ -39,16 +39,20 @@ json.dump(course, open(P("data", "course.json"), "w", encoding="utf-8"), ensure_
 
 # every old spelling (raw and HTML-escaped) of a title -> its new one
 pairs = []
+for i, prev in old_store.get("titles", {}).items():     # titles applied by an earlier run (now in the HTML)
+    if i in new and prev != new[i] and prev != orig.get(i):
+        for a, b in ((prev, new[i]), (H.escape(prev, quote=False), H.escape(new[i], quote=False)), (H.escape(prev), H.escape(new[i]))):
+            if (i, a, b) not in pairs: pairs.append((i, a, b))
 for i, o in orig.items():
     if i in new and o != new[i]:
-        for a, b in ((o, new[i]), (H.escape(o, quote=False), H.escape(new[i], quote=False))):
-            pairs.append((i, a, b))
+        for a, b in ((o, new[i]), (H.escape(o, quote=False), H.escape(new[i], quote=False)), (H.escape(o), H.escape(new[i]))):
+            if (i, a, b) not in pairs: pairs.append((i, a, b))
 num = {l["id"]: l.get("num", "") for p in course for ch in p["chapters"] for l in ch["lessons"]}
 code = {ch["id"]: ch.get("code", "") for p in course for ch in p["chapters"]}
 
 NEEDS_MAP = {o: n for i, o, n in pairs}                     # "Needs: Phase 1, Lessons 01 (Linear Algebra Intuition), ..."
-NEEDS_RE = re.compile(r"(?<![\w&])(?:%s)(?![\w])" % "|".join(re.escape(o) for o in sorted(NEEDS_MAP, key=len, reverse=True)))
-ANY_RE = re.compile("|".join(re.escape(o) for o in sorted(NEEDS_MAP, key=len, reverse=True)))
+NEEDS_RE = re.compile(r"(?:(?<=[(,;:] )|(?<=\())(?:%s)(?=\)|,|;|<)" % "|".join(re.escape(o) for o in sorted(NEEDS_MAP, key=len, reverse=True)))
+ANY_RE = re.compile("|".join(re.escape(o) for o in sorted({a for _, a, _ in pairs}, key=len, reverse=True)))
 changed = 0
 for f in sorted(os.listdir(P("lessons"))):
     if not f.endswith(".html"): continue
@@ -61,10 +65,21 @@ for f in sorted(os.listdir(P("lessons"))):
         if i.startswith("ph-"):                             # the course map in lesson 0.0 ("Setup & Tooling · 32 lessons") and crumbs
             b = b.replace(f"</span>{o} · ", f"</span>{n} · ").replace(f"Phase {code[i]} · {o}<", f"Phase {code[i]} · {n}<")
         elif num.get(i):                                    # "14.1 The Agent Loop..." in Covers lists, "14.1 · ..." labels
-            b = b.replace(f"{num[i]} {o}", f"{num[i]} {n}").replace(f"{num[i]} · {o}", f"{num[i]} · {n}")
+            for sep in (" ", " · "):                        # the old title must end there, so a run never re-applies
+                pre = f"{num[i]}{sep}"
+                b = re.sub(r"(?<![\d.])" + re.escape(pre + o) + r"(?=<|\"|,|;|\)| ·|\n)",
+                           lambda m, s=b, pre=pre: m.group(0) if s.startswith(pre + n, m.start()) else pre + n, b)
         if i.startswith("cs-"):                             # related cheat-sheet boxes: "Cheat sheet · Agent Harness Engineering"
             b = b.replace(f"Cheat sheet · {o}<", f"Cheat sheet · {n}<")
-    b = re.sub(r"<li><strong>Needs</strong>:.*?</li>", lambda m: NEEDS_RE.sub(lambda x: NEEDS_MAP[x.group(0)], m.group(0)), b)
+    def fix_needs(m):
+        s = m.group(0)
+        def one(x):                                         # leave it if the new title is already there around it
+            o, n = x.group(0), NEEDS_MAP[x.group(0)]
+            k = n.find(o)
+            if k >= 0 and s[x.start() - k: x.start() - k + len(n)] == n: return o
+            return n
+        return NEEDS_RE.sub(one, s)
+    b = re.sub(r"<li><strong>Needs</strong>:.*?</li>", fix_needs, b)
     if b != a: open(path, "w", encoding="utf-8").write(b); changed += 1
 
 json.dump({"course": T.COURSE, "titles": new, "original": orig}, open(P("data", "titles.json"), "w", encoding="utf-8"), ensure_ascii=False, indent=1)
