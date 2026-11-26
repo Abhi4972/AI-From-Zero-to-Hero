@@ -52,7 +52,8 @@ def convert(lesson_dir, num, store):
     raw = (d / "docs" / "en.md").read_text()
     m = re.match(r"#\s+(.+)\n", raw)
     title = m.group(1).strip() if m else d.name
-    motto = " ".join(x[1:].strip() for x in re.findall(r"^>.*$", raw[:600], re.M))
+    mq = re.search(r"(?:^>.*\n?)+", raw[:4000], re.M)      # the first block quote, whole (it can be long)
+    motto = " ".join(x[1:].strip() for x in mq.group(0).splitlines()) if mq else ""
     meta = dict(re.findall(r"^\*\*(Type|Languages|Prerequisites|Time):\*\*\s*(.+)$", raw, re.M))
     minutes = int((re.search(r"(\d+)", meta.get("Time", "45")) or [0, 45])[1])
     body = raw[m.end():] if m else raw
