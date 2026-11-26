@@ -18,7 +18,7 @@ Everything is on one site: one menu for all 22 phases, one search across every l
 | 6 · Serving, Safety & Capstones | 17 LLM Inference, Infrastructure and LLMOps · 18 AI Safety, Alignment and Ethics · 19 Capstone Builds | 161 |
 | 7 · Projects and Case Files | 20 Hands-On AI Projects · 21 Interview Case Files: Debugging AI Systems | 144 |
 
-Each phase has up to three sections: its own lessons, **Cheat sheets** (one-page references) and companion lessons marked **From Zero to Agents**, grouped by topic and numbered after the phase's own lessons. Phase 20 builds 79 small, tested projects stage by stage, from a starter level to frontier systems. Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
+Each phase lists its lessons in one numbered order, with gentle introductions placed right before the deeper lessons they lead into, followed by its **Cheat sheets** (one-page references). The order lives in `data/blend_src.py` and is applied by `tools/blend.py`. Phase 20 builds 79 small, tested projects stage by stage, from a starter level to frontier systems. Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
 
 ## Using it
 
