@@ -36,7 +36,7 @@ def place(a, after):
     heads = list(re.finditer(r"<h2\b[^>]*>(.*?)</h2>", a, re.S))
     txt = lambda m: re.sub(r"<[^>]+>", "", m.group(1)).strip()
     h = next((m for m in heads if after and txt(m).startswith(after)), None) if after else \
-        next((m for m in heads if not re.match(r"The problem", txt(m))), None)
+        next((m for m in heads if not re.match(r"(The )?problem\b", txt(m), re.I)), None)
     if not h: raise RuntimeError(f"no section {after!r}")
     end = heads[heads.index(h) + 1].start() if heads.index(h) + 1 < len(heads) else len(a)
     pos = h.end()
