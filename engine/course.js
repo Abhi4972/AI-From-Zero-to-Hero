@@ -148,7 +148,7 @@
     const chWith = phases.filter(c => tally(c.lessons).n).length;
     const quizzes = Object.keys(S.q).length;
     let h = '<header class="home-hero"><div class="eyebrow"><span>A complete course</span><span class="dot">·</span><span>' + lessons.length + " lessons</span><span class=\"dot\">·</span><span>about " + hrs(lessons.reduce((a, l) => a + l.min, 0)) + " hours</span></div>" +
-      "<h1>AI from Scratch</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, and on to serving, safety and capstone projects, in six parts. Every lesson has its code run, its figures live, and quick checks, exercises and interview questions to make it stick.</p></header>";
+      "<h1>AI from Zero to Hero</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, and on to serving, safety and capstone projects, in six parts. Every lesson has its code run, its figures live, and quick checks, exercises and interview questions to make it stick.</p></header>";
     h += '<section class="dash" aria-label="Your progress"><div class="dash-ring">' + ringSvg(frac) + '<div class="dash-pct"><b>' + Math.round(frac * 100) + "%</b><span>complete</span></div></div>" +
       '<div class="dash-body"><div class="dash-line">' + (all.done === 0 ? "You have not started yet." : all.done === all.n ? "You have finished this path. Well done." : all.done + " of " + all.n + " lessons finished") +
       "<small>" + (all.done ? "About " + hrs(all.min - all.doneMin) + " hours left of " + hrs(all.min) : "About " + hrs(all.min) + " hours, at your own pace") + (S.path !== "all" ? " on the “" + PATHS[S.path][0] + "” path" : "") + ".</small></div>" +
@@ -271,7 +271,7 @@
       view = { kind: "chapter", id: id }; openCh[id] = true;
       setView("chapter"); renderChapter(chById[id]); renderNav(id, ""); if (window.ZXP) window.ZXP.enter("chapter");
       $("tb-where").textContent = "Phase " + chById[id].code + " · " + chById[id].title;
-      document.title = chById[id].title + " · AI from Scratch";
+      document.title = chById[id].title + " · AI from Zero to Hero";
     } else if (artById[id]) {
       const l = byId[id], art = artById[id];
       if (art.dataset.stub) {
@@ -291,14 +291,14 @@
       modules.forEach(m => { m.hidden = m !== art; });
       setView("lesson"); if (window.ZXP) window.ZXP.lesson(art, l); highlight(art); renderOnPage(art); renderNav(l.ch.id, id); lessonButtons();
       $("tb-where").textContent = l.num + " · " + l.title;
-      document.title = l.title + " · AI from Scratch";
+      document.title = l.title + " · AI from Zero to Hero";
       if (S.last !== id) { S.last = id; S.t = Date.now(); saveLocal(); queuePush(); }
       const a = document.querySelector(".nav-link.active"), rail = $("rail");
       if (a && rail) { const top = a.offsetTop; if (top < rail.scrollTop + 60 || top > rail.scrollTop + rail.clientHeight - 60) rail.scrollTop = Math.max(0, top - rail.clientHeight / 3); }
     } else {
       view = { kind: "home", id: "" };
       setView("home"); renderHome(); renderNav("", ""); if (window.ZXP) window.ZXP.enter("home");
-      $("tb-where").textContent = ""; document.title = "AI from Scratch";
+      $("tb-where").textContent = ""; document.title = "AI from Zero to Hero";
     }
     if (scroll !== false) window.scrollTo(0, 0);
     onScroll();

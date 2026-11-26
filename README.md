@@ -1,4 +1,4 @@
-# AI from Scratch
+# AI from Zero to Hero
 
 A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams: **948 lessons in 20 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
 
@@ -10,12 +10,12 @@ Everything is on one site: one menu for all 20 phases, one search across every l
 
 | Part | Phases | Lessons |
 |---|---|---|
-| 1 · Foundations | 0 Setup & Tooling · 1 Math Foundations · 2 ML Fundamentals · 3 Deep Learning Core | 129 |
-| 2 · Perception | 4 Computer Vision · 5 NLP, Foundations to Advanced · 6 Speech & Audio | 126 |
-| 3 · Models | 7 Transformers Deep Dive · 8 Generative AI · 9 Reinforcement Learning · 10 LLMs from Scratch | 127 |
-| 4 · Building with LLMs | 11 LLM Engineering · 12 Multimodal AI · 13 Tools & Protocols | 145 |
-| 5 · Agents | 14 Agent Engineering · 15 Autonomous Systems · 16 Multi-Agent & Swarms | 260 |
-| 6 · Serving, Safety & Capstones | 17 Infrastructure & Production · 18 Ethics, Safety & Alignment · 19 Capstone Projects | 161 |
+| 1 · Foundations | 0 Your Workbench · 1 The Maths You Need · 2 How Machines Learn · 3 Neural Networks, Inside Out | 129 |
+| 2 · Perception | 4 Teaching Machines to See · 5 Working with Language · 6 Sound and Speech | 126 |
+| 3 · Models | 7 Inside the Transformer · 8 Models That Create · 9 Learning from Reward · 10 Build Your Own Language Model | 127 |
+| 4 · Building with LLMs | 11 Putting LLMs to Work · 12 Text, Images, Audio and Beyond · 13 Connecting Models to Tools | 145 |
+| 5 · Agents | 14 Building Agents · 15 Agents That Run on Their Own · 16 Agents in Teams | 260 |
+| 6 · Serving, Safety & Capstones | 17 Serving and Scaling · 18 Safe and Responsible AI · 19 Capstone Builds | 161 |
 
 Each phase has up to three sections: its own lessons, **Cheat sheets** (one-page references) and companion lessons marked **From Zero to Agents**, grouped by topic and numbered after the phase's own lessons. Start with **Lesson 0.0**, which explains how the course works and suggests five routes through it.
 
@@ -33,6 +33,7 @@ lessons/<id>.html     each lesson (edit these)
 data/course.json      parts, phases and the lesson list: order, numbers, titles, minutes (edit this)
 data/zxt.json         the one-line summaries the lesson player shows per section
 data/diagrams/<id>.mmd  the step-through diagram of a lesson, as Mermaid source (edit these)
+data/titles_src.py    this course's names for its phases, lessons and cheat sheets (edit this, then run tools/retitle.py)
 engine/               the app: page shell, styles and scripts
 img/ figs/ repo-assets/ src/   images and data used by lessons
 shared/               Python runtime (Pyodide 0.26.4) and maths fonts
@@ -47,6 +48,7 @@ After changing a lesson or `data/course.json`, run
 ```bash
 python3 tools/renumber.py   # only if lesson numbers changed: updates every "Lesson N" reference
 python3 tools/diagrams.py   # only if a diagram source changed: re-renders it into its lesson (needs mmdc)
+python3 tools/retitle.py    # only if data/titles_src.py changed, or lessons were regenerated from the source repo
 python3 tools/build.py
 ```
 

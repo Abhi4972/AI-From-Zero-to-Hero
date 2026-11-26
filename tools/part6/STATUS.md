@@ -9,6 +9,7 @@ Helpers: rd.py <ppNN> prints a source lesson compactly; heads.txt lists converte
 Done: all of Part 6. Phase 17, 18 and 19 overlays (144 lessons, a1701-a1987) and step-through diagrams (data/diagrams/a17*, a18*, a19*; lessons with upstream Mermaid use that instead).
 Runner: lessons are run as a real __main__ module (multiprocessing pickling works), a full main() gets 150 s, local paths are scrubbed from output; lessons that import multiprocessing run with PYTHONPATH=sitefix (torch file_system sharing).
 build_p6 splits main.py for @@mainpy at AST top-level definitions, never inside a string.
+IMPORTANT: build_p6.py writes the source repo's titles; always run tools/retitle.py afterwards (the course's own names live in data/titles_src.py).
 IMPORTANT: build_p6.py rewrites lesson HTML, which removes the step-through diagrams; always run tools/diagrams.py (all ids) afterwards.
 conv.py now keeps the whole first block quote as the one-line idea (it used to cut at 600 characters).
 Note: many toy main.py outputs contradict their own captions; read boxes say so honestly.

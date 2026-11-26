@@ -1,5 +1,5 @@
 
-/* xv.js: animated step-through diagrams for AI from Scratch.
+/* xv.js: animated step-through diagrams for AI from Zero to Hero.
    Two styles:
      iso   - an isometric plate: blocks on a gridded base, packets travelling along wires, live counters,
              a side panel per step and a numbered step rail. Plays by itself (Pause, Replay, Back, Next).

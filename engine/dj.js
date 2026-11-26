@@ -86,7 +86,7 @@
   const rail = el("nav", "dj-rail");
   rail.setAttribute("aria-label", "Sections");
   const NAV = [["home", "#home", "Home", "home"], ["curriculum", "#curriculum", "Curriculum", "grid"], ["interview", "#interview", "Interview prep", "chat"], ["playground", "#playground", "Playground", "lab"], ["review", "#review", "Review", "review"]];
-  rail.innerHTML = '<a class="dj-logo" href="#home" aria-label="AI from Scratch, home">AI<span>·</span>S</a><div class="dj-icons">' +
+  rail.innerHTML = '<a class="dj-logo" href="#home" aria-label="AI from Zero to Hero, home">Z<span>·</span>H</a><div class="dj-icons">' +
     NAV.map(n => '<a class="dj-ic" data-k="' + n[0] + '" href="' + n[1] + '" aria-label="' + n[2] + '">' + ic(n[3]) + '<span class="dj-tip">' + n[2] + "</span></a>").join("") + "</div>";
   document.body.appendChild(rail);
   const tb2 = el("button", "dj-ic dj-theme2"); tb2.type = "button"; $(".dj-icons", rail).appendChild(tb2);
@@ -522,7 +522,7 @@
     if (page) {
       $("#view-home").hidden = true; $("#view-chapter").hidden = true; $("#lesson-wrap").hidden = true; view.hidden = false;
       if (id !== "review") rvList = null; if (id === "review") { rvList = null; }
-      page[0](); $("#tb-where").textContent = page[1]; document.title = page[1] + " · AI from Scratch"; window.scrollTo(0, 0);
+      page[0](); $("#tb-where").textContent = page[1]; document.title = page[1] + " · AI from Zero to Hero"; window.scrollTo(0, 0);
     } else {
       view.hidden = true; if (view.innerHTML) { view.innerHTML = ""; }
       if (kind === "lesson") augLesson(L[id].art);
