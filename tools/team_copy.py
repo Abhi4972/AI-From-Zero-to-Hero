@@ -92,16 +92,18 @@ s = open(l0, encoding="utf-8").read()
 s = re.sub(r"<li><strong>Part 7 · Projects and Case Files \(Phases 20 and 21\)\.</strong>.*?</li>",
            "<li><strong>Part 7 · Hands-On Projects (Phase 20).</strong> 79 smaller projects you build and test stage by stage, from starter tools to frontier systems.</li>", s, flags=re.S)
 s = re.sub(r"<li><strong>Part 8 · Project Library \(Phases 22 to 30\)\.</strong>", "<li><strong>Part 8 · Project Library (Phases 21 to 29).</strong>", s)
+s = s.replace("<li><strong>Part 9 · Forward Deployed Engineering (Phase 31).</strong>", "<li><strong>Part 9 · Forward Deployed Engineering (Phase 30).</strong>")
+s = s.replace("About 25 hours for Phase 31,", "About 25 hours for Phase 30,")
 s = re.sub(r'<li><a href="#ph-21"><span class="num">21</span>[^<]*</a></li>', "", s)
 s = s.replace('<span class="cmap-pname">Projects and Case Files</span>', '<span class="cmap-pname">Hands-On Projects</span>')
-s = re.sub(r"[\d,]+ lessons in 31 phases: 753 lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
+s = re.sub(r"[\d,]+ lessons in 3[12] phases: 753 lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
            f"{n_total:,} lessons in {n_ph} phases: 753 lessons in phases 0 to 19, 79 guided projects, 199 cheat sheets", s)
 for a, b in [(" Build projects from Phase 20 as you go, and work the case files of Phase 21 before interviews.", " Build projects from Phase 20 as you go."),
              (", the case files of Phase 21 about 22", ""),
              ("to jump to any lesson, section heading or interview question by name", "to jump to any lesson or section heading by name"),
              (", and interview questions with model answers", ""), (" and interview questions with model answers", ""),
-             ("then hands-on projects, interview case files and a project library", "then hands-on projects and a project library"),
-             ("Eight parts, 31 phases", f"Eight parts, {n_ph} phases"), ("Pick a route through the 31 phases", f"Pick a route through the {n_ph} phases"),
+             ("then hands-on projects, interview case files, a project library and forward deployed engineering", "then hands-on projects, a project library and forward deployed engineering"),
+             ("Nine parts, 32 phases", f"Nine parts, {n_ph} phases"), ("Pick a route through the 32 phases", f"Pick a route through the {n_ph} phases"),
              ("then practice and interview questions.", "then practice."), ("<span>In Interview prep</span>", "<span>In the Playground</span>"),
              ("The seventh and eighth are practice.", "The seventh and eighth are practice.")]:
     s = s.replace(a, b)
@@ -110,10 +112,10 @@ s = re.sub(r"<li><strong>Review, Interview prep and Playground\.</strong>(.*?)<e
 s = s.replace("The icons on the left open them. <em>Review</em>", "The icons on the left open them. <em>Review</em>")
 open(l0, "w", encoding="utf-8").write(s)
 
-edit(P("engine", "course.js"), [("guided projects, interview case files and a project library", "guided projects and a project library"),
+edit(P("engine", "course.js"), [("guided projects, interview case files, a project library and forward deployed engineering", "guided projects, a project library and forward deployed engineering"),
                                 ("quick checks, exercises and interview questions to make it stick", "quick checks and exercises to make it stick")])
-edit(P("engine", "player.js"), [("a seventh of projects and interview case files, and an eighth", "a seventh of hands-on projects, and an eighth"),
-                                ('"Course map":"31 phases in eight parts;', f'"Course map":"{n_ph} phases in eight parts;')])
+edit(P("engine", "player.js"), [("a seventh of projects and interview case files, an eighth", "a seventh of hands-on projects, an eighth"),
+                                ('"Course map":"32 phases in nine parts;', f'"Course map":"{n_ph} phases in nine parts;')])
 dj = P("engine", "dj.js"); s = open(dj, encoding="utf-8").read()
 for a, b in [('["interview", "#interview", "Interview prep", "chat"], ', ""), ('<a class="dj-btn" href="#interview">Practise interview questions</a>', ""),
              ('placeholder="Search lessons, sections, interview questions, labs"', 'placeholder="Search lessons, sections and labs"'),
@@ -131,10 +133,11 @@ s = s[:k] + s[s.index("\n", k) + 1:]
 open(dj, "w", encoding="utf-8").write(s)
 
 rd = P("README.md"); s = open(rd, encoding="utf-8").read()
-s = re.sub(r"then 79 guided projects, 60 interview case files and a library of (\d+) more projects and recipes: \*\*[\d,]+ lessons in 31 phases\*\*",
-           lambda m: f"then 79 guided projects and a library of {m.group(1)} more projects and recipes: **{n_total:,} lessons in {n_ph} phases**", s)
+s = re.sub(r"then 79 guided projects, 60 interview case files and a library of (\d+) more projects and recipes, and a forward deployed engineering intensive: \*\*[\d,]+ lessons in 32 phases\*\*",
+           lambda m: f"then 79 guided projects, a library of {m.group(1)} more projects and recipes, and a forward deployed engineering intensive: **{n_total:,} lessons in {n_ph} phases**", s)
+s = s.replace("| 9 · Forward Deployed Engineering | 31 Forward Deployed Engineering with Claude |", "| 9 · Forward Deployed Engineering | 30 Forward Deployed Engineering with Claude |")
 s = s.replace("quick checks, interview questions and a review queue", "quick checks and a review queue")
-s = s.replace("one menu for all 31 phases", f"one menu for all {n_ph} phases")
+s = s.replace("one menu for all 32 phases", f"one menu for all {n_ph} phases")
 s = s.replace("| 7 · Projects and Case Files | 20 Hands-On AI Projects · 21 Interview Case Files: Debugging AI Systems | 144 |", "| 7 · Hands-On Projects | 20 Hands-On AI Projects | 83 |")
 s = re.sub(r"(\| 8 · Project Library \|)([^|]*)\|", lambda m: m.group(1) + re.sub(r"\b(2[2-9]|30)\b(?= )", lambda x: str(int(x.group(1)) - 1), m.group(2)) + "|", s)
 s = s.replace(" Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened.", "")

@@ -31,7 +31,7 @@ The Claude Agent SDK gives you the same harness Claude Code uses: the loop, tool
 ```pyshow
 import asyncio
 from claude_agent_sdk import query, ClaudeAgentOptions, tool, create_sdk_mcp_server, AssistantMessage, ResultMessage, TextBlock
-import adapter     # the validated, audited functions from lesson 31.9
+import adapter     # the validated, audited tool functions built earlier
 
 @tool("get_policy", "Read-only policy lookup by number like HM-123456", {"policy_number": str})
 async def get_policy(args):
