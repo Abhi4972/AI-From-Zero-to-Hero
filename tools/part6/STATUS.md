@@ -31,3 +31,10 @@ Then: python3 px/dgext.py (diagrams), and in the site tools/diagrams.py, tools/r
 build_p6 rewrites lesson HTML, which removes the step-through diagrams: always rerun tools/diagrams.py afterwards.
 Fence language "pyshow" = Python shown, never run. Heavy lessons (124M-parameter models) run one at a time (c["heavy"]).
 Companion lessons are blended into phases by tools/blend.py (data/blend_src.py); run it once only (data/blend.json records it).
+
+# Part 9 (phase 31) — Forward Deployed Engineering with Claude
+Original lessons written for this course (not copied), modelled on Anthropic's Claude FDE learning path (Skilljar, 9 courses) and the Frontier Academy
+4-day intensive, plus Product School's FDE certification and public FDE write-ups. Sources live in fde/NN-*.md (front matter: title, minutes, group, lessons, optional type).
+ext_fde.py converts them: {{NEEDS}} -> lesson links from `lessons:`, "31.N" -> links, NB mode runs the python blocks; ```pyshow is shown only (API/SDK calls).
+Build: python3 build_p6.py 31, then in the site tools/diagrams.py (data/diagrams/a31NN.mmd written by hand), tools/retitle.py, tools/build.py.
+Running case: Harbor Mutual (claims intake). Capstone unseen case: Northwind Freight. Prices and model names checked against platform.claude.com docs, Nov 2026.

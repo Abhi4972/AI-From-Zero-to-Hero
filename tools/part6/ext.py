@@ -29,6 +29,8 @@ PHASES = {
          "Building agents on Claude's own harness: the Agent SDK for research, operations and security agents, and managed agents for long-running, supervised work. They need an Anthropic API key."),
     30: ("ext/snowflake", "Snowflake AI and Data Samples",
          "Cortex AI, Snowpark ML, Streamlit in Snowflake, Iceberg and data engineering samples. They need a Snowflake account."),
+    31: ("ext/fde", "Forward Deployed Engineering with Claude",
+         "An intensive on the forward deployed engineer's job: discovery, scoping, building on Claude inside a customer's systems, security review, evals, rollout, adoption and handover, ending with a simulated deployment and a graded practical."),
 }
 PART = "Project Library"
 
