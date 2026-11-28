@@ -151,6 +151,11 @@ s = re.sub(r"\n[^\n]*tools/migrate\.py[^\n]*", "", s)
 open(rd, "w", encoding="utf-8").write(s)
 edit(P("THIRD_PARTY_NOTICES.md"), [("lessons, figures and interview questions are adapted", "lessons and figures are adapted")], strict=False)
 
+# the team edition's name and label
+edit(P("engine", "course.js"), [('<div class="ed-chip">Complete edition</div>', '<div class="ed-chip">Team edition</div>'),
+                                ('document.title = "AI from Zero to Hero · Complete edition";', 'document.title = "AI from Zero to Hero · Team edition";')])
+edit(P("engine", "head.html"), [("AI from Zero to Hero · Complete edition", "AI from Zero to Hero · Team edition")])
+edit(P("README.md"), [("# AI from Zero to Hero (Complete edition)", "# AI from Zero to Hero (Team edition)")])
 # the team edition lives in its own repository, without the "-Complete" suffix
 for f in [P("README.md"), P("index.html"), P("engine", "head.html")] + glob.glob(P("vol*", "index.html")):
     if os.path.exists(f):

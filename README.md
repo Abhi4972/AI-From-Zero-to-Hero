@@ -1,4 +1,4 @@
-# AI from Zero to Hero
+# AI from Zero to Hero (Complete edition)
 
 A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects, 60 interview case files and a library of 427 more projects and recipes, a forward deployed engineering intensive, and an MLOps and LLMOps phase: **1,559 lessons in 33 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
 
