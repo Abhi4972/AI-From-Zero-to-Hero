@@ -39,7 +39,7 @@ GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE brightwell_ai_dev;
 CREATE ROLE IF NOT EXISTS brightwell_tagging;                       -- a pipeline role that only classifies text
 GRANT USE AI FUNCTION AI_CLASSIFY ON ACCOUNT TO ROLE brightwell_tagging;
 GRANT DATABASE ROLE SNOWFLAKE.AI_FUNCTIONS_USER TO ROLE brightwell_tagging;
-GRANT USAGE ON WAREHOUSE ai_wh TO ROLE brightwell_ai_dev;      -- MEDIUM or smaller is enough for AI functions (lesson 33.32)
+GRANT USAGE ON WAREHOUSE ai_wh TO ROLE brightwell_ai_dev;      -- MEDIUM or smaller is enough for AI functions (see the cost lesson)
 ```
 
 ## Layer 2: which models?
