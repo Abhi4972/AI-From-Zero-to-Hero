@@ -1,6 +1,6 @@
 # AI from Zero to Hero (Team edition)
 
-A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects, a library of 427 more projects and recipes, a forward deployed engineering intensive, an MLOps and LLMOps phase, and an AI on Snowflake phase: **1,533 lessons in 33 phases**, with runnable Python, maths, interactive figures, quick checks and a review queue, all in the browser.
+A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects, a library of 427 more projects and recipes, a forward deployed engineering intensive, an MLOps and LLMOps phase, and an AI on Snowflake phase: **1,537 lessons in 33 phases**, with runnable Python, maths, interactive figures, quick checks and a review queue, all in the browser.
 
 **Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero/ (team edition). You can also serve this folder with any static web server (see *Run it locally* below).
 
@@ -13,8 +13,8 @@ Everything is on one site: one menu for all 33 phases, one search across every l
 | 1 · Foundations | 0 Dev Environment and AI Tooling · 1 Mathematics for Machine Learning · 2 Machine Learning Algorithms · 3 Deep Learning and Neural Networks | 129 |
 | 2 · Perception | 4 Computer Vision and Image Models · 5 Natural Language Processing (NLP) · 6 Speech and Audio AI | 126 |
 | 3 · Models | 7 Transformer Architecture and Attention · 8 Generative AI Models · 9 Reinforcement Learning (RL) · 10 Build an LLM from Scratch | 127 |
-| 4 · Building with LLMs | 11 LLM Engineering and Applications · 12 Multimodal Models · 13 Tool Use, MCP and Agent Protocols | 145 |
-| 5 · Agents | 14 AI Agents: Design and Engineering · 15 Autonomous Agents and Self-Improvement · 16 Multi-Agent Systems and Swarms | 260 |
+| 4 · Building with LLMs | 11 LLM Engineering and Applications · 12 Multimodal Models · 13 Tool Use, MCP and Agent Protocols | 146 |
+| 5 · Agents | 14 AI Agents: Design and Engineering · 15 Autonomous Agents and Self-Improvement · 16 Multi-Agent Systems and Swarms | 263 |
 | 6 · Serving, Safety & Capstones | 17 LLM Inference, Infrastructure and LLMOps · 18 AI Safety, Alignment and Ethics · 19 Capstone Builds | 161 |
 | 7 · Hands-On Projects | 20 Hands-On AI Projects | 83 |
 | 8 · Project Library | 21 Machine Learning Projects · 22 Build-from-Scratch Projects · 23 RAG and Search Projects · 24 LLM Application Projects · 25 AI Agent Projects · 26 Multi-Agent and MCP Projects · 27 Claude API Recipes · 28 Claude Agent SDK and Managed Agents Recipes · 29 Snowflake AI and Data Samples | 427 |
