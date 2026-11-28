@@ -33,11 +33,11 @@ ALTER STAGE docs.raw.files REFRESH;            -- update the directory table aft
 SELECT relative_path, size, last_modified FROM DIRECTORY(@docs.raw.files) ORDER BY last_modified DESC LIMIT 5;
 ```
 
-`TO_FILE('@docs.raw.files', 'policies/returns-2026.pdf')` turns a staged path into a FILE reference that `AI_PARSE_DOCUMENT`, `AI_EXTRACT`, `AI_COMPLETE` and `AI_TRANSCRIBE` accept. For sources such as SharePoint and Google Drive, **Openflow connectors** sync files incrementally into a stage (the "simple ingest" variants) or straight into a Cortex Search service (the Cortex Search variants), optionally with document permissions.
+`TO_FILE('@docs.raw.files', 'policies/returns-2026.pdf')` turns a staged path into a FILE reference that `AI_PARSE_DOCUMENT`, `AI_EXTRACT`, `AI_COMPLETE` and `AI_TRANSCRIBE` accept. For sources such as SharePoint and Google Drive, **Openflow connectors** sync files incrementally into a stage (the "simple ingest" variants) or straight into a Cortex Search service (the Cortex Search variants), optionally with document permissions. Those permissions are indexed as columns such as `user_emails`; the querying application applies them by passing the user in a filter (`@contains` on `user_emails`), so the application must supply the right identity (lesson 33.13). Openflow's second generation (GA 8 Sep 2026) added more connectors (Oracle, BigQuery, Jira, HubSpot among them) and Openflow Endpoints (GA 16 Oct 2026); **Snowflake Datastream** (preview, announced at Summit 2026) is a managed Kafka-compatible streaming service that inherits Snowflake governance and lineage, and **dynamic tables** keep downstream AI tables fresh without hand-written schedules.
 
 ## Parsing
 
-`AI_PARSE_DOCUMENT(file, options)` has three modes: `'OCR'` (text only), `'LAYOUT'` (keeps headings and tables as Markdown) and `'AGENTIC'` (adds understanding of charts and diagrams). `page_split => TRUE` returns one object per page, which you want for citations and chunking. It is billed per page processed, so parse once and keep the result.
+`AI_PARSE_DOCUMENT(file, options)` has three modes: `'OCR'` (text only), `'LAYOUT'` (keeps headings and tables as Markdown) and `'AGENTIC'` (adds understanding of charts and diagrams; public preview from 28 Oct 2026). Image extraction is GA (April 2026). `page_split => TRUE` returns one object per page, which you want for citations and chunking. It is billed per page processed, so parse once and keep the result.
 
 ```sql
 CREATE TABLE IF NOT EXISTS docs.parsed.pages (relative_path STRING, page_index INT, content STRING, parsed_at TIMESTAMP_NTZ);
@@ -120,6 +120,7 @@ Which statements are right?
 
 :::checked Sources and further reading
 - [Parsing documents with AI_PARSE_DOCUMENT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/parse-document)
+- [Query the Cortex Search service with the SharePoint connector](https://docs.snowflake.com/en/connectors/unstructured-data-connectors/sharepoint/cortex)
 - [About Openflow Connector for SharePoint](https://docs.snowflake.com/en/user-guide/data-integration/openflow/connectors/sharepoint/about)
 - [Cost considerations for Cortex AI Functions](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql-cost)
 :::

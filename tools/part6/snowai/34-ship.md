@@ -21,7 +21,7 @@ Treat AI objects like code: definitions in Git, deployed by a pipeline, tested b
 
 ## The problem
 
-Brightwell's agent specification lived only in Snowsight. Someone edited the orchestration instructions in production on a Friday; tool routing broke (lesson 33.12's v1 numbers came back); nobody could see what changed or roll back.
+Brightwell's agent specification lived only in Snowsight. Someone edited the orchestration instructions in production on a Friday; tool routing broke (lesson 33.17's v1 numbers came back); nobody could see what changed or roll back.
 
 ## The repository
 
@@ -36,9 +36,9 @@ brightwell-ai/
     50_mcp_servers.sql
     60_tasks.sql
   eval/
-    golden_tools.yaml               -- lesson 33.12: question -> expected tools
-    golden_answers.csv              -- lesson 33.10 and 33.14
-    golden_sql.yaml                 -- lesson 33.11: question -> trusted SQL
+    golden_tools.yaml               -- lesson 33.17: question -> expected tools
+    golden_answers.csv              -- lesson 33.14 and 33.24
+    golden_sql.yaml                 -- lesson 33.16: question -> trusted SQL
   app/streamlit_app.py
   snowflake.yml                     -- Snowflake CLI project definition
 ```
@@ -91,7 +91,7 @@ The plan turns a diff into a release: the embedding-model change becomes a side-
 ```pyshow
 # app/streamlit_app.py: a thin chat front end. Agents APIs need the container runtime for Streamlit in Snowflake.
 import streamlit as st
-from agent_client import run_agent        # your wrapper around POST .../agents/RETURNS_ASSISTANT:run (lesson 33.12)
+from agent_client import run_agent        # your wrapper around POST .../agents/RETURNS_ASSISTANT:run (lesson 33.17)
 
 st.title("Brightwell returns assistant")
 if q := st.chat_input("Ask about returns"):
@@ -99,10 +99,10 @@ if q := st.chat_input("Ask about returns"):
     answer, trace_id = run_agent(q, thread_id=st.session_state.get("thread_id"))
     st.chat_message("assistant").write(answer)
     if st.button("Not helpful"):
-        send_feedback(trace_id, positive=False)     # feeds lesson 33.14's loop
+        send_feedback(trace_id, positive=False)     # feeds lesson 33.24's loop
 ```
 
-Keep the app thin: the agent holds the logic, the app holds the conversation and the feedback buttons (which feed lesson 33.14's loop). For most internal users, CoWork (lesson 33.13) removes the need for a custom app at all.
+Keep the app thin: the agent holds the logic, the app holds the conversation and the feedback buttons (which feed lesson 33.24's loop). For most internal users, CoWork (lesson 33.20) removes the need for a custom app at all.
 
 :::check
 Which statements are right?

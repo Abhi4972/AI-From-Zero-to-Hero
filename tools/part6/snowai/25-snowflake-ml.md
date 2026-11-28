@@ -7,7 +7,7 @@ lessons: a3214, a3022, a0213
 :::goals What you will be able to do
 - Prepare features where the data lives with Snowpark, and pull only what training needs
 - Choose between a warehouse, a notebook on the container runtime and an ML Job for each part of the work
-- Run training as an ML Job on a compute pool and hand the model to the registry (lesson 32.14)
+- Run training as an ML Job on a compute pool and hand the model to the registry (lesson 33.26)
 :::
 
 :::prereq Before you start
@@ -28,9 +28,9 @@ Brightwell wants a weekly demand forecast per SKU and store: 2,400 SKUs, 60 stor
 | Step | Run it in | Why |
 |---|---|---|
 | Filtering, joins, weekly aggregates, lags | Snowpark DataFrames or SQL on a warehouse | Scales with the warehouse; data never leaves |
-| Exploration and prototyping in Python | Notebooks on the container runtime | Python packages and GPUs, next to the data |
+| Exploration and prototyping in Python | Notebooks in Workspaces on the Container Runtime (GA 5 Feb 2026; the older notebooks are now "Legacy Snowflake Notebooks") | Python packages and GPUs, next to the data; compute monitoring and run observability since July 2026 |
 | Scheduled or large training | ML Jobs on a compute pool | Repeatable, versioned code; CPU or GPU; multi-node if needed |
-| Registry, features, monitoring | Model Registry, Feature Store, ML Observability | Lesson 32.14 |
+| Registry, features, monitoring | Experiments, Datasets, Feature Store, Model Registry, model monitors | Lesson 33.26 |
 
 ## Snowpark: aggregate before you pull
 
@@ -100,7 +100,7 @@ Which statements are right?
 :::recap What to keep
 - Push down filtering, joins and aggregation with Snowpark.
 - Notebooks to explore; ML Jobs to train repeatably on compute pools.
-- Hand models to the registry and monitor them (lesson 32.14).
+- Hand models to the registry and monitor them (lesson 33.26); package job code as Code Bundles.
 :::
 
 ## Exercises

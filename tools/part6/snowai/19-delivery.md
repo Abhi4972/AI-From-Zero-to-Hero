@@ -1,13 +1,13 @@
 ---
-title: Getting AI to People and Tools: Snowflake CoWork, the Managed MCP Server and Cortex AI Gateway
+title: Getting AI to People and Tools: the Managed MCP Server, Streamlit, App Runtime and the Choice of Door
 minutes: 55
-group: Structured questions and agents
+group: Agent products: CoWork, CoCo, apps and the gateway
 lessons: a1114, a1719
 ---
 :::goals What you will be able to do
-- Publish an agent to business users in Snowflake CoWork (formerly Snowflake Intelligence)
+- Choose the right door for each audience: CoWork, CoCo, an MCP server, your own app, a Native App or the AI Gateway
 - Expose agents, search services and semantic views to external AI clients through a Snowflake-managed MCP server, without bypassing governance
-- Point OpenAI- and Anthropic-compatible clients at Cortex AI Gateway, and know when that is the right door
+- Build your own front end with Streamlit in Snowflake or App Runtime, keeping the logic in the agent
 :::
 
 :::prereq Before you start
@@ -16,27 +16,25 @@ lessons: a1114, a1719
 :::
 
 :::plain The idea in one line
-Build the agent once in Snowflake, then choose the door: CoWork for people, an MCP server for AI tools, the AI Gateway for applications that just need a model.
+Build the agent once in Snowflake, then choose the door: CoWork for people, CoCo for builders, an MCP server for AI tools, your own app or a Native App for customers, the AI Gateway for applications that just need a model.
 :::
 
 ## The problem
 
 Brightwell's returns agent works in a notebook. Store managers want it in a chat app, the engineering team wants the same governed numbers inside their coding assistant, and a partner's chatbot wants to call a model without moving data out. Three audiences, three doors, one governance model.
 
-## Door 1: Snowflake CoWork for people
+## The doors at a glance
 
-CoWork is the end-user surface for agents (renamed from Snowflake Intelligence at Summit 2026, with per-user personalised agents, skills, connectors, memory and publishable dashboards called artifacts). Setup, from the getting-started guide: an ACCOUNTADMIN creates the CoWork object, grants usage to an admin role, and agents are created under **AI & ML » Agents** and made available to users with the right roles.
+| Door | For | Lesson |
+|---|---|---|
+| Snowflake CoWork | Business users: chat, artifacts, automations | 33.20 |
+| Snowflake CoCo | Developers and data teams | 33.21 |
+| A Snowflake-managed MCP server | External AI clients that need governed answers | this lesson |
+| Streamlit in Snowflake and App Runtime | Your own application, inside the account | this lesson |
+| A Native App | Customers in their own accounts | 33.22 |
+| Cortex AI Gateway | Applications and coding agents that need models, not your data | 33.23 |
 
-```sql
-USE ROLE ACCOUNTADMIN;
-CREATE SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT;   -- the object keeps its original name
-GRANT USAGE ON SNOWFLAKE INTELLIGENCE SNOWFLAKE_INTELLIGENCE_OBJECT_DEFAULT TO ROLE snowflake_intelligence_admin;
-GRANT USAGE ON AGENT support.agents.returns_assistant TO ROLE store_manager;
-```
-
-Requests from CoWork are rate-limited separately from the Agents REST API. Resource budgets can cap a CoWork deployment's monthly credits (lesson 33.18).
-
-## Door 2: a Snowflake-managed MCP server for AI tools
+## A Snowflake-managed MCP server for AI tools
 
 The server is a Snowflake object that exposes tools over the Model Context Protocol at `https://<account_url>/api/v2/databases/<db>/schemas/<schema>/mcp-servers/<name>`. Tool types: `CORTEX_AGENT_RUN` (an agent), `CORTEX_SEARCH_SERVICE_QUERY`, `CORTEX_ANALYST_MESSAGE` (a semantic view), `SYSTEM_EXECUTE_SQL` (read-only by default) and `GENERIC` (a UDF or procedure); up to 50 tools. Snowflake's own advice: for governed business questions expose **only the agent**, because putting `SYSTEM_EXECUTE_SQL` on the same server lets clients go around the agent's rules; give direct SQL its own server and a least-privileged role.
 
@@ -54,20 +52,13 @@ GRANT USAGE ON MCP SERVER support.mcp.returns_server TO ROLE mcp_returns_client;
 GRANT USAGE ON AGENT support.agents.returns_assistant TO ROLE mcp_returns_client;
 ```
 
-Authentication: Snowflake OAuth (recommended; a security integration with `ALLOWED_ROLES_LIST` restricted to the MCP role) or a programmatic access token sent as a bearer header, restricted to the least-privileged role and kept out of shared config files. If the account name contains underscores, use hyphens in the host name.
+Authentication: Snowflake OAuth (recommended; External OAuth and configurable scopes are GA from 22 Jul 2026; a security integration with `ALLOWED_ROLES_LIST` restricted to the MCP role) or a programmatic access token sent as a bearer header, restricted to the least-privileged role and kept out of shared config files. If the account name contains underscores, use hyphens in the host name. Sessions through the managed MCP server are marked agent-active, so agent-aware policies and session scopes apply (lesson 33.30); background runs and async tools were added on 4 Nov 2026.
 
-## Door 3: Cortex AI Gateway for applications
+## Your own application: Streamlit and App Runtime
 
-The gateway accepts standard API shapes at `https://<account-host>/api/v2/aigateways/SNOWFLAKE`: `/v1/chat/completions` (OpenAI-compatible, non-Claude models), `/v1/messages` (Anthropic-compatible, Claude models) and `/v1/responses` (OpenAI Responses, preview). Inference stays in the Snowflake perimeter and usage is attributed to the calling user. It needs `USAGE` on the gateway plus model access (lesson 33.2); `DESCRIBE AI GATEWAY SNOWFLAKE` gives the exact endpoint.
-
-```pyshow
-from anthropic import Anthropic
-client = Anthropic(base_url="https://<account-host>/api/v2/aigateways/SNOWFLAKE", api_key=SNOWFLAKE_OAUTH_TOKEN)  # SDK appends /v1/messages
-msg = client.messages.create(model="claude-sonnet-4-5", max_tokens=300,
-                             messages=[{"role": "user", "content": "Summarise this return request: ..."}])
-```
-
-The gateway gives a model, not Brightwell's data or rules. If the client needs governed answers, use door 2 with the agent.
+- **Streamlit in Snowflake** runs apps next to the data with the viewer's or owner's rights; 2026 added the container runtime (GA 9 Mar), development in Workspaces (GA 1 Jun), sharing with individual users and embedding in other portals (announced GA), restricted caller's rights (preview Feb), and automatic MCP exposure of an app's functions as agent tools (public preview).
+- **App Runtime** (GA 1 Sep 2026) goes further: a full-stack web app (React, Next.js) deployed inside the account with SSO, RBAC and audit logging; serverless scale-to-zero compute and Workspaces development are in preview from 19 Nov 2026.
+- The app calls the agent (lesson 33.17) or the Agent SDK (lesson 33.18) and holds only the conversation and the feedback buttons.
 
 ## Locally: review an MCP server design
 
@@ -100,11 +91,11 @@ Which statements are right?
 - ✓ For governed business questions, an MCP server should expose the agent rather than raw SQL.
 - ✗ Cortex AI Gateway gives external clients access to Brightwell's governed data.
   It gives access to models; governed data and rules come through an agent or MCP tools.
-- ✓ Snowflake CoWork is the 2026 name for Snowflake Intelligence.
+- ✓ An app built on App Runtime or Streamlit should call the agent rather than reimplement its rules.
 :::
 
 :::recap What to keep
-- CoWork for people, MCP server for AI tools, AI Gateway for apps that need a model.
+- CoWork for people, CoCo for builders, MCP server for AI tools, Streamlit or App Runtime for your own app, Native Apps for customers, AI Gateway for model calls.
 - MCP: agent-only servers for governed answers; separate, least-privileged SQL servers.
 - OAuth over long-lived tokens; restrict roles at every door.
 :::
@@ -116,7 +107,6 @@ Which statements are right?
 3. Decide which door a supplier-portal chatbot should use, and justify it in three sentences.
 
 :::checked Sources and further reading
-- [Getting started with Snowflake CoWork](https://docs.snowflake.com/en/user-guide/snowflake-cortex/snowflake-cowork/getting-started)
 - [Snowflake-managed MCP server](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp)
-- [Inference with Cortex AI Gateway](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-ai-gateway/inference)
+- Snowflake release notes 2026: Streamlit in Snowflake container runtime (9 Mar), App Runtime (1 Sep, 19 Nov), External OAuth and scopes for MCP servers (22 Jul), managed MCP server background runs (4 Nov)
 :::

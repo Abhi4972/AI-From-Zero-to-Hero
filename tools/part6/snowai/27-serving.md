@@ -1,5 +1,5 @@
 ---
-title: Serving Your Own Models: Warehouse Inference, Snowpark Container Services, GPUs and When to Customise a Model
+title: Serving Your Own Models: Warehouse Inference, Snowpark Container Services, GPUs and the ML Gateway
 minutes: 60
 group: Quality, ML and serving
 lessons: a3214, a3060, a1728
@@ -7,7 +7,7 @@ lessons: a3214, a3060, a1728
 :::goals What you will be able to do
 - Choose between warehouse inference, a real-time service in Snowpark Container Services, and a hosted Cortex model
 - Deploy a registered model as a service with `create_service` and call it over REST
-- Size a GPU service from traffic and latency, and decide whether customising an open model is worth it
+- Size a GPU service from traffic and latency, and roll out new versions safely behind an ML gateway with shadow traffic and A/B splits
 :::
 
 :::prereq Before you start
@@ -70,20 +70,21 @@ print("fraud score :", size_service(900, 12, 8, instance_credits_per_hour=0.5))
 print("open LLM    :", size_service(20, 900, 16, instance_credits_per_hour=4.0))
 ```
 
-The credit rates here are placeholders for the exercise: use the compute-pool rates for your instance family from Snowflake's Service Consumption Table. The shape of the result is the lesson: real-time services are paid for by the hour whether busy or idle, so compare the monthly figure with what the same traffic would cost per token on a hosted model (lesson 33.18), and set `max_instances` and auto-suspend to match the traffic pattern.
+The credit rates here are placeholders for the exercise: use the compute-pool rates for your instance family from Snowflake's Service Consumption Table. The shape of the result is the lesson: real-time services are paid for by the hour whether busy or idle, so compare the monthly figure with what the same traffic would cost per token on a hosted model (lesson 33.32), and set `max_instances` and auto-suspend to match the traffic pattern.
 
-## Should Brightwell customise an LLM?
+## Several endpoints behind one name: the ML gateway
 
-Snowflake announced Cortex Training at Summit 2026 for customising open-weight LLMs on managed GPUs. Before reaching for it, the honest checklist:
+A Snowflake ML **gateway** object gives one stable hostname in front of up to five service endpoints (more on request) and splits traffic by percentage. Callers need `USAGE` on the gateway, not service roles on each endpoint, and changes to targets or percentages take effect in about a minute.
 
-| Question | If yes |
-|---|---|
-| Can prompting, examples and retrieval reach the quality bar? | Stop; no training needed |
-| Is the task narrow, high-volume and stable, with thousands of good labelled examples? | Customising a small model may cut cost and latency |
-| Will the base model be retired or upgraded soon? | Budget for re-training and re-evaluation (lesson 32.19) |
-| Can you evaluate the customised model on a golden set better than the hosted one? | Required before any switch |
+| Pattern | How | Status |
+|---|---|---|
+| A/B test a new model version | Deploy it as a second service and send it a share of traffic; compare outcomes | Gateway monitoring and A/B testing GA 4 Aug 2026 |
+| Shadow traffic | All requests go to the primary; a percentage is mirrored to shadow endpoints whose responses are not returned | Preview 8 Sep 2026 |
+| Failover | Traffic shifts away from an endpoint that is suspended, unhealthy or dropped, onto endpoints with at least 1% | GA |
 
-For Brightwell's product descriptions, retrieval of the spec sheet plus a hosted model met the bar in the pilot, so the request was declined: a cheaper, reversible answer.
+Shadow first, then a small A/B share, then full traffic is the safe order for a model that affects customers. Inference logs can be captured automatically for real-time services, which feeds the monitoring in lesson 33.26. This ML gateway is a different object from Cortex AI Gateway (lesson 33.23), which governs calls to LLMs.
+
+Customising an LLM is a separate decision, covered in lesson 33.28.
 
 :::check
 Which statements are right?
@@ -91,23 +92,23 @@ Which statements are right?
 - ✓ Real-time services in Snowpark Container Services cost compute by the hour, busy or idle.
 - ✗ A fraud score that must answer in 150 ms is best served by warehouse inference.
   Warehouse inference suits batch; real-time calls need a service with an endpoint.
-- ✓ Customising an LLM should only follow when prompting and retrieval cannot meet a measured quality bar.
+- ✓ Shadow traffic mirrors requests to a new endpoint without returning its responses to callers.
 :::
 
 :::recap What to keep
 - Warehouse for batch, container services for real-time and GPU, Cortex for language tasks.
 - `create_service`, ingress endpoint, `dataframe_split` payloads.
-- Size from peak traffic and latency; compare always-on cost with per-token cost; customise last.
+- Size from peak traffic and latency; compare always-on cost with per-token cost; roll out through shadow, then A/B, behind one gateway.
 :::
 
 ## Exercises
 
 1. Halve the fraud model's latency. How many instances do you save at peak?
 2. Find the request rate at which the open-LLM service becomes cheaper than a hosted model for you, given rates from the consumption table.
-3. Write the evaluation plan that would justify customising a model for review tagging (lesson 33.5).
+3. Design the shadow-then-A/B rollout for fraud model v2: percentages, duration and the metric that ends each stage.
 
 :::checked Sources and further reading
 - [Deploy models for real-time inference (REST API)](https://docs.snowflake.com/en/developer-guide/snowflake-ml/inference/real-time-inference-rest-api)
 - [Model serving in Snowpark Container Services](https://docs.snowflake.com/developer-guide/snowflake-ml/model-registry/container)
-- [Snowflake Summit 2026: context, custom model training, Iceberg v3](https://www.constellationr.com/index%2Ephp/insights/news/snowflake-summit-2026-context-custom-model-training-iceberg-v3), Constellation Research
+- [Use gateways to route inference requests to multiple endpoints](https://docs.snowflake.com/en/developer-guide/snowflake-ml/model-registry/gateway) and [Gateway monitoring and A/B testing](https://docs.snowflake.com/en/developer-guide/snowflake-ml/inference/gateway-monitor-and-ab-testing)
 :::

@@ -46,6 +46,8 @@ FROM DIRECTORY(@docs.raw.files)
 WHERE relative_path LIKE 'contracts/%';
 ```
 
+2026 changes: extraction scores (GA 22 May), the scale factor parameter (GA 12 Mar), client-side encrypted stages and network-restricted accounts (GA 20 Aug), page filtering with `FL_FILTER_PAGES` (November), a reported accuracy gain on 2 Nov, and citations linking values to source content (preview 18 Nov). `AI_EXTRACT` runs on the arctic-extract model, which you can fine-tune on your own documents (lesson 33.28). It replaces Document AI: the Document AI UI and the `!PREDICT` method were decommissioned on 16 March 2026. Models migrated to the Model Registry still run through `AI_EXTRACT`'s legacy Document AI support but cannot be fine-tuned further; new work should use `AI_EXTRACT` with a `responseFormat` per document type.
+
 The result has `response` (the fields), `error`, and with scores a `scoring` object. Each page counts as 970 input tokens for billing, and the response format counts too, so page selection (lesson 33.3) matters here as much as for parsing.
 
 ## Locally: measure, threshold and route
@@ -117,6 +119,7 @@ Which statements are right?
 3. Write the dynamic table that exposes only values above their field's threshold.
 
 :::checked Sources and further reading
+- [Document AI decommission](https://docs.snowflake.com/en/release-notes/bcr-bundles/un-bundled/bcr-2156), Snowflake behaviour change notice
 - [AI_EXTRACT](https://docs.snowflake.com/en/sql-reference/functions/ai_extract)
 - [Extracting information from documents with AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/document-extraction)
 - [Cost considerations for Cortex AI Functions](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql-cost)

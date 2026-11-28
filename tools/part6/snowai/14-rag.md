@@ -25,7 +25,7 @@ Brightwell's first prototype answered "Can I return a used tent?" with "Yes, wit
 
 ## The pattern in Snowflake
 
-In an application: query the Cortex Search service (Python or REST), build a prompt with numbered sources, call `AI_COMPLETE`, then validate. In most production cases the same flow sits inside a Cortex Agent (lesson 33.12), which does retrieval, answering and citations for you; building it once by hand shows what the agent is doing and what to test.
+In an application: query the Cortex Search service (Python or REST), build a prompt with numbered sources, call `AI_COMPLETE`, then validate. In most production cases the same flow sits inside a Cortex Agent (lesson 33.17), which does retrieval, answering and citations for you; building it once by hand shows what the agent is doing and what to test.
 
 ```pyshow
 from snowflake.core import Root
@@ -76,7 +76,7 @@ for name, a in ANSWERS.items():
     print(f"{name:26} {check(a, SOURCES)}")
 ```
 
-The check is simple but catches the failure that matters most in policy answers: a number (days, percentages, prices) that does not appear in the source cited for it. Version 2 looks trustworthy, with a citation and a confident tone, but its 60 days come from the unused-items rule while it cites the used-items rule, which says 30. Version 1 has no citations at all. A model-based grounding judge (lesson 33.14) adds checks for claims without numbers, such as "full refund".
+The check is simple but catches the failure that matters most in policy answers: a number (days, percentages, prices) that does not appear in the source cited for it. Version 2 looks trustworthy, with a citation and a confident tone, but its 60 days come from the unused-items rule while it cites the used-items rule, which says 30. Version 1 has no citations at all. A model-based grounding judge (lesson 33.24) adds checks for claims without numbers, such as "full refund".
 
 ## A golden set for the retrieval layer
 

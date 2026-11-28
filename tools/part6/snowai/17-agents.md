@@ -78,7 +78,7 @@ CREATE OR REPLACE AGENT support.agents.returns_assistant
   $$;
 ```
 
-Notes from the documentation: the specification can be up to 100,000 bytes; `orchestration.budget` caps time and tokens per request; creation succeeding does not prove the tools are valid, so test before deploying. Custom tools are stored procedures or UDFs; they must return a single value (a `RETURNS TABLE` procedure fails at run time), cannot take `OBJECT` parameters, and results are capped at 32 KB. The exact `tool_resources` keys for custom tools are best generated once from Snowsight's agent editor and then kept in version control (lesson 33.19), because the editor and docs evolve.
+Notes from the documentation: the specification can be up to 100,000 bytes; `orchestration.budget` caps time and tokens per request; creation succeeding does not prove the tools are valid, so test before deploying. Custom tools are stored procedures or UDFs; they must return a single value (a `RETURNS TABLE` procedure fails at run time), cannot take `OBJECT` parameters, and results are capped at 32 KB. The exact `tool_resources` keys for custom tools are best generated once from Snowsight's agent editor and then kept in version control (lesson 33.34), because the editor and docs evolve.
 
 Access: callers need `SNOWFLAKE.CORTEX_USER` or `SNOWFLAKE.CORTEX_AGENT_USER`, privileges on the agent, and privileges on every object its tools touch. If a caller lacks access to one tool, the run can continue with the tools it can reach, which is governance working as intended.
 
@@ -100,7 +100,7 @@ The stream emits events such as `response.status`, `response.thinking.delta`, `r
 
 ## Locally: test tool routing before release
 
-The most common agent failure is the wrong tool, or a missing one, for part of a question. Record which tools the agent called on a golden question set (from the traces, lesson 33.14) and score them.
+The most common agent failure is the wrong tool, or a missing one, for part of a question. Record which tools the agent called on a golden question set (from the traces, lesson 33.24) and score them.
 
 ```python
 GOLDEN = [   # question -> tools that should be called

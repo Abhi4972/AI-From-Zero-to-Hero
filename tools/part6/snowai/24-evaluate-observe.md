@@ -42,9 +42,11 @@ run.compute_metrics(metrics=["context_relevance", "groundedness", "answer_releva
 
 The judges are LLMs; calibrate them against human labels before trusting them as a gate (lesson 32.17), and compare runs only on the same dataset version.
 
+For agents there is a built-in path too: **Cortex Agent evaluations** (GA 13 Mar 2026) score an agent on a dataset in Snowsight, can target a specific agent version (GA 21 Aug 2026), and add tool-level metrics such as tool selection and tool execution (preview 11 Jun 2026). AI functions have their own evaluation and optimization (lesson 33.11). Use the same golden questions across all three so results stay comparable.
+
 ## After release: traces and feedback
 
-Agent telemetry lands in the `SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS` event table: one trace per turn, with spans for planning, each tool call (Search, Analyst, MCP), SQL execution, chart generation and the response. End-user feedback is stored as `CORTEX_AGENT_FEEDBACK` events. Reading full inputs and outputs needs the account privilege `READ UNREDACTED AI OBSERVABILITY EVENTS TABLE`; without it, roles see metadata only. That is a privacy control worth keeping narrow.
+Agent telemetry lands in the `SNOWFLAKE.LOCAL.AI_OBSERVABILITY_EVENTS` event table: one trace per turn, with spans for planning, each tool call (Search, Analyst, MCP), SQL execution, chart generation and the response. End-user feedback is stored as `CORTEX_AGENT_FEEDBACK` events. Reading full inputs and outputs needs the account privilege `READ UNREDACTED AI OBSERVABILITY EVENTS TABLE`; without it, roles see metadata only. That is a privacy control worth keeping narrow. Data lineage now covers Cortex Agents (September 2026), and traces from apps and coding agents routed through Cortex AI Gateway land in the gateway's observability tables (lesson 33.23); Snowflake has announced Agent Trace Intelligence (private preview) to find looping agents and failing tools from these traces.
 
 ```sql
 SELECT *

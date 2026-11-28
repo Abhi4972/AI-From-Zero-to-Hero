@@ -28,15 +28,18 @@ Brightwell Outfitters wants one returns assistant for store managers and support
 
 | Layer | Brightwell build | Lesson |
 |---|---|---|
-| Access | Named roles; PUBLIC defaults revoked; model RBAC; `CORTEX_ENABLED_CROSS_REGION = 'AWS_EU'`; per-user quotas | 33.2, 33.18 |
+| Access | Named roles; PUBLIC defaults revoked; model RBAC; `CORTEX_ENABLED_CROSS_REGION = 'AWS_EU'`; per-user quotas | 33.2, 33.32 |
+| Context | Classification profile, tag-based masking, owner and risk tags on every AI object | 33.4 |
 | Ingest | Stage with directory table; SharePoint via Openflow; incremental `AI_PARSE_DOCUMENT` (LAYOUT, page split) | 33.3 |
-| Enrich | `AI_CLASSIFY` themes on tickets; `AI_EXTRACT` contract terms with scores; `AI_TRANSCRIBE` calls; `AI_REDACT` before sharing | 33.5 to 33.7 |
-| Retrieve | Chunks with `SPLIT_TEXT_RECURSIVE_CHARACTER`; Cortex Search service with region and doc-type attributes | 33.8, 33.9 |
-| Numbers | Semantic view with return-rate metric, synonyms, verified queries; row access by region | 33.11, 33.17 |
-| Agent | `CREATE AGENT` with PolicySearch, ReturnsAnalyst, OrderStatus; orchestration instructions; budget | 33.12 |
-| Deliver | CoWork for staff; an agent-only MCP server for the engineering team | 33.13 |
-| Quality | TruLens evaluation run before release; weekly trace report; feedback to golden set | 33.10, 33.14 |
-| Ship | SQL in Git; Snowflake CLI; side-by-side rebuilds; golden-set gates | 33.19 |
+| Enrich | `AI_CLASSIFY` themes on tickets (as a custom AI function, evaluated and optimised); `AI_EXTRACT` contract terms with scores; `AI_TRANSCRIBE` calls; `AI_REDACT` before sharing | 33.6 to 33.8, 33.11 |
+| Retrieve | Chunks with `SPLIT_TEXT_RECURSIVE_CHARACTER`; Cortex Search service with region and doc-type attributes | 33.12, 33.13 |
+| Numbers | Semantic view with return-rate metric, synonyms, verified queries; row access by region | 33.16, 33.29 |
+| Agent | `CREATE AGENT` with PolicySearch, ReturnsAnalyst, OrderStatus; orchestration instructions; budget | 33.17 |
+| Deliver | CoWork for staff; an agent-only MCP server for the engineering team; coding agents through Cortex AI Gateway | 33.19, 33.20, 33.23 |
+| Contain | Agent-aware masking on emails; Restricted Session Scope for agent sessions; `SERVICE_AGENT` user for the nightly triage automation; guardrails in log mode, then block | 33.29, 33.30 |
+| Govern | Inventory reconciled with approvals; AI Governance page; evidence queries; preview register | 33.31, 33.33 |
+| Quality | TruLens evaluation run before release; weekly trace report; feedback to golden set | 33.14, 33.24 |
+| Ship | SQL in Git; Snowflake CLI; side-by-side rebuilds; golden-set gates | 33.34 |
 
 ## Part 1: the readiness check
 
@@ -53,6 +56,8 @@ EVIDENCE = {   # filled from your test runs; these are the values from this phas
     "analyst":  {"execution_accuracy": 1.0, "golden_questions": 2},
     "agent":    {"routing_exact": 6 / 6, "missed_tool_calls": 0},
     "security": {"isolation_tests_pass": True, "mcp_agent_only": True},
+    "contain":  {"agent_scope_set": True, "agent_masking": True, "service_agent_for_automation": True, "guardrails_on": True},
+    "govern":   {"inventory_reconciled": True, "owners_tagged": False, "previews_have_fallbacks": True},
     "cost":     {"estimated_monthly_credits": 950, "budget_credits": 1200},
     "ship":     {"objects_in_git": True, "gates_in_ci": True},
 }
@@ -63,6 +68,8 @@ RULES = [
     ("analyst",  lambda e: e["execution_accuracy"] >= 0.9 and e["golden_questions"] >= 30, "execution accuracy >= 0.9 on 30+ questions"),
     ("agent",    lambda e: e["routing_exact"] >= 0.9 and e["missed_tool_calls"] == 0, "routing exact >= 90%, no missed tools"),
     ("security", lambda e: all(e.values()), "isolation tests and agent-only MCP"),
+    ("contain",  lambda e: all(e.values()), "agent sessions scoped, masked, identified, guarded"),
+    ("govern",   lambda e: all(e.values()), "inventory reconciled, owners tagged, previews covered"),
     ("cost",     lambda e: e["estimated_monthly_credits"] <= 0.85 * e["budget_credits"], "estimate within 85% of budget"),
     ("ship",     lambda e: all(e.values()), "objects in Git, gates in CI"),
 ]
@@ -73,7 +80,7 @@ def readiness(evidence):
 print(readiness(EVIDENCE))
 ```
 
-The lessons' toy golden sets were deliberately small; the gate asks for 30 or more questions per golden set because a handful of questions cannot show a release is safe. The other failures are real work items: per-user quotas are not set, and the fit theme's recall is too low (lesson 33.5's fix). That is the honest state of a first build.
+The lessons' toy golden sets were deliberately small; the gate asks for 30 or more questions per golden set because a handful of questions cannot show a release is safe. The other failures are real work items: per-user quotas are not set, the fit theme's recall is too low (lesson 33.6's fix), and some AI objects have no owner tag (lesson 33.31). That is the honest state of a first build.
 
 ## Part 2: build it
 
@@ -81,15 +88,16 @@ The lessons' toy golden sets were deliberately small; the gate asks for 30 or mo
 2. **Corpus**: parse the policies with page split, chunk them, and create the Search service with `product_line`, `doc_type` and `region` attributes.
 3. **Semantic view**: build it with the return-rate metric and three verified queries; reach 30 golden questions with trusted SQL and measure execution accuracy.
 4. **Agent**: write the specification; reach 30 routing questions; lint the spec; fix until there are no missed tools.
-5. **Security**: add the region row access policy and email masking; run isolation tests for three roles.
-6. **Delivery**: publish to CoWork; create an agent-only MCP server and review it with lesson 33.13's checker.
+5. **Security and containment**: add the region row access policy and agent-aware email masking; run isolation tests for three roles; set a Restricted Session Scope for agent sessions and a `SERVICE_AGENT` user for automation; turn on guardrails in log mode.
+6. **Delivery**: publish to CoWork; create an agent-only MCP server and review it with lesson 33.19's checker.
 7. **Quality**: run a TruLens evaluation on the golden answers; set up the weekly trace report.
 8. **Cost**: estimate monthly credits from token counts and traffic; set per-user quotas and a budget.
-9. **Ship**: put everything in Git with a deployment plan and CI gates; rerun `readiness` until it says READY.
+9. **Govern**: tag owners and risk on every agent, search service and MCP server; reconcile the inventory with approvals; list the preview features you rely on and their fallbacks.
+10. **Ship**: put everything in Git with a deployment plan and CI gates; rerun `readiness` until it says READY.
 
 ## Rubric
 
-Score each 0 (missing), 1 (present, no evidence), 2 (evidence), 3 (evidence plus explained trade-offs). Pass: 27 of 36 and no zeros.
+Score each 0 (missing), 1 (present, no evidence), 2 (evidence), 3 (evidence plus explained trade-offs). Pass: 32 of 42 and no zeros.
 
 | Criterion | What earns a 3 |
 |---|---|
@@ -104,6 +112,8 @@ Score each 0 (missing), 1 (present, no evidence), 2 (evidence), 3 (evidence plus
 | Evaluation | Calibrated judges; golden sets versioned; feedback loop running |
 | Cost | Estimate before run; attribution by query tag; quotas and budget |
 | Shipping | Objects in Git; side-by-side rebuilds; CI gates |
+| Agent containment | Session scope, agent-aware policies, service identity for automation, guardrails measured in log mode |
+| Governance | Owners and risk on every AI object; inventory reconciled; preview dependencies with fallbacks |
 | Judgement | At least one component deliberately not used, with reasons |
 
 :::check
@@ -116,7 +126,7 @@ Which statements are right?
 :::
 
 :::recap What to keep
-- One architecture: access, ingest, enrich, retrieve, numbers, agent, deliver, quality, ship.
+- One architecture: access, context, ingest, enrich, retrieve, numbers, agent, deliver, contain, govern, quality, ship.
 - A readiness gate built from each layer's evidence.
 - Score yourself on the rubric; fix zeros first.
 :::

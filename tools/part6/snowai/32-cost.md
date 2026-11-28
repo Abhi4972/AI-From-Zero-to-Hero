@@ -21,7 +21,7 @@ Most Snowflake AI cost is tokens multiplied by rows; estimate both before you ru
 
 ## The problem
 
-Brightwell's review-tagging job (lesson 33.5) ran on 4 million rows with a large model and long category descriptions, on an X-Large warehouse "to make it faster". It was not faster, and it cost several times the estimate nobody made.
+Brightwell's review-tagging job (lesson 33.6) ran on 4 million rows with a large model and long category descriptions, on an X-Large warehouse "to make it faster". It was not faster, and it cost several times the estimate nobody made.
 
 ## How it is billed
 
@@ -88,6 +88,21 @@ With these placeholder rates the ranking is what matters, and it holds for real 
 - **Budgets**: monthly limits for the account or groups of objects with notifications and actions (actions can lag hours); resource budgets for tagged agents, CoWork and Search; shared resource budgets for tagged users.
 - **Query tags**: set `QUERY_TAG` on pipelines so the usage view attributes credits to jobs, not just roles.
 - **Warehouse**: a dedicated MEDIUM or smaller warehouse for AI work, with auto-suspend.
+- **Caching**: response caching for AI functions (September 2026) and prompt caching for `AI_COMPLETE` (GA 18 Nov 2026) cut the cost of repeated instructions; put the shared part of a prompt first.
+- **CoCo limits**: per-surface daily limits (`CORTEX_CODE_*_DAILY_EST_CREDIT_LIMIT_PER_USER`, lesson 33.21); weekly per-user quota limits and named include/exclude lists (GA 16 Sep 2026); users can check their own limits with `MY_BUDGET_SUMMARY` (GA 28 Oct 2026).
+
+| Usage view (`SNOWFLAKE.ACCOUNT_USAGE`) | Covers |
+|---|---|
+| `CORTEX_AI_FUNCTIONS_USAGE_HISTORY` | AI functions, including custom AI functions |
+| `CORTEX_REST_API_USAGE_HISTORY` | Cortex REST API calls (lesson 33.9) |
+| `AI_GATEWAY_USAGE_HISTORY` | Cortex AI Gateway (lesson 33.23) |
+| `CORTEX_AGENT_USAGE_HISTORY` | Cortex Agents (GA 25 Feb 2026) |
+| `SNOWFLAKE_INTELLIGENCE_USAGE_HISTORY` | CoWork (GA 25 Feb 2026) |
+| `SNOWFLAKE_COCO_USAGE_HISTORY` | CoCo (GA 17 Aug 2026; also in Organization Usage) |
+| `CORTEX_AI_GUARDRAILS_USAGE_HISTORY` | Guardrail checks |
+| `METERING_DAILY_HISTORY` | Service-level totals, including the `AI_SERVICES` breakout (April 2026) |
+
+Organisation-level budgets across accounts, tag-based cost anomaly detection and cross-account organisation usage views were announced as generally available in November 2026.
 
 :::check
 Which statements are right?

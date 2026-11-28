@@ -26,19 +26,23 @@ Snowflake now has a managed AI component for almost every step from raw files to
 
 ## The layers
 
-| Layer | Components (November 2026 names) | Use it for | Lesson |
+| Layer | Components (November 2026 names) | Use it for | Lessons |
 |---|---|---|---|
-| Access and spend | `USE AI FUNCTIONS`, `CORTEX_USER` / `AI_FUNCTIONS_USER`, model RBAC, cross-region setting, budgets and quotas | Who may call which model, where inference runs, how much it may cost | 33.2, 33.18 |
-| Ingest and parse | Stages, directory tables, Openflow connectors, `AI_PARSE_DOCUMENT` | Getting files in and turning them into text | 33.3 |
-| AI in SQL | Cortex AI Functions: `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`, `AI_AGG`, `AI_EXTRACT`, `AI_TRANSCRIBE`, `AI_EMBED` and more | Enriching rows in bulk inside queries and pipelines | 33.4 to 33.8 |
-| Retrieval | Cortex Search services | Hybrid keyword and vector search over text, with filters | 33.9, 33.10 |
-| Structured questions | Semantic views and Cortex Analyst | Natural-language questions answered with governed SQL | 33.11 |
-| Orchestration | Cortex Agents (`CREATE AGENT`) | One assistant that plans and uses Search, Analyst and custom tools | 33.12 |
-| Delivery to people and tools | Snowflake CoWork (formerly Snowflake Intelligence), the Snowflake-managed MCP server, Cortex AI Gateway, Streamlit | Putting agents in front of users, external AI clients and apps | 33.13, 33.19 |
-| Quality | AI Observability (TruLens-based evaluations, agent traces, feedback) | Measuring and monitoring answers | 33.14 |
-| Classic and custom ML | Snowflake ML: notebooks, ML Jobs, Feature Store, Model Registry, ML Observability, model serving in Snowpark Container Services | Training and serving your own models | 33.15, 33.16 |
+| Access and spend | `USE AI FUNCTIONS`, `CORTEX_USER` / `AI_FUNCTIONS_USER` / `CORTEX_AGENT_USER` / `CORTEX_REST_API_USER`, model RBAC, cross-region setting, budgets and quotas | Who may call which model, where inference runs, what it may cost | 33.2, 33.32 |
+| Data and context | Stages, Openflow, Datastream, dynamic tables, `AI_PARSE_DOCUMENT`; Horizon Catalog: classification, tags, lineage, access history, Horizon Context, Business Ontology, Cortex Sense | Getting data in, knowing what it is, giving AI governed business meaning | 33.3, 33.4 |
+| AI in SQL | Cortex AI Functions: `AI_COMPLETE`, `AI_CLASSIFY`, `AI_FILTER`, `AI_AGG`, `AI_SUMMARIZE`, `AI_SENTIMENT`, `AI_EXTRACT`, `AI_TRANSCRIBE`, `AI_EMBED`, `AI_REDACT` and more; custom AI functions, AI Function Studio, Snowflake Decision | Enriching rows in bulk inside queries and pipelines, with measured quality | 33.5 to 33.8, 33.11 |
+| Model APIs | Cortex REST API (Chat Completions, Messages, Responses) | Calling hosted models from applications | 33.9 |
+| ML in SQL | ML Functions: `FORECAST`, `ANOMALY_DETECTION`, `CLASSIFICATION`, `TOP_INSIGHTS` | Forecasts and anomalies without writing Python | 33.10 |
+| Retrieval | Embeddings and `VECTOR`, Cortex Search services, Cortex Knowledge Extensions, AI-ready listings | Hybrid search over text, RAG, licensed knowledge | 33.12 to 33.15 |
+| Structured questions | Semantic views, Semantic Studio and Autopilot, Cortex Analyst | Natural-language questions answered with governed SQL | 33.16 |
+| Agents | Cortex Agents: tools, threads, feedback, Agent SDK, async API, code execution, Coding Agent, MCP | Assistants that plan and act with governed tools | 33.17, 33.18 |
+| Agent products | Managed MCP servers, Streamlit and App Runtime; Snowflake CoWork (formerly Snowflake Intelligence); Snowflake CoCo (formerly Cortex Code); agents in Native Apps; Cortex AI Gateway | Putting AI in front of business users, developers, customers and external AI clients, under one governed endpoint | 33.19 to 33.23 |
+| Quality | AI Observability: TruLens evaluations, agent evaluations, traces, feedback | Measuring and monitoring answers | 33.24 |
+| Classic and custom ML | Notebooks on Container Runtime, ML Jobs, Experiments, Datasets, Feature Store, Model Registry, ML Lineage, model monitors, ML gateway, Cortex Fine-tuning, Cortex Training | Training, tracking, serving and customising your own models | 33.25 to 33.28 |
+| Trust | RBAC, masking and row policies, Cortex AI Guardrails, agent identity, Restricted Session Scope, data movement policies, Multi-Party Approval, Trust Center, AI Governance page | Keeping AI safe, compliant and auditable | 33.29 to 33.31 |
+| Operations | Cost views, quotas, the preview radar, Snowflake CLI, Git, CI/CD | Running it all economically and repeatably on a platform that changes weekly | 33.32 to 33.34 |
 
-Snowflake renamed two products at Summit 2026: **Snowflake Intelligence is now Snowflake CoWork**, and **Cortex Code is now CoCo** (the coding agent for developers). Documentation URLs still carry the old names in places; this phase uses the new ones.
+Snowflake renamed two products at Summit 2026: **Snowflake Intelligence is now Snowflake CoWork**, and **Cortex Code is now Snowflake CoCo**. Documentation URLs and some object names still carry the old names; this phase uses the new ones. Many 2026 features are in preview; each lesson states the status where it matters, and lesson 33.33 lists every AI feature still in private or public preview in November 2026 and how to build on them safely.
 
 ## Choosing a component
 
@@ -50,12 +54,13 @@ def recommend(data, asker, output, volume_rows=0):
     if data == "documents" and output == "enriched column": picks += ["AI_PARSE_DOCUMENT or AI_EXTRACT in a pipeline"]
     if data == "rows" and output == "enriched column":     picks += ["AI_CLASSIFY / AI_SENTIMENT / AI_EXTRACT / AI_COMPLETE in SQL"]
     if data in ("documents", "rows") and output == "answer": picks += ["Cortex Search service", "AI_COMPLETE over retrieved text (RAG)"]
-    if data == "tables" and output in ("answer", "number"): picks += ["semantic view + Cortex Analyst"]
+    if data == "tables" and output in ("answer", "number"): picks += ["semantic view, queried through a Cortex Agent's Analyst tool"]
     if data == "mixed" and output == "answer":             picks += ["Cortex Search", "semantic view", "Cortex Agent combining both"]
-    if output == "prediction":                             picks += ["Snowflake ML: train, register, serve (lessons 15-16)"]
+    if output == "prediction" and data == "tables" and asker == "analyst": picks += ["ML Functions in SQL: FORECAST, ANOMALY_DETECTION (lesson 10)"]
+    elif output == "prediction":                           picks += ["Snowflake ML: train, register, serve (lessons 25 to 28)"]
     if asker == "business user" and output == "answer":    picks += ["publish the agent in Snowflake CoWork"]
-    if asker == "external client":                         picks += ["Snowflake-managed MCP server or Cortex AI Gateway"]
-    if volume_rows > 1_000_000 and "SQL" in " ".join(picks): picks += ["estimate tokens with AI_COUNT_TOKENS first (lesson 18)"]
+    if asker == "external client":                         picks += ["Snowflake-managed MCP server (governed answers) or Cortex AI Gateway (model calls)"]
+    if volume_rows > 1_000_000 and "SQL" in " ".join(picks): picks += ["estimate tokens with AI_COUNT_TOKENS first (lesson 32)"]
     return picks
 
 CASES = [
@@ -64,6 +69,7 @@ CASES = [
     ("store managers ask 'what were returns by region last month?'", dict(data="tables", asker="business user", output="number")),
     ("support agents ask 'can this customer return a used tent?'", dict(data="mixed", asker="business user", output="answer")),
     ("forecast weekly demand per SKU", dict(data="tables", asker="pipeline", output="prediction")),
+    ("a finance analyst wants next quarter's returns forecast", dict(data="tables", asker="analyst", output="prediction")),
     ("a coding assistant outside Snowflake needs governed sales numbers", dict(data="tables", asker="external client", output="number")),
 ]
 for need, spec in CASES:
@@ -74,7 +80,7 @@ The function is deliberately simple, but the questions are the ones that matter 
 
 ## Why "next to the data" matters
 
-Calling an external model from a Python job means exporting data, managing a second set of credentials and copying permissions by hand. In Snowflake, the AI call runs inside the query: role-based access, masking policies and row access policies apply before the model sees a row, usage is attributed to the user and query, and the output lands in a governed table. The trade-offs are real too: you choose from the models Snowflake hosts, inference may need to run in another region (lesson 33.2), and costs are in credits that need their own monitoring (lesson 33.18).
+Calling an external model from a Python job means exporting data, managing a second set of credentials and copying permissions by hand. In Snowflake, the AI call runs inside the query: role-based access, masking policies and row access policies apply before the model sees a row, usage is attributed to the user and query, and the output lands in a governed table. The trade-offs are real too: you choose from the models Snowflake hosts, inference may need to run in another region (lesson 33.2), and costs are in credits that need their own monitoring (lesson 33.32).
 
 :::check
 Which statements are right?
@@ -86,7 +92,7 @@ Which statements are right?
 :::
 
 :::recap What to keep
-- Access, ingest, AI functions, Search, Analyst, Agents, delivery, quality, ML: a layer for each step.
+- Access, context, AI functions, Search, Analyst, Agents, agent products, quality, ML, trust, operations: a layer for each step.
 - Choose by data type, asker and output; prefer the smallest component that works.
 - Next to the data means shared governance and attribution, with model choice and region as trade-offs.
 :::
@@ -94,7 +100,7 @@ Which statements are right?
 ## Exercises
 
 1. Add two use cases from your own work to `CASES`. Do you agree with the recommendation?
-2. Extend `recommend` with a rule for real-time scoring inside an application (hint: lesson 33.16).
+2. Extend `recommend` with a rule for real-time scoring inside an application (hint: lesson 33.27).
 3. List which Brightwell data would be in scope for each layer, and which data must never reach a model.
 
 :::checked Sources and further reading

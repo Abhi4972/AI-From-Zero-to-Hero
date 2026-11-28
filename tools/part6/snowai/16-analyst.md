@@ -70,6 +70,8 @@ SELECT * FROM SEMANTIC_VIEW(retail.semantic.sales_returns DIMENSIONS (products.p
 
 Clause order matters (facts before dimensions before metrics), at least one dimension or metric is required, and comments and synonyms are not decoration: they are what Analyst reads. The verified query above is abbreviated; write the full SQL in yours. Semantic views are also queryable by BI tools, which keeps human and AI definitions the same.
 
+Semantic views gained a lot in 2026. Generally available: standard SQL clauses over semantic views (March), entity-level filters (May), SQL queries as logical tables and variables (June), `DEFINE SEMANTIC VIEW` in DCM Projects and **Semantic Studio**, an AI-assisted editor in Workspaces (30 September), and **materializations** that precompute metrics (11 November). In preview: `CREATE OR ALTER SEMANTIC VIEW`, relationship paths, range joins, many-to-many relationships, level-of-detail expressions, Tableau export, and **Semantic View Autopilot**, which builds and refines views from query history, Tableau, Power BI and Horizon connectors. Object tags on semantic views let the governance lesson (33.31) find the ones agents use.
+
 ## Asking Analyst
 
 ```pyshow
@@ -85,7 +87,7 @@ for item in resp["message"]["content"]:
         print("ambiguous; suggestions:", item)
 ```
 
-The response contains `text` (Analyst's interpretation), `sql` (the statement, with a `confidence` object naming any verified query it used) or `suggestions` when the question is ambiguous. Snowflake recommends Cortex Agents for new applications, since an agent can call Analyst as a tool (lesson 33.12); the semantic view is the same either way.
+The response contains `text` (Analyst's interpretation), `sql` (the statement, with a `confidence` object naming any verified query it used) or `suggestions` when the question is ambiguous. On 28 August 2026 Snowflake recommended transitioning from calling Cortex Analyst directly to Cortex Agents, which call Analyst as a tool and add orchestration, evaluation and agent identity (lessons 33.17 and 33.30). The semantic view is the same either way, so the modelling work in this lesson carries over unchanged.
 
 ## Locally: execution accuracy on a mini warehouse
 
@@ -168,6 +170,7 @@ Which statements are right?
 :::checked Sources and further reading
 - [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view)
 - [Cortex Analyst REST API](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst/rest-api)
+- [Best practices for modeling semantic views](https://docs.snowflake.com/en/user-guide/views-semantic/best-practices-modeling)
 - [Cortex Analyst Verified Query Repository](https://docs.snowflake.com/user-guide/snowflake-cortex/cortex-analyst/verified-query-repository)
 - Yu et al., "Spider: A Large-Scale Human-Labeled Dataset for Complex and Cross-Domain Semantic Parsing and Text-to-SQL Task", EMNLP 2018: execution-based evaluation
 :::

@@ -97,7 +97,7 @@ The third ticket passes JSON parsing but fails the business rules: an empty prod
 | Keep | Avoid |
 |---|---|
 | The task, the allowed values, and the definition of each field | Asking the model to compute totals or dates it can read from columns |
-| A short example for ambiguous fields | Long instructions repeated per row when a task function would do (lesson 33.5) |
+| A short example for ambiguous fields | Long instructions repeated per row when a task function would do (lesson 33.6) |
 | The text the model needs, nothing else | Passing whole customer records "for context": cost and privacy |
 
 :::check

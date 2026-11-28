@@ -50,3 +50,8 @@ Original lessons in snowai/NN-*.md, converted by ext_snowai.py (links 31.N, 32.N
 Snowflake SQL/Python is shown (sql/pyshow fences), checked against docs.snowflake.com in Nov 2026 (AI functions, model RBAC, cross-region,
 Cortex Search, semantic views, CREATE AGENT, MCP server, AI Gateway, AI Observability, ML Jobs, SPCS serving, usage views). Local Python parts run.
 Product names: Snowflake Intelligence -> Snowflake CoWork, Cortex Code -> CoCo (Summit 2026).
+Expanded 28 Nov 2026 to 35 lessons covering every Snowflake AI, ML and agent feature with its status (GA, public preview, private preview):
+Horizon (04), REST API (09), ML Functions (10), custom AI functions and AI Function Studio (11), Knowledge Extensions (15), advanced agents (18),
+CoWork (20), CoCo (21), Native Apps (22), Cortex AI Gateway (23), ML lifecycle (26), customising models (28), agent identity and containment (30),
+governance on public standards: NIST AI RMF, ISO/IEC 42001, EU AI Act as amended, OWASP LLM Top 10 (31), preview radar (33).
+Sources are public only: Snowflake docs, release notes and blogs, standards bodies, law-firm summaries. No proprietary frameworks are used.
