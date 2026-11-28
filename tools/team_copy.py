@@ -166,7 +166,7 @@ edit(P("engine", "course.js"), [('<div class="ed-chip">Complete edition</div>', 
 edit(P("engine", "head.html"), [("AI from Zero to Hero · Complete edition", "AI from Zero to Hero · Team edition")])
 edit(P("README.md"), [("# AI from Zero to Hero (Complete edition)", "# AI from Zero to Hero (Team edition)")])
 # the team edition lives in its own repository, without the "-Complete" suffix
-for f in [P("README.md"), P("index.html"), P("engine", "head.html")] + glob.glob(P("vol*", "index.html")):
+for f in [P("README.md"), P("index.html"), P("engine", "head.html"), P("engine", "course.js")] + glob.glob(P("vol*", "index.html")):
     if os.path.exists(f):
         t = open(f, encoding="utf-8").read()
         open(f, "w", encoding="utf-8").write(t.replace("AI-From-Zero-to-Hero-Complete", "AI-From-Zero-to-Hero"))
