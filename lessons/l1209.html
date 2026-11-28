@@ -1,0 +1,440 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Scaling agents: capacity, quotas and tenants</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.113</span><span class="chip">120 min</span><span class="chip chip-depth">Go deeper</span><span class="chip chip-done" data-done-chip="l1209" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Size an agent service with Little's law, and find the real bottleneck, which is usually token quota rather than servers</li>
+<li>Design the runtime for long, bursty, stateful work: queues, workers, lanes, streaming and state stores</li>
+<li>Keep one tenant from starving the others with <mark class="term" id="term-l1209-5" title="Industry term: Fair scheduling. Giving each tenant a share of workers so one cannot starve the others">fair scheduling</mark>, per-tenant caps, budgets and admission control</li>
+<li>Choose the cost and latency levers in order of payoff, and know what each one breaks</li>
+<li>Plan for ten times the load: what fails first and what to change before it does</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l1208">Lesson 14.112</a></li>
+<li><strong>Depth</strong>: Deepen</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l1209-0">Exponential backoff with jitter</a></td>
+<td>Retry delays that grow and are randomized</td>
+<td>Rate limits</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l1209-1">Retry-After</a></td>
+<td>A header telling the client how long to wait</td>
+<td>429 responses</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l1209-2">Little's law</a></td>
+<td>Work in flight equals arrival rate times time in the system</td>
+<td>Sizing</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l1209-3">Admission control</a></td>
+<td>Rejecting or deferring new work when the system is near its limits</td>
+<td>Runtime shape</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l1209-4">Lanes</a></td>
+<td>Separate queues, workers and quota for interactive, background and batch work</td>
+<td>Runtime shape</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l1209-5">Fair scheduling</a></td>
+<td>Giving each tenant a share of workers so one cannot starve the others</td>
+<td>Hands-on</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">2</span><span class="lb-names">Provisioned throughput, Batch APIs</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>Provisioned throughput</td><td>Reserved model capacity for steady load</td><td><a class="xref" href="#l1210">Lesson 14.114</a></td></tr><tr><td>Batch APIs</td><td>Discounted asynchronous processing</td><td><a class="xref" href="#l1210">Lesson 14.114</a></td></tr></tbody></table></div></details>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Successful agent products hit provider rate limits and served many customers with uneven load. Capacity planning, queues and per-tenant limits became necessary to scale fairly and keep customers' data apart.</p></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Many customers sharing the same kitchen</div><div class="co-body"><p>At scale, the limits are provider quotas (requests and <span class="cx" data-c="635" tabindex="0">tokens per minute</span>), concurrency, and fairness between customers. Scaling means queueing work, controlling concurrency, giving each tenant budgets and limits so one heavy customer cannot starve the rest, and keeping each tenant's data, memory and caches strictly separate.</p></div></aside>
+<h2>Scaling</h2>
+<ul>
+<li>Model calls dominate latency; run independent <span class="cx" data-c="637" tabindex="0">tool calls</span> and <span class="cx" data-c="606" tabindex="0">sub-agents</span> <strong>in parallel</strong>.</li>
+<li>Scale workers on <strong>queue depth</strong>, not CPU: agent workers mostly wait on I/O.</li>
+<li>Respect provider <strong>rate limits</strong> with client-side limiting and backoff; spread load across regions and deployments through the gateway.</li>
+<li>Put <strong>per-run ceilings</strong> on steps, tokens and wall-clock time.</li>
+<li>Keep conversation and workflow state in a database, never in worker memory, so any worker can continue any run.</li>
+</ul>
+<p>Backoff deserves code, because the naive version (retry immediately, or every second) turns a provider's rate limit into an outage. Use <strong><mark class="term" id="term-l1209-0" title="Industry term: Exponential backoff with jitter. Retry delays that grow and are randomized">exponential backoff with jitter</mark></strong>, and obey <code><mark class="term" id="term-l1209-1" title="Industry term: Retry-After. A header telling the client how long to wait">Retry-After</mark></code> when the provider sends it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class RateLimited(Exception):
+    def __init__(self, retry_after: float | None):
+        self.retry_after = retry_after
+
+def call_with_backoff(fn, max_attempts: int = 5, base: float = 0.5, cap: float = 20.0, sleep=None) -&gt; tuple:
+    &quot;&quot;&quot;Exponential backoff with full jitter; honors Retry-After when the server sends one.&quot;&quot;&quot;
+    waits = []
+    for attempt in range(max_attempts):
+        try:
+            return fn(attempt), waits
+        except RateLimited as e:
+            delay = e.retry_after if e.retry_after is not None else random.uniform(0, min(cap, base * 2 ** attempt))
+            waits.append(round(delay, 2))
+            (sleep or (lambda s: None))(delay)                      # time.sleep in real code
+    raise RuntimeError(f&quot;gave up after {max_attempts} attempts; waited {waits}&quot;)
+
+def provider(attempt: int) -&gt; str:
+    if attempt &lt; 3:
+        raise RateLimited(retry_after=4.0 if attempt == 2 else None)   # 429s; the third carries Retry-After
+    return &quot;ok&quot;
+
+random.seed(42)
+print(call_with_backoff(provider))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">('ok', [0.32, 0.03, 4.0])
+</code></pre></div>
+<p>The first two waits are random draws below 0.5 s and 1 s ("full jitter"), so a thousand workers hitting the same 429 do not all retry at the same instant; the third wait is the 4 seconds the provider asked for. The <span class="cx" data-c="554" tabindex="0">SDKs</span> from OpenAI and Anthropic do this for you (<code>max_retries</code>), and so do gateways; write it yourself for tools and internal APIs.</p></div></aside>
+<aside class="co co-scenario"><div class="co-label">Choose by scenario</div><div class="co-title">Something is wrong in production: the response playbook</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Signal</th>
+<th>First move</th>
+<th>Then</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Error rate spikes after a release</td>
+<td>Roll back the release (prompt, model mapping, index alias, code)</td>
+<td>Diff the release manifests and replay failing <span class="cx" data-c="649" tabindex="0">traces</span></td>
+</tr>
+<tr>
+<td>Provider errors or rate limits</td>
+<td>Fail over through the gateway to the backup deployment</td>
+<td>Raise quotas or spread across Regions</td>
+</tr>
+<tr>
+<td>Quality drops (judge scores, complaints) with no errors</td>
+<td>Compare traces before and after; check for a model or index change</td>
+<td>Canary any fix before full rollout</td>
+</tr>
+<tr>
+<td>Cost spikes</td>
+<td>Find the top runs by cost; cap steps and tokens per run</td>
+<td>Look for loops, tool results that ballooned, or a cache that stopped hitting</td>
+</tr>
+<tr>
+<td>Latency rises</td>
+<td>Check queue depth and provider latency per model</td>
+<td>Scale workers on queue depth; shift traffic to faster deployments</td>
+</tr>
+<tr>
+<td>A harmful action happened</td>
+<td><span class="cx" data-c="319" tabindex="0">Kill switch</span> to read-only mode (<a class="xref" href="#l1004">Lesson 15.25</a>)</td>
+<td>Incident review, regression test, then re-enable gradually</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<p>A web service scales with requests. An agent service scales with <strong>runs</strong>, and a run is long (seconds to hours), bursty, stateful and expensive: each one holds context, makes several model calls and may wait on tools or people. That changes the arithmetic and the architecture. <a class="xref" href="#l1208">Lesson 14.112</a> covered where agents run and how they survive crashes; this lesson is about what happens when there are many of them.</p>
+<h2>Size it before you build it</h2>
+<p>Two numbers decide most of the design:</p>
+<ul>
+<li><strong>Runs in flight</strong> = arrival rate x time per run (<mark class="term" id="term-l1209-2" title="Industry term: Little&#x27;s law. Work in flight equals arrival rate times time in the system">Little's law</mark>). It sets the number of workers, the memory for contexts and the connections to tools.</li>
+<li><strong>Tokens per minute at peak</strong> = arrival rate x tokens per run. It is checked against the provider's <strong><span class="cx" data-c="647" tabindex="0">TPM</span> quota</strong>, which is often the first thing to run out.</li>
+</ul>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+
+def capacity(tasks_per_day, peak_factor, seconds_per_task, steps, input_tokens_per_step,
+             output_tokens_per_step, tpm_quota, workers_per_pod=50):
+    &quot;&quot;&quot;Size an agent service for its peak hour. Little's law: work in flight = arrival rate x time in system.&quot;&quot;&quot;
+    peak_rate = tasks_per_day / 86_400 * peak_factor                      # tasks per second at peak
+    in_flight = peak_rate * seconds_per_task                              # concurrent runs
+    tokens_per_task = steps * (input_tokens_per_step + output_tokens_per_step)
+    tpm_needed = peak_rate * 60 * tokens_per_task
+    pods = math.ceil(in_flight * 1.3 / workers_per_pod)                    # 30% headroom
+    return {&quot;peak tasks/s&quot;: round(peak_rate, 2), &quot;runs in flight&quot;: math.ceil(in_flight),
+            &quot;pods (50 workers, 30% headroom)&quot;: pods, &quot;tokens per task&quot;: tokens_per_task,
+            &quot;TPM needed&quot;: round(tpm_needed), &quot;TPM quota&quot;: tpm_quota,
+            &quot;quota headroom&quot;: f&quot;{tpm_quota / tpm_needed:.2f}x&quot;}
+
+base = dict(tasks_per_day=60_000, peak_factor=3, seconds_per_task=40, steps=6,
+            input_tokens_per_step=9_000, output_tokens_per_step=300, tpm_quota=10_000_000)
+for name, change in [(&quot;today&quot;, {}), (&quot;after launch in a second region&quot;, {&quot;tasks_per_day&quot;: 120_000}),
+                     (&quot;plus a longer system prompt&quot;, {&quot;tasks_per_day&quot;: 120_000, &quot;input_tokens_per_step&quot;: 14_000})]:
+    r = capacity(**{**base, **change})
+    print(f&quot;{name}:&quot;)
+    print(&quot;   &quot; + &quot; | &quot;.join(f&quot;{k} {v:,}&quot; if isinstance(v, int) else f&quot;{k} {v}&quot; for k, v in r.items()))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">today:
+   peak tasks/s 2.08 | runs in flight 84 | pods (50 workers, 30% headroom) 3 | tokens per task 55,800 | TPM needed 6,975,000 | TPM quota 10,000,000 | quota headroom 1.43x
+after launch in a second region:
+   peak tasks/s 4.17 | runs in flight 167 | pods (50 workers, 30% headroom) 5 | tokens per task 55,800 | TPM needed 13,950,000 | TPM quota 10,000,000 | quota headroom 0.72x
+plus a longer system prompt:
+   peak tasks/s 4.17 | runs in flight 167 | pods (50 workers, 30% headroom) 5 | tokens per task 85,800 | TPM needed 21,450,000 | TPM quota 10,000,000 | quota headroom 0.47x
+</code></pre></div>
+<p>Five pods handle the doubled traffic easily; the token quota does not. A second region halves the headroom, and a <span class="cx" data-c="616" tabindex="0">system prompt</span> that grew by 5,000 tokens takes it to less than half of what is needed, with no change in traffic. This is the most common scaling surprise with agents: <strong>prompt changes are capacity changes</strong>. Treat input tokens per step as a capacity number, review it in every release, and reserve quota (<span class="cx cx-later" data-c="475" tabindex="0">provisioned throughput</span><a class="cx-pill" href="#l1210" title="Taught later, in Lesson 12.10">later · 14.114</a>, committed capacity) before a launch rather than after the first 429s.</p></div></aside>
+<h2>The runtime shape that scales</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Pattern</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Long runs</td>
+<td>Accept the request, enqueue the run, return a run ID; stream progress to the user</td>
+<td>Web servers should not hold a socket open for minutes; queues absorb bursts (<a class="xref" href="#l1208">Lesson 14.112</a>)</td>
+</tr>
+<tr>
+<td>Bursts</td>
+<td>A durable queue in front of a pool of workers that autoscale on queue depth</td>
+<td>Scale on the work waiting, not on CPU, which idles while waiting for models</td>
+</tr>
+<tr>
+<td>Different urgency</td>
+<td>Separate <strong><mark class="term" id="term-l1209-4" title="Industry term: Lanes. Separate queues, workers and quota for interactive, background and batch work">lanes</mark></strong>: interactive, background and batch, each with its own workers and quota share</td>
+<td>A nightly batch must never slow down a customer conversation</td>
+</tr>
+<tr>
+<td>State</td>
+<td>Run state in a durable store keyed by run ID, not in the worker's memory</td>
+<td>Any worker can resume any run; deploys do not lose work</td>
+</tr>
+<tr>
+<td>Slow tools</td>
+<td>Bulkheads: a separate pool and timeout per slow dependency</td>
+<td>One slow tool cannot exhaust every worker (<a class="xref" href="#l1207">Lesson 14.111</a>)</td>
+</tr>
+<tr>
+<td>Quota</td>
+<td>All model traffic through the gateway, which enforces per-team and per-tenant shares</td>
+<td>Quota becomes something you allocate, not something you discover (<a class="xref" href="#l1204">Lesson 14.108</a>)</td>
+</tr>
+<tr>
+<td>Overload</td>
+<td><strong><mark class="term" id="term-l1209-3" title="Industry term: Admission control. Rejecting or deferring new work when the system is near its limits">Admission control</mark></strong>: reject or defer new batch work when queue age or quota use crosses a threshold; keep interactive lanes open</td>
+<td>Shedding load early keeps the service usable for the work that matters</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Hands-on · Fair scheduling across tenants</h2>
+<p>In a multi-tenant agent product, one large customer's batch job can fill the queue and make every other customer wait. The simulation below runs three tenants on 20 workers. At one minute, <code>bigco</code> submits 900 batch runs. First-in, first-out scheduling lets that burst delay everyone; round-robin across tenants with a concurrency cap per tenant keeps the others fast.</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 900 320" role="img" aria-label="One queue against one queue per tenant. In the lesson&#x27;s simulation a single customer&#x27;s batch of 900 runs makes everyone wait over twenty minutes; with per-tenant queues and a cap, the small tenants wait seconds and the batch waits for itself." style="min-width:560px"><defs><marker id="ah197" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah197a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah197p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah197k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah197r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah197w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><text class="h" x="14" y="28" text-anchor="start">ONE QUEUE, FIRST IN FIRST OUT</text><text class="t" x="14" y="56" text-anchor="start">everyone</text><rect class="w" x="120" y="40" width="14" height="22" rx="3"/><rect class="w" x="137" y="40" width="14" height="22" rx="3"/><rect class="w" x="154" y="40" width="14" height="22" rx="3"/><rect class="w" x="171" y="40" width="14" height="22" rx="3"/><rect class="w" x="188" y="40" width="14" height="22" rx="3"/><rect class="w" x="205" y="40" width="14" height="22" rx="3"/><rect class="w" x="222" y="40" width="14" height="22" rx="3"/><rect class="w" x="239" y="40" width="14" height="22" rx="3"/><rect class="w" x="256" y="40" width="14" height="22" rx="3"/><rect class="w" x="273" y="40" width="14" height="22" rx="3"/><rect class="w" x="290" y="40" width="14" height="22" rx="3"/><rect class="w" x="307" y="40" width="14" height="22" rx="3"/><rect class="w" x="324" y="40" width="14" height="22" rx="3"/><rect class="w" x="341" y="40" width="14" height="22" rx="3"/><rect class="w" x="358" y="40" width="14" height="22" rx="3"/><rect class="w" x="375" y="40" width="14" height="22" rx="3"/><rect class="w" x="392" y="40" width="14" height="22" rx="3"/><rect class="w" x="409" y="40" width="14" height="22" rx="3"/><rect class="w" x="426" y="40" width="14" height="22" rx="3"/><rect class="w" x="443" y="40" width="14" height="22" rx="3"/><rect class="w" x="460" y="40" width="14" height="22" rx="3"/><rect class="w" x="477" y="40" width="14" height="22" rx="3"/><rect class="w" x="494" y="40" width="14" height="22" rx="3"/><rect class="w" x="511" y="40" width="14" height="22" rx="3"/><rect class="w" x="528" y="40" width="14" height="22" rx="3"/><rect class="w" x="545" y="40" width="14" height="22" rx="3"/><rect class="a" x="562" y="40" width="14" height="22" rx="3"/><rect class="w" x="579" y="40" width="14" height="22" rx="3"/><rect class="w" x="596" y="40" width="14" height="22" rx="3"/><rect class="w" x="613" y="40" width="14" height="22" rx="3"/><rect class="w" x="630" y="40" width="14" height="22" rx="3"/><rect class="w" x="647" y="40" width="14" height="22" rx="3"/><rect class="w" x="664" y="40" width="14" height="22" rx="3"/><rect class="p" x="681" y="40" width="14" height="22" rx="3"/><rect class="w" x="698" y="40" width="14" height="22" rx="3"/><rect class="w" x="715" y="40" width="14" height="22" rx="3"/><rect class="w" x="732" y="40" width="14" height="22" rx="3"/><rect class="w" x="749" y="40" width="14" height="22" rx="3"/><rect class="w" x="766" y="40" width="14" height="22" rx="3"/><path class="l" d="M 790.0 51.0 L 826.0 51.0" marker-end="url(#ah197)"/><rect class="b" x="828" y="30" width="58" height="42" rx="8"/><text x="857.0" y="55.5" text-anchor="middle">workers</text><text class="s" x="120" y="86" text-anchor="start">acme and kirana&#x27;s requests sit behind bigco&#x27;s batch:</text><text class="r" x="440" y="86" text-anchor="start">p95 wait about 1,360 seconds for all three</text><line class="sep" x1="14" y1="106" x2="886" y2="106"/><text class="h" x="14" y="132" text-anchor="start">ONE QUEUE PER TENANT, ROUND-ROBIN, WITH A CAP</text><text class="t" x="14" y="162" text-anchor="start">acme</text><rect class="a" x="120" y="146" width="14" height="22" rx="3"/><rect class="a" x="137" y="146" width="14" height="22" rx="3"/><rect class="a" x="154" y="146" width="14" height="22" rx="3"/><text class="t" x="14" y="194" text-anchor="start">kirana</text><rect class="p" x="120" y="178" width="14" height="22" rx="3"/><rect class="p" x="137" y="178" width="14" height="22" rx="3"/><text class="t" x="14" y="226" text-anchor="start">bigco</text><rect class="w" x="120" y="210" width="14" height="22" rx="3"/><rect class="w" x="137" y="210" width="14" height="22" rx="3"/><rect class="w" x="154" y="210" width="14" height="22" rx="3"/><rect class="w" x="171" y="210" width="14" height="22" rx="3"/><rect class="w" x="188" y="210" width="14" height="22" rx="3"/><rect class="w" x="205" y="210" width="14" height="22" rx="3"/><rect class="w" x="222" y="210" width="14" height="22" rx="3"/><rect class="w" x="239" y="210" width="14" height="22" rx="3"/><rect class="w" x="256" y="210" width="14" height="22" rx="3"/><rect class="w" x="273" y="210" width="14" height="22" rx="3"/><rect class="w" x="290" y="210" width="14" height="22" rx="3"/><rect class="w" x="307" y="210" width="14" height="22" rx="3"/><rect class="w" x="324" y="210" width="14" height="22" rx="3"/><rect class="w" x="341" y="210" width="14" height="22" rx="3"/><rect class="w" x="358" y="210" width="14" height="22" rx="3"/><rect class="w" x="375" y="210" width="14" height="22" rx="3"/><rect class="w" x="392" y="210" width="14" height="22" rx="3"/><rect class="w" x="409" y="210" width="14" height="22" rx="3"/><rect class="w" x="426" y="210" width="14" height="22" rx="3"/><rect class="w" x="443" y="210" width="14" height="22" rx="3"/><rect class="w" x="460" y="210" width="14" height="22" rx="3"/><rect class="w" x="477" y="210" width="14" height="22" rx="3"/><rect class="w" x="494" y="210" width="14" height="22" rx="3"/><rect class="w" x="511" y="210" width="14" height="22" rx="3"/><rect class="w" x="528" y="210" width="14" height="22" rx="3"/><rect class="w" x="545" y="210" width="14" height="22" rx="3"/><rect class="w" x="562" y="210" width="14" height="22" rx="3"/><rect class="w" x="579" y="210" width="14" height="22" rx="3"/><rect class="w" x="596" y="210" width="14" height="22" rx="3"/><rect class="w" x="613" y="210" width="14" height="22" rx="3"/><rect class="w" x="630" y="210" width="14" height="22" rx="3"/><rect class="w" x="647" y="210" width="14" height="22" rx="3"/><rect class="w" x="664" y="210" width="14" height="22" rx="3"/><rect class="w" x="681" y="210" width="14" height="22" rx="3"/><path class="l" d="M 720.0 157.0 L 760.0 180.0" marker-end="url(#ah197)"/><path class="l" d="M 720.0 189.0 L 760.0 189.0" marker-end="url(#ah197)"/><path class="l" d="M 720.0 221.0 L 760.0 198.0" marker-end="url(#ah197)"/><rect class="b" x="762" y="166" width="62" height="46" rx="8"/><text x="793.0" y="185.5" text-anchor="middle">take</text><text class="s" x="793.0" y="201.5" text-anchor="middle">in turn</text><path class="l" d="M 826.0 189.0 L 838.0 189.0" marker-end="url(#ah197)"/><rect class="b" x="840" y="168" width="46" height="42" rx="8"/><text x="863.0" y="193.5" text-anchor="middle">work</text><text class="k" x="120" y="258" text-anchor="start">acme p95 wait 38 s   ·   kirana 9 s   ·   bigco 2,757 s</text><text class="s" x="120" y="278" text-anchor="start">The tenant that sent the burst absorbs the delay. Show it an honest completion estimate.</text><text class="s" x="450" y="306" text-anchor="middle">Budgets work the same way at three levels: per run (the harness), per tenant (the gateway), and for the whole service.</text></svg></div><figcaption>One queue against one queue per tenant. In the lesson&#x27;s simulation a single customer&#x27;s batch of 900 runs makes everyone wait over twenty minutes; with per-tenant queues and a cap, the small tenants wait seconds and the batch waits for itself.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import heapq, random
+from collections import defaultdict, deque
+
+def schedule(policy, seconds=600, workers=20, seed=3):
+    &quot;&quot;&quot;Three tenants share 20 agent workers; each run takes 20-40 s. Tenant 'bigco' floods the
+    queue at second 60 with 900 batch runs; 'acme' and 'kirana' send a steady interactive trickle.&quot;&quot;&quot;
+    rng = random.Random(seed)
+    arrivals = defaultdict(list)
+    for t in range(seconds):
+        if rng.random() &lt; 0.25: arrivals[t].append(&quot;acme&quot;)
+        if rng.random() &lt; 0.15: arrivals[t].append(&quot;kirana&quot;)
+        if rng.random() &lt; 0.20: arrivals[t].append(&quot;bigco&quot;)
+    arrivals[60] += [&quot;bigco&quot;] * 900
+    fifo, per_tenant = deque(), defaultdict(deque)
+    running, waits, active = [], defaultdict(list), defaultdict(int)
+    CAP = {&quot;acme&quot;: 8, &quot;kirana&quot;: 8, &quot;bigco&quot;: 10}          # per-tenant concurrency caps
+    rr = deque([&quot;acme&quot;, &quot;kirana&quot;, &quot;bigco&quot;])
+    for t in range(seconds + 3000):
+        while running and running[0][0] &lt;= t:            # free finished workers
+            _, tenant = heapq.heappop(running); active[tenant] -= 1
+        for tenant in arrivals.get(t, []):
+            (fifo if policy == &quot;fifo&quot; else per_tenant[tenant]).append((t, tenant))
+        while len(running) &lt; workers:
+            job = None
+            if policy == &quot;fifo&quot;:
+                job = fifo.popleft() if fifo else None
+            else:                                         # round robin over tenants with work and spare cap
+                for _ in range(len(rr)):
+                    tenant = rr[0]; rr.rotate(-1)
+                    if per_tenant[tenant] and active[tenant] &lt; CAP[tenant]:
+                        job = per_tenant[tenant].popleft(); break
+            if job is None:
+                break
+            start, tenant = job
+            waits[tenant].append(t - start); active[tenant] += 1
+            heapq.heappush(running, (t + rng.randint(20, 40), tenant))
+    return waits
+
+for policy in [&quot;fifo&quot;, &quot;fair&quot;]:
+    w = schedule(policy)
+    cells = []
+    for tenant in [&quot;acme&quot;, &quot;kirana&quot;, &quot;bigco&quot;]:
+        x = sorted(w[tenant]); cells.append(f&quot;{tenant} p95 wait {x[int(len(x) * .95)]:4} s&quot;)
+    print(f&quot;{policy:5} | &quot; + &quot; | &quot;.join(cells))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">fifo  | acme p95 wait 1358 s | kirana p95 wait 1360 s | bigco p95 wait 1351 s
+fair  | acme p95 wait   38 s | kirana p95 wait    9 s | bigco p95 wait 2757 s
+</code></pre></div>
+<p>With a single queue, the two small tenants wait more than twenty minutes for interactive work because a batch arrived first. With per-tenant queues and caps, their p95 wait drops to seconds and the tenant that sent the burst absorbs the delay. In production, put batch work in its own lane with its own quota as well, and show <code>bigco</code> an honest completion estimate. The same pattern applies inside one company: per-team caps at the gateway keep one team's experiment from exhausting the shared quota.</p></div></aside>
+<h2>Budgets at three levels</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Level</th>
+<th>Budget</th>
+<th>Enforced by</th>
+<th>When it trips</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Run</strong></td>
+<td>Steps, tokens, wall-clock time and cost per run</td>
+<td>The <span class="cx" data-c="18" tabindex="0">harness</span> (<a class="xref" href="#l0312">Lesson 14.13</a>)</td>
+<td>Stop, summarize progress, escalate or ask the user</td>
+</tr>
+<tr>
+<td><strong>Tenant or team</strong></td>
+<td>Spend and quota per day or month</td>
+<td>The gateway (<a class="xref" href="#l1204">Lesson 14.108</a>)</td>
+<td>Degrade to a cheaper model, defer batch work, alert the account owner</td>
+</tr>
+<tr>
+<td><strong>Service</strong></td>
+<td>Total spend and quota</td>
+<td>Gateway and finance alerts (<a class="xref" href="#l1210">Lesson 14.114</a>)</td>
+<td>Page; admission control sheds batch lanes first</td>
+</tr>
+</tbody>
+</table></div>
+<p>Without run budgets, a looping agent spends a tenant's monthly budget in an afternoon. Without tenant budgets, one tenant spends everyone's.</p>
+<h2>Cost and latency levers, in order of payoff</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Lever</th>
+<th>Typical effect</th>
+<th>What it can break</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong><span class="cx" data-c="465" tabindex="0">Prompt caching</span></strong> with a stable prefix</td>
+<td>Large input-cost and latency cuts on agents, which are input-heavy (<a class="xref" href="#l1210">Lesson 14.114</a>, <a class="xref" href="#l1501">Lesson 14.163</a>)</td>
+<td>Anything that changes the prefix: timestamps, reordered tools</td>
+</tr>
+<tr>
+<td><strong>Shorter context</strong>: compact tool results, prune history, load detail on demand</td>
+<td>Fewer tokens per step, better accuracy</td>
+<td>Lost facts if pruning is careless; keep the system of record as truth</td>
+</tr>
+<tr>
+<td><strong>Model routing</strong>: a small model for routine steps, a large one for hard ones</td>
+<td>Lower cost per task</td>
+<td>Quality on the hard tail; route by evidence from <span class="cx" data-c="219" tabindex="0">evals</span></td>
+</tr>
+<tr>
+<td><strong>Fewer sequential steps</strong>: parallel tool calls, code that does deterministic work</td>
+<td>Lower latency</td>
+<td>Harder debugging if parallel calls interact</td>
+</tr>
+<tr>
+<td><strong><span class="cx cx-later" data-c="66" tabindex="0">Batch APIs</span><a class="cx-pill" href="#l1210" title="Taught later, in Lesson 12.10">later · 14.114</a></strong> for work that can wait</td>
+<td>About half the price at major providers</td>
+<td>Latency of hours; use only in batch lanes</td>
+</tr>
+<tr>
+<td><strong>Semantic or result caching</strong> for repeated questions</td>
+<td>Large savings on repetitive traffic</td>
+<td>Stale or wrong answers if keys ignore user, permissions or time</td>
+</tr>
+<tr>
+<td><strong>Self-hosting</strong> a tuned small model for a high-volume step</td>
+<td>Lower cost at high, steady volume</td>
+<td>You now run <span class="cx" data-c="266" tabindex="0">GPUs</span> (<a class="xref" href="#l1205">Lesson 14.109</a>)</td>
+</tr>
+</tbody>
+</table></div>
+<h2>What breaks at ten times the load</h2>
+<p>Ask this in every design review (<a class="xref" href="#l1219">Lesson 14.123</a>). For agents the usual order is: provider quota and rate limits, then a tool or database that was sized for human traffic (agents call tools far more often than people click), then cost, then queue latency for interactive users, and only then your own servers. The fixes are the ones above, applied before the launch that needs them.</p>
+<aside class="co co-field"><div class="co-label">From the field</div><div class="co-title">Scale stories</div><div class="co-body"><p>Clay described running about 350 million go-to-market agent runs a month (<a href="https://www.youtube.com/watch?v=LmQtSORYPfw">How Clay runs 350 million GTM agents a month</a>, Interrupt 2026, 12 min). Notion's AI team reported that a model upgrade at the same list price used about three times as many output tokens, so the bill rose sharply with no price change; output tokens per task deserve the same monitoring as price (<a href="https://www.youtube.com/watch?v=-I5W5QVAT8E">Notion's Token Town</a>, 24 min). Anthropic's "Tokens Should Have Jobs" talk compares spending a fixed budget of about 600,000 tokens in different ways and finds that how tokens are allocated across roles changes the score on the same task (<a href="https://www.youtube.com/watch?v=PXj0p_mW9nI">talk</a>, 13 min).</p></div></aside>
+<aside class="co co-scenario"><div class="co-label">Choose by scenario</div><div class="co-title">Scaling is not working: what to change</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>You see</th>
+<th>Try first</th>
+<th>Then</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>429s at peak</td>
+<td>Gateway quota shares and backoff (<a class="xref" href="#l1207">Lesson 14.111</a>)</td>
+<td>Reserved capacity; a second provider as fallback</td>
+</tr>
+<tr>
+<td>Interactive users wait behind batch jobs</td>
+<td>Separate lanes and quota shares</td>
+<td>Admission control that sheds batch first</td>
+</tr>
+<tr>
+<td>One tenant slows everyone</td>
+<td>Per-tenant queues and concurrency caps</td>
+<td>Per-tenant budgets and pricing that reflects usage</td>
+</tr>
+<tr>
+<td>Costs grow faster than traffic</td>
+<td>Cost per successful task by release; <span class="cx" data-c="94" tabindex="0">cache hit rate</span></td>
+<td>Shorter context and routing, measured by evals</td>
+</tr>
+<tr>
+<td>A tool falls over when agents arrive</td>
+<td>Rate limits and caches in front of it</td>
+<td>Ask its owners for capacity; batch reads</td>
+</tr>
+<tr>
+<td>Deploys lose running work</td>
+<td>Durable run state and draining</td>
+<td>Workflows with checkpoints (<a class="xref" href="#l1208">Lesson 14.112</a>)</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-watch"><div class="co-label">Watch the practitioners</div><div class="co-body"><ul>
+<li><a href="https://www.youtube.com/watch?v=LmQtSORYPfw">How Clay runs 350 million GTM agents a month</a>: Interrupt 2026, 12 min</li>
+<li><a href="https://www.youtube.com/watch?v=-I5W5QVAT8E">Notion's Token Town</a>: Notion, AI Engineer World's Fair 2026, 24 min</li>
+<li><a href="https://www.youtube.com/watch?v=ZUdIsRZhWXI">Stanford CS25 V6: Serving Transformers, Lessons from the Trenches</a>: Stanford Online, 1 h 23 min</li>
+<li><a href="https://www.youtube.com/watch?v=7c9FSUVcXR0">Operating Distributed Inference Systems at Scale</a>: Nishant Gupta and Naman Ahuja, Meta, 20 min</li>
+</ul>
+<p>More talks and design drills on real cases: <a class="xref" href="#l1501">Lesson 14.163</a>.</p></div></aside>
+<aside class="co co-repos"><div class="co-label">Code to study</div><div class="co-body"><ul>
+<li><a href="https://github.com/BerriAI/litellm">BerriAI/litellm</a>: a gateway with per-key budgets, rate limits, fallbacks and routing</li>
+<li><a href="https://github.com/vllm-project/vllm">vllm-project/vllm</a>: <span class="cx" data-c="139" tabindex="0">continuous batching</span> and <span class="cx" data-c="456" tabindex="0">prefix caching</span> for self-hosted models</li>
+<li><a href="https://github.com/temporalio/samples-python">temporalio/samples-python</a>: queued, durable workers for long runs</li>
+</ul></div></aside>
+<aside class="co co-lab"><div class="co-label">Hands-on lab</div><div class="co-title">Lab P7 · Plan for ten times the load</div><div class="co-body"><ol>
+<li>Fill in the capacity function with your agent's real numbers from traces. Find your bottleneck at today's peak and at ten times it.</li>
+<li>Split your work into lanes. Write the quota share and worker count for each.</li>
+<li>Add per-tenant (or per-team) caps to the scheduler and replay a burst from one tenant.</li>
+<li>Write the three levels of budget for your agent and what happens when each one trips.</li>
+<li>Pick the cost lever with the best payoff for your traces, apply it, and show with evals that quality held.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Scaling is adding servers."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Provider rate limits and token budgets are usually the real ceiling.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "All customers can share one queue fairly."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Without per-tenant limits, one heavy customer slows everyone.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Caches can be shared across tenants."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Cache keys must include the tenant, or data leaks between customers.</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Provider quota is 2 million tokens per minute. A sale doubles traffic to 3 million. What happens, and what are three mitigations? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>One large tenant's batch job shares a quota with interactive users. What do users experience? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-body"><p>Autoscaling adds workers, but throughput does not rise. What is the bottleneck? (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Design <span class="cx" data-c="622" tabindex="0">tenant isolation</span> for ShopKart's assistant offered to marketplace sellers: data, quotas and costs. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l1209-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Quotas are capacity</span></summary><div class="qa-a"><p>Requests get rate-limited (429s). Mitigations: request a quota increase ahead of time, spread across regions or deployments, prioritize critical traffic and degrade the rest, and cache.</p></div></details>
+<details class="qa" id="l1209-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Noisy neighbors</span></summary><div class="qa-a"><p>Rate limits and slow responses during the job. Separate quotas per tenant or workload, and schedule batch work off-peak.</p></div></details>
+<details class="qa" id="l1209-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Find the real limit</span></summary><div class="qa-a"><p>Likely the provider quota, a database, or a tool backend, not the workers. Measure where requests wait.</p></div></details>
+<details class="qa" id="l1209-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Tenant isolation</span></summary><div class="qa-a"><p>Per-tenant namespaces for data and memory, per-tenant quotas and budgets at the gateway, tenant ID on every trace, and noisy-tenant protections.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l1209-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How do you scale an agent system?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Find the limiting resource (provider quotas, GPUs, tools, databases), plan capacity for peaks, isolate tenants and workloads, use queues and <span class="cx" data-c="60" tabindex="0">background runs</span> for slow work, cache and route to cheaper models, and degrade gracefully under overload.</p>
+<p><strong>A plausible wrong answer.</strong> "Add more servers." Agents are usually limited by quotas and dependencies.</p>
+<p><strong>Follow-ups.</strong> How do you prioritize traffic under overload?</p></div></details>
+<details class="qa" id="l1209-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">429 errors spike every Monday morning. What do you do?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Find the cause (batch jobs, a tenant, a traffic pattern), reschedule or separate it, raise quotas ahead of known peaks, and add backoff and queueing.</p>
+<p><strong>A plausible wrong answer.</strong> "Ask the provider for unlimited quota." Plan capacity instead.</p>
+<p><strong>Follow-ups.</strong> How would you forecast peaks?</p></div></details>
+<details class="qa" id="l1209-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Shared or dedicated capacity for a large customer?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Dedicated (provisioned throughput or separate quotas) when the customer needs guarantees and pays for them; shared with limits for the rest. Mixing gives predictability without wasting capacity.</p>
+<p><strong>A plausible wrong answer.</strong> "Shared for everyone, it is cheaper." Until the large customer degrades everyone.</p>
+<p><strong>Follow-ups.</strong> How would you price it?</p></div></details>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l1209-q1"><p class="q-text"><span class="q-num">Q1</span>Why scale agent workers on queue depth rather than CPU?</p><div class="opts"><button type="button" class="opt" data-correct="true" id="l1209-q1-o0"><span class="opt-key">A</span><span>Agent workers mostly wait on model and tool I/O, so CPU stays low even when they are overloaded</span></button><button type="button" class="opt" data-correct="false" id="l1209-q1-o1"><span class="opt-key">B</span><span>CPU metrics are unavailable</span></button><button type="button" class="opt" data-correct="false" id="l1209-q1-o2"><span class="opt-key">C</span><span>Queues are cheaper</span></button><button type="button" class="opt" data-correct="false" id="l1209-q1-o3"><span class="opt-key">D</span><span>Models need queues</span></button></div><p class="q-explain" hidden>Waiting work is the real load signal.</p></div><div class="q" id="l1209-q2"><p class="q-text"><span class="q-num">Q2</span>Why add random jitter to exponential backoff?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l1209-q2-o0"><span class="opt-key">A</span><span>To make retries slower</span></button><button type="button" class="opt" data-correct="true" id="l1209-q2-o1"><span class="opt-key">B</span><span>So many clients that hit the same rate limit do not all retry at the same instant</span></button><button type="button" class="opt" data-correct="false" id="l1209-q2-o2"><span class="opt-key">C</span><span>Providers require it</span></button><button type="button" class="opt" data-correct="false" id="l1209-q2-o3"><span class="opt-key">D</span><span>To bypass Retry-After</span></button></div><p class="q-explain" hidden>Synchronized retries turn a rate limit into an outage.</p></div><div class="q" id="l1209-q3"><p class="q-text"><span class="q-num">Q3</span>An agent service has 5 pods idling at 30% CPU but returns 429 errors at peak. What is the likely bottleneck?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l1209-q3-o0"><span class="opt-key">A</span><span>CPU</span></button><button type="button" class="opt" data-correct="true" id="l1209-q3-o1"><span class="opt-key">B</span><span>The model provider's token-per-minute quota</span></button><button type="button" class="opt" data-correct="false" id="l1209-q3-o2"><span class="opt-key">C</span><span>The vector database</span></button><button type="button" class="opt" data-correct="false" id="l1209-q3-o3"><span class="opt-key">D</span><span>Network bandwidth</span></button></div><p class="q-explain" hidden>Agents usually run out of model quota long before servers.</p></div><div class="q" id="l1209-q4"><p class="q-text"><span class="q-num">Q4</span>A release adds 5,000 tokens to the system prompt. Why does capacity planning care?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l1209-q4-o0"><span class="opt-key">A</span><span>It does not; prompts are not infrastructure</span></button><button type="button" class="opt" data-correct="true" id="l1209-q4-o1"><span class="opt-key">B</span><span>Tokens per minute scale with input tokens per step, so the same traffic needs much more quota</span></button><button type="button" class="opt" data-correct="false" id="l1209-q4-o2"><span class="opt-key">C</span><span>Longer prompts are faster</span></button><button type="button" class="opt" data-correct="false" id="l1209-q4-o3"><span class="opt-key">D</span><span>It only changes cost, not capacity</span></button></div><p class="q-explain" hidden>Prompt changes are capacity changes.</p></div><div class="q" id="l1209-q5"><p class="q-text"><span class="q-num">Q5</span>What protects interactive users from a tenant's 900-run batch job?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l1209-q5-o0"><span class="opt-key">A</span><span>A bigger first-in, first-out queue</span></button><button type="button" class="opt" data-correct="true" id="l1209-q5-o1"><span class="opt-key">B</span><span>Per-tenant queues with concurrency caps, and a separate batch lane with its own quota</span></button><button type="button" class="opt" data-correct="false" id="l1209-q5-o2"><span class="opt-key">C</span><span>Turning off streaming</span></button><button type="button" class="opt" data-correct="false" id="l1209-q5-o3"><span class="opt-key">D</span><span>A faster model</span></button></div><p class="q-explain" hidden>Fairness is a scheduling decision, not a hardware one.</p></div><div class="q" id="l1209-q6"><p class="q-text"><span class="q-num">Q6</span>Which budget stops a looping agent from spending a tenant's month in an afternoon?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l1209-q6-o0"><span class="opt-key">A</span><span>The service-level budget</span></button><button type="button" class="opt" data-correct="true" id="l1209-q6-o1"><span class="opt-key">B</span><span>A per-run budget on steps, tokens, time and cost, enforced by the harness</span></button><button type="button" class="opt" data-correct="false" id="l1209-q6-o2"><span class="opt-key">C</span><span>The finance team's monthly review</span></button><button type="button" class="opt" data-correct="false" id="l1209-q6-o3"><span class="opt-key">D</span><span>The provider's invoice</span></button></div><p class="q-explain" hidden>Catch runaway runs at the run level, where they start.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l1209" id="done-l1209">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l1209" id="undo-l1209" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l1208"><span class="pn-dir">Previous</span><span class="pn-t">14.112 · Durable execution and deployment</span></a><a class="pn next" href="#l1210"><span class="pn-dir">Next</span><span class="pn-t">14.114 · Cost engineering</span></a></div></footer>

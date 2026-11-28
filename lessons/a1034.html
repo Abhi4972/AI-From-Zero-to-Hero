@@ -1,0 +1,586 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · Build an LLM from Scratch</a></nav><h1>Activation Recomputation and Gradient Checkpointing</h1><div class="m-meta"><span class="chip chip-num">Lesson 10.31</span><span class="chip">70 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1034" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 10.7 (Pre-Training Mini-GPT), Lesson 10.8 (Scaling &amp; Distributed)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 70 minutes.</li>
+<li><strong>Code in</strong>: Python (with numpy, optional torch). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Backprop keeps every intermediate activation. At 70B parameters and 128K context that is 3 TB of activations per rank. Checkpointing trades FLOPs for memory: recompute instead of save. The question is which segments to drop, and the answer is not "all of them."</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Gradient checkpointing</td>
+<td>"Save memory by redoing forward"</td>
+<td>Store segment inputs only; recompute intermediates during backward to get gradient-support tensors</td>
+</tr>
+<tr>
+<td>Activation recomputation</td>
+<td>"Same as checkpointing"</td>
+<td>The HPC-flavored name for the same technique</td>
+</tr>
+<tr>
+<td>Segment size (k)</td>
+<td>"How many layers per checkpoint"</td>
+<td>Number of layers whose intermediates are dropped and rematerialized together</td>
+</tr>
+<tr>
+<td>Selective checkpointing</td>
+<td>"Korthikanti's trick"</td>
+<td>Recompute only expensive-to-store activations (attention softmax); keep cheap ones</td>
+</tr>
+<tr>
+<td>Full checkpointing</td>
+<td>"The naive version"</td>
+<td>Recompute every layer's intermediates in every segment</td>
+</tr>
+<tr>
+<td>Block checkpointing</td>
+<td>"Coarse-grained"</td>
+<td>Checkpoint whole transformer blocks; largest granularity</td>
+</tr>
+<tr>
+<td>FLOP overhead</td>
+<td>"The compute tax"</td>
+<td>Extra FLOPs per step = (recompute FLOPs) / (fwd + bwd FLOPs); 33% naive, 5% selective</td>
+</tr>
+<tr>
+<td>Activation offload</td>
+<td>"Ship to CPU"</td>
+<td>Move activations to CPU RAM across forward-&gt;backward; alternative to recompute</td>
+</tr>
+<tr>
+<td>sqrt-L rule</td>
+<td>"The classical optimum"</td>
+<td>For uniform-cost layers, optimal checkpoint spacing is $\sqrt{L}$ layers</td>
+</tr>
+<tr>
+<td>Attention-softmax volume</td>
+<td>"The O(L^2) problem"</td>
+<td>$L^2 \cdot \text{heads} \cdot \text{batch}$ floats; dominates activation memory at long contexts</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>To compute gradients, backpropagation needs the intermediate results of the forward pass, so training normally keeps all of them in memory, and for long sequences that is far more than the model's own weights. Gradient checkpointing keeps only a few of them (say, each layer's input) and recomputes the rest during the backward pass when they are needed: more computation, much less memory, and exactly the same gradients. Selective checkpointing goes further by recomputing only what is cheap to recompute but expensive to store. This lesson runs the lesson's numpy version, computes the published memory formulas, and measures real checkpointing in PyTorch and Hugging Face on a real model. No model is trained.</p></div></aside>
+<p>Training a transformer stores, for each layer, the inputs to every op that is differentiated in backward: the attention inputs, the Q/K/V projections, the softmax output, the FFN inputs, the norm outputs, and the residual stream. For a layer with hidden size <code>d</code>, sequence length <code>L</code>, batch <code>B</code>, this is on the order of <code>12 * B * L * d</code> floats per layer.</p>
+<p>For <code>d=8192, L=8192, B=1</code>, that's about 805M values, or 1.6 GB/layer in BF16 by this rough count. Korthikanti et al.'s exact count is 34 bytes per element of <code>B·L·d</code> without the attention scores, 2.1 GiB per layer and about 136 GiB for 64 layers when FlashAttention avoids storing scores, plus <code>5·heads·L/d</code> bytes per element (another 20 GiB per layer at this length) if the scores are kept. That is before you multiply by microbatch size or factor in tensor-parallel copies.</p>
+<p>The two-sided bill: BF16 weights plus optimizer state might fit in 80GB, but activations push you past. Gradient checkpointing (aka activation recomputation) is the standard fix. Drop most activations; redo the forward during backward to get them back. Cost: extra FLOPs. Benefit: memory drops by the ratio of checkpoint segments to total layers.</p>
+<p>Done naively, checkpointing costs roughly 33% more FLOPs per step: one extra forward pass. Done well — selective checkpointing per the "smart selection" of Korthikanti et al. — you save 5x memory for under 5% FLOP overhead. And with FP8 matmuls, FSDP offload, and expert-parallel MoE this really matters: you can't afford either the memory or the wasted compute.</p>
+<h2>Idea 1 · What Backward Actually Needs</h2>
+<p><code>output = layer(input)</code>. Backward wants <code>grad_input</code> and <code>grad_params</code>. To compute them it needs:</p>
+<ul>
+<li><code>input</code> (to compute <code>grad_params = input.T @ grad_output</code> for linear layers)</li>
+<li>some activation derivative intermediates (the derivative of ReLU/GELU/softmax depends on the activation value)</li>
+</ul>
+<p>The forward pass stores these automatically in the autograd graph. Every <code>tensor.retain_grad()</code> and every op that needs its input retains a reference.</p>
+<figure class="diagram mmfig" data-mmd="a1034" data-h="ddc7e49306"><div class="dg-scroll"><svg class="dg mm" id="mmddc7e49306" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 775.609px; background-color: transparent;" viewBox="0 0 775.609375 481" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmddc7e49306{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmddc7e49306 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmddc7e49306 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmddc7e49306 .error-icon{fill:#f4efe7;}#mmddc7e49306 .error-text{fill:#0b1018;stroke:#0b1018;}#mmddc7e49306 .edge-thickness-normal{stroke-width:1px;}#mmddc7e49306 .edge-thickness-thick{stroke-width:3.5px;}#mmddc7e49306 .edge-pattern-solid{stroke-dasharray:0;}#mmddc7e49306 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmddc7e49306 .edge-pattern-dashed{stroke-dasharray:3;}#mmddc7e49306 .edge-pattern-dotted{stroke-dasharray:2;}#mmddc7e49306 .marker{fill:#6c6357;stroke:#6c6357;}#mmddc7e49306 .marker.cross{stroke:#6c6357;}#mmddc7e49306 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmddc7e49306 p{margin:0;}#mmddc7e49306 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmddc7e49306 .cluster-label text{fill:#0b1018;}#mmddc7e49306 .cluster-label span{color:#0b1018;}#mmddc7e49306 .cluster-label span p{background-color:transparent;}#mmddc7e49306 .label text,#mmddc7e49306 span{fill:#211c16;color:#211c16;}#mmddc7e49306 .node rect,#mmddc7e49306 .node circle,#mmddc7e49306 .node ellipse,#mmddc7e49306 .node polygon,#mmddc7e49306 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmddc7e49306 .rough-node .label text,#mmddc7e49306 .node .label text,#mmddc7e49306 .image-shape .label,#mmddc7e49306 .icon-shape .label{text-anchor:middle;}#mmddc7e49306 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmddc7e49306 .rough-node .label,#mmddc7e49306 .node .label,#mmddc7e49306 .image-shape .label,#mmddc7e49306 .icon-shape .label{text-align:center;}#mmddc7e49306 .node.clickable{cursor:pointer;}#mmddc7e49306 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmddc7e49306 .arrowheadPath{fill:#0b0b0b;}#mmddc7e49306 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmddc7e49306 .flowchart-link{stroke:#6c6357;fill:none;}#mmddc7e49306 .edgeLabel{background-color:#ffffff;text-align:center;}#mmddc7e49306 .edgeLabel p{background-color:#ffffff;}#mmddc7e49306 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmddc7e49306 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmddc7e49306 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmddc7e49306 .cluster text{fill:#0b1018;}#mmddc7e49306 .cluster span{color:#0b1018;}#mmddc7e49306 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmddc7e49306 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmddc7e49306 rect.text{fill:none;stroke-width:0;}#mmddc7e49306 .icon-shape,#mmddc7e49306 .image-shape{background-color:#ffffff;text-align:center;}#mmddc7e49306 .icon-shape p,#mmddc7e49306 .image-shape p{background-color:#ffffff;padding:2px;}#mmddc7e49306 .icon-shape .label rect,#mmddc7e49306 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmddc7e49306 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmddc7e49306 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmddc7e49306 .node .neo-node{stroke:#b5521b;}#mmddc7e49306 [data-look="neo"].node rect,#mmddc7e49306 [data-look="neo"].cluster rect,#mmddc7e49306 [data-look="neo"].node polygon{stroke:url(#mmddc7e49306-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmddc7e49306 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmddc7e49306 [data-look="neo"].node path{stroke:url(#mmddc7e49306-gradient);stroke-width:1px;}#mmddc7e49306 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmddc7e49306 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmddc7e49306 [data-look="neo"].node circle{stroke:url(#mmddc7e49306-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmddc7e49306 [data-look="neo"].node circle .state-start{fill:#000000;}#mmddc7e49306 [data-look="neo"].icon-shape .icon{fill:url(#mmddc7e49306-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmddc7e49306 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmddc7e49306-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmddc7e49306 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmddc7e49306_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmddc7e49306_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmddc7e49306_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M384.098,59L384.098,63.167C384.098,67.333,384.098,75.667,384.168,83.417C384.238,91.167,384.379,98.334,384.449,101.917L384.519,105.501" id="mmddc7e49306-L_FWD_K_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_FWD_K_0" data-points="W3sieCI6Mzg0LjA5NzY1NjI1LCJ5Ijo1OX0seyJ4IjozODQuMDk3NjU2MjUsInkiOjg0fSx7IngiOjM4NC41OTc2NTYyNSwieSI6MTA5LjV9XQ==" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M322.144,151.312L282.428,159.677C242.711,168.041,163.277,184.771,123.561,198.385C83.844,212,83.844,222.5,83.844,227.75L83.844,233" id="mmddc7e49306-L_K_MEM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_MEM_0" data-points="W3sieCI6MzIyLjE0NDMzNTQyNTQzNTMsInkiOjE1MS4zMTIxMDgzNTA4NzA2fSx7IngiOjgzLjg0Mzc1LCJ5IjoyMDEuNX0seyJ4Ijo4My44NDM3NSwieSI6MjM3fV0=" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M336.384,166.5L326.291,172.333C316.199,178.167,296.013,189.833,285.921,200.917C275.828,212,275.828,222.5,275.828,227.75L275.828,233" id="mmddc7e49306-L_K_SEG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_SEG_0" data-points="W3sieCI6MzM2LjM4Mzg4MDYxNTIzNDQsInkiOjE2Ni41fSx7IngiOjI3NS44MjgxMjUsInkiOjIwMS41fSx7IngiOjI3NS44MjgxMjUsInkiOjIzN31d" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M432.811,166.5L442.737,172.333C452.663,178.167,472.515,189.833,482.441,200.917C492.367,212,492.367,222.5,492.367,227.75L492.367,233" id="mmddc7e49306-L_K_SEL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_SEL_0" data-points="W3sieCI6NDMyLjgxMTQzMTg4NDc2NTYsInkiOjE2Ni41fSx7IngiOjQ5Mi4zNjcxODc1LCJ5IjoyMDEuNX0seyJ4Ijo0OTIuMzY3MTg3NSwieSI6MjM3fV0=" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M447.444,150.527L490.401,159.022C533.358,167.518,619.273,184.509,662.23,198.254C705.188,212,705.188,222.5,705.188,227.75L705.188,233" id="mmddc7e49306-L_K_OFF_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_K_OFF_0" data-points="W3sieCI6NDQ3LjQ0Mzc1MjgyNjI2MzEsInkiOjE1MC41MjY1NTY4NDc0NzM3Nn0seyJ4Ijo3MDUuMTg3NSwieSI6MjAxLjV9LHsieCI6NzA1LjE4NzUsInkiOjIzN31d" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M275.828,309L275.828,313.167C275.828,317.333,275.828,325.667,280.798,333.597C285.768,341.528,295.708,349.057,300.678,352.821L305.648,356.585" id="mmddc7e49306-L_SEG_RE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SEG_RE_0" data-points="W3sieCI6Mjc1LjgyODEyNSwieSI6MzA5fSx7IngiOjI3NS44MjgxMjUsInkiOjMzNH0seyJ4IjozMDguODM3MTI4NDI5ODc4LCJ5IjozNTl9XQ==" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/><path d="M492.367,309L492.367,313.167C492.367,317.333,492.367,325.667,487.397,333.597C482.427,341.528,472.487,349.057,467.517,352.821L462.547,356.585" id="mmddc7e49306-L_SEL_RE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_SEL_RE_0" data-points="W3sieCI6NDkyLjM2NzE4NzUsInkiOjMwOX0seyJ4Ijo0OTIuMzY3MTg3NSwieSI6MzM0fSx7IngiOjQ1OS4zNTgxODQwNzAxMjIsInkiOjM1OX1d" data-look="classic" marker-end="url(#mmddc7e49306_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_FWD_K_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(83.84375, 201.5)"><g class="label" data-id="L_K_MEM_0" transform="translate(-35.1640625, -10.5)"><foreignObject width="70.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>everything</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(275.828125, 201.5)"><g class="label" data-id="L_K_SEG_0" transform="translate(-36.671875, -10.5)"><foreignObject width="73.34375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>checkpoint</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(492.3671875, 201.5)"><g class="label" data-id="L_K_SEL_0" transform="translate(-29.421875, -10.5)"><foreignObject width="58.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>selective</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(705.1875, 201.5)"><g class="label" data-id="L_K_OFF_0" transform="translate(-23.2890625, -10.5)"><foreignObject width="46.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>offload</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SEG_RE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_SEL_RE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmddc7e49306-flowchart-FWD-0" data-look="classic" transform="translate(384.09765625, 33.5)"><rect class="basic label-container" style="" x="-74.859375" y="-25.5" width="149.71875" height="51"/><g class="label" style="" transform="translate(-44.859375, -10.5)"><rect/><foreignObject width="89.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Forward pass</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-K-1" data-look="classic" transform="translate(384.09765625, 137.5)"><polygon points="14.25,0 123.96875,0 138.21875,-28.5 123.96875,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-69.109375,28.5)"/><g class="label" style="" transform="translate(-47.359375, -21)"><rect/><foreignObject width="94.71875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>What to keep<br />for backward?</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-MEM-3" data-look="classic" transform="translate(83.84375, 273)"><rect class="basic label-container" style="" x="-75.84375" y="-36" width="151.6875" height="72"/><g class="label" style="" transform="translate(-45.84375, -21)"><rect/><foreignObject width="91.6875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Fast,<br />huge memory</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-SEG-5" data-look="classic" transform="translate(275.828125, 273)"><rect class="basic label-container" style="" x="-66.140625" y="-36" width="132.28125" height="72"/><g class="label" style="" transform="translate(-36.140625, -21)"><rect/><foreignObject width="72.28125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Segment<br />inputs only</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-SEL-7" data-look="classic" transform="translate(492.3671875, 273)"><rect class="basic label-container" style="" x="-100.3984375" y="-36" width="200.796875" height="72"/><g class="label" style="" transform="translate(-70.3984375, -21)"><rect/><foreignObject width="140.796875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Drop cheap-to-redo,<br />big tensors (softmax)</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-OFF-9" data-look="classic" transform="translate(705.1875, 273)"><rect class="basic label-container" style="" x="-62.421875" y="-36" width="124.84375" height="72"/><g class="label" style="" transform="translate(-32.421875, -21)"><rect/><foreignObject width="64.84375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Move to<br />CPU RAM</p></span></div></foreignObject></g></g><g class="node default" id="mmddc7e49306-flowchart-RE-11" data-look="classic" transform="translate(384.09765625, 416)"><rect class="basic label-container" style="" x="-130" y="-57" width="260" height="114"/><g class="label" style="" transform="translate(-100, -42)"><rect/><foreignObject width="200" height="84"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Backward recomputes the segment:<br />about one extra forward, much less memory</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmddc7e49306-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmddc7e49306-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmddc7e49306-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<h2>Idea 2 · Naive Full Checkpointing</h2>
+<p>Split the network into <code>N</code> segments. During forward, store only the <em>input</em> to each segment. When backward needs intermediates, rerun the segment's forward pass to materialize them, then differentiate.</p>
+<p>Example: 32-layer transformer split into 32 segments of 1 layer each.</p>
+<ul>
+<li>Memory: 32 layer-inputs (small) vs 32 * (activation volume per layer) (huge).</li>
+<li>Extra compute: 1 extra forward per segment, i.e., ~33% more forward FLOPs total (since backward is 2x forward, full step becomes 1 + 1 + 2 = 4 units instead of 1 + 2 = 3).</li>
+</ul>
+<p>This is the original Chen et al. 2016 recipe: one checkpoint every <code>sqrt(L)</code> layers to balance memory and compute. For <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">64</span></span></span></span>, that's 8 checkpoints.</p>
+<figure class="xv" data-xv="ckpt-recompute" aria-label="Step-through: what a forward pass stores with and without checkpointing, and the backward recompute."></figure>
+<h2>Idea 3 · Selective Checkpointing (Korthikanti 2022)</h2>
+<p>Not all activations cost the same. The attention softmax output is <code>B*L*L*heads</code> and grows <em>quadratically</em> with sequence length. The FFN hidden activation is <code>B*L*4d</code> and grows linearly. For long sequences the softmax dominates.</p>
+<p>Selective checkpointing keeps the cheap-to-store activations (linear projections, residuals) and recomputes only the expensive ones (attention). You pay minimal FLOPs to recompute but save the <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">L</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> memory.</p>
+<p>Megatron-Core implements this as "selective" activation recomputation. Used in most 2024+ frontier training runs.</p>
+<h2>Idea 4 · Offload</h2>
+<p>Alternative to recompute: ship activations to CPU RAM between forward and backward. Requires PCIe bandwidth; beneficial when idle bandwidth exceeds the cost of rematerialization. Mixed strategies are common: checkpoint some layers, offload others.</p>
+<p>PyTorch offers activation offload as the context manager <code>torch.autograd.graph.save_on_cpu()</code>; FSDP2's <code>CPUOffloadPolicy</code> offloads parameters, gradients and optimizer state instead. Offload shines when GPU is bottlenecked on memory but CPU-GPU transfer has headroom.</p>
+<h2>Idea 5 · Recompute Cost Model</h2>
+<p>Per-step FLOPs with naive checkpointing every <code>k</code> layers out of <code>L</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">flops_fwd_normal = L * f_layer
+flops_bwd_normal = 2 * L * f_layer
+flops_total_normal = 3 * L * f_layer
+
+flops_fwd_ckpt = L * f_layer
+flops_recompute = L * f_layer  # one extra forward per layer in the segment
+flops_bwd_ckpt = 2 * L * f_layer
+flops_total_ckpt = 4 * L * f_layer
+overhead = 4 / 3 - 1 = 0.33 = 33%
+</code></pre></div>
+<p>With selective checkpointing you recompute only the attention kernel, not the whole layer:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">flops_recompute_selective = L * f_attention ~= L * f_layer * 0.15
+overhead_selective = (3 + 0.15) / 3 - 1 = 0.05 = 5%
+</code></pre></div>
+<h2>Idea 6 · Memory Savings Model</h2>
+<p>Activation volume per layer: <code>A</code>. For <code>L</code> layers, total activation memory: <code>L * A</code>.</p>
+<p>Full checkpoint (segment size 1): store only <code>L * input_volume</code> (~<code>L * 1/10 A</code> for a standard transformer). Saves ~<code>9 * L * A * 1/10</code>.</p>
+<p>Checkpoint every <code>k</code> layers: store <code>L/k * A</code> plus <code>k-1</code> layers' worth within the active segment.</p>
+<p>At <code>k = sqrt(L)</code>, memory and recompute cost both scale with <code>sqrt(L)</code> — the optimal tradeoff for uniform-cost layers.</p>
+<h2>Idea 7 · When Not to Checkpoint</h2>
+<ul>
+<li>The innermost layers of a pipeline stage already in-flight. They have to finish anyway.</li>
+<li>The first and last layers if they dominate the stage's compute (rare in transformers).</li>
+<li>Attention kernels already using FlashAttention — Flash already recomputes the softmax fast, so additional layer-level checkpointing adds little on top.</li>
+</ul>
+<h2>Idea 8 · Implementation Patterns</h2>
+<ol>
+<li>
+<p><strong>Function wrapper:</strong> wrap a segment in <code>torch.utils.checkpoint.checkpoint(fn, input)</code>. PyTorch stores only <code>input</code>, recomputes everything else on backward.</p>
+</li>
+<li>
+<p><strong>Decorator-based:</strong> label layers as checkpointable; the trainer decides at config time which segments get wrapped.</p>
+</li>
+<li>
+<p><strong>Manual explicit recompute:</strong> write the backward pass yourself, calling a custom <code>recompute_forward</code> that duplicates the forward with the stored input.</p>
+</li>
+</ol>
+<p>All three give the same functional result. Wrappers are the standard idiom.</p>
+<h2>Idea 9 · Interaction with TP / PP / FP8</h2>
+<ul>
+<li><strong>Tensor parallel:</strong> checkpoint inputs must be gathered or rescattered on recompute; handle the communication cost.</li>
+<li><strong>Pipeline parallel:</strong> typical pattern is to checkpoint each pipeline-stage's forward so reverse-order microbatches can reuse activation memory.</li>
+<li><strong>FP8 recompute:</strong> amax histories updated during recompute must match the original forward's, or the FP8 scale drifts. Most frameworks snapshot the scale.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="activation-recompute"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Activation memory per layer</strong> (Korthikanti et al., 16-bit, sequence <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>, batch <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span>, hidden <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span>, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">a</span></span></span></span> heads, no tensor parallelism):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">layer</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord">34</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0074em;vertical-align:-0.686em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3214em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">h</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">5</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">a</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mspace"> </span><span class="mord text"><span class="mord">bytes</span></span><span class="mord">.</span></span></span></span></span></div>
+The first term (projections, MLP, norms, dropout masks) grows linearly in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">s</span></span></span></span>; the second (attention scores and softmax) quadratically. FlashAttention and selective recomputation both remove the second term.</p>
+<p><strong>Full checkpointing every <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> layers</strong> of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span>: keep <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mclose">⌉</span></span></span></span> segment inputs (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span><span class="mord mathnormal">bh</span></span></span></span> bytes each) and rebuild one segment at a time:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">peak</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord"><span class="delimsizing size2">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">L</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">⌉</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mord mathnormal">s</span><span class="mord mathnormal">bh</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">M</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.109em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">layer</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">extra compute</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">3</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace"> </span><span class="mord text"><span class="mord">of a step (one more forward)</span></span><span class="mord">.</span></span></span></span></span></div>
+With layer activations <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span></span></span></span> times the input, the peak is smallest near <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.24em;vertical-align:-0.305em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.935em;"><span class="svg-align" style="top:-3.2em;"><span class="pstrut" style="height:3.2em;"></span><span class="mord" style="padding-left:1em;"><span class="mord mathnormal">L</span><span class="mord">/</span><span class="mord mathnormal">A</span></span></span><span style="top:-2.895em;"><span class="pstrut" style="height:3.2em;"></span><span class="hide-tail" style="min-width:1.02em;height:1.28em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.28em" viewBox="0 0 400000 1296" preserveAspectRatio="xMinYMin slice"><path d="M263,681c0.7,0,18,39.7,52,119
+c34,79.3,68.167,158.7,102.5,238c34.3,79.3,51.8,119.3,52.5,120
+c340,-704.7,510.7,-1060.3,512,-1067
+l0 -0
+c4.7,-7.3,11,-11,19,-11
+H40000v40H1012.3
+s-271.3,567,-271.3,567c-38.7,80.7,-84,175,-136,283c-52,108,-89.167,185.3,-111.5,232
+c-22.3,46.7,-33.8,70.3,-34.5,71c-4.7,4.7,-12.3,7,-23,7s-12,-1,-12,-1
+s-109,-253,-109,-253c-72.7,-168,-109.3,-252,-110,-252c-10.7,8,-22,16.7,-34,26
+c-22,17.3,-33.3,26,-34,26s-26,-26,-26,-26s76,-59,76,-59s76,-60,76,-60z
+M1001 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.305em;"><span></span></span></span></span></span></span></span></span>; Chen et al.'s <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1133em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9267em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">L</span></span></span><span style="top:-2.8867em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1133em;"><span></span></span></span></span></span></span></span></span> assumes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">A</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span>.</p>
+<p><strong>Selective recomputation</strong> of the attention core costs its share of FLOPs: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.2604em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.4911em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">4</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">24</span><span class="mord mathnormal">s</span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7401em;"><span style="top:-2.989em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">4</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mord mathnormal">h</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> of a forward pass.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">64 layers, hidden 8,192, 64 heads, 8,192 tokens, batch 1</div><div class="co-body"><ul>
+<li>Linear term: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">34</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.28</span></span></span></span> GB per layer, 136 GiB for 64 layers.</li>
+<li>Score term: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192/8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">320</span></span></span></span> bytes per element: 21.5 GB per layer, 1,280 GiB more. Removing it (FlashAttention, or selective recompute) is the single biggest saving.</li>
+<li>Full checkpointing of every layer: 64 inputs of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">192</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">134</span></span></span></span> MB, 8 GiB, plus one layer being rebuilt (2.1 GiB): about 10 GiB.</li>
+<li>Price: one more forward pass, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.1901em;vertical-align:-0.345em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">3</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> more step compute. Selective recomputation of the attention core costs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8056em;vertical-align:-0.0556em;"></span><span class="mord">4.8%</span></span></span></span> at this length.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Checkpointing changes the gradients a little."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It recomputes the same operations; the gradients are identical (0 difference in the real runs below).</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "More segments means more recompute."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Full checkpointing recomputes the forward once whatever the segment size; the segment size trades stored inputs against the size of one rebuilt segment.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Selective checkpointing is a different algorithm from FlashAttention."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Both avoid storing the attention-score matrices; with FlashAttention the selective recompute of attention is already built in.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>With Hugging Face's gradient checkpointing on SmolLM2-135M (30 layers, 2 × 512 tokens), will the memory saved for backward drop to roughly the 30 layer inputs (68 MiB), and will the step take much longer on this CPU? (Solution P1.)</p></div></aside>
+<h2>Step 1 · A Toy Model With Segments</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np
+
+
+def linear_forward(x, w, b):
+    return x @ w + b
+
+
+def relu(x):
+    return np.maximum(x, 0)
+
+
+def layer_forward(x, w1, b1, w2, b2):
+    h = relu(linear_forward(x, w1, b1))
+    return linear_forward(h, w2, b2)
+
+
+def model_forward(x, params):
+    activations = [x]
+    h = x
+    for w1, b1, w2, b2 in params:
+        h = layer_forward(h, w1, b1, w2, b2)
+        activations.append(h)
+    return h, activations
+</code></pre></div>
+
+<h2>Step 2 · Naive Backward Needing All Activations</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def model_backward(grad_output, activations, params):
+    grads = [None] * len(params)
+    g = grad_output
+    for i in range(len(params) - 1, -1, -1):
+        w1, b1, w2, b2 = params[i]
+        x_in = activations[i]
+        h_pre = linear_forward(x_in, w1, b1)
+        h = relu(h_pre)
+        gh = g @ w2.T
+        gw2 = h.T @ g
+        gb2 = g.sum(axis=0)
+        g_pre = gh * (h_pre &gt; 0)
+        gx = g_pre @ w1.T
+        gw1 = x_in.T @ g_pre
+        gb1 = g_pre.sum(axis=0)
+        grads[i] = (gw1, gb1, gw2, gb2)
+        g = gx
+    return g, grads
+</code></pre></div>
+
+<h2>Step 3 · Checkpoint-Every-k Memory</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def model_forward_checkpointed(x, params, k=4):
+    saved_inputs = [x]
+    h = x
+    for i, (w1, b1, w2, b2) in enumerate(params):
+        h = layer_forward(h, w1, b1, w2, b2)
+        if (i + 1) % k == 0:
+            saved_inputs.append(h)
+    return h, saved_inputs
+
+
+def model_backward_checkpointed(grad_output, saved_inputs, params, k=4):
+    grads = [None] * len(params)
+    g = grad_output
+    segments = [(j * k, min((j + 1) * k, len(params))) for j in range(len(saved_inputs))]
+    for seg_idx in range(len(saved_inputs) - 1, -1, -1):
+        start, end = segments[seg_idx]
+        if start &gt;= end:
+            continue
+        x_in = saved_inputs[seg_idx]
+        _, seg_acts = model_forward(x_in, params[start:end])
+        g, seg_grads = model_backward(g, seg_acts, params[start:end])
+        for j, gr in enumerate(seg_grads):
+            grads[start + j] = gr
+    return g, grads
+</code></pre></div>
+
+<h2>Step 4 · Cost Model</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def checkpoint_cost(n_layers, segment_size, flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+
+
+def selective_checkpoint_cost(n_layers, attention_fraction=0.15,
+                              flops_per_layer=1.0):
+    fwd = n_layers * flops_per_layer
+    recompute = n_layers * attention_fraction * flops_per_layer
+    bwd = 2 * n_layers * flops_per_layer
+    return {
+        &quot;fwd&quot;: fwd,
+        &quot;recompute&quot;: recompute,
+        &quot;bwd&quot;: bwd,
+        &quot;total&quot;: fwd + recompute + bwd,
+        &quot;overhead_vs_no_ckpt&quot;: (fwd + recompute + bwd) / (fwd + bwd) - 1.0,
+    }
+</code></pre></div>
+
+<h2>Step 5 · Memory Estimator</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def activation_memory_mb(n_layers, hidden=8192, seq=8192,
+                        batch=1, bytes_per_value=2):
+    per_layer = 12 * batch * seq * hidden * bytes_per_value
+    return n_layers * per_layer / 1e6
+
+
+def memory_after_checkpoint(n_layers, segment_size, hidden=8192,
+                           seq=8192, batch=1, bytes_per_value=2):
+    n_seg = max(1, n_layers // segment_size)
+    saved = (n_seg + segment_size) * 1 * batch * seq * hidden * bytes_per_value
+    return saved / 1e6
+</code></pre></div>
+
+<h2>Step 6 · Optimal Segment Size</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def optimal_segment(n_layers):
+    return int(round(np.sqrt(n_layers)))
+</code></pre></div>
+
+<h2>Step 7 · Selective Checkpoint Decision</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def should_recompute(layer_type, activation_bytes, recompute_flops_ratio):
+    if layer_type == &quot;attention&quot; and activation_bytes &gt; 100 * 1e6:
+        return True
+    if layer_type == &quot;ffn&quot; and activation_bytes &gt; 500 * 1e6:
+        return recompute_flops_ratio &lt; 0.1
+    return False
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The lesson&#x27;s numpy version</div><div class="co-body"><p><code>main.py</code>: full and checkpointed backward on a numpy MLP compared for exact equality, then the lesson's cost and memory models for segment sizes 1 to 64 (a few seconds).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import runpy
+runpy.run_path(&quot;main.py&quot;, run_name=&quot;__main__&quot;)    # numpy checkpointing check and cost/memory models; a few seconds
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">equivalence: {&#x27;output_match&#x27;: True, &#x27;max_grad_diff&#x27;: 0.0}
+k=  1  overhead=0.0%
+k=  2  overhead=16.7%
+k=  4  overhead=25.0%
+k=  8  overhead=29.2%
+k= 16  overhead=31.2%
+k= 32  overhead=32.3%
+k= 64  overhead=32.8%
+selective overhead: 5.0%
+optimal segment for L=64: 8
+activation memory (no ckpt), L=64, d=8192, seq=8192, batch=1: 103079.2 MB
+  checkpoint k=  1: 8724.2 MB
+  checkpoint k=  4: 2684.4 MB
+  checkpoint k=  8: 2147.5 MB
+  checkpoint k= 16: 2684.4 MB
+  checkpoint k= 32: 4563.4 MB</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Equivalence.</strong> The checkpointed numpy backward produces exactly the same output and gradients (difference 0.0): recomputation repeats the same arithmetic.</p>
+<p><strong>Cost model.</strong> The script's formula charges <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> of a forward for recomputation, so segment size 1 shows 0% and 64 shows 33%. That contradicts the text above, where 32 segments of one layer each cost 33%: if only layer inputs are stored, every layer's internals must be recomputed, a full extra forward pass, whatever the segment size. Its "selective 5%" is an assumption (attention as 15% of a layer's FLOPs), not a measurement; the next run computes it.</p>
+<p><strong>Memory model.</strong> Activations without checkpointing come out at 103 GB using 12 values per <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">s</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span>; the published count is 34 bytes (17 values), or far more if attention scores are kept (next run). For the checkpointed cases the script counts the stored inputs plus <em>one input's</em> worth per layer of the rebuilt segment, so k = 8 looks best (2.1 GB). Counting a rebuilt layer at its full size moves the optimum to much smaller segments.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The published formulas</div><div class="co-body"><p>A: Korthikanti et al.'s activation memory for a 64-layer, hidden-8,192 model at three sequence lengths, with attention scores kept, with FlashAttention, and with full recomputation. B: peak memory for checkpointing every k layers when a layer's activations are 17 times its input. C: the cost of recomputing only the attention core.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+
+print(&quot;A. Activation memory per layer (Korthikanti et al. 2022, 16-bit, no tensor parallelism)&quot;)
+print(&quot;   bytes = s*b*h*(34 + 5*a*s/h): 34 for the projections, MLP, norms and dropout masks; 5as/h for attention scores&quot;)
+h, a, b, L = 8192, 64, 1, 64
+print(f&quot;  hidden {h}, {a} heads, batch {b}, {L} layers&quot;)
+print(f&quot;  {'sequence':&gt;8} {'scores kept':&gt;14} {'FlashAttention':&gt;15} {'full recompute':&gt;15}   (GiB for all {L} layers)&quot;)
+for s in [2048, 8192, 32768]:
+    keep = s * b * h * (34 + 5 * a * s / h) * L
+    flash = s * b * h * 34 * L                       # no attention-score matrices stored (selective recompute does the same)
+    full = s * b * h * 2 * L                         # only each layer's input
+    print(f&quot;  {s:&gt;8} {keep / 2**30:&gt;14.0f} {flash / 2**30:&gt;15.0f} {full / 2**30:&gt;15.1f}&quot;)
+print(f&quot;  the lesson's estimate, 12 values x 2 bytes per s*b*h at 8192 tokens: {12 * 2 * 8192 * h * L / 2**30:.0f} GiB&quot;)
+print()
+
+print(&quot;B. Checkpointing every k layers (Chen et al. 2016): store L/k segment inputs, rebuild one segment at a time&quot;)
+A = 17                                               # a layer's full activations, in units of its input (34 / 2 bytes)
+L = 64
+print(f&quot;  {L} layers, full activations of a layer = {A} x its input; memory in units of one layer input&quot;)
+print(f&quot;  {'k':&gt;3} {'stored inputs':&gt;14} {'one rebuilt segment':&gt;20} {'peak':&gt;6} {'extra compute':&gt;14}&quot;)
+for k in [1, 2, 4, 8, 16, 32, 64]:
+    stored, seg = math.ceil(L / k), k * A
+    print(f&quot;  {k:&gt;3} {stored:&gt;14} {seg:&gt;20} {stored + seg:&gt;6}   {'+33% (one more forward)':&gt;22}&quot;)
+print(f&quot;  no checkpointing: {L * A} units; best k near sqrt(L / A) = {math.sqrt(L / A):.1f} when inputs are this cheap&quot;)
+print(&quot;  every k recomputes the whole forward once: the overhead is 1/3 of a step whatever k is&quot;)
+print()
+
+print(&quot;C. Selective recomputation's cost: recompute only the attention core&quot;)
+s, h = 8192, 8192
+attn_core = 4 * s * s * h                            # QK^T and attention x V, FLOPs per sequence per layer (2 * 2 * s^2 * h)
+dense = 24 * s * h * h                               # projections and MLP (4h), FLOPs per sequence per layer
+print(f&quot;  at {s} tokens and hidden {h}: attention core {attn_core / (attn_core + dense):.0%} of a layer's forward FLOPs&quot;)
+print(f&quot;  recomputing it adds {attn_core / (3 * (attn_core + dense)):.1%} to a training step; at 2,048 tokens &quot;
+      f&quot;{4 * 2048 ** 2 * h / (3 * (4 * 2048 ** 2 * h + 24 * 2048 * h * h)):.1%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. Activation memory per layer (Korthikanti et al. 2022, 16-bit, no tensor parallelism)
+   bytes = s*b*h*(34 + 5*a*s/h): 34 for the projections, MLP, norms and dropout masks; 5as/h for attention scores
+  hidden 8192, 64 heads, batch 1, 64 layers
+  sequence    scores kept  FlashAttention  full recompute   (GiB for all 64 layers)
+      2048            114              34             2.0
+      8192           1416             136             8.0
+     32768          21024             544            32.0
+  the lesson&#x27;s estimate, 12 values x 2 bytes per s*b*h at 8192 tokens: 96 GiB
+
+B. Checkpointing every k layers (Chen et al. 2016): store L/k segment inputs, rebuild one segment at a time
+  64 layers, full activations of a layer = 17 x its input; memory in units of one layer input
+    k  stored inputs  one rebuilt segment   peak  extra compute
+    1             64                   17     81   +33% (one more forward)
+    2             32                   34     66   +33% (one more forward)
+    4             16                   68     84   +33% (one more forward)
+    8              8                  136    144   +33% (one more forward)
+   16              4                  272    276   +33% (one more forward)
+   32              2                  544    546   +33% (one more forward)
+   64              1                 1088   1089   +33% (one more forward)
+  no checkpointing: 1088 units; best k near sqrt(L / A) = 1.9 when inputs are this cheap
+  every k recomputes the whole forward once: the overhead is 1/3 of a step whatever k is
+
+C. Selective recomputation&#x27;s cost: recompute only the attention core
+  at 8192 tokens and hidden 8192: attention core 14% of a layer&#x27;s forward FLOPs
+  recomputing it adds 4.8% to a training step; at 2,048 tokens 1.3%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A.</strong> For a 64-layer model with hidden size 8,192, keeping attention scores is what explodes memory: 1,416 GiB at 8,192 tokens and 21,024 GiB at 32,768. Without the score matrices (FlashAttention, or selective recomputation of attention) the same model needs 136 GiB at 8,192 tokens, and full checkpointing of every layer only 8 GiB of stored inputs. The lesson's rough count (12 values per element, 96 GiB at 8,192 tokens) is in the right range for the case without scores.</p>
+<p><strong>B.</strong> Full checkpointing always costs one extra forward (a third of a step), so the segment size only trades stored inputs against the one segment being rebuilt. When a layer's activations are 17 times its input, rebuilding big segments is expensive, and the peak is lowest at 1 or 2 layers per segment (81 and 66 units against 1,088 without checkpointing). Chen et al.'s <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.04em;vertical-align:-0.1133em;"></span><span class="mord sqrt"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.9267em;"><span class="svg-align" style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord" style="padding-left:0.833em;"><span class="mord mathnormal">L</span></span></span><span style="top:-2.8867em;"><span class="pstrut" style="height:3em;"></span><span class="hide-tail" style="min-width:0.853em;height:1.08em;"><svg xmlns="http://www.w3.org/2000/svg" width="400em" height="1.08em" viewBox="0 0 400000 1080" preserveAspectRatio="xMinYMin slice"><path d="M95,702
+c-2.7,0,-7.17,-2.7,-13.5,-8c-5.8,-5.3,-9.5,-10,-9.5,-14
+c0,-2,0.3,-3.3,1,-4c1.3,-2.7,23.83,-20.7,67.5,-54
+c44.2,-33.3,65.8,-50.3,66.5,-51c1.3,-1.3,3,-2,5,-2c4.7,0,8.7,3.3,12,10
+s173,378,173,378c0.7,0,35.3,-71,104,-213c68.7,-142,137.5,-285,206.5,-429
+c69,-144,104.5,-217.7,106.5,-221
+l0 -0
+c5.3,-9.3,12,-14,20,-14
+H400000v40H845.2724
+s-225.272,467,-225.272,467s-235,486,-235,486c-2.7,4.7,-9,7,-19,7
+c-6,0,-10,-1,-12,-3s-194,-422,-194,-422s-65,47,-65,47z
+M834 80h400000v40h-400000z"/></svg></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1133em;"><span></span></span></span></span></span></span></span></span> rule (8 layers for 64) assumes activations as small as the inputs; for transformers checkpointing every layer, as Hugging Face and Megatron do, is near optimal.</p>
+<p><strong>C.</strong> Recomputing only the attention core (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0435em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">Q</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07153em;">K</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">⊤</span></span></span></span></span></span></span></span></span></span></span> and the weighted sum of values) costs 14% of a layer's forward FLOPs at 8,192 tokens and hidden 8,192: 4.8% more per training step, 1.3% at 2,048 tokens. That buys the removal of the quadratic score memory, which is why selective recomputation is so cheap for what it saves.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<ul>
+<li><strong>torch.utils.checkpoint</strong>: <code>from torch.utils.checkpoint import checkpoint</code> — the canonical wrapper in PyTorch. Wraps a function; stores only inputs, recomputes on backward.</li>
+<li><strong>Megatron-Core activation recomputation</strong>: supports <code>selective</code>, <code>full</code>, and <code>block</code> modes. Standard in 2024+ frontier training.</li>
+<li><strong>Activation offload in PyTorch</strong>: <code>with torch.autograd.graph.save_on_cpu(pin_memory=True):</code> around the forward pass moves saved activations to CPU memory and back during backward. (FSDP2's <code>CPUOffloadPolicy</code> offloads parameters, gradients and optimizer state, not activations.)</li>
+<li><strong>DeepSpeed</strong>: ZeRO-Offload moves optimizer states and gradients to the CPU; its activation-checkpointing settings can also keep checkpoints in CPU memory (<code>cpu_checkpointing</code>).</li>
+<li><strong>Selective checkpointing in PyTorch</strong>: <code>torch.utils.checkpoint.checkpoint(..., context_fn=partial(create_selective_checkpoint_contexts, policy))</code> with a policy that marks ops as must-save or recompute (run after Use it).</li>
+<li><strong>Hugging Face</strong>: <code>model.gradient_checkpointing_enable()</code> checkpoints every decoder layer.</li>
+</ul>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Real checkpointing, measured</div><div class="co-body"><p>Part 1: one training step of SmolLM2-135M (fp32, 2 × 512 tokens) with and without <code>gradient_checkpointing_enable()</code>, counting the bytes autograd keeps for backward (with <code>saved_tensors_hooks</code>) and checking the gradients. Part 2: twelve MLP blocks run without checkpointing, with PyTorch's selective checkpointing (a policy that saves matrix-multiply outputs and recomputes the rest) and with full checkpointing. No training; about 70 seconds on CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time, warnings, torch, torch.nn as nn, transformers
+from torch.utils.checkpoint import checkpoint, create_selective_checkpoint_contexts, CheckpointPolicy
+from functools import partial
+from transformers import AutoModelForCausalLM
+transformers.logging.set_verbosity_error()
+torch.manual_seed(0); warnings.filterwarnings(&quot;ignore&quot;)
+
+class Saved:                                   # count the bytes autograd keeps from the forward pass for backward
+    def __init__(self): self.bytes, self.on = 0, True
+    def pack(self, t):
+        if self.on: self.bytes += t.numel() * t.element_size()
+        return t
+    def unpack(self, t): return t
+
+def step(model, ids, ckpt):
+    model.zero_grad()
+    if ckpt: model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={&quot;use_reentrant&quot;: False})
+    else: model.gradient_checkpointing_disable()
+    s = Saved(); t = time.perf_counter()
+    with torch.autograd.graph.saved_tensors_hooks(s.pack, s.unpack):
+        loss = model(ids, labels=ids).loss
+    s.on = False                               # recomputation during backward is not counted as stored
+    loss.backward(); dt = time.perf_counter() - t
+    return s.bytes, dt, loss.item(), torch.cat([p.grad.flatten() for p in model.parameters()])
+
+print(&quot;1. Hugging Face gradient checkpointing on SmolLM2-135M (30 layers), batch 2 x 512 tokens, fp32, one step&quot;)
+model = AutoModelForCausalLM.from_pretrained(&quot;HuggingFaceTB/SmolLM2-135M&quot;, dtype=torch.float32).train()
+ids = torch.randint(0, 49152, (2, 512))
+step(model, ids, False)                                                     # warm-up
+b0, t0, l0, g0 = step(model, ids, False)
+b1, t1, l1, g1 = step(model, ids, True)
+print(f&quot;  {'':&lt;22} {'saved for backward':&gt;19} {'time':&gt;8}&quot;)
+print(f&quot;  {'no checkpointing':&lt;22} {b0 / 2**20:&gt;15.0f} MiB {t0:&gt;7.2f}s&quot;)
+print(f&quot;  {'every layer':&lt;22} {b1 / 2**20:&gt;15.0f} MiB {t1:&gt;7.2f}s&quot;)
+print(f&quot;  same loss: {l0 == l1}; largest gradient difference {(g0 - g1).abs().max():.1e}&quot;)
+print(f&quot;  (with checkpointing, what remains is mostly the 30 layer inputs plus the logits and loss at the end:&quot;)
+print(f&quot;  one layer input is {2 * 512 * 576 * 4 / 2**20:.2f} MiB; 30 of them = {30 * 2 * 512 * 576 * 4 / 2**20:.0f} MiB; logits 2 x 512 x 49,152 x 4 bytes = {2 * 512 * 49152 * 4 / 2**20:.0f} MiB)&quot;)
+
+print(&quot;\n2. Selective checkpointing with PyTorch's policy API, 12 blocks of width 1024, 4 x 1024 tokens&quot;)
+class Block(nn.Module):
+    def __init__(s, d=1024):
+        super().__init__(); s.n = nn.LayerNorm(d); s.up = nn.Linear(d, 4 * d); s.down = nn.Linear(4 * d, d)
+    def forward(s, x): return x + s.down(torch.nn.functional.gelu(s.up(s.n(x))))
+blocks = nn.ModuleList(Block() for _ in range(12))
+x0 = torch.randn(4, 1024, 1024, requires_grad=True)
+sac_bytes = [0]                                                             # what the policy keeps (stored outside autograd's hooks)
+def keep_matmuls(ctx, op, *args, **kw):                                     # save matmul outputs, recompute the rest
+    if op in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default):
+        if not ctx.is_recompute:
+            a, b = (args[0], args[1]) if op == torch.ops.aten.mm.default else (args[1], args[2])
+            sac_bytes[0] += a.shape[0] * b.shape[1] * 4
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+def run(mode):
+    for b in blocks: b.zero_grad()
+    sac_bytes[0] = 0; s = Saved(); t = time.perf_counter()
+    with torch.autograd.graph.saved_tensors_hooks(s.pack, s.unpack):
+        h = x0
+        for b in blocks:
+            if mode == &quot;none&quot;: h = b(h)
+            elif mode == &quot;full&quot;: h = checkpoint(b, h, use_reentrant=False)
+            else: h = checkpoint(b, h, use_reentrant=False, context_fn=partial(create_selective_checkpoint_contexts, keep_matmuls))
+    s.on = False
+    h.pow(2).mean().backward()
+    return s.bytes + sac_bytes[0], time.perf_counter() - t, torch.cat([p.grad.flatten() for p in blocks.parameters()])
+run(&quot;none&quot;)
+rows = {m: run(m) for m in [&quot;none&quot;, &quot;selective&quot;, &quot;full&quot;]}
+for m, (b, t, g) in rows.items():
+    print(f&quot;  {m:&lt;10} saved {b / 2**20:7.0f} MiB  time {t:5.2f}s  gradient difference from none {(g - rows['none'][2]).abs().max():.1e}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. Hugging Face gradient checkpointing on SmolLM2-135M (30 layers), batch 2 x 512 tokens, fp32, one step
+                          saved for backward     time
+  no checkpointing                  2633 MiB    5.93s
+  every layer                        569 MiB    5.64s
+  same loss: True; largest gradient difference 0.0e+00
+  (with checkpointing, what remains is mostly the 30 layer inputs plus the logits and loss at the end:
+  one layer input is 2.25 MiB; 30 of them = 68 MiB; logits 2 x 512 x 49,152 x 4 bytes = 192 MiB)
+
+2. Selective checkpointing with PyTorch&#x27;s policy API, 12 blocks of width 1024, 4 x 1024 tokens
+  none       saved    2304 MiB  time 11.92s  gradient difference from none 0.0e+00
+  selective  saved    1152 MiB  time 11.80s  gradient difference from none 0.0e+00
+  full       saved     192 MiB  time 12.13s  gradient difference from none 0.0e+00</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Part 1.</strong> Without checkpointing, autograd keeps 2,633 MiB for one step of SmolLM2-135M on 2 × 512 tokens, about five times the model's weights in fp32 (540 MB). With Hugging Face's <code>gradient_checkpointing_enable()</code> it keeps 569 MiB: the 30 layer inputs (68 MiB), plus what sits outside the checkpointed layers, mostly the logits (192 MiB) and the loss computation over a 49,152-token vocabulary. Loss and gradients are identical (difference 0.0). The step took about 5% longer here; on GPUs the cost of one more forward pass is closer to the theoretical third, because there the backward pass is not as dominant.</p>
+<p><strong>Part 2.</strong> For twelve MLP blocks, no checkpointing keeps 2,304 MiB, full checkpointing 192 MiB (just the block inputs) and selective checkpointing, which saves the outputs of the matrix multiplies and recomputes LayerNorm and GELU, 1,152 MiB. Selective cost no extra time (recomputing elementwise ops is cheap), full cost about 6% here. All three give identical gradients. Choosing what to save is a policy: save what is expensive to recompute (matrix multiplies), recompute what is cheap but large (elementwise results, attention scores).</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Checkpoint a block that contains dropout, and recompute it during backward without restoring the random number generator's state. What happens to the gradients? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Selective activation recomputation</strong> (Megatron-Core's <code>selective</code> mode, PyTorch's selective activation checkpointing with policies) is the default in large-model training; full recompute is kept for the tightest memory budgets.</li>
+<li><strong>FlashAttention</strong> in every training stack removes the quadratic attention-score memory, the biggest single activation cost at long context.</li>
+<li><strong>Activation offload</strong> to CPU (PyTorch <code>save_on_cpu</code>, Megatron-Core fine-grained offloading) for long-context training where recompute is too slow.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2205.05198">Korthikanti et al.</a>, <a href="https://arxiv.org/abs/1604.06174">Chen et al.</a>, <a href="https://docs.pytorch.org/docs/stable/checkpoint.html">PyTorch checkpoint docs</a>, <a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/training/activation-recomputation.html">Megatron Bridge activation recomputation</a>, <a href="https://arxiv.org/abs/2307.08691">FlashAttention-2</a>, <a href="https://docs.pytorch.org/docs/stable/autograd.html#saved-tensors-hooks">PyTorch autograd saved tensors hooks</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Backward needs forward intermediates; storing all of them can dwarf the weights.</li>
+<li>Checkpointing stores segment inputs and recomputes the rest: one more forward, identical gradients.</li>
+<li>Per layer: 34·sbh bytes plus 5·a·s²·b for attention scores; FlashAttention removes the second.</li>
+<li>Selective checkpointing keeps expensive-to-recompute tensors and recomputes cheap ones.</li>
+<li>Offload trades memory for PCIe traffic instead of FLOPs.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-training-memory-checkpoints"><span class="t" style="--cs-hue:20">TM</span>Cheat sheet · Checkpoints, Gradient Accumulation and Training Memory</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/prompt-activation-recompute-policy.md</code> — a prompt that takes your model config (layers, hidden, seq, batch) and available GPU memory and emits a per-layer recompute policy (none / selective / full / offload).</p>
+<p><strong><code>outputs/skill-checkpointing-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: checkpointing-planner
+description: Choose an activation recomputation policy per layer (none / selective / full / offload) given a training config and HBM budget.
+version: 1.0.0
+phase: 10
+lesson: 34
+tags: [gradient-checkpointing, activation-recomputation, selective-checkpoint, fsdp-offload, training-memory]
+---
+
+Given the training config (layer count L, hidden size d, sequence length S, microbatch B, dtype bytes per value, attention kernel, tensor-parallel degree TP, pipeline-parallel degree PP, expert-parallel degree EP if MoE) and the per-rank HBM budget after weights and optimizer state, output:
+
+1. Per-layer policy. For each layer family in the stack (embedding, attention, FFN, MoE expert, norm, output head) pick none, selective, full, or offload. Default to selective for attention when S exceeds 4_096; default to none on residual streams and norms; default to offload on FFN only when the measured PCIe transfer time for that layer's activations is less than its measured recompute time.
+2. Segment size k. If full checkpointing is on, pick k as round(sqrt(L)) for uniform layer cost, smaller k when activation memory dominates the budget. Report extra FLOP percentage as (1/k) of forward FLOPs.
+3. FlashAttention interaction. Confirm whether the attention kernel already recomputes softmax. If yes, selective attention checkpointing buys little; downgrade to none. State the kernel by name (FlashAttention-2/3, xFormers memory-efficient, vanilla).
+4. TP / PP plan. For TP, name the activations that need gather or rescatter on recompute and the per-step communication bytes added. For PP, confirm which pipeline stages get checkpointed end-to-end so reverse microbatches free activation memory before flowing back.
+5. Budget math. Predict activation memory before and after the policy (in MB per rank). Predict FLOP overhead as percent of fwd+bwd. Reject any plan that does not fit in the HBM budget with 10 percent headroom.
+
+Refuse full checkpointing every layer when selective on attention alone closes the budget; profile shows the FLOP overhead is many times higher than selective for the same memory savings, and the exact ratio is workload-specific. Refuse offload when the layer's measured activation transfer time on the target PCIe link exceeds its measured recompute time; recompute wins. Refuse &quot;checkpoint everywhere&quot; for FP8 training when the chosen framework does not snapshot amax history; the recompute will drift the scale and silently corrupt gradients.
+
+Example input: &quot;L=64, d=8192, S=8192, B=1, bf16, FlashAttention-3, TP=8, PP=4, HBM budget per rank 32 GB after weights, MoE with 8 experts and EP=8.&quot;
+
+Example output:
+- Per-layer policy: attention selective, FFN none, MoE expert full, embedding none, output head offload.
+- Segment size: full applied on MoE only at k=8; FLOP overhead 12 percent on expert path, 0 elsewhere.
+- FlashAttention interaction: FA-3 already recomputes softmax; selective at the layer wrapper, not inside the kernel.
+- TP / PP plan: TP gather of the attention input on recompute, 0.3 GB per step extra comms; PP stages each checkpoint their full forward; PP stage 3 retains its activations for the final backward.
+- Budget math: activations 38 GB without policy, 11 GB with policy. Total FLOP overhead 7.5 percent fwd+bwd.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Verify correctness. Run <code>model_forward</code> + <code>model_backward</code> (full activations) vs <code>model_forward_checkpointed</code> + <code>model_backward_checkpointed</code> (segments). Parameter gradients must be identical to machine precision.</p>
+</li>
+<li>
+<p>Sweep segment size <code>k</code> from 1 to <code>L</code>. Plot FLOP overhead and memory. Find the knee of the curve.</p>
+</li>
+<li>
+<p>Implement selective checkpointing: store the attention-module input but not its intermediates. Measure the FLOP overhead vs full-layer checkpointing for a 32-layer model at seq=8192.</p>
+</li>
+<li>
+<p>Add offload. Save segment inputs to a simulated "CPU buffer" (a separate list). Measure "PCIe bandwidth" as bytes/time and find the breakeven point between offload and recompute.</p>
+</li>
+<li>
+<p>Benchmark a real PyTorch transformer with and without <code>torch.utils.checkpoint</code>. Measure memory (via <code>torch.cuda.max_memory_allocated</code>) and step time.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1034-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Not quite to 68 MiB, and only slightly slower</span></summary><div class="qa-a"><p>Not quite to 68 MiB: memory falls from 2,633 MiB to 569 MiB. The 30 layer inputs are indeed only 68 MiB, but the logits (2 × 512 × 49,152 numbers, 192 MiB) and the loss computation sit outside the checkpointed decoder layers and are still stored. With large vocabularies the output layer is a big part of what remains; chunked or fused cross-entropy losses exist for this reason. And the step was only about 5% slower on this CPU, with exactly the same gradients.</p></div></details>
+<details class="qa" id="a1034-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Different dropout masks, wrong gradients</span></summary><div class="qa-a"><p>The recomputed forward uses different dropout masks, so the activations rebuilt in backward differ from the ones that produced the loss, and the gradients are computed for a network that never ran: wrong, and differently wrong at every step. Training may still appear to work, just worse and less reproducibly. This is why <code>torch.utils.checkpoint</code> saves and restores the random number generator state by default (<code>preserve_rng_state=True</code>), and why Megatron tracks separate RNG states for tensor-parallel ranks. The same applies to any non-deterministic op, and FP8 scaling factors must be replayed for the same reason.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/1604.06174">Chen et al., 2016 -- "Training Deep Nets with Sublinear Memory Cost"</a> -- the original paper that formalized gradient checkpointing</li>
+<li><a href="https://arxiv.org/abs/2205.05198">Korthikanti et al., 2022 -- "Reducing Activation Recomputation in Large Transformer Models"</a> -- selective activation recomputation and the formal cost analysis</li>
+<li><a href="https://arxiv.org/abs/2002.05645">Pudipeddi et al., 2020 -- "Training Large Neural Networks with Constant Memory using a New Execution Algorithm"</a> -- alternative constant-memory approach via reverse-mode rematerialization</li>
+<li><a href="https://arxiv.org/abs/2101.06840">Ren et al., 2021 -- "ZeRO-Offload: Democratizing Billion-Scale Model Training"</a> -- activation offload at scale</li>
+<li><a href="https://pytorch.org/docs/stable/checkpoint.html">PyTorch torch.utils.checkpoint docs</a> -- the standard API</li>
+<li><a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/training/activation-recomputation.html">Megatron Bridge activation recomputation documentation</a> -- selective, full, and block modes</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1034" id="done-a1034">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1034" id="undo-a1034" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1025"><span class="pn-dir">Previous</span><span class="pn-t">10.30 · EAGLE and Speculative Decoding Basics</span></a><a class="pn next" href="#l2704"><span class="pn-dir">Next</span><span class="pn-t">10.32 · What language models get wrong, and why retrieval, tools and agents exist</span></a></div></footer>

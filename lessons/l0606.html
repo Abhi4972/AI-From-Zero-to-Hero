@@ -1,0 +1,599 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Middleware: approvals, limits, summaries and guardrails</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.56</span><span class="chip">70 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0606" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Name the points in the agent loop where middleware runs, and write your own hooks</li>
+<li>Pause an agent before a risky tool call, and approve, reject or edit it from outside the run</li>
+<li>Add call limits, conversation summaries and PII redaction with built-in middleware</li>
+<li>Predict the order in which several middleware run, and why it matters</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l0605">Lesson 14.55</a>. <a class="xref" href="#l0302">Lessons 14.3</a> (the approval hook), 3.5 (pausing for approval) and 2.8 (compaction) are the hand-built versions.</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 70 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langchain</code> 1.5.2 and <code>langgraph</code> 1.2.24.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0606-0">Middleware</a></td>
+<td>Hooks that run around the agent loop's model and tool calls</td>
+<td>The problem</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0606-1">Interrupt</a></td>
+<td>A pause in a graph run that returns a request to the caller and waits for a resume</td>
+<td>Idea 2</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0606-2">PII redaction</a></td>
+<td>Replacing personal data such as email addresses before a model or a log sees it</td>
+<td>Idea 5</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">2</span><span class="lb-names">LangGraph, Sandbox</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>LangGraph</td><td>A library for building agents as graphs of steps with saved state, so runs can pause, resume and branch</td><td><a class="xref" href="#l0610">Lesson 14.60</a></td></tr><tr><td>Sandbox</td><td>An isolated environment where an agent&#x27;s code or actions cannot reach anything important</td><td><a class="xref" href="#l1003">Lesson 15.23</a></td></tr></tbody></table></div></details>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">The model on this page is the lab rig</div><div class="co-body"><p><code>chat</code> is a real <span class="cx" data-c="326" tabindex="0">LangChain</span> chat model pointed at <code>mockllm</code> (<a class="xref" href="#l0601">Lesson 14.51</a>), which follows fixed rules. Everything around the model, the <mark class="term" id="term-l0606-0" title="Industry term: Middleware. Hooks that run around the agent loop&#x27;s model and tool calls">middleware</mark>, interrupts and checkpoints, is the real library.</p></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from mockllm import start                       # the lab rig (Lesson 6.1)
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+
+chat = init_chat_model(&quot;openai:mock-model&quot;, base_url=start(), api_key=&quot;mock&quot;, temperature=0)
+ORDERS = {&quot;A-1001&quot;: &quot;shipped&quot;, &quot;A-1002&quot;: &quot;processing&quot;}
+
+@tool
+def get_order_status(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Return the shipping status for a ShopKart order ID like 'A-1001'.&quot;&quot;&quot;
+    return f&quot;{order_id} is {ORDERS.get(order_id, 'not found')}&quot;
+
+@tool
+def cancel_order(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Cancel a ShopKart order that has not shipped yet.&quot;&quot;&quot;
+    return f&quot;{order_id} cancelled&quot;
+</code></pre></div>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Teams kept forking <code>create_agent</code> to add trimming, retries, approvals or model switching. Following the pattern web frameworks used for decades, LangChain 1.0 added <strong>middleware</strong>: hooks around each model and <span class="cx" data-c="637" tabindex="0">tool call</span>, so behaviour can be added without rewriting the loop.</p></div></aside>
+<h2>The problem: the agent loop needs hooks</h2>
+<p>The plain <code>create_agent</code> loop from <a class="xref" href="#l0605">Lesson 14.55</a> cancels an order the moment a customer asks. Production agents need more than the loop: a person approving risky actions, a cap on how many model calls a run may make, history that is summarized before it overflows the <span class="cx" data-c="135" tabindex="0">context window</span>, personal data kept away from the model. In <a class="xref" href="#l0302">Lesson 14.3</a> you added <code>risky</code> and <code>approve</code> hooks to your own <code>Agent</code> class for this. <strong>Middleware</strong> is LangChain's set of hooks around the loop, and a library of ready-made ones.</p>
+<h2>Idea 1 · Where middleware runs</h2>
+<p><strong>Middleware</strong> is code that runs at fixed points of the <span class="cx" data-c="20" tabindex="0">agent loop</span>: before the model is called, around the model call, around each tool call, and after the model replies. The four small functions below do nothing except print a line when they run. Attach them to an agent, ask one question, and the printout shows you the order of the hooks.</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 880 320" role="img" aria-label="Where middleware runs in the agent loop. Node-style hooks (before and after) run at fixed points and can read or change the state. Wrap-style hooks surround the model call or a tool call, so they can change the request, retry it, replace the result, or skip the call entirely." style="min-width:560px"><defs><marker id="ah141" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah141a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah141p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah141k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah141r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah141w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><rect class="b" x="30" y="130" width="110" height="50" rx="8"/><text x="85.0" y="159.5" text-anchor="middle">run starts</text><rect class="a" x="200" y="60" width="240" height="200" rx="12"/><text class="mono" x="320" y="84" text-anchor="middle">wrap_model_call</text><rect class="b" x="230" y="130" width="180" height="60" rx="8"/><text x="320.0" y="156.5" text-anchor="middle" font-weight="600">model call</text><text class="s" x="320.0" y="172.5" text-anchor="middle">request → response</text><rect class="p" x="560" y="60" width="220" height="200" rx="12"/><text class="mono" x="670" y="84" text-anchor="middle">wrap_tool_call</text><rect class="b" x="590" y="130" width="160" height="60" rx="8"/><text x="670.0" y="156.5" text-anchor="middle" font-weight="600">one tool call</text><text class="s" x="670.0" y="172.5" text-anchor="middle">arguments → result</text><path class="l" d="M 142.0 155.0 L 198.0 155.0" marker-end="url(#ah141)"/><text class="mono" x="170" y="116" text-anchor="middle">before_agent</text><text class="mono" x="170" y="196" text-anchor="middle">before_model</text><path class="l" d="M 442.0 155.0 L 558.0 155.0" marker-end="url(#ah141)"/><text class="s" x="500.0" y="149.0" text-anchor="middle">tool calls?</text><text class="mono" x="500" y="196" text-anchor="middle">after_model</text><path class="l d" d="M 670 262 C 670 304, 320 304, 320 262" marker-end="url(#ah141)"/><text class="s" x="495" y="312" text-anchor="middle">tool results go back; before_model runs again</text><path class="l" d="M 500.0 138.0 L 500.0 40.0" marker-end="url(#ah141)"/><text class="s" x="510" y="34" text-anchor="start">no tool calls: after_agent runs and the run ends</text><text class="s" x="320" y="228" text-anchor="middle">change the prompt, tools or model;</text><text class="s" x="320" y="244" text-anchor="middle">retry, fall back, cache</text><text class="s" x="670" y="228" text-anchor="middle">approve, block, retry,</text><text class="s" x="670" y="244" text-anchor="middle">or replace the result</text></svg></div><figcaption>Where middleware runs in the agent loop. Node-style hooks (before and after) run at fixed points and can read or change the state. Wrap-style hooks surround the model call or a tool call, so they can change the request, retry it, replace the result, or skip the call entirely.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents import create_agent
+from langchain.agents.middleware import before_model, after_model, wrap_model_call, wrap_tool_call
+
+@before_model
+def count_messages(state, runtime):
+    print(f&quot;  before_model   | {len(state['messages'])} messages so far&quot;)
+
+@wrap_model_call
+def time_model(request, handler):
+    response = handler(request)                         # the actual model call happens here
+    print(f&quot;  wrap_model_call| model returned {len(response.result[-1].tool_calls)} tool call(s)&quot;)
+    return response
+
+@after_model
+def after(state, runtime):
+    print(f&quot;  after_model    | last message is {type(state['messages'][-1]).__name__}&quot;)
+
+@wrap_tool_call
+def log_tool(request, handler):
+    print(f&quot;  wrap_tool_call | {request.tool_call['name']}({request.tool_call['args']})&quot;)
+    return handler(request)
+
+agent = create_agent(chat, tools=[get_order_status], middleware=[count_messages, time_model, after, log_tool])
+print(agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is A-1002?&quot;}]})[&quot;messages&quot;][-1].content)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  before_model   | 1 messages so far
+  wrap_model_call| model returned 1 tool call(s)
+  after_model    | last message is AIMessage
+  wrap_tool_call | get_order_status({'order_id': 'A-1002'})
+  before_model   | 3 messages so far
+  wrap_model_call| model returned 0 tool call(s)
+  after_model    | last message is AIMessage
+Here is what I found: A-1002 is processing
+</code></pre></div></div></aside>
+<p>Read the output as a timeline. Each model call is surrounded by <code>before_model</code>, <code>wrap_model_call</code> (which receives a <code>handler</code>; calling it is the model call) and <code>after_model</code>. Each tool call runs inside <code>wrap_tool_call</code>. There are also <code>before_agent</code> and <code>after_agent</code>, which run once per invocation. Every built-in middleware below is made of these hooks:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Hook</th>
+<th>Runs</th>
+<th>Typical use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>before_agent</code>, <code>after_agent</code></td>
+<td>Once per <code>invoke</code></td>
+<td>Load or save per-user data, final checks</td>
+</tr>
+<tr>
+<td><code>before_model</code></td>
+<td>Before every model call</td>
+<td>Trim or summarize history, redact input</td>
+</tr>
+<tr>
+<td><code>wrap_model_call</code></td>
+<td>Around every model call</td>
+<td>Retries, fallbacks, choosing a model or tools per call, dynamic prompts</td>
+</tr>
+<tr>
+<td><code>after_model</code></td>
+<td>After every model call</td>
+<td>Approval of tool calls, limits, output checks</td>
+</tr>
+<tr>
+<td><code>wrap_tool_call</code></td>
+<td>Around every tool call</td>
+<td>Retries, timing, error handling, logging</td>
+</tr>
+</tbody>
+</table></div>
+<p>Hooks can also change things, not just watch: a <code>before_model</code> hook can return <code>{"messages": ...}</code> to update the state, and a <code>wrap_model_call</code> hook can change <code>request</code> (its messages, tools or model) before calling <code>handler</code>.</p>
+<p>There are two shapes of hook, and the difference explains most of what follows:</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Checkpoints on a road, and wrappers around a call</div><div class="co-body"><ul>
+<li><strong>Node-style hooks</strong> (<code>before_agent</code>, <code>before_model</code>, <code>after_model</code>, <code>after_agent</code>) are checkpoints the agent passes: your function sees the <strong>state</strong> and may return changes to it, or a jump. What they return is <strong>saved</strong> in the agent's state.</li>
+<li><strong>Wrap-style hooks</strong> (<code>wrap_model_call</code>, <code>wrap_tool_call</code>) wrap one call, like a decorator (<a class="xref" href="#l2108">Lesson 0.16</a>). Your function gets the <strong>request</strong> about to be sent and a <code>handler</code> that performs it; you may change the request, call the handler, retry it, or skip it. Changes to the request affect <strong>that call only</strong> and are not saved.</li>
+</ul></div></aside>
+<p>The same loop in plain Python, with the hook points marked, shows where each runs:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def call_model(messages):                        # stands in for the real model
+    return &quot;TOOL:lookup&quot; if len(messages) == 1 else &quot;Here is your answer.&quot;
+
+def plain_agent(user_text, before_model=None, wrap_model=None):
+    messages = [user_text]
+    while True:
+        if before_model: before_model(messages)                        # node-style: sees the state
+        call = wrap_model(call_model) if wrap_model else call_model    # wrap-style: wraps the call
+        reply = call(messages)
+        messages.append(reply)
+        if not reply.startswith(&quot;TOOL:&quot;):
+            return messages
+        messages.append(f&quot;result of {reply[5:]}&quot;)                       # run the tool
+
+def log_size(messages):
+    print(f&quot;[before_model] {len(messages)} messages&quot;)
+
+def wrapped(inner):                                                     # receives the &quot;handler&quot;
+    def wrapper(messages):
+        reply = inner(messages)                                         # the real call happens here
+        print(f&quot;[wrap_model] model replied {reply!r}&quot;)
+        return reply
+    return wrapper
+
+print(plain_agent(&quot;Where is A-1002?&quot;, before_model=log_size, wrap_model=wrapped))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[before_model] 1 messages
+[wrap_model] model replied 'TOOL:lookup'
+[before_model] 3 messages
+[wrap_model] model replied 'Here is your answer.'
+['Where is A-1002?', 'TOOL:lookup', 'result of lookup', 'Here is your answer.']
+</code></pre></div></div></aside>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Plain Python above</th>
+<th>LangChain middleware</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>before_model(messages)</code> at the top of the loop</td>
+<td><code>@before_model</code>, receiving <code>state</code> and <code>runtime</code></td>
+</tr>
+<tr>
+<td><code>wrap_model(call_model)</code> returning a wrapper</td>
+<td><code>@wrap_model_call</code>, receiving <code>request</code> and <code>handler</code></td>
+</tr>
+<tr>
+<td><code>inner(messages)</code> inside the wrapper</td>
+<td><code>handler(request)</code>: the real call, through any inner middleware</td>
+</tr>
+<tr>
+<td>The <code>while True</code> loop</td>
+<td>The graph <code>create_agent</code> builds</td>
+</tr>
+</tbody>
+</table></div>
+<p>A <code>request</code> carries <code>messages</code>, <code>system_message</code>, <code>tools</code>, <code>model</code>, <code>state</code> and <code>runtime</code> (with <code>context</code> and <code>store</code>); <code>request.override(...)</code> returns a copy with some of them replaced.</p>
+<h2>Idea 2 · Human approval: pause, decide, resume</h2>
+<p>Some tools should not run until a person agrees. <code>HumanInTheLoopMiddleware</code> names those tools. When the model asks for one, the run stops and returns a description of the pending call. Your application shows it to a person and then resumes the same run with their decision. Because the run has to be found again later, the agent needs a checkpointer and a thread ID. Watch a cancellation pause and then continue:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+
+guarded = create_agent(chat, tools=[get_order_status, cancel_order], checkpointer=InMemorySaver(),
+                       middleware=[HumanInTheLoopMiddleware(interrupt_on={&quot;cancel_order&quot;: True})])
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;customer-42&quot;}}
+
+out = guarded.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Please cancel A-1002&quot;}]}, cfg, version=&quot;v2&quot;)
+request = out.interrupts[0].value
+print(&quot;paused for:&quot;, request[&quot;action_requests&quot;][0][&quot;name&quot;], request[&quot;action_requests&quot;][0][&quot;args&quot;])
+print(&quot;allowed:   &quot;, request[&quot;review_configs&quot;][0][&quot;allowed_decisions&quot;])
+print(&quot;next step: &quot;, guarded.get_state(cfg).next)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">paused for: cancel_order {'order_id': 'A-1002'}
+allowed:    ['approve', 'edit', 'reject', 'respond']
+next step:  ('HumanInTheLoopMiddleware.after_model',)
+</code></pre></div></div></aside>
+<p>The model asked to cancel; <code>HumanInTheLoopMiddleware</code> stopped the run in its <code>after_model</code> hook, before the tool ran, and returned an <strong><mark class="term" id="term-l0606-1" title="Industry term: Interrupt. A pause in a graph run that returns a request to the caller and waits for a resume">interrupt</mark></strong> describing the request. The checkpointer saved the state, and <code>next</code> shows where the run will continue. Nothing is waiting in memory: the decision can come minutes or days later, from another process, such as an approval dashboard. You resume by invoking the same thread with a <code>Command</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">out = guarded.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;reject&quot;, &quot;message&quot;: &quot;Customer must confirm by phone first&quot;}]}),
+                     cfg, version=&quot;v2&quot;)
+print(out.value[&quot;messages&quot;][-2].content)
+print(out.value[&quot;messages&quot;][-1].content)
+
+cfg2 = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;customer-43&quot;}}
+guarded.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Please cancel A-1002&quot;}]}, cfg2, version=&quot;v2&quot;)
+out = guarded.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;approve&quot;}]}), cfg2, version=&quot;v2&quot;)
+print(out.value[&quot;messages&quot;][-1].content)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">User rejected the tool call for `cancel_order` with reason: Customer must confirm by phone first
+Here is what I found: User rejected the tool call for `cancel_order` with reason: Customer must confirm by phone first
+Here is what I found: A-1002 cancelled
+</code></pre></div></div></aside>
+<p>A rejection becomes a <code>ToolMessage</code> with your reason, so the model can tell the customer what happens next; an approval runs the tool. This is <a class="xref" href="#l0305">Lesson 14.6</a>'s <code>waiting_for_approval</code> and <code>decide</code>, built on <span class="cx cx-later" data-c="327" tabindex="0">LangGraph</span><a class="cx-pill" href="#l0610" title="Taught later, in Lesson 6.10">later · 14.60</a>'s <code>interrupt</code> and <code>Command</code>, which <a class="xref" href="#l0613">Lesson 14.63</a> uses directly.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Two places, two people</div><div class="co-body"><p>Approval needs two decisions, by two people, at two times. <strong>At setup, the developer writes the policy</strong> in <code>interrupt_on</code>: which tools pause, and which answers a reviewer may give. <strong>At run time, the reviewer decides each case</strong>, and that answer goes into <code>Command(resume=...)</code>.</p></div></aside>
+<p>The policy, one entry per tool:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th><code>interrupt_on</code> value</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>False</code>, or the tool left out</td>
+<td>Never pause</td>
+</tr>
+<tr>
+<td><code>True</code></td>
+<td>Pause, and allow all four decisions</td>
+</tr>
+<tr>
+<td><code>{"allowed_decisions": [...]}</code></td>
+<td>Pause, and allow only those</td>
+</tr>
+<tr>
+<td><code>{..., "when": fn}</code></td>
+<td>Pause only when <code>fn(request)</code> returns <code>True</code> for this call</td>
+</tr>
+<tr>
+<td><code>{..., "description": "..."}</code></td>
+<td>The text the reviewer sees</td>
+</tr>
+</tbody>
+</table></div>
+<p>The reviewer's four decisions:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Decision</th>
+<th>Shape</th>
+<th>What the model sees</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>approve</td>
+<td><code>{"type": "approve"}</code></td>
+<td>The tool's real result</td>
+</tr>
+<tr>
+<td>edit</td>
+<td><code>{"type": "edit", "edited_action": {"name": "cancel_order", "args": {...}}}</code></td>
+<td>The result of the edited call, plus a note that a reviewer changed it</td>
+</tr>
+<tr>
+<td>reject</td>
+<td><code>{"type": "reject", "message": "..."}</code></td>
+<td>An <strong>error</strong> result: "User rejected the tool call..."</td>
+</tr>
+<tr>
+<td>respond</td>
+<td><code>{"type": "respond", "message": "..."}</code></td>
+<td>Your text as a <strong>successful</strong> result, as if the tool returned it</td>
+</tr>
+</tbody>
+</table></div>
+<p>Never use <code>respond</code> to deny: the model would believe the action succeeded. It is for tools that ask the customer a question, where the reviewer's reply is the answer.</p>
+<p>The resume shape depends on <code>interrupt_mode</code>. The default, <code>"batched"</code>, is what you just used: one pause per model turn, whose value lists every gated call under <code>action_requests</code>, answered with <code>{"decisions": [...]}</code>, <strong>one decision per action, in the same order</strong>. With <code>"per_call"</code>, each gated call is its own pause, answered by interrupt ID. A <code>when</code> function narrows the gate to the risky calls, here high-value orders only:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">HIGH_VALUE = {&quot;A-1002&quot;}
+
+def high_value(request) -&gt; bool:                         # request.tool_call has name, args and id
+    return request.tool_call[&quot;args&quot;][&quot;order_id&quot;] in HIGH_VALUE
+
+per_call = create_agent(chat, tools=[cancel_order], checkpointer=InMemorySaver(), middleware=[
+    HumanInTheLoopMiddleware(interrupt_on={&quot;cancel_order&quot;: {&quot;allowed_decisions&quot;: [&quot;approve&quot;, &quot;reject&quot;],
+                                                            &quot;when&quot;: high_value}},
+                             interrupt_mode=&quot;per_call&quot;)])
+
+for order in [&quot;A-1003&quot;, &quot;A-1002&quot;]:
+    c = {&quot;configurable&quot;: {&quot;thread_id&quot;: f&quot;pc-{order}&quot;}}
+    out = per_call.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;Please cancel {order}&quot;}]}, c, version=&quot;v2&quot;)
+    if not out.interrupts:
+        print(order, &quot;-&gt; no pause:&quot;, out.value[&quot;messages&quot;][-1].content)
+        continue
+    pause = out.interrupts[0]
+    print(order, &quot;-&gt; paused:&quot;, {k: pause.value[k] for k in (&quot;type&quot;, &quot;name&quot;, &quot;args&quot;)})
+    out = per_call.invoke(Command(resume={pause.id: {&quot;type&quot;: &quot;approve&quot;}}), c, version=&quot;v2&quot;)   # keyed by ID
+    print(order, &quot;-&gt; after approval:&quot;, out.value[&quot;messages&quot;][-1].content)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A-1003 -&gt; no pause: Here is what I found: A-1003 cancelled
+A-1002 -&gt; paused: {'type': 'tool_approval', 'name': 'cancel_order', 'args': {'order_id': 'A-1002'}}
+A-1002 -&gt; after approval: Here is what I found: A-1002 cancelled
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li>A-1003 is not in <code>HIGH_VALUE</code>, so <code>when</code> returned <code>False</code> and the tool ran without a pause.</li>
+<li>A-1002 paused. In per-call mode the interrupt's value describes one call: <code>type</code> (<code>"tool_approval"</code>), <code>name</code>, <code>args</code>, plus <code>tool_call_id</code> and <code>description</code>.</li>
+<li>The resume maps that interrupt's ID to one decision. In batched mode the same answer would be <code>{"decisions": [{"type": "approve"}]}</code>. Mixing up the two shapes is the most common approval bug.</li>
+<li><code>when</code> runs again on resume, so it must give the same answer for the same call: no clocks or lookups that can change.</li>
+</ul></div></aside>
+<h2>Idea 3 · Limits that end a run gracefully</h2>
+<p><a class="xref" href="#l0302">Lesson 14.3</a>'s loop had a step limit so that a confused agent could not run for ever. The middleware version is a pair of counters: one for model calls, one for tool calls. With <code>exit_behavior="end"</code> the run stops cleanly with what it has so far, without raising an error. Here the limit is set to one model call, so that you can see it trigger:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import ModelCallLimitMiddleware, ToolCallLimitMiddleware
+
+capped = create_agent(chat, tools=[get_order_status],
+                      middleware=[ModelCallLimitMiddleware(run_limit=1, exit_behavior=&quot;end&quot;)])
+for m in capped.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is A-1001?&quot;}]})[&quot;messages&quot;]:
+    print(f&quot;{type(m).__name__:12} | {m.content or m.tool_calls[0]['name']}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">HumanMessage | Where is A-1001?
+AIMessage    | get_order_status
+ToolMessage  | A-1001 is shipped
+AIMessage    | Model call limits exceeded: run limit (1/1)
+</code></pre></div></div></aside>
+<p>With <code>run_limit=1</code> the agent ran the tool but was not allowed a second model call, so the middleware ended the run with a message instead of raising. <code>exit_behavior="error"</code> raises instead, which suits batch jobs where a half-answered run should fail loudly. <code>thread_limit</code> caps calls across a whole conversation, and <code>ToolCallLimitMiddleware</code> does the same for one tool or for all of them. Compare <code>recursion_limit</code> (<a class="xref" href="#l0605">Lesson 14.55</a>), which counts graph steps and always raises.</p>
+<h2>Idea 4 · Summaries before the context overflows</h2>
+<p><a class="xref" href="#l0208">Lesson 11.8</a> <span class="cx" data-c="122" tabindex="0">compacted</span> long conversations by hand. <code>SummarizationMiddleware</code> does it in <code>before_model</code>: when the history passes a trigger, older messages are replaced by a summary written by a model you choose, and the most recent ones are kept as they are.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import SummarizationMiddleware
+
+long_chat = create_agent(chat, tools=[get_order_status], checkpointer=InMemorySaver(),
+                         middleware=[SummarizationMiddleware(chat, trigger=(&quot;messages&quot;, 6), keep=(&quot;messages&quot;, 2))])
+cfg3 = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;long&quot;}}
+for q in [&quot;Where is A-1001?&quot;, &quot;Where is A-1002?&quot;, &quot;Where is A-1001 now?&quot;]:
+    msgs = long_chat.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: q}]}, cfg3)[&quot;messages&quot;]
+    print(f&quot;{len(msgs)} messages | first: {msgs[0].content[:48]!r}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">4 messages | first: 'Where is A-1001?'
+4 messages | first: 'Here is a summary of the conversation to date:\n\n'
+4 messages | first: 'Here is a summary of the conversation to date:\n\n'
+</code></pre></div></div></aside>
+<p>The thread stays at four messages: a summary, then the recent turn. The lab rig's "summary" is its fixed sentence; a real model writes one, guided by a default prompt that asks for the session's intent, decisions, artifacts and next steps. Triggers can be a message count, a token count, or a fraction of the model's context window. The middleware never splits a tool call from its result, which would break the conversation (<a class="xref" href="#l0301">Lesson 14.2</a>'s rule).</p>
+<h2>Idea 5 · Personal data never reaches the model</h2>
+<p><code>PIIMiddleware</code> finds personal data in the messages, such as an email address, and replaces it before the request leaves your process. To prove that it works, a second small middleware prints exactly what the model is about to receive:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import PIIMiddleware
+
+@wrap_model_call
+def show_request(request, handler):
+    print(&quot;model sees:&quot;, next(m.content for m in request.messages if m.type == &quot;human&quot;))
+    return handler(request)
+
+private = create_agent(chat, tools=[get_order_status], middleware=[PIIMiddleware(&quot;email&quot;, strategy=&quot;redact&quot;), show_request])
+private.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is A-1001? Mail me at ravi@example.com&quot;}]})
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">model sees: Where is A-1001? Mail me at [REDACTED_EMAIL]
+model sees: Where is A-1001? Mail me at [REDACTED_EMAIL]
+</code></pre></div></div></aside>
+<p>The email address was replaced before the first model call (it prints twice because the agent made two model calls, both with the redacted text). Strategies are <code>redact</code>, <code>mask</code> (keep the last characters), <code>hash</code> and <code>block</code> (raise). Built-in detectors cover email, credit card, IP, MAC address and URL; you can pass your own regex or function, for example for Indian phone numbers or PAN numbers. Because redaction changed the message in the state, the original address is not saved in checkpoints either. <a class="xref" href="#l1001">Lesson 15.21</a> covers what pattern-based detection misses.</p>
+<h2>The order of middleware</h2>
+<p>When several middleware wrap the same call, the order of the list matters. The first one listed is the outermost: it sees the request first and the response last, like the layers of an onion. Three tagging functions make the nesting visible:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def tag(name):
+    @wrap_model_call(name=f&quot;tag_{name}&quot;)       # middleware names must be unique
+    def mw(request, handler):
+        print(f&quot;  {name} in&quot;)
+        response = handler(request)
+        print(f&quot;  {name} out&quot;)
+        return response
+    return mw
+
+ordered = create_agent(chat, tools=[], middleware=[tag(&quot;A&quot;), tag(&quot;B&quot;)])
+ordered.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;hello&quot;}]})
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  A in
+  B in
+  B out
+  A out
+</code></pre></div></div></aside>
+<p>The first middleware in the list is the outermost: its <code>before_*</code> hooks run first and its <code>after_*</code> hooks run last, like nested function calls. Order is a design decision. Put redaction before anything that logs messages, or the log holds the personal data. Put retries inside fallbacks, so a model is retried before you give up on it. Put approval where it sees the final tool calls.</p>
+<h2>Other built-in middleware</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Middleware</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ModelFallbackMiddleware</code>, <code>ModelRetryMiddleware</code></td>
+<td>Try other models, or retry with backoff, when a model call fails</td>
+</tr>
+<tr>
+<td><code>ToolRetryMiddleware</code>, <code>ToolErrorMiddleware</code></td>
+<td>Retry failing tools; turn tool errors into results</td>
+</tr>
+<tr>
+<td><code>ContextEditingMiddleware</code></td>
+<td>Clear old tool results from the context once it grows past a size</td>
+</tr>
+<tr>
+<td><code>LLMToolSelectorMiddleware</code>, <code>ProviderToolSearchMiddleware</code></td>
+<td>Pick a relevant subset of many tools before each call (<a class="xref" href="#l0303">Lesson 14.4</a>'s <span class="cx" data-c="642" tabindex="0">tool search</span>). Measure before adopting: the selector is an extra model call per turn, and with a strong model and 100 tools it doubled calls and cost without improving accuracy in the LangChain manual's tests</td>
+</tr>
+<tr>
+<td><code>TodoListMiddleware</code></td>
+<td>Give the agent a planning tool and a to-do list in its state (<a class="xref" href="#l0308">Lesson 14.9</a>)</td>
+</tr>
+<tr>
+<td><code>LLMToolEmulator</code></td>
+<td>Have a model pretend to be tools, for testing before the tools exist</td>
+</tr>
+<tr>
+<td><code>ShellToolMiddleware</code>, <code>FilesystemFileSearchMiddleware</code></td>
+<td>A shell and file search, with execution policies for <span class="cx cx-later" data-c="548" tabindex="0">sandboxing</span><a class="cx-pill" href="#l1003" title="Taught later, in Lesson 10.3">later · 15.23</a></td>
+</tr>
+<tr>
+<td><code>@dynamic_prompt</code></td>
+<td>Build the <span class="cx" data-c="616" tabindex="0">system prompt</span> per call, for example from the user's tier</td>
+</tr>
+<tr>
+<td><code>ModelRefusalMiddleware</code></td>
+<td>Handle a provider refusal (a standard <code>refusal</code> content block since LangChain 1.5) instead of passing it on as an answer</td>
+</tr>
+<tr>
+<td><code>ModelRouterMiddleware</code> (beta, LangChain 1.5)</td>
+<td>Pick one of several configured models for each run, decided by a small <strong>decision model</strong> (<code>classifier=</code>) from the new <code>langchain_core.decisions</code> API</td>
+</tr>
+<tr>
+<td><code>AutoModeMiddleware</code> (beta, LangChain 1.5)</td>
+<td>Ask a decision model whether each call to the tools you list is risky or unauthorised, and block it if so; its default rule treats everything in state as data and only explicit user messages as permission</td>
+</tr>
+</tbody>
+</table></div>
+<p>Two more changes in LangChain 1.5 are worth knowing. <code>SummarizationMiddleware</code> accepts <code>summarizer=</code>, a separate model or function for writing summaries, so you can summarise with a cheap model. And the <strong>Decisions API</strong> (<code>langchain_core.decisions</code>) gives typed answers to questions such as yes/no (<code>Noul</code>), pick one (<code>Choice</code>) or rate (<code>Score</code>); the router and auto-mode middleware are built on it, and you can write your own guard on top of it. Both middlewares are beta: pin your version and test them on your own traffic.</p>
+<h2>What the library replaces</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>You wrote</th>
+<th>Middleware gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>risky</code> and <code>approve</code> hooks (<a class="xref" href="#l0302">Lesson 14.3</a>), <code>waiting_for_approval</code> and <code>decide</code> (<a class="xref" href="#l0305">Lesson 14.6</a>)</td>
+<td><code>HumanInTheLoopMiddleware</code> with a checkpointer and <code>Command(resume=...)</code></td>
+</tr>
+<tr>
+<td><code>max_steps</code> and <code>token_budget</code> (<a class="xref" href="#l0302">Lesson 14.3</a>)</td>
+<td><code>ModelCallLimitMiddleware</code>, <code>ToolCallLimitMiddleware</code></td>
+</tr>
+<tr>
+<td>Compaction (<a class="xref" href="#l0208">Lesson 11.8</a>)</td>
+<td><code>SummarizationMiddleware</code>, <code>ContextEditingMiddleware</code></td>
+</tr>
+<tr>
+<td>Retries and fallbacks (Lessons <a class="xref" href="#l0205">11.5</a> and <a class="xref" href="#l0304">14.5</a>)</td>
+<td><code>ModelRetryMiddleware</code>, <code>ModelFallbackMiddleware</code>, <code>ToolRetryMiddleware</code></td>
+</tr>
+<tr>
+<td>Your own logging around calls</td>
+<td><code>wrap_model_call</code>, <code>wrap_tool_call</code></td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangChain docs: <em>Middleware</em> (built-in middleware, custom middleware), <em><span class="cx" data-c="287" tabindex="0">Human-in-the-loop</span></em>.</li>
+<li><strong>Versions</strong>: <code>langchain</code> 1.5.2, <code>langgraph</code> 1.2.24.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Middleware hooks and decorators</td>
+<td>Stable since LangChain 1.0</td>
+</tr>
+<tr>
+<td><code>HumanInTheLoopMiddleware</code> (approve, edit, reject, respond)</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td>Summarization, call limits, PII, retries, fallbacks</td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>invoke(..., version="v2")</code> returning <code>interrupts</code> and <code>value</code></td>
+<td>Documented</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In Idea 1, <code>count_messages</code> printed 1 and then 3. What will it print for "Where are A-1001 and A-1002?", and why not 4 on the second call? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Use the approval middleware without a checkpointer:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">unsaved = create_agent(chat, tools=[cancel_order], middleware=[HumanInTheLoopMiddleware(interrupt_on={&quot;cancel_order&quot;: True})])
+state = unsaved.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Please cancel A-1002&quot;}]})
+print(sorted(state))
+try:
+    unsaved.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;approve&quot;}]}))
+except Exception as e:
+    print(type(e).__name__, &quot;|&quot;, str(e)[:90])
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['__interrupt__', 'messages']
+RuntimeError | Cannot use Command(resume=...) without checkpointer
+</code></pre></div>
+<p>The run paused. Why can it never be resumed? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: the approval that never arrives</div><div class="co-body"><p>ShopKart's approval dashboard resumes paused cancellations. Customers report that approved cancellations never happen. The dashboard code:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def approve_from_dashboard(ticket_id):
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: f&quot;approval-{ticket_id}&quot;}}       # the dashboard's thread ID
+    return guarded.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;approve&quot;}]}), cfg, version=&quot;v2&quot;)
+
+support_cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;customer-99&quot;}}               # the chat's thread ID
+guarded.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Please cancel A-1002&quot;}]}, support_cfg, version=&quot;v2&quot;)
+try:
+    approve_from_dashboard(99)
+except Exception as e:
+    print(type(e).__name__)
+print(&quot;customer-99 still waiting at:&quot;, guarded.get_state(support_cfg).next)
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">OpenAIConnectionError
+customer-99 still waiting at: ('HumanInTheLoopMiddleware.after_model',)
+</code></pre></div>
+<p>(The lab rig fails on a request with no messages, which the client reports as a connection error; a real provider returns a 400 error.) Find the bug. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Build <code>careful</code>, an agent that redacts emails, caps model calls at four per run, and pauses before <code>cancel_order</code> with only approve and reject allowed. Check what the saved state holds for the customer's message. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0606-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Parallel calls add one message per call</span></summary><div class="qa-a"><p>1, then 4: the question, the model's turn with two tool calls, and two <code>ToolMessage</code>s. It is 4 rather than 3 because each parallel call gets its own result message; there are still only two model calls.</p></div></details>
+<details class="qa" id="l0606-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A pause needs somewhere to wait</span></summary><div class="qa-a"><p>Pausing means saving the state and stopping; resuming means loading it. With no checkpointer, nothing was saved, so <code>Command(resume=...)</code> has nothing to continue and LangGraph raises <code>RuntimeError: Cannot use Command(resume=...) without checkpointer</code>. Any agent that can interrupt needs a checkpointer and a thread ID, and in production a database checkpointer (<a class="xref" href="#l0612">Lesson 14.62</a>), because a deploy restarts the process.</p></div></details>
+<details class="qa" id="l0606-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Resume the thread that paused</span></summary><div class="qa-a"><p>The dashboard resumes <code>approval-99</code>, a thread that never ran, so LangGraph starts a new run there with no messages, and the model call fails. The customer's thread, <code>customer-99</code>, is still waiting. The interrupt belongs to the thread that paused, so the approval request must carry that thread's ID:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def approve(thread_id):
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: thread_id}}                      # resume the thread that paused
+    return guarded.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;approve&quot;}]}), cfg, version=&quot;v2&quot;)
+
+print(approve(&quot;customer-99&quot;).value[&quot;messages&quot;][-1].content)
+print(&quot;customer-99 now at:&quot;, guarded.get_state(support_cfg).next)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Here is what I found: A-1002 cancelled
+customer-99 now at: ()
+</code></pre></div>
+<p>In production, store the thread ID with each pending approval, and alert on approvals that wait longer than your service level.</p></div></details>
+<details class="qa" id="l0606-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Redaction, limits and restricted decisions</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">careful = create_agent(chat, tools=[get_order_status, cancel_order], checkpointer=InMemorySaver(),
+                       middleware=[PIIMiddleware(&quot;email&quot;, strategy=&quot;redact&quot;),
+                                   ModelCallLimitMiddleware(run_limit=4, exit_behavior=&quot;end&quot;),
+                                   HumanInTheLoopMiddleware(interrupt_on={&quot;cancel_order&quot;: {&quot;allowed_decisions&quot;: [&quot;approve&quot;, &quot;reject&quot;]}})])
+c = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;c-1&quot;}}
+out = careful.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Please cancel A-1002, I'm ravi@example.com&quot;}]}, c, version=&quot;v2&quot;)
+print(out.interrupts[0].value[&quot;review_configs&quot;][0][&quot;allowed_decisions&quot;])
+print(careful.get_state(c).values[&quot;messages&quot;][0].content)
+out = careful.invoke(Command(resume={&quot;decisions&quot;: [{&quot;type&quot;: &quot;approve&quot;}]}), c, version=&quot;v2&quot;)
+print(out.value[&quot;messages&quot;][-1].content)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['approve', 'reject']
+Please cancel A-1002, I'm [REDACTED_EMAIL]
+Here is what I found: A-1002 cancelled
+</code></pre></div>
+<p>The saved conversation holds the redacted text, so the email never reaches the model, the checkpoint database or <span class="cx" data-c="649" tabindex="0">traces</span> that read the state. The approver can only approve or reject; an <code>edit</code> decision would be refused.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0606-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How does human approval work in a LangChain agent?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> <code>HumanInTheLoopMiddleware</code> runs after each model call. If the reply contains a call to a tool configured for review, it raises a LangGraph interrupt with the requested actions and the allowed decisions. The checkpointer saves the state and the run returns. Later, any process invokes the same thread with <code>Command(resume={"decisions": [...]})</code>; the middleware applies each decision: approve runs the tool, edit runs it with new arguments, reject sends the reason back to the model as a tool result, respond answers the model directly.</p>
+<p><strong>A plausible wrong answer.</strong> "The agent waits in a loop until someone approves." Nothing waits in memory; the run ends and is resumed from the checkpoint, which is why it survives restarts.</p>
+<p><strong>Follow-ups.</strong> What must be stored with each pending approval? How would you time out an approval?</p></div></details>
+<details class="qa" id="l0606-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">After adding a logging middleware, customer emails appear in your logs, even though <mark class="term" id="term-l0606-2" title="Industry term: PII redaction. Replacing personal data such as email addresses before a model or a log sees it">PII redaction</mark> is on. Why?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Middleware order. The logging middleware is earlier in the list than the redaction middleware, so its <code>before_model</code> hook (or its <code>wrap_model_call</code>, before calling the handler) sees the messages before redaction. The first middleware in the list is the outermost. Move redaction first, or log only after the handler returns, and add a test that sends a fake email and checks the logs.</p>
+<p><strong>A plausible wrong answer.</strong> "PII detection missed the email." The detector worked; the log read the message before it ran.</p>
+<p><strong>Follow-ups.</strong> Which other middleware would you put before logging?</p></div></details>
+<details class="qa" id="l0606-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Would you put guardrails, retries and approvals in middleware, or in a gateway and a separate service?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Both, by scope. Organization-wide policies that apply to every model call, such as provider fallbacks, budgets, rate limits and basic content filters, belong in a gateway (<a class="xref" href="#l1204">Lesson 14.108</a>), so every app gets them. Anything that depends on the agent's state belongs in middleware: approval of a specific tool call, limits per run or thread, summarizing this conversation, redaction before this agent's model sees the text. Approvals also need a service outside the agent to collect decisions and resume threads.</p>
+<p><strong>A plausible wrong answer.</strong> "All in middleware, so the agent is self-contained." Then every team reimplements, and drifts on, the same organization policies.</p>
+<p><strong>Follow-ups.</strong> How would you test that an approval rule cannot be bypassed?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Write a hook for each of <code>before_model</code>, <code>wrap_model_call</code> and <code>wrap_tool_call</code>, and print the order they run in.</li>
+<li>Pause an agent before a risky tool, then approve and reject from a separate call.</li>
+<li>Add a model-call limit that ends the run gracefully, and a summary that keeps the thread short.</li>
+<li>Explain the order of middleware, with one example where the wrong order leaks data.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0606-q1"><p class="q-text"><span class="q-num">Q1</span>When does HumanInTheLoopMiddleware stop the run?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0606-q1-o0"><span class="opt-key">A</span><span>Before the model is called</span></button><button type="button" class="opt" data-correct="true" id="l0606-q1-o1"><span class="opt-key">B</span><span>After the model asks for a configured tool, before the tool runs</span></button><button type="button" class="opt" data-correct="false" id="l0606-q1-o2"><span class="opt-key">C</span><span>After the tool runs</span></button><button type="button" class="opt" data-correct="false" id="l0606-q1-o3"><span class="opt-key">D</span><span>At the end of the conversation</span></button></div><p class="q-explain" hidden>It interrupts in its after_model hook, and the checkpointer saves the state.</p></div><div class="q" id="l0606-q2"><p class="q-text"><span class="q-num">Q2</span>How do you continue a paused run?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0606-q2-o0"><span class="opt-key">A</span><span>Call invoke again with the same question</span></button><button type="button" class="opt" data-correct="true" id="l0606-q2-o1"><span class="opt-key">B</span><span>Invoke the same thread with Command(resume={"decisions": [...]})</span></button><button type="button" class="opt" data-correct="false" id="l0606-q2-o2"><span class="opt-key">C</span><span>Restart the process</span></button><button type="button" class="opt" data-correct="false" id="l0606-q2-o3"><span class="opt-key">D</span><span>Use a new thread ID</span></button></div><p class="q-explain" hidden>A new thread ID starts a new, empty run.</p></div><div class="q" id="l0606-q3"><p class="q-text"><span class="q-num">Q3</span>Middleware list [A, B]: in which order do the after_model hooks run?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0606-q3-o0"><span class="opt-key">A</span><span>A, then B</span></button><button type="button" class="opt" data-correct="true" id="l0606-q3-o1"><span class="opt-key">B</span><span>B, then A</span></button><button type="button" class="opt" data-correct="false" id="l0606-q3-o2"><span class="opt-key">C</span><span>At the same time</span></button><button type="button" class="opt" data-correct="false" id="l0606-q3-o3"><span class="opt-key">D</span><span>Only A's runs</span></button></div><p class="q-explain" hidden>The first middleware is the outermost: first in, last out.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0606" id="done-l0606">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0606" id="undo-l0606" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0605"><span class="pn-dir">Previous</span><span class="pn-t">14.55 · create_agent: the LangChain agent loop</span></a><a class="pn next" href="#l0607"><span class="pn-dir">Next</span><span class="pn-t">14.57 · Retrieval with LangChain components</span></a></div></footer>

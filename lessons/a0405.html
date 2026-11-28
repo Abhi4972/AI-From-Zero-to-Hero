@@ -1,0 +1,668 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-04">Phase 4 · Computer Vision and Image Models</a></nav><h1>Fine-Tuning and Transfer Learning for Vision</h1><div class="m-meta"><span class="chip chip-num">Lesson 4.5</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a0405" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Distinguish feature extraction from fine-tuning and pick the right one based on dataset size, domain distance, and compute budget</li>
+<li>Load a pretrained backbone, replace its classifier head, and train only the head to a working baseline in under 20 lines</li>
+<li>Progressively unfreeze layers with discriminative learning rates so early generic features get smaller updates than late task-specific ones</li>
+<li>Diagnose the three common failures: feature drift from too-high LR on unfrozen blocks, BN statistics collapse on tiny datasets, and catastrophic forgetting</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 4.3 (CNNs), Lesson 4.4 (Image Classification with CNNs)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Somebody else spent a million GPU hours teaching a network what edges, textures, and object parts look like. You should borrow those features before training your own.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feature extraction</td>
+<td>"Freeze and train head"</td>
+<td>Backbone parameters frozen, only the new classifier head receives gradient</td>
+</tr>
+<tr>
+<td>Fine-tuning</td>
+<td>"Retrain end-to-end"</td>
+<td>All parameters trainable, usually with much smaller LR than scratch training</td>
+</tr>
+<tr>
+<td>Discriminative LR</td>
+<td>"Smaller LR for early layers"</td>
+<td>Optimizer parameter groups where early-stage LR is a fraction of late-stage LR</td>
+</tr>
+<tr>
+<td>Layer-wise LR decay</td>
+<td>"Smooth LR gradient"</td>
+<td>Per-layer LR multiplied by decay^(L - k); common in transformer fine-tunes</td>
+</tr>
+<tr>
+<td>Catastrophic forgetting</td>
+<td>"The model lost ImageNet"</td>
+<td>A too-high LR overwrites pretrained features before the new task signal is learnt</td>
+</tr>
+<tr>
+<td>BN statistics drift</td>
+<td>"Running mean is wrong"</td>
+<td>BatchNorm running_mean/var computed on a different distribution than the current task, silently hurting accuracy</td>
+</tr>
+<tr>
+<td>Linear probe</td>
+<td>"Frozen backbone + linear head"</td>
+<td>Evaluation of pretrained features — accuracy of the best linear classifier on top of the frozen representation</td>
+</tr>
+<tr>
+<td>Catastrophic collapse</td>
+<td>"Everything predicts one class"</td>
+<td>Happens when fine-tuning with an LR high enough to destroy features before gradients from the head can stabilise</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A network trained on ImageNet's 1.3 million photos has already learned general visual features: edges, textures, shapes, object parts. Transfer learning reuses that. You replace the final classification layer with one for your own classes and either train only that layer (<strong>feature extraction</strong>) or let the whole network adjust gently (<strong>fine-tuning</strong>). With a few thousand images, this beats training from scratch by a wide margin, provided the learning rates are small and the batch-norm statistics are handled with care.</p></div></aside>
+<p>Training a ResNet-50 on ImageNet costs anywhere from tens to hundreds of GPU-hours, depending on the hardware and how tuned the recipe is, plus the data and the know-how. Very few teams have that budget for every task they ship. What almost every team actually ships is a pretrained backbone with a new head trained on a few hundred or few thousand task-specific images.</p>
+<p>This is not a shortcut. The first conv block of any ImageNet-trained CNN learns edges and Gabor-like filters. The next few blocks learn textures and simple motifs. The middle blocks learn object parts. The final blocks learn combinations that start to look like the 1,000 ImageNet categories. The first 90% of that hierarchy transfers almost unchanged to medical imaging, industrial inspection, satellite data, and every other vision task — because nature has a limited vocabulary of edges and textures. The last 10% is what you actually train.</p>
+<p>Getting transfer right has three bugs waiting for you: destroying pretrained features with a too-high learning rate, starving the model of information by freezing too much, and letting BatchNorm's running statistics drift toward a tiny dataset that the rest of the network never learnt from. This lesson walks each of them on purpose.</p>
+<h2>Idea 1 · Feature extraction vs fine-tuning</h2>
+<p>Two regimes, picked by how much you trust the pretrained features and how much data you have.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm19b722eb0b" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1025.31px; background-color: transparent;" viewBox="0 0 1025.3125 158" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm19b722eb0b{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm19b722eb0b .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm19b722eb0b .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm19b722eb0b .error-icon{fill:#f4efe7;}#mm19b722eb0b .error-text{fill:#0b1018;stroke:#0b1018;}#mm19b722eb0b .edge-thickness-normal{stroke-width:1px;}#mm19b722eb0b .edge-thickness-thick{stroke-width:3.5px;}#mm19b722eb0b .edge-pattern-solid{stroke-dasharray:0;}#mm19b722eb0b .edge-thickness-invisible{stroke-width:0;fill:none;}#mm19b722eb0b .edge-pattern-dashed{stroke-dasharray:3;}#mm19b722eb0b .edge-pattern-dotted{stroke-dasharray:2;}#mm19b722eb0b .marker{fill:#6c6357;stroke:#6c6357;}#mm19b722eb0b .marker.cross{stroke:#6c6357;}#mm19b722eb0b svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm19b722eb0b p{margin:0;}#mm19b722eb0b .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm19b722eb0b .cluster-label text{fill:#0b1018;}#mm19b722eb0b .cluster-label span{color:#0b1018;}#mm19b722eb0b .cluster-label span p{background-color:transparent;}#mm19b722eb0b .label text,#mm19b722eb0b span{fill:#211c16;color:#211c16;}#mm19b722eb0b .node rect,#mm19b722eb0b .node circle,#mm19b722eb0b .node ellipse,#mm19b722eb0b .node polygon,#mm19b722eb0b .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm19b722eb0b .rough-node .label text,#mm19b722eb0b .node .label text,#mm19b722eb0b .image-shape .label,#mm19b722eb0b .icon-shape .label{text-anchor:middle;}#mm19b722eb0b .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm19b722eb0b .rough-node .label,#mm19b722eb0b .node .label,#mm19b722eb0b .image-shape .label,#mm19b722eb0b .icon-shape .label{text-align:center;}#mm19b722eb0b .node.clickable{cursor:pointer;}#mm19b722eb0b .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm19b722eb0b .arrowheadPath{fill:#0b0b0b;}#mm19b722eb0b .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm19b722eb0b .flowchart-link{stroke:#6c6357;fill:none;}#mm19b722eb0b .edgeLabel{background-color:#ffffff;text-align:center;}#mm19b722eb0b .edgeLabel p{background-color:#ffffff;}#mm19b722eb0b .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm19b722eb0b .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm19b722eb0b .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm19b722eb0b .cluster text{fill:#0b1018;}#mm19b722eb0b .cluster span{color:#0b1018;}#mm19b722eb0b div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm19b722eb0b .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm19b722eb0b rect.text{fill:none;stroke-width:0;}#mm19b722eb0b .icon-shape,#mm19b722eb0b .image-shape{background-color:#ffffff;text-align:center;}#mm19b722eb0b .icon-shape p,#mm19b722eb0b .image-shape p{background-color:#ffffff;padding:2px;}#mm19b722eb0b .icon-shape .label rect,#mm19b722eb0b .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm19b722eb0b .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm19b722eb0b .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm19b722eb0b .node .neo-node{stroke:#b5521b;}#mm19b722eb0b [data-look="neo"].node rect,#mm19b722eb0b [data-look="neo"].cluster rect,#mm19b722eb0b [data-look="neo"].node polygon{stroke:url(#mm19b722eb0b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm19b722eb0b [data-look="neo"].swimlane.cluster rect{filter:none;}#mm19b722eb0b [data-look="neo"].node path{stroke:url(#mm19b722eb0b-gradient);stroke-width:1px;}#mm19b722eb0b [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm19b722eb0b [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm19b722eb0b [data-look="neo"].node circle{stroke:url(#mm19b722eb0b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm19b722eb0b [data-look="neo"].node circle .state-start{fill:#000000;}#mm19b722eb0b [data-look="neo"].icon-shape .icon{fill:url(#mm19b722eb0b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm19b722eb0b [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm19b722eb0b-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm19b722eb0b :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm19b722eb0b_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm19b722eb0b_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm19b722eb0b_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mm19b722eb0b-FT" data-look="classic"><rect style="" x="8" y="8" width="484.59375" height="142"/><g class="cluster-label" transform="translate(163.5390625, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Fine-tuning</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> —</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> end-to-end</tspan></tspan></text></g></g></g></g><g class="edgePaths"><path d="M243.344,79L249.594,79C255.844,79,268.344,79,280.177,79C292.01,79,303.177,79,308.76,79L314.344,79" id="mm19b722eb0b-L_FT1_FT2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_FT1_FT2_0" data-points="W3sieCI6MjQzLjM0Mzc1LCJ5Ijo3OX0seyJ4IjoyODAuODQzNzUsInkiOjc5fSx7IngiOjMxOC4zNDM3NSwieSI6Nzl9XQ==" data-look="classic" marker-end="url(#mm19b722eb0b_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_FT1_FT2_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm19b722eb0b-flowchart-FT1-2" data-look="classic" transform="translate(144.421875, 79)"><rect class="basic label-container" style="fill:#fef3c7 !important;stroke:#d97706 !important" x="-98.921875" y="-36" width="197.84375" height="72"/><g class="label" style="" transform="translate(-68.921875, -21)"><rect/><foreignObject width="137.84375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Pretrained backbone<br />(tiny LR)</p></span></div></foreignObject></g></g><g class="node default" id="mm19b722eb0b-flowchart-FT2-3" data-look="classic" transform="translate(386.71875, 79)"><rect class="basic label-container" style="fill:#dcfce7 !important;stroke:#16a34a !important" x="-68.375" y="-36" width="136.75" height="72"/><g class="label" style="" transform="translate(-38.375, -21)"><rect/><foreignObject width="76.75" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>New head<br />(normal LR)</p></span></div></foreignObject></g></g></g></g><g class="root" transform="translate(534.59375, 0)"><g class="clusters"><g class="cluster" id="mm19b722eb0b-FE" data-look="classic"><rect style="" x="8" y="8" width="474.71875" height="142"/><g class="cluster-label" transform="translate(118.4375, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Feature</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> extraction</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> —</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> backbone</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> frozen</tspan></tspan></text></g></g></g></g><g class="edgePaths"><path d="M243.344,79L249.594,79C255.844,79,268.344,79,280.177,79C292.01,79,303.177,79,308.76,79L314.344,79" id="mm19b722eb0b-L_FE1_FE2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_FE1_FE2_0" data-points="W3sieCI6MjQzLjM0Mzc1LCJ5Ijo3OX0seyJ4IjoyODAuODQzNzUsInkiOjc5fSx7IngiOjMxOC4zNDM3NSwieSI6Nzl9XQ==" data-look="classic" marker-end="url(#mm19b722eb0b_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_FE1_FE2_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm19b722eb0b-flowchart-FE1-0" data-look="classic" transform="translate(144.421875, 79)"><rect class="basic label-container" style="fill:#e5e7eb !important;stroke:#6b7280 !important" x="-98.921875" y="-36" width="197.84375" height="72"/><g class="label" style="" transform="translate(-68.921875, -21)"><rect/><foreignObject width="137.84375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Pretrained backbone<br />(no gradient)</p></span></div></foreignObject></g></g><g class="node default" id="mm19b722eb0b-flowchart-FE2-1" data-look="classic" transform="translate(381.78125, 79)"><rect class="basic label-container" style="fill:#dcfce7 !important;stroke:#16a34a !important" x="-63.4375" y="-36" width="126.875" height="72"/><g class="label" style="" transform="translate(-33.4375, -21)"><rect/><foreignObject width="66.875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>New head<br />(trained)</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mm19b722eb0b-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm19b722eb0b-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm19b722eb0b-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>Rules of thumb:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Dataset size</th>
+<th>Domain distance</th>
+<th>Recipe</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&lt; 1k images</td>
+<td>close to ImageNet</td>
+<td>Freeze backbone, train head only</td>
+</tr>
+<tr>
+<td>1k-10k</td>
+<td>close</td>
+<td>Freeze first 2-3 stages, fine-tune the rest</td>
+</tr>
+<tr>
+<td>10k-100k</td>
+<td>any</td>
+<td>Fine-tune end-to-end with discriminative LR</td>
+</tr>
+<tr>
+<td>100k+</td>
+<td>far</td>
+<td>Fine-tune everything; consider training from scratch if domain is far enough</td>
+</tr>
+</tbody>
+</table></div>
+<p>"Close to ImageNet" roughly means natural RGB photos with object-like content. Medical CT scans, overhead satellite imagery, and microscopy are far domains — the features still help, but you will need to let more layers adapt.</p>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Five ways to train a ResNet-18 on 2,000 CIFAR-10 photos for 3 epochs: (a) from scratch, (b) ImageNet weights frozen, train only the head, (c) fine-tune everything at learning rate 0.01, (d) fine-tune everything at 0.2, (e) the lesson's recipe: discriminative learning rates (peak 0.01) with batch-norm statistics frozen. Rank them by test accuracy. (Solution P1; the runs are under "Use it".)</p></div></aside>
+<h2>Idea 2 · Why freezing works at all</h2>
+<p>The ImageNet features a CNN learns are not specialised to the 1,000 categories. They are specialised to the statistics of natural images: edges at specific orientations, textures, contrast patterns, shape primitives. Those statistics are stable across almost every visual domain a human can name. That is why a model trained on ImageNet and evaluated zero-shot on CIFAR-10 with just a new linear head (no fine-tuning of the backbone) reaches 80%+ accuracy. The head is learning which of the already-learnt features to weight for this task.</p>
+<h2>Idea 3 · Discriminative learning rates</h2>
+<p>When you do unfreeze, early layers should train slower than late layers. Early layers encode generic features that you want to preserve; late layers encode task-specific structure that you need to move a lot.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Typical recipe:
+
+  stage 0 (stem + first group): lr = base_lr / 100    (mostly fixed)
+  stage 1:                       lr = base_lr / 10
+  stage 2:                       lr = base_lr / 3
+  stage 3 (last backbone group): lr = base_lr
+  head:                          lr = base_lr  (or slightly higher)
+</code></pre></div>
+<p>In PyTorch this is just a list of parameter groups passed to the optimizer. One model, five learning rates, zero extra code.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The learning rates the helper produces</div><div class="co-body"><p>With <code>base_lr = 1e-3</code> and <code>decay = 0.3</code>, each stage gets 0.3 times the rate of the stage after it:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Factor</th>
+<th>Learning rate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>fc (new head)</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">0</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1.0</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>layer4</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">3.0</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>layer3</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">9.0</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>layer2</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.7</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>layer1</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">4</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">8.1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+<tr>
+<td>conv1, bn1</td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">3</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span></span></span></span></td>
+<td><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2.43</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span></span></span></span></td>
+</tr>
+</tbody>
+</table></div>
+<p>The stem moves about 400 times more slowly than the head: generic edge detectors barely change, task-specific layers adapt. Step 3 prints exactly these values.</p></div></aside>
+<h2>Idea 4 · The BatchNorm problem</h2>
+<p>BN layers hold <code>running_mean</code> and <code>running_var</code> buffers that were computed on ImageNet. If your task has a different pixel distribution — different lighting, different sensor, different colour space — those buffers are wrong. Three options in order of preference:</p>
+<ol>
+<li><strong>Fine-tune with BN in train mode.</strong> Let BN update its running statistics along with everything else. Default choice when the task dataset is medium-sized (&gt;= 5k examples).</li>
+<li><strong>Freeze BN in eval mode.</strong> Keep the ImageNet statistics and train only the weights. Correct when your dataset is small enough that BN's moving average would be noisy.</li>
+<li><strong>Replace BN with GroupNorm.</strong> Removes the moving-average problem entirely. Used in detection and segmentation backbones where batch size per GPU is tiny.</li>
+</ol>
+<p>Getting this wrong silently tanks accuracy by 5-15%.</p>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Freezing the backbone with <code>requires_grad = False</code> also freezes batch norm."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It stops the weights from learning, but in <code>train()</code> mode BatchNorm still updates its running mean and variance from your batches. Freezing those statistics needs the layers in <code>eval()</code> mode, as <code>freeze_bn_stats</code> does.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Fine-tuning everything always beats training only the head."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only with sensible learning rates. Under "Use it", fine-tuning everything at 0.2 wrecks the pretrained features and ends at chance (about 10 percent), far below the frozen backbone's 74 percent.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Pretrained features only help when your classes are in ImageNet."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> CIFAR-10's 32-pixel photos look nothing like ImageNet's, yet the frozen ImageNet features beat training from scratch by about 40 points on 2,000 images.</li>
+</ul></div></aside>
+<h2>Idea 5 · Head design</h2>
+<p>The classifier head is 1-3 linear layers plus an optional dropout. Every torchvision backbone ships a default head that you replace:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)          # ResNet
+backbone.classifier[1] = nn.Linear(..., num_classes)                    # EfficientNet, MobileNet
+backbone.heads.head = nn.Linear(..., num_classes)                       # torchvision ViT
+</code></pre></div>
+<p>For small datasets, a single linear layer is usually enough. Adding a hidden layer (Linear -&gt; ReLU -&gt; Dropout -&gt; Linear) helps when the task distribution is farther from the backbone's training distribution.</p>
+<h2>Idea 6 · Layer-wise LR decay</h2>
+<p>A smoother version of discriminative LR used in modern fine-tuning (BEiT, DINOv2, ViT-B fine-tunes). Instead of grouping layers into stages, give every layer a slightly smaller LR than the one above it:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0541em;vertical-align:-0.3597em;"></span><span class="mord"><span class="mord text"><span class="mord">lr_layer</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1264em;"><span style="top:-2.3403em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3597em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0044em;vertical-align:-0.31em;"></span><span class="mord text"><span class="mord">base_lr</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1279em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord text"><span class="mord">decay</span></span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.9334em;"><span style="top:-3.1473em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">L</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>With decay = 0.75 and L = 12 transformer blocks, the first block trains at <code>0.75^11 ≈ 0.04x</code> the head's LR. Matters more for transformer fine-tunes than for CNNs, where stage-grouped LRs are usually enough.</p>
+<h2>Idea 7 · What to evaluate</h2>
+<p>Transfer-learning runs need two numbers you would not track on a scratch run:</p>
+<ul>
+<li><strong>Pretrained-only accuracy</strong> — the head's accuracy with the backbone frozen. This is your floor.</li>
+<li><strong>Fine-tuned accuracy</strong> — the same model after end-to-end training. This is your ceiling.</li>
+</ul>
+<p>If fine-tuned is less than pretrained-only, you have a learning-rate or BN bug. Always print both.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="transfer-learning"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Linear probe.</strong> Keep the pretrained backbone <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ϕ</span></span></span></span> fixed and train only a head on its features: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6944em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">y</span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1944em;"><span class="mord">^</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathrm">softmax</span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mord mathnormal">ϕ</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">b</span><span class="mclose">)</span></span></span></span>. With a 2,048-dimensional ResNet-50 feature and 10 classes that is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2048</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">10</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">10</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">20</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">490</span></span></span></span> trainable parameters, against 25.6 million in the backbone, and it is a convex problem.</p>
+<p><strong>Fine-tuning</strong> updates everything, usually with smaller learning rates for earlier layers, because they hold general features (edges, textures) that need little change. Layer-wise learning-rate decay gives layer <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.01968em;">l</span></span></span></span> of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span></p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">η</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">η</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">head</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0935em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8991em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord mathnormal mtight">L</span><span class="mbin mtight">−</span><span class="mord mathnormal mtight" style="margin-right:0.01968em;">l</span></span></span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal" style="margin-right:0.05556em;">γ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.65</span><span class="mord text"><span class="mord">–</span></span><span class="mord">0.9</span></span></span></span></span></div></p>
+<p><strong>Why it works.</strong> Features learned on a large, varied dataset make a new task nearly linearly separable; the small dataset then only has to learn the head (few parameters, low variance) instead of the whole network.</p>
+<p><strong>BatchNorm with small batches.</strong> Fine-tuning with a batch of 8 makes batch statistics noisy; keeping BatchNorm layers in evaluation mode (using the pretrained running mean and variance) or freezing them avoids it.</p>
+<p><strong>Evaluation.</strong> Compare against the linear probe and against training from scratch on the same data; report the gap per class, since transfer helps classes that resemble the pretraining data most.</p></div></aside>
+<h2>Step 1 · Load a pretrained backbone and inspect it</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+import torch.nn as nn
+from torchvision.models import resnet18, ResNet18_Weights
+
+backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+print(backbone)
+print()
+print(&quot;classifier head:&quot;, backbone.fc)
+print(&quot;feature dim:&quot;, backbone.fc.in_features)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ResNet(
+  (conv1): Conv2d(3, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
+  (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+  (relu): ReLU(inplace=True)
+  (maxpool): MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+  (layer1): Sequential(
+    (0): BasicBlock(
+      (conv1): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (relu): ReLU(inplace=True)
+      (conv2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+    )
+    (1): BasicBlock(
+      (conv1): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn1): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (relu): ReLU(inplace=True)
+      (conv2): Conv2d(64, 64, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn2): BatchNorm2d(64, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+    )
+  )
+  (layer2): Sequential(
+    (0): BasicBlock(
+      (conv1): Conv2d(64, 128, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1), bias=False)
+      (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (relu): ReLU(inplace=True)
+      (conv2): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn2): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      (downsample): Sequential(
+        (0): Conv2d(64, 128, kernel_size=(1, 1), stride=(2, 2), bias=False)
+        (1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+      )
+    )
+    (1): BasicBlock(
+      (conv1): Conv2d(128, 128, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1), bias=False)
+      (bn1): BatchNorm2d(128, eps=1e-05, momentum=0.1, affine=True, bias=True, track_running_stats=True)
+…
+(51 more lines)</code></pre></div></div></aside>
+<p><code>ResNet18</code> has four stages (<code>layer1..layer4</code>) plus a stem and a <code>fc</code> head. Every torchvision classification backbone has an analogous structure.</p>
+<h2>Step 2 · Feature extraction — freeze everything, replace the head</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def make_feature_extractor(num_classes=10):
+    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    for p in model.parameters():
+        p.requires_grad = False
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    return model
+
+model = make_feature_extractor(num_classes=10)
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+frozen = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+print(f&quot;trainable: {trainable:&gt;10,}&quot;)
+print(f&quot;frozen:    {frozen:&gt;10,}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">trainable:      5,130
+frozen:    11,176,512</code></pre></div></div></aside>
+<p>Only <code>model.fc</code> is trainable. The backbone is a frozen feature extractor.</p>
+<h2>Step 3 · Discriminative fine-tuning</h2>
+<p>A utility that builds parameter groups with stage-specific learning rates.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def discriminative_param_groups(model, base_lr=1e-3, decay=0.3):
+    stages = [
+        [&quot;conv1&quot;, &quot;bn1&quot;],
+        [&quot;layer1&quot;],
+        [&quot;layer2&quot;],
+        [&quot;layer3&quot;],
+        [&quot;layer4&quot;],
+        [&quot;fc&quot;],
+    ]
+    groups = []
+    for i, names in enumerate(stages):
+        lr = base_lr * (decay ** (len(stages) - 1 - i))
+        params = [p for n, p in model.named_parameters()
+                  if any(n.startswith(k) for k in names)]
+        if params:
+            groups.append({&quot;params&quot;: params, &quot;lr&quot;: lr, &quot;name&quot;: &quot;_&quot;.join(names)})
+    return groups
+
+model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+model.fc = nn.Linear(model.fc.in_features, 10)
+for p in model.parameters():
+    p.requires_grad = True
+
+groups = discriminative_param_groups(model)
+for g in groups:
+    print(f&quot;{g['name']:&gt;10s}  lr={g['lr']:.2e}  params={sum(p.numel() for p in g['params']):&gt;8,}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> conv1_bn1  lr=2.43e-06  params=   9,536
+    layer1  lr=8.10e-06  params= 147,968
+    layer2  lr=2.70e-05  params= 525,568
+    layer3  lr=9.00e-05  params=2,099,712
+    layer4  lr=3.00e-04  params=8,393,728
+        fc  lr=1.00e-03  params=   5,130</code></pre></div></div></aside>
+<p><code>decay=0.3</code> means each stage trains at 30% of the rate of the next one. <code>fc</code> gets <code>base_lr</code>, <code>layer4</code> gets <code>0.3 * base_lr</code>, <code>conv1</code> gets <code>0.3^5 * base_lr ≈ 0.00243 * base_lr</code>. Extreme sounding; empirically it works.</p>
+<h2>Step 4 · BatchNorm handling</h2>
+<p>Helper to freeze BN running statistics without freezing its weights.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def freeze_bn_stats(model):
+    for m in model.modules():
+        if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+    return model
+</code></pre></div>
+
+<p>Call it after you set <code>model.train()</code> at the start of every epoch. <code>model.train()</code> flips everything to training mode; this reverses it only for BN layers.</p>
+<h2>Step 5 · A minimal end-to-end fine-tuning loop</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from torch.optim import SGD
+from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import torch.nn.functional as F
+
+def fine_tune(model, train_loader, val_loader, device, epochs=5, base_lr=1e-3, freeze_bn=False):
+    model = model.to(device)
+    groups = discriminative_param_groups(model, base_lr=base_lr)
+    optimizer = SGD(groups, momentum=0.9, weight_decay=1e-4, nesterov=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
+
+    for epoch in range(epochs):
+        model.train()
+        if freeze_bn:
+            freeze_bn_stats(model)
+        tr_loss, tr_correct, tr_total = 0.0, 0, 0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = F.cross_entropy(logits, y, label_smoothing=0.1)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            tr_loss += loss.item() * x.size(0)
+            tr_total += x.size(0)
+            tr_correct += (logits.argmax(-1) == y).sum().item()
+        scheduler.step()
+
+        model.eval()
+        va_total, va_correct = 0, 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                pred = model(x).argmax(-1)
+                va_total += x.size(0)
+                va_correct += (pred == y).sum().item()
+        print(f&quot;epoch {epoch}  train {tr_loss/tr_total:.3f}/{tr_correct/tr_total:.3f}  &quot;
+              f&quot;val {va_correct/va_total:.3f}&quot;)
+    return model
+</code></pre></div>
+
+<p>On a small CIFAR-10 experiment under "Use it" (2,000 training photos, 3 epochs), this recipe with frozen batch-norm statistics reaches about 84 percent, against about 74 percent for the head alone and about 33 percent from scratch. With all 50,000 photos and more epochs, fine-tuned ResNet-18s reach the mid-90s.</p>
+<h2>Step 6 · Progressive unfreezing</h2>
+<p>A schedule that unfreezes one stage per epoch from the end toward the beginning. Mitigates feature drift at the cost of some extra epochs.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def progressive_unfreeze_schedule(model):
+    stages = [&quot;layer4&quot;, &quot;layer3&quot;, &quot;layer2&quot;, &quot;layer1&quot;]
+    yielded = set()
+
+    def start():
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.fc.parameters():
+            p.requires_grad = True
+
+    def unfreeze(epoch):
+        if epoch &lt; len(stages):
+            name = stages[epoch]
+            yielded.add(name)
+            for n, p in model.named_parameters():
+                if n.startswith(name):
+                    p.requires_grad = True
+            return name
+        return None
+
+    return start, unfreeze
+</code></pre></div>
+
+<p>Call <code>start()</code> once before the first epoch. Call <code>unfreeze(epoch)</code> at the start of each epoch. Rebuild the optimizer whenever the set of trainable parameters changes, otherwise the frozen params still hold cached moments that confuse it.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>For most real tasks, <code>torchvision.models</code> + three lines is enough. The heavier machinery above matters when you run into the problems that library defaults cannot fix.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from torchvision.models import resnet50, ResNet50_Weights
+
+num_classes = 10
+model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+model.fc = nn.Linear(model.fc.in_features, num_classes)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+print(model.fc, f&quot;| {sum(p.numel() for p in model.parameters()):,} parameters&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Linear(in_features=2048, out_features=10, bias=True) | 23,528,522 parameters</code></pre></div></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-body"><p>The five recipes from the predict question on real data: 2,000 CIFAR-10 training photos upscaled to 96 × 96, 3 epochs each, tested on 1,000 held-out photos. The runs are split over several blocks so each stays short.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time
+import torch.nn.functional as F
+from torchvision.datasets import CIFAR10
+
+def to_input(images):
+    x = torch.tensor(images).permute(0, 3, 1, 2).float() / 255
+    x = F.interpolate(x, size=96, mode=&quot;bilinear&quot;, align_corners=False)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return (x - mean) / std
+
+cifar_train = CIFAR10(&quot;./data&quot;, train=True, download=True)
+cifar_test = CIFAR10(&quot;./data&quot;, train=False, download=True)
+Xtr, Ytr = to_input(cifar_train.data[:2000]), torch.tensor(cifar_train.targets[:2000])
+Xte, Yte = to_input(cifar_test.data[:1000]), torch.tensor(cifar_test.targets[:1000])
+
+def test_accuracy(m):
+    m.eval()
+    with torch.no_grad():
+        return (torch.cat([m(Xte[i:i + 250]).argmax(1) for i in range(0, 1000, 250)]) == Yte).float().mean().item()
+
+def train(m, optimizer, epochs=3, keep_bn_frozen=False, head_only=False, smoothing=0.0):
+    for epoch in range(epochs):
+        m.train()
+        if head_only:
+            m.eval()                      # the frozen backbone stays exactly as it was, batch norm included
+        elif keep_bn_frozen:
+            freeze_bn_stats(m)
+        order = torch.randperm(len(Xtr))
+        for i in range(0, len(Xtr), 64):
+            idx = order[i:i + 64]
+            loss = F.cross_entropy(m(Xtr[idx]), Ytr[idx], label_smoothing=smoothing)
+            optimizer.zero_grad(); loss.backward(); optimizer.step()
+    return test_accuracy(m)
+
+def fresh(pretrained=True):
+    torch.manual_seed(0)
+    m = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1 if pretrained else None)
+    m.fc = nn.Linear(m.fc.in_features, 10)
+    return m
+
+recipes = {}
+start = time.perf_counter()
+m = make_feature_extractor(10); torch.manual_seed(0)
+recipes[&quot;head only (frozen backbone)&quot;] = train(m, SGD(m.fc.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4), head_only=True)
+m = fresh(pretrained=False)
+recipes[&quot;from scratch&quot;] = train(m, SGD(m.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4))
+for name, acc in recipes.items():
+    print(f&quot;{name:34s} test accuracy {acc:.1%}&quot;)
+print(f&quot;({time.perf_counter() - start:.0f} s)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">head only (frozen backbone)        test accuracy 73.5%
+from scratch                       test accuracy 33.0%
+(99 s)</code></pre></div></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">m = fresh()
+recipes[&quot;fine-tune all, lr 0.01&quot;] = train(m, SGD(m.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4))
+print(f&quot;fine-tune all, lr 0.01            test accuracy {recipes['fine-tune all, lr 0.01']:.1%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">fine-tune all, lr 0.01            test accuracy 73.8%</code></pre></div></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">m = fresh()
+recipes[&quot;fine-tune all, lr 0.2&quot;] = train(m, SGD(m.parameters(), lr=0.2, momentum=0.9, weight_decay=1e-4))
+print(f&quot;fine-tune all, lr 0.2             test accuracy {recipes['fine-tune all, lr 0.2']:.1%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">fine-tune all, lr 0.2             test accuracy 9.1%</code></pre></div></div></aside>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import matplotlib.pyplot as plt
+
+m = fresh()
+recipes[&quot;discriminative LRs, BN frozen&quot;] = train(
+    m, SGD(discriminative_param_groups(m, base_lr=1e-2), momentum=0.9, weight_decay=1e-4, nesterov=True),
+    keep_bn_frozen=True, smoothing=0.1)
+print(f&quot;discriminative LRs, BN frozen     test accuracy {recipes['discriminative LRs, BN frozen']:.1%}&quot;)
+
+order = [&quot;from scratch&quot;, &quot;fine-tune all, lr 0.2&quot;, &quot;head only (frozen backbone)&quot;, &quot;fine-tune all, lr 0.01&quot;, &quot;discriminative LRs, BN frozen&quot;]
+fig, ax = plt.subplots(figsize=(7, 3))
+ax.barh(order, [recipes[k] * 100 for k in order], color=[&quot;#b7bfcb&quot;, &quot;#566070&quot;, &quot;#474d9a&quot;, &quot;#474d9a&quot;, &quot;#b24a1d&quot;])
+ax.axvline(10, color=&quot;#171a21&quot;, ls=&quot;:&quot;, lw=1); ax.text(11, -0.45, &quot;chance&quot;, fontsize=8)
+ax.set_xlabel(&quot;test accuracy (%)&quot;); ax.set_xlim(0, 100)
+ax.spines[[&quot;top&quot;, &quot;right&quot;]].set_visible(False)
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">discriminative LRs, BN frozen     test accuracy 84.4%</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/9b42c9b2f9ccb067.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Pretrained weights are worth about 40 points here: training from scratch on 2,000 photos gets roughly a third right. The head alone already reaches about three-quarters. Fine-tuning everything at a single learning rate of 0.01 does no better than the head alone, while the lesson's recipe (small rates for early layers, batch-norm statistics frozen) adds about 10 more points. And a learning rate of 0.2 destroys the pretrained features within the first epoch: chance level, worse than starting from scratch.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Take the recipe that worked, but leave batch norm in training mode: call <code>train(..., keep_bn_frozen=False, smoothing=0.1)</code> with the same discriminative groups. How much accuracy does it lose, and why does batch norm care about your 64-image batches? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Replace the head, then choose: train only the head (little data) or fine-tune (more data, more domain distance).</li>
+<li>Early layers hold generic features: give them much smaller learning rates than the head.</li>
+<li>Freeze batch-norm statistics (<code>eval()</code> on BN layers) when your data or batches are small.</li>
+<li>A learning rate that suits training from scratch destroys pretrained features.</li>
+<li>Always report head-only accuracy as the floor that fine-tuning must beat.</li>
+</ul></div></aside>
+<p>Two other production-grade defaults:</p>
+<ul>
+<li><code>timm</code> ships ~800 pretrained vision backbones with a consistent API (<code>timm.create_model("resnet50", pretrained=True, num_classes=10)</code>). For any fine-tune beyond the torchvision zoo, it is the standard.</li>
+<li>For transformers, <code>transformers.AutoModelForImageClassification.from_pretrained(name, num_labels=N)</code> gives you ViT / BEiT / DeiT with the same loading semantics as text models.</li>
+</ul>
+<h2>Solutions</h2>
+<details class="qa" id="a0405-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The ranking</span></summary><div class="qa-a"><p>From best to worst: <strong>(e)</strong> the discriminative recipe with frozen batch norm (about 84 percent), then <strong>(b)</strong> head only (about 74 percent) and <strong>(c)</strong> fine-tuning everything at 0.01 (about 74 percent, and unstable from epoch to epoch), then <strong>(a)</strong> from scratch (about 33 percent), and last <strong>(d)</strong> fine-tuning at 0.2 (about 9 percent, chance level). The big learning rate is worse than starting from scratch because it throws away the good starting point and then cannot recover in three epochs.</p></div></details>
+<details class="qa" id="a0405-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Batch norm drifts</span></summary><div class="qa-a"><p>It falls to about <strong>76 percent</strong>, roughly 8 points below the frozen-statistics run, which matches the lesson's warning of a 5 to 15 percent loss. In training mode every BatchNorm layer normalises with the statistics of the current 64 upscaled CIFAR images and keeps updating its running averages toward them. Those differ from ImageNet's, so the pretrained layers after each BN suddenly receive inputs on a different scale, and the small, noisy batches make it worse.</p></div></details>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Backbones to start from.</strong> DINOv3 (Meta, August 2025, licensed for commercial use) and DINOv2 give strong general features; SigLIP 2 for image-text tasks; ConvNeXt and EfficientNet when inference must be cheap.</li>
+<li><strong>Parameter-efficient fine-tuning.</strong> LoRA through Hugging Face PEFT works for ViTs as well as LLMs, so one base model can serve several fine-tuned tasks.</li>
+<li><strong>Freeze, then unfreeze.</strong> Linear probe first, then fine-tune the last blocks with a lower learning rate, remains the standard recipe.</li>
+</ul>
+<p>Sources: <a href="https://ai.meta.com/blog/dinov3-self-supervised-vision-model/">DINOv3 announcement</a>, <a href="https://huggingface.co/docs/peft/task_guides/image_classification_lora">PEFT image classification with LoRA</a>, <a href="https://huggingface.co/docs/transformers/model_doc/siglip2">SigLIP 2</a>.</p></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-cnn-architectures"><span class="t" style="--cs-hue:15">CA</span>Cheat sheet · Transfer Learning and CNN Architectures</a><a href="#cs-computer-vision"><span class="t" style="--cs-hue:5">CV</span>Cheat sheet · Computer Vision Quick Reference</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces:</p>
+<ul>
+<li><code>outputs/prompt-fine-tune-planner.md</code> — a prompt that picks feature-extraction vs progressive vs end-to-end fine-tuning based on dataset size, domain distance, and compute budget.</li>
+<li><code>outputs/skill-freeze-inspector.md</code> — a skill that, given a PyTorch model, reports which parameters are trainable, which BatchNorm layers are in eval mode, and whether the optimizer is actually being fed the trainable parameters.</li>
+</ul>
+<p><strong><code>outputs/prompt-fine-tune-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-fine-tune-planner
+description: Pick feature extraction vs progressive vs end-to-end fine-tuning given dataset size, domain distance, and compute budget
+phase: 4
+lesson: 5
+---
+
+You are a transfer-learning planner. Given the inputs below, return one regime, a parameter-group plan, and a short schedule. The plan must survive a real review, not describe generic advice.
+
+## Inputs
+
+- `task_type`: classification | detection | segmentation | embedding
+- `num_train_labels`: integer
+- `input_resolution`: HxW of production images
+- `domain_distance`: close | medium | far
+  - close: natural RGB photos of object-like content
+  - medium: close to natural but with a shift (surveillance, smartphone low-light, non-standard crop)
+  - far: medical, satellite, microscopy, thermal, document scans, industrial close-up
+- `compute_budget`: edge | serverless | gpu_hours_N
+
+## Decision rules
+
+Apply in order; first matching rule wins. Boundaries are half-open `[a, b)` to avoid overlap.
+
+1. `num_train_labels &lt; 1,000` -&gt; `feature_extraction` regardless of domain.
+2. `1,000 &lt;= num_train_labels &lt; 10,000` and `domain_distance == close` -&gt; `partial_fine_tune` (freeze stem + stage 1, fine-tune rest).
+3. `1,000 &lt;= num_train_labels &lt; 10,000` and `domain_distance in [medium, far]` -&gt; `partial_fine_tune` with the stem frozen only; unfreeze the FPN/decoder and top stages.
+4. `10,000 &lt;= num_train_labels &lt;= 100,000` -&gt; `discriminative_fine_tune` (all layers, stage-grouped LR).
+5. `num_train_labels &gt; 100,000` and `domain_distance in [close, medium]` -&gt; `discriminative_fine_tune` at default base LR (`1e-4`).
+6. `num_train_labels &gt; 100,000` and `domain_distance == far` -&gt; `discriminative_fine_tune` with higher base LR (`5e-4` to `1e-3`); consider `scratch_train` if `compute_gpu_hours &gt;= 500`.
+7. `compute_budget == edge` -&gt; distil the result; never ship a 100M+ param backbone to edge regardless of regime.
+
+## Output format
+
+```
+[regime]
+  choice: feature_extraction | partial_fine_tune | discriminative_fine_tune | scratch_train
+  reason: &lt;one sentence that names dataset size, domain distance, and budget&gt;
+
+[param groups]
+  - stage: &lt;name&gt;   lr: &lt;float&gt;   trainable: yes|no   bn_mode: train|frozen
+  ...
+  total trainable params: &lt;N&gt;
+
+[schedule]
+  optimizer:    &lt;SGD | AdamW&gt;  weight_decay: &lt;X&gt;   momentum: &lt;X&gt;
+  scheduler:    &lt;CosineAnnealingLR | OneCycleLR&gt;  epochs: &lt;N&gt;
+  warmup:       &lt;epochs or steps&gt;
+  label_smoothing: &lt;X or none&gt;
+  mixup:        &lt;alpha or none&gt;
+  augmentation: &lt;list of transforms&gt;
+
+[evaluation]
+  track: linear_probe_val_acc, fine_tune_val_acc, per_class_recall
+  gate:  fine_tune_val_acc &gt;= linear_probe_val_acc  (else the run has a bug)
+```
+
+## Rules
+
+- Always report both `linear_probe_val_acc` and final `fine_tune_val_acc`. If the fine-tune ends below the probe, the plan is wrong.
+- For `domain_distance == far`, prefer GroupNorm-based backbones or recommend freezing BN running statistics.
+- For `compute_budget == edge`, name the distillation target model explicitly (e.g. MobileNetV3-Small, EfficientNet-Lite0, MobileViT-XXS).
+- Never recommend fine-tuning every layer at the same LR unless the user explicitly asks for it.
+- Do not invent datasets or backbones that do not exist in torchvision or timm.
+</code></pre></div>
+<p><strong><code>outputs/skill-freeze-inspector.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-freeze-inspector
+description: Report which parameters are trainable, which BatchNorm layers are in eval mode, and whether the optimizer is actually consuming the trainable parameters
+version: 1.0.0
+phase: 4
+lesson: 5
+tags: [computer-vision, transfer-learning, debugging, pytorch]
+---
+
+# Freeze Inspector
+
+Transfer-learning bugs hide in three places: parameters that should be frozen but are not, parameters that should be trainable but are not, and optimizers that were built before the freeze state changed. This skill surfaces all three in one pass.
+
+## When to use
+
+- Right after setting `requires_grad` on a subset of parameters.
+- Before the first training step of a fine-tune run.
+- After calling `freeze_bn_stats` or any helper that flips BN mode.
+- When val accuracy is stuck at random and you suspect nothing is actually training.
+
+## Inputs
+
+- `model`: a PyTorch `nn.Module`.
+- `optimizer`: the optimizer about to be used for training.
+- Optional `expected_frozen_prefixes`: list of parameter-name prefixes that should be frozen (e.g. `[&quot;conv1&quot;, &quot;bn1&quot;, &quot;layer1&quot;]`).
+
+## Steps
+
+1. **Walk parameters.** For each `(name, param)`:
+   - record `requires_grad`
+   - record `shape` and `numel`
+
+2. **Walk modules.** For each module:
+   - if it is BatchNorm, record whether it is in eval mode and whether its affine parameters are trainable.
+
+3. **Inspect the optimizer.** For each parameter group:
+   - flatten its `params` into a set of `id(p)`.
+   - compare with the set of all `id(p)` for params where `requires_grad == True`.
+
+4. **Detect the four failure modes:**
+   - `leaked_train`: a param has `requires_grad=True` but does not appear in the optimizer (gradient is computed but never applied).
+   - `ghost_train`: a param appears in the optimizer but has `requires_grad=False` (optimizer state is wasted; can also cause bugs if you later re-enable requires_grad).
+   - `bn_mismatch`: either (a) a BN layer is in train mode (accumulates running stats) while its affine parameters (`weight`, `bias`) are frozen, or (b) a BN layer is in eval mode (frozen stats) while its affine parameters are trainable. Both states are inconsistent and almost always a bug.
+   - `expected_vs_actual`: any prefix listed in `expected_frozen_prefixes` still has a trainable parameter.
+
+## Report
+
+```
+[freeze-inspector]
+  model trainable params: &lt;N&gt;
+  model frozen params:    &lt;N&gt;
+  batchnorm layers in eval mode: &lt;count&gt;
+  batchnorm layers in train mode: &lt;count&gt;
+
+[optimizer coverage]
+  trainable params fed to optimizer: &lt;M&gt; of &lt;N&gt;
+  leaked_train: &lt;list of names&gt; (trainable but not in optimizer)
+  ghost_train:  &lt;list of names&gt; (in optimizer but frozen)
+
+[bn audit]
+  mismatched layers: &lt;list of names&gt;
+
+[expectations]
+  expected_frozen_prefixes: &lt;...&gt;
+  violating params:         &lt;list&gt;
+
+[verdict]
+  ok | &lt;one-line summary of the most severe issue&gt;
+```
+
+## Rules
+
+- Only report parameter names; never print the weights themselves.
+- Sort every list alphabetically by parameter name.
+- If optimizer coverage is 100% and there are no mismatches, return `ok` and stop.
+- For `leaked_train`, always recommend rebuilding the optimizer after the freeze state changed.
+- For `ghost_train`, recommend removing the parameter group or setting `requires_grad=True` if the intent was to train it.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>(Easy)</strong> Train a <code>ResNet18</code> as a linear probe (backbone frozen) and as a full fine-tune on the same synthetic-CIFAR dataset. Report both accuracies side by side. Explain which gap tells you the features transfer well and which tells you they do not.</li>
+<li><strong>(Medium)</strong> Introduce a bug on purpose: set <code>base_lr = 1e-1</code> on the backbone stage instead of the head. Show the training loss explode, then recover by applying the <code>discriminative_param_groups</code> helper. Record the LR at which each stage starts diverging.</li>
+<li><strong>(Hard)</strong> Take a medical imaging dataset (e.g. CheXpert-small, PatchCamelyon, or HAM10000) and compare three regimes: (a) ImageNet-pretrained frozen backbone + linear head; (b) ImageNet-pretrained fine-tune end-to-end; (c) scratch training. Report accuracy and compute cost for each. At what dataset size does scratch training become competitive?</li>
+</ol>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/1411.1792">How transferable are features in deep neural networks? (Yosinski et al., 2014)</a> — the paper that quantified feature transferability across layers</li>
+<li><a href="https://arxiv.org/abs/1801.06146">Universal Language Model Fine-tuning (ULMFiT, Howard &amp; Ruder, 2018)</a> — the original discriminative LR / progressive unfreezing recipe; the ideas transfer directly to vision</li>
+<li><a href="https://huggingface.co/docs/timm">timm documentation</a> — the reference for modern vision backbones and the exact fine-tune defaults they were trained with</li>
+<li><a href="https://arxiv.org/abs/1805.08974">A Simple Framework for Linear-Probe Evaluation (Kornblith et al., 2019)</a> — why linear-probe accuracy matters and how to report it correctly</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0405" id="done-a0405">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0405" id="undo-a0405" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0404"><span class="pn-dir">Previous</span><span class="pn-t">4.4 · Image Classification with CNNs</span></a><a class="pn next" href="#a0406"><span class="pn-dir">Next</span><span class="pn-t">4.6 · YOLO Object Detection from Scratch</span></a></div></footer>

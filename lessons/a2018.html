@@ -1,0 +1,537 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-20">Phase 20 · Hands-On AI Projects</a></nav><h1>Explaining Configuration Drift</h1><div class="m-meta"><span class="chip chip-num">Lesson 20.18</span><span class="chip">480 min</span><span class="chip chip-core">Project</span><span class="chip chip-done" data-done-chip="a2018" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Load named configuration layers</li>
+<li>Resolve precedence with provenance</li>
+<li>Compare effective values</li>
+<li>Export redacted CI evidence</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: nothing beyond the earlier phases.</li>
+<li><strong>Type</strong>: Project, level 2 (). <strong>Time</strong>: about 8 hours over 4 steps.</li>
+<li><strong>Code in</strong>: Go.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Explain why two environments resolve the same setting differently.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>"It works on staging but not in production." Often the code is the same and the configuration differs: a timeout set in a defaults file and overridden by an environment variable, or a secret that changed. Finding which layer won, and why, is tedious by hand.</p>
+<p>This project explains configuration drift. It loads named layers in order (defaults, then files, then environment), resolves each key while keeping the full history of which layer set what, compares the expected values with what a running system actually reports, and exports a report that is safe to hand to a CI job or an AI assistant because secret values are redacted.</p></div></aside>
+<p>Help a developer compare declared defaults, environment overrides and observed JSON configuration. Preserve precedence and redaction rules, expose shadowed values, and attach every explanation to its source file or variable name. Export a drift report that an assistant can consume without receiving secret values.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. Go implementations are exercised by the grader.</p>
+<p><strong>What you will build:</strong> Redacted configuration diff and precedence evidence JSON</p>
+<h2>Step 1 · Load named configuration layers</h2>
+<p><em>Step 1 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Reject ambiguous configuration before comparing environments.</p>
+</blockquote>
+<p><strong>What you build.</strong> Build <code>Load</code> for a one-MiB JSON object containing ordered <code>layers</code>, required <code>observed</code>, and optional <code>sensitive</code> exact key names. Layer names must be unique. This tool uses flat, scalar keys; flatten nested configurations explicitly before use.</p>
+<p><strong>Worked example.</strong> The fixture declares timeout 30 in defaults.json, then timeout 5 in env:TIMEOUT. Both values survive input parsing. A nested timeout object is rejected because this contract does not imply a deep-merge policy.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-configuration-drift-explainer-1"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Load(data []byte) (Input, error)</code> returns typed <code>Layer{Name, Values}</code> records. Reject unknown top-level/layer fields, trailing JSON, null maps, duplicate names and blank keys. Scalars may be null, string, boolean or number.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<details class="qa" id="a2018-qa1"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (37 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;testing&quot;
+)
+
+func TestValid(t *testing.T) {
+    x, e := Load([]byte(`{&quot;layers&quot;:[{&quot;name&quot;:&quot;base&quot;,&quot;values&quot;:{&quot;a&quot;:1}}],&quot;observed&quot;:{&quot;a&quot;:1}}`))
+    if e != nil || len(x.Layers) != 1 {
+        t.Fatal(x, e)
+    }
+}
+func TestUnknown(t *testing.T) {
+    if _, e := Load([]byte(`{&quot;layers&quot;:[],&quot;observed&quot;:{},&quot;oops&quot;:1}`)); e == nil {
+        t.Fatal(&quot;unknown field&quot;)
+    }
+}
+func TestDuplicate(t *testing.T) {
+    if _, e := Load([]byte(`{&quot;layers&quot;:[{&quot;name&quot;:&quot;x&quot;,&quot;values&quot;:{}},{&quot;name&quot;:&quot;x&quot;,&quot;values&quot;:{}}],&quot;observed&quot;:{}}`)); e == nil {
+        t.Fatal(&quot;duplicate&quot;)
+    }
+}
+func TestNested(t *testing.T) {
+    if _, e := Load([]byte(`{&quot;layers&quot;:[],&quot;observed&quot;:{&quot;a&quot;:{&quot;nested&quot;:1}}}`)); e == nil {
+        t.Fatal(&quot;nested&quot;)
+    }
+}
+func TestTrailing(t *testing.T) {
+    if _, e := Load([]byte(`{&quot;layers&quot;:[],&quot;observed&quot;:{}} {}`)); e == nil {
+        t.Fatal(&quot;trailing&quot;)
+    }
+}
+func TestBounds(t *testing.T) {
+    if _, e := Load(make([]byte, (1&lt;&lt;20)+1)); e == nil {
+        t.Fatal(&quot;unbounded&quot;)
+    }
+}
+</code></pre></div></div></details>
+<h2>Step 2 · Resolve precedence with provenance</h2>
+<p><em>Step 2 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Keep every shadowed setting while choosing the last declared value.</p>
+</blockquote>
+<p><strong>What you build.</strong> Implement <code>Resolve</code> over validated layers. A later layer overrides an earlier one. Preserve all source names and values in order for each key. Resolution is an internal operation and can contain secrets; only the report is safe to export.</p>
+<p><strong>Worked example.</strong> timeout has history [(defaults.json,30),(env:TIMEOUT,5)] and effective value 5. An unrelated region value remains local. Explicit null replaces an earlier value instead of deleting the key.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-configuration-drift-explainer-2"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Resolve(layers []Layer) map[string]Effective</code>, where <code>Effective{Value any, History []Source}</code> and <code>Source{Layer string, Value any}</code>. Empty layers produce an empty map.</p>
+<details class="qa" id="a2018-qa2"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (35 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;testing&quot;
+)
+
+func TestLaterWins(t *testing.T) {
+    r := Resolve([]Layer{{&quot;a&quot;, map[string]any{&quot;x&quot;: 1.0}}, {&quot;b&quot;, map[string]any{&quot;x&quot;: 2.0}}})
+    if r[&quot;x&quot;].Value != 2.0 {
+        t.Fatal(r)
+    }
+}
+func TestHistory(t *testing.T) {
+    r := Resolve([]Layer{{&quot;a&quot;, map[string]any{&quot;x&quot;: 1.0}}, {&quot;b&quot;, map[string]any{&quot;x&quot;: 2.0}}})
+    if len(r[&quot;x&quot;].History) != 2 || r[&quot;x&quot;].History[0].Layer != &quot;a&quot; {
+        t.Fatal(r)
+    }
+}
+func TestNullOverride(t *testing.T) {
+    r := Resolve([]Layer{{&quot;a&quot;, map[string]any{&quot;x&quot;: true}}, {&quot;b&quot;, map[string]any{&quot;x&quot;: nil}}})
+    if r[&quot;x&quot;].Value != nil || len(r[&quot;x&quot;].History) != 2 {
+        t.Fatal(r)
+    }
+}
+func TestUntouched(t *testing.T) {
+    r := Resolve([]Layer{{&quot;a&quot;, map[string]any{&quot;held-out&quot;: &quot;north&quot;}}, {&quot;b&quot;, map[string]any{}}})
+    if r[&quot;held-out&quot;].Value != &quot;north&quot; {
+        t.Fatal(r)
+    }
+}
+func TestEmpty(t *testing.T) {
+    if len(Resolve(nil)) != 0 {
+        t.Fatal(&quot;not empty&quot;)
+    }
+}
+</code></pre></div></div></details>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Which layer won?</div><div class="co-body"><p>Layers in order: <code>defaults.json</code> sets <code>timeout: 30</code>, <code>api_token</code>, <code>region: local</code>; then <code>env:TIMEOUT</code> sets <code>timeout: 5</code>.</p>
+<ol>
+<li><code>timeout</code>: history <code>[(defaults.json, 30), (env:TIMEOUT, 5)]</code>. The later layer wins, so the expected value is 5.</li>
+<li><code>region</code>: set once, by defaults, expected <code>local</code>.</li>
+<li><code>api_token</code>: set once; the value is a secret, kept in memory for comparison only.</li>
+<li>The observed system reports <code>timeout: 30</code>. Expected 5, observed 30: the environment variable never reached the running process.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A missing key and a key set to <code>null</code> are different results.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Secrets can be redacted before comparing, since only the report is exported.
+  Redacting first would make two different tokens look equal; compare first, then redact.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Every shadowed value stays in the history, so you can see what was overridden.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> <code>--check</code> exits 1 when drift is found.
+  It exits 2 for drift, 0 for none, and 1 for invalid input or I/O errors, so CI can tell them apart.</li>
+</ul></div></aside>
+<h2>Step 3 · Compare effective values</h2>
+<p><em>Step 3 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Distinguish equal, changed, missing and unexpected keys.</p>
+</blockquote>
+<p><strong>What you build.</strong> Compare expected resolved values with the observed scalar map. Emit one sorted row per union key. A missing key is different from a present null. Evaluate equality before redacting so two different secret values still report changed.</p>
+<p><strong>Worked example.</strong> The effective timeout is 5 but observed timeout is 30, so kind is changed. api_token also changes, but both displayed values and every history value become [REDACTED]. region stays equal.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-configuration-drift-explainer-3"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Compare(in Input) Report</code> returns <code>schemaVersion:1</code>, <code>drift:boolean</code>, and sorted <code>changes</code>. Each row has <code>key</code>, <code>kind</code>, <code>expected</code>, <code>observed</code>, <code>history</code>, <code>redacted</code>. Sensitive keys match password/secret/token/api-key/credential case-insensitively or the explicit sensitive list.</p>
+<details class="qa" id="a2018-qa3"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (36 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;testing&quot;
+)
+
+func TestChanged(t *testing.T) {
+    r := Compare(Input{Layers: []Layer{{&quot;a&quot;, map[string]any{&quot;x&quot;: 1.0}}}, Observed: map[string]any{&quot;x&quot;: 2.0}})
+    if !r.Drift || r.Changes[0].Kind != &quot;changed&quot; {
+        t.Fatal(r)
+    }
+}
+func TestMissingNull(t *testing.T) {
+    r := Compare(Input{Layers: []Layer{{&quot;a&quot;, map[string]any{&quot;x&quot;: nil}}}, Observed: map[string]any{}})
+    if r.Changes[0].Kind != &quot;missing&quot; {
+        t.Fatal(r)
+    }
+}
+func TestUnexpectedSecret(t *testing.T) {
+    r := Compare(Input{Observed: map[string]any{&quot;api-key&quot;: &quot;private&quot;}})
+    if r.Changes[0].Observed != &quot;[REDACTED]&quot; || r.Changes[0].Kind != &quot;unexpected&quot; {
+        t.Fatal(r)
+    }
+}
+func TestEqualSecret(t *testing.T) {
+    r := Compare(Input{Layers: []Layer{{&quot;a&quot;, map[string]any{&quot;password&quot;: &quot;same&quot;}}}, Observed: map[string]any{&quot;password&quot;: &quot;same&quot;}})
+    if r.Drift || r.Changes[0].History[0].Value != &quot;[REDACTED]&quot; {
+        t.Fatal(r)
+    }
+}
+func TestSortedAndExplicit(t *testing.T) {
+    r := Compare(Input{Observed: map[string]any{&quot;z&quot;: false, &quot;opaque&quot;: &quot;hide&quot;}, Sensitive: []string{&quot;opaque&quot;}})
+    if r.Changes[0].Key != &quot;opaque&quot; || !r.Changes[0].Redacted {
+        t.Fatal(r)
+    }
+}
+</code></pre></div></div></details>
+<h2>Step 4 · Export redacted CI evidence</h2>
+<p><em>Step 4 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Produce a report an assistant can consume without receiving secret values.</p>
+</blockquote>
+<p><strong>What you build.</strong> Compose the stages in the CLI. Output JSON to stdout and optionally a mode-0600 file. The report is the only exported data structure. <code>--check</code> exits 2 when drift is present, 0 when equal, and 1 for invalid input or I/O failures.</p>
+<p><strong>Worked example.</strong> Run the README command and use Python to load the report: schemaVersion is 1 and changed keys are api_token and timeout. Searching the serialized bytes for either fixture token must find nothing.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-configuration-drift-explainer-4"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Export(in Input) ([]byte,error)</code> serializes only <code>Compare(in)</code>. CLI: <code>go run . --input PATH --out PATH [--check]</code>. Go run wraps child exit codes, so build a binary when checking exact exit code 2.</p>
+<details class="qa" id="a2018-qa4"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (43 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;bytes&quot;
+    &quot;encoding/json&quot;
+    &quot;testing&quot;
+)
+
+func TestExportSchema(t *testing.T) {
+    b, e := Export(Input{Observed: map[string]any{}})
+    var r Report
+    if e != nil || json.Unmarshal(b, &amp;r) != nil || r.SchemaVersion != 1 {
+        t.Fatal(string(b), e)
+    }
+}
+func TestNoCurrentSecret(t *testing.T) {
+    b, _ := Export(Input{Observed: map[string]any{&quot;TOKEN&quot;: &quot;held-out-secret&quot;}})
+    if bytes.Contains(b, []byte(&quot;held-out-secret&quot;)) {
+        t.Fatal(string(b))
+    }
+}
+func TestNoHistoricSecret(t *testing.T) {
+    b, _ := Export(Input{Layers: []Layer{{&quot;base&quot;, map[string]any{&quot;password&quot;: &quot;ancient&quot;}}, {&quot;override&quot;, map[string]any{&quot;password&quot;: &quot;latest&quot;}}}, Observed: map[string]any{}})
+    if bytes.Contains(b, []byte(&quot;ancient&quot;)) || bytes.Contains(b, []byte(&quot;latest&quot;)) {
+        t.Fatal(string(b))
+    }
+}
+func TestConsumer(t *testing.T) {
+    b, _ := Export(Input{Layers: []Layer{{&quot;base&quot;, map[string]any{&quot;timeout&quot;: 4.0}}}, Observed: map[string]any{&quot;timeout&quot;: 5.0}})
+    var r Report
+    json.Unmarshal(b, &amp;r)
+    if !r.Drift || r.Changes[0].History[0].Layer != &quot;base&quot; {
+        t.Fatal(r)
+    }
+}
+func TestStable(t *testing.T) {
+    in := Input{Observed: map[string]any{&quot;b&quot;: 2.0, &quot;a&quot;: 1.0}}
+    a, _ := Export(in)
+    b, _ := Export(in)
+    if !bytes.Equal(a, b) {
+        t.Fatal(&quot;nondeterministic&quot;)
+    }
+}
+</code></pre></div></div></details>
+<h2>Run the finished project</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Expected: <code>timeout</code> 5 (from the environment), <code>region</code> local, and the default <code>api_token</code>. Observed: <code>timeout</code> 30, <code>region</code> local, and a different, live token. Which keys will be reported as changed, and what will the report show for the token?</p></div></aside>
+<p>The finished reference runs with one command, from its <code>solution/</code> folder:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">go run .
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{
+  &quot;schemaVersion&quot;: 1,
+  &quot;drift&quot;: true,
+  &quot;changes&quot;: [
+    {
+      &quot;key&quot;: &quot;api_token&quot;,
+      &quot;kind&quot;: &quot;changed&quot;,
+      &quot;expected&quot;: &quot;[REDACTED]&quot;,
+      &quot;observed&quot;: &quot;[REDACTED]&quot;,
+      &quot;history&quot;: [
+        {
+          &quot;layer&quot;: &quot;defaults.json&quot;,
+          &quot;value&quot;: &quot;[REDACTED]&quot;
+        }
+      ],
+      &quot;redacted&quot;: true
+    },
+    {
+      &quot;key&quot;: &quot;region&quot;,
+      &quot;kind&quot;: &quot;equal&quot;,
+      &quot;expected&quot;: &quot;local&quot;,
+      &quot;observed&quot;: &quot;local&quot;,
+      &quot;history&quot;: [
+        {
+          &quot;layer&quot;: &quot;defaults.json&quot;,
+          &quot;value&quot;: &quot;local&quot;
+        }
+      ],
+      &quot;redacted&quot;: false
+    },
+    {
+      &quot;key&quot;: &quot;timeout&quot;,
+      &quot;kind&quot;: &quot;changed&quot;,
+      &quot;expected&quot;: 5,
+      &quot;observed&quot;: 30,
+      &quot;history&quot;: [
+        {
+          &quot;layer&quot;: &quot;defaults.json&quot;,
+          &quot;value&quot;: 30
+        },
+        {
+          &quot;layer&quot;: &quot;env:TIMEOUT&quot;,
+          &quot;value&quot;: 5
+        }
+      ],
+      &quot;redacted&quot;: false
+    }
+  ]
+}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><code>drift: true</code>. <code>timeout</code> is <code>changed</code>: expected 5, observed 30, and the history shows both layers, so the cause is visible at once: the <code>env:TIMEOUT</code> override is not in effect. <code>region</code> is <code>equal</code>. <code>api_token</code> is <code>changed</code>, but both values appear as <code>[REDACTED]</code> and <code>redacted: true</code>: the tool compared the real values and then hid them, so the report proves the token differs without revealing either one.</p></div></aside>
+<h2>Read the finished code</h2>
+<p>The complete reference, file by file. Open a file to read it; the stages above say which part each function belongs to.</p>
+<details class="qa" id="a2018-qa5"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/fixtures/config.json</code> (23 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;layers&quot;: [
+    {
+      &quot;name&quot;: &quot;defaults.json&quot;,
+      &quot;values&quot;: {
+        &quot;timeout&quot;: 30,
+        &quot;api_token&quot;: &quot;fixture-token-default&quot;,
+        &quot;region&quot;: &quot;local&quot;
+      }
+    },
+    {
+      &quot;name&quot;: &quot;env:TIMEOUT&quot;,
+      &quot;values&quot;: {
+        &quot;timeout&quot;: 5
+      }
+    }
+  ],
+  &quot;observed&quot;: {
+    &quot;timeout&quot;: 30,
+    &quot;api_token&quot;: &quot;fixture-token-live&quot;,
+    &quot;region&quot;: &quot;local&quot;
+  }
+}
+</code></pre></div></div></details>
+<details class="qa" id="a2018-qa6"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/main.go</code> (190 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;bytes&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;flag&quot;
+    &quot;fmt&quot;
+    &quot;io&quot;
+    &quot;os&quot;
+    &quot;reflect&quot;
+    &quot;regexp&quot;
+    &quot;sort&quot;
+    &quot;strings&quot;
+)
+
+type Layer struct {
+    Name   string         `json:&quot;name&quot;`
+    Values map[string]any `json:&quot;values&quot;`
+}
+type Input struct {
+    Layers    []Layer        `json:&quot;layers&quot;`
+    Observed  map[string]any `json:&quot;observed&quot;`
+    Sensitive []string       `json:&quot;sensitive&quot;`
+}
+type Source struct {
+    Layer string `json:&quot;layer&quot;`
+    Value any    `json:&quot;value&quot;`
+}
+type Effective struct {
+    Value   any
+    History []Source
+}
+type Change struct {
+    Key      string   `json:&quot;key&quot;`
+    Kind     string   `json:&quot;kind&quot;`
+    Expected any      `json:&quot;expected&quot;`
+    Observed any      `json:&quot;observed&quot;`
+    History  []Source `json:&quot;history&quot;`
+    Redacted bool     `json:&quot;redacted&quot;`
+}
+type Report struct {
+    SchemaVersion int      `json:&quot;schemaVersion&quot;`
+    Drift         bool     `json:&quot;drift&quot;`
+    Changes       []Change `json:&quot;changes&quot;`
+}
+
+func Load(data []byte) (Input, error) {
+    var in Input
+    if len(data) &gt; 1&lt;&lt;20 {
+        return in, errors.New(&quot;input exceeds one MiB&quot;)
+    }
+    d := json.NewDecoder(bytes.NewReader(data))
+    d.DisallowUnknownFields()
+    if err := d.Decode(&amp;in); err != nil {
+        return in, err
+    }
+    var tail any
+    if d.Decode(&amp;tail) != io.EOF {
+        return in, errors.New(&quot;trailing JSON&quot;)
+    }
+    if in.Layers == nil || in.Observed == nil {
+        return in, errors.New(&quot;layers and observed are required&quot;)
+    }
+    seen := map[string]bool{}
+    for _, l := range in.Layers {
+        if strings.TrimSpace(l.Name) == &quot;&quot; || seen[l.Name] || l.Values == nil {
+            return in, errors.New(&quot;invalid or duplicate layer&quot;)
+        }
+        seen[l.Name] = true
+        if err := validate(l.Values); err != nil {
+            return in, err
+        }
+    }
+    if err := validate(in.Observed); err != nil {
+        return in, err
+    }
+    for _, k := range in.Sensitive {
+        if strings.TrimSpace(k) == &quot;&quot; {
+            return in, errors.New(&quot;blank sensitive key&quot;)
+        }
+    }
+    return in, nil
+}
+func validate(values map[string]any) error {
+    for k, v := range values {
+        if strings.TrimSpace(k) == &quot;&quot; || strings.ContainsAny(k, &quot;\r\n\x00&quot;) {
+            return errors.New(&quot;invalid key&quot;)
+        }
+        switch v.(type) {
+        case nil, string, bool, float64:
+        default:
+            return errors.New(&quot;values must be JSON scalars&quot;)
+        }
+    }
+    return nil
+}
+func Resolve(layers []Layer) map[string]Effective {
+    out := map[string]Effective{}
+    for _, l := range layers {
+        for k, v := range l.Values {
+            e := out[k]
+            e.Value = v
+            e.History = append(e.History, Source{l.Name, v})
+            out[k] = e
+        }
+    }
+    return out
+}
+
+var secret = regexp.MustCompile(`(?i)(password|secret|token|api[_-]?key|credential)`)
+
+func Compare(in Input) Report {
+    effective := Resolve(in.Layers)
+    keys := map[string]bool{}
+    sensitive := map[string]bool{}
+    for _, k := range in.Sensitive {
+        sensitive[k] = true
+    }
+    for k := range effective {
+        keys[k] = true
+    }
+    for k := range in.Observed {
+        keys[k] = true
+    }
+    order := []string{}
+    for k := range keys {
+        order = append(order, k)
+    }
+    sort.Strings(order)
+    out := Report{SchemaVersion: 1, Changes: []Change{}}
+    for _, k := range order {
+        e, expected := effective[k]
+        actual, observed := in.Observed[k]
+        kind := &quot;equal&quot;
+        if !expected {
+            kind = &quot;unexpected&quot;
+        } else if !observed {
+            kind = &quot;missing&quot;
+        } else if !reflect.DeepEqual(e.Value, actual) {
+            kind = &quot;changed&quot;
+        }
+        if kind != &quot;equal&quot; {
+            out.Drift = true
+        }
+        c := Change{Key: k, Kind: kind, Expected: e.Value, Observed: actual, History: append([]Source{}, e.History...), Redacted: secret.MatchString(k) || sensitive[k]}
+        if c.Redacted {
+            if expected {
+                c.Expected = &quot;[REDACTED]&quot;
+            }
+            if observed {
+                c.Observed = &quot;[REDACTED]&quot;
+            }
+            for i := range c.History {
+                c.History[i].Value = &quot;[REDACTED]&quot;
+            }
+        }
+        out.Changes = append(out.Changes, c)
+    }
+    return out
+}
+func Export(in Input) ([]byte, error) { return json.MarshalIndent(Compare(in), &quot;&quot;, &quot;  &quot;) }
+func main() {
+    input := flag.String(&quot;input&quot;, &quot;fixtures/config.json&quot;, &quot;configuration JSON&quot;)
+    output := flag.String(&quot;out&quot;, &quot;&quot;, &quot;report path (stdout by default)&quot;)
+    check := flag.Bool(&quot;check&quot;, false, &quot;exit 2 when drift exists&quot;)
+    flag.Parse()
+    b, err := os.ReadFile(*input)
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    in, err := Load(b)
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    b, err = Export(in)
+    if err == nil &amp;&amp; *output != &quot;&quot; {
+        err = os.WriteFile(*output, append(b, '\n'), 0600)
+    }
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    fmt.Println(string(b))
+    if *check &amp;&amp; Compare(in).Drift {
+        os.Exit(2)
+    }
+}
+</code></pre></div></div></details>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A script prints <code>diff &lt;(cat expected.env) &lt;(env)</code> into a CI log to debug drift. The log is public. What leaked, and what does this project do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this project</div><div class="co-body"><ul>
+<li>Load named layers in a stated order; reject ambiguous input.</li>
+<li>Resolve with provenance: keep every value each layer set.</li>
+<li>Compare before redacting; missing, null and empty are different.</li>
+<li>Export only a redacted report; use distinct exit codes for drift and errors.</li>
+</ul></div></aside>
+<h2>Build it on your machine</h2>
+<p>Each step above is meant to be built, not only read. The source repository ships a starter and the checks for every step, and its test runner grades your own folder step by step:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">git clone https://github.com/rohitg00/ai-engineering-from-scratch
+cd ai-engineering-from-scratch
+python3 scripts/project_test.py configuration-drift-explainer --init my-configuration-drift-explainer
+python3 scripts/project_test.py configuration-drift-explainer --stage 1 --path my-configuration-drift-explainer
+</code></pre></div>
+<p>Write the step, run its checks, then move to the next step. The checks for each step are also shown above, under that step, so you can see what is expected before you start.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a separate JSON-flattening adapter and specify whether arrays should be atomic values. <em>(step 1)</em></li>
+<li>Compare explicit null, missing key and an empty string. They represent three different effective configurations. <em>(step 2)</em></li>
+<li>Add an explicit allowlist for a CI consumer that only considers selected drift rows blocking. <em>(step 3)</em></li>
+<li>Integrate the built binary into CI and pass the redacted JSON as an assistant attachment. Source names and nonsecret values remain visible; select sensitive keys deliberately. <em>(step 4)</em></li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a2018-qa7"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol>
+<li>A flattening adapter</li>
+</ol></span></summary><div class="qa-a"><p>Write it as a separate step that turns nested objects into dotted keys (<code>db.pool.size</code>) and treats arrays as single atomic values, so <code>["a","b"]</code> and <code>["b","a"]</code> count as different. Document the choice, because element-by-element comparison is a different policy.</p></div></details>
+<details class="qa" id="a2018-qa8"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="2">
+<li>Null, missing and empty</li>
+</ol></span></summary><div class="qa-a"><p><code>null</code> means "explicitly unset", a missing key means "never configured", and <code>""</code> is a real value. Code often behaves differently for each (a default applies, an error is raised, an empty string is used), so the report keeps them apart.</p></div></details>
+<details class="qa" id="a2018-qa9"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="3">
+<li>A blocking allowlist</li>
+</ol></span></summary><div class="qa-a"><p>Add a list of keys whose drift should fail CI. The report still lists every change, but <code>--check</code> exits 2 only when an allowlisted key differs. Print the allowlist in the report so nobody wonders why a change did not block.</p></div></details>
+<details class="qa" id="a2018-qa10"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="4">
+<li>CI and an assistant</li>
+</ol></span></summary><div class="qa-a"><p>Run the binary in CI with <code>--check</code>, save the redacted JSON as a build artifact, and attach that file (not raw logs) when asking an assistant for help. Choose the sensitive keys deliberately: anything not listed will appear in plain text.</p></div></details>
+<details class="qa" id="a2018-qa11"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A diff in a public log</span></summary><div class="qa-a"><p>Every environment variable on both sides, including tokens and passwords. This project keeps secret values in memory for the comparison and exports only <code>[REDACTED]</code> with a flag saying they differ.</p></div></details>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-progressive-delivery"><span class="t" style="--cs-hue:28">SC</span>Cheat sheet · A/B Tests, Canaries and Shadow Traffic for LLMs</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a2018" id="done-a2018">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a2018" id="undo-a2018" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a2017"><span class="pn-dir">Previous</span><span class="pn-t">20.17 · Building Chart Storyboards</span></a><a class="pn next" href="#a2019"><span class="pn-dir">Next</span><span class="pn-t">20.19 · Asking Questions of CSV Data</span></a></div></footer>

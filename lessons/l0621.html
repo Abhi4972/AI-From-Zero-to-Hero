@@ -1,0 +1,323 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Serving LangGraph yourself: your own API, customer isolation, front ends and CI</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.71</span><span class="chip">50 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0621" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Serve an agent from your own FastAPI service with a database checkpointer, approvals and per-customer threads</li>
+<li>Keep customers apart: authentication, thread scoping and the bug that breaks it</li>
+<li>Stream to a front end, including LangGraph's newer v3 event-streaming API, and know what <code>useStream</code> gives a React app</li>
+<li>Test agents in CI with recorded model replies, and gate pull requests on an eval score</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l0617">Lessons 14.67</a> (Agent Server), 6.13 (interrupts) and 6.8 (testing).</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 50 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langgraph</code> 1.2.24, <code>langchain</code> 1.5.2 and <code>fastapi</code> 0.162.0.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0621-0">Cassette</a></td>
+<td>Recorded model replies replayed in tests instead of calling the model</td>
+<td>Idea 4</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">The model on this page is the lab rig</div><div class="co-body"><p><code>chat</code> is a real <span class="cx" data-c="326" tabindex="0">LangChain</span> chat model pointed at <code>mockllm</code> (<a class="xref" href="#l0601">Lesson 14.51</a>). The FastAPI service runs for real, called through FastAPI's test client, and the checkpoints go to a real SQLite file.</p></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">uv add fastapi langgraph-checkpoint-sqlite      # langgraph-checkpoint-postgres in production
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import os, sqlite3, json, warnings
+from mockllm import start                                # the lab rig (Lesson 6.1)
+from langchain.chat_models import init_chat_model
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+from langchain.tools import tool
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
+
+warnings.filterwarnings(&quot;ignore&quot;)
+chat = init_chat_model(&quot;openai:mock-model&quot;, base_url=start(), api_key=&quot;mock&quot;)
+ORDERS = {&quot;A-1001&quot;: &quot;shipped&quot;, &quot;A-1002&quot;: &quot;processing&quot;}
+
+@tool
+def get_order_status(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Return the shipping status for a ShopKart order ID like 'A-1001'.&quot;&quot;&quot;
+    return f&quot;{order_id} is {ORDERS.get(order_id, 'not found')}&quot;
+
+@tool
+def cancel_order(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Cancel a ShopKart order that has not shipped yet.&quot;&quot;&quot;
+    return f&quot;{order_id} cancelled&quot;
+</code></pre></div>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Some companies cannot use a hosted agent service and need agents inside their own APIs and infrastructure. This lesson builds the serving layer by hand with FastAPI, showing what the platform would otherwise provide.</p></div></aside>
+<h2>The problem: you need the API without the platform</h2>
+<p><a class="xref" href="#l0617">Lesson 14.67</a>'s <span class="cx" data-c="22" tabindex="0">Agent Server</span> gives you threads, runs, interrupts and streaming over HTTP. Some teams cannot use it: the platform team runs everything on its own FastAPI stack, the license or data rules do not fit, or the agent is one feature inside an existing service. Then you build the thin service yourself. The hard parts are not the HTTP routes; they are durable state, approvals that resume the right run, and making sure one customer can never reach another's conversation.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Building the counter yourself</div><div class="co-body"><p>Agent Server gives you a ready-made service. Sometimes you need your own: your company's API conventions, an existing web app, or a platform you already run. Then your web framework (FastAPI here) receives requests, checks who is calling, picks the right thread for that customer, calls the compiled graph, and streams the result back. Everything Agent Server did for you becomes a few lines you own, which is the point and the cost.</p></div></aside>
+<h2>Idea 1 · An agent behind your own API</h2>
+<p>This is a complete small service: a FastAPI application with two routes in front of the agent from <a class="xref" href="#l0606">Lesson 14.56</a>. One route takes a customer's message and runs the agent; the other takes a person's decision on a paused action and resumes the run. Conversations are saved in SQLite, so they survive a restart. Read the two route functions first; the rest is set-up.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+if os.path.exists(&quot;support.db&quot;):
+    os.remove(&quot;support.db&quot;)
+agent = create_agent(chat, tools=[get_order_status, cancel_order],
+                     middleware=[HumanInTheLoopMiddleware(interrupt_on={&quot;cancel_order&quot;: True})],
+                     checkpointer=SqliteSaver(sqlite3.connect(&quot;support.db&quot;, check_same_thread=False)))
+USERS = {&quot;token-ravi&quot;: &quot;C-42&quot;, &quot;token-meera&quot;: &quot;C-77&quot;}            # your identity provider in real life
+
+def customer_for(authorization: str) -&gt; str:
+    customer = USERS.get(authorization.removeprefix(&quot;Bearer &quot;))
+    if not customer:
+        raise HTTPException(401, &quot;unknown token&quot;)
+    return customer
+
+def thread(customer: str, conversation: str) -&gt; dict:
+    return {&quot;configurable&quot;: {&quot;thread_id&quot;: f&quot;{customer}:{conversation}&quot;}}   # threads are scoped to the customer
+
+class Message(BaseModel):
+    text: str
+
+class Decision(BaseModel):
+    approve: bool
+    reason: str = &quot;&quot;
+
+app = FastAPI()
+
+@app.post(&quot;/conversations/{conversation}/messages&quot;)
+def send(conversation: str, msg: Message, authorization: str = Header()):
+    cfg = thread(customer_for(authorization), conversation)
+    out = agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: msg.text}]}, cfg, version=&quot;v2&quot;)
+    if out.interrupts:
+        req = out.interrupts[0].value[&quot;action_requests&quot;][0]
+        return {&quot;status&quot;: &quot;needs_approval&quot;, &quot;action&quot;: req[&quot;name&quot;], &quot;args&quot;: req[&quot;args&quot;]}
+    return {&quot;status&quot;: &quot;answered&quot;, &quot;reply&quot;: out.value[&quot;messages&quot;][-1].content}
+
+@app.post(&quot;/conversations/{conversation}/decision&quot;)
+def decide(conversation: str, d: Decision, authorization: str = Header()):
+    cfg = thread(customer_for(authorization), conversation)
+    if not agent.get_state(cfg).next:
+        raise HTTPException(409, &quot;nothing is waiting for a decision&quot;)
+    decision = {&quot;type&quot;: &quot;approve&quot;} if d.approve else {&quot;type&quot;: &quot;reject&quot;, &quot;message&quot;: d.reason}
+    out = agent.invoke(Command(resume={&quot;decisions&quot;: [decision]}), cfg, version=&quot;v2&quot;)
+    return {&quot;status&quot;: &quot;answered&quot;, &quot;reply&quot;: out.value[&quot;messages&quot;][-1].content}
+</code></pre></div>
+<p>Two routes cover a conversation with approvals. A message runs the agent; if the agent pauses for approval, the route returns the pending action instead of a reply. A decision resumes the paused run with a <code>Command</code> (<a class="xref" href="#l0613">Lesson 14.63</a>). Calling it as a client would:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from fastapi.testclient import TestClient
+
+api = TestClient(app)
+ravi = {&quot;Authorization&quot;: &quot;Bearer token-ravi&quot;}
+print(api.post(&quot;/conversations/1/messages&quot;, json={&quot;text&quot;: &quot;Where is A-1002?&quot;}, headers=ravi).json())
+print(api.post(&quot;/conversations/1/messages&quot;, json={&quot;text&quot;: &quot;Please cancel A-1002&quot;}, headers=ravi).json())
+print(api.post(&quot;/conversations/1/decision&quot;, json={&quot;approve&quot;: True}, headers=ravi).json())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'status': 'answered', 'reply': 'Here is what I found: A-1002 is processing'}
+{'status': 'needs_approval', 'action': 'cancel_order', 'args': {'order_id': 'A-1002'}}
+{'status': 'answered', 'reply': 'Here is what I found: A-1002 cancelled'}
+</code></pre></div></div></aside>
+<p>The checkpointer is a database, so a paused cancellation survives a deploy, and the decision can come from another worker. In production, use <code>PostgresSaver</code> (or <code>AsyncPostgresSaver</code> with an async service), and move long runs to a background worker so the HTTP request does not wait for the whole agent.</p>
+<h2>Idea 2 · Keep customers apart</h2>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 900 300" role="img" aria-label="Keeping customers apart in your own service. The customer comes from the verified token, never from the URL, and it becomes part of every key the agent&#x27;s storage uses." style="min-width:560px"><defs><marker id="ah153" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah153a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah153p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah153k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah153r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah153w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><rect class="b" x="14" y="40" width="150" height="56" rx="8"/><text x="89.0" y="64.5" text-anchor="middle">Ravi&#x27;s app</text><text class="s" x="89.0" y="80.5" text-anchor="middle">token for C-42</text><rect class="b" x="14" y="150" width="150" height="56" rx="8"/><text x="89.0" y="174.5" text-anchor="middle">Meera&#x27;s app</text><text class="s" x="89.0" y="190.5" text-anchor="middle">token for C-77</text><path class="l" d="M 166.0 68.0 L 236.0 110.0" marker-end="url(#ah153)"/><path class="l" d="M 166.0 178.0 L 236.0 136.0" marker-end="url(#ah153)"/><text class="t" x="89" y="114" text-anchor="middle">POST /chat/1</text><text class="t" x="89" y="224" text-anchor="middle">POST /chat/1</text><rect class="w" x="238" y="92" width="160" height="62" rx="8"/><text x="318.0" y="119.5" text-anchor="middle">Your API</text><text class="s" x="318.0" y="135.5" text-anchor="middle">verify the token first</text><path class="l" d="M 400.0 123.0 L 470.0 123.0" marker-end="url(#ah153)"/><text class="s" x="435" y="111" text-anchor="middle">customer</text><rect class="a" x="472" y="92" width="176" height="62" rx="8"/><text x="560.0" y="119.5" text-anchor="middle" font-weight="600">Build the keys</text><text class="s" x="560.0" y="135.5" text-anchor="middle">customer : conversation</text><path class="l a" d="M 650.0 108.0 L 700.0 74.0" marker-end="url(#ah153a)"/><path class="l a" d="M 650.0 138.0 L 700.0 172.0" marker-end="url(#ah153a)"/><rect class="f" x="702" y="30" width="184" height="86" rx="10"/><text class="h" x="714" y="50">thread C-42:1</text><text class="s" x="716" y="74" text-anchor="start">Ravi&#x27;s checkpoints</text><text class="s" x="716" y="92" text-anchor="start">store namespace (C-42, …)</text><rect class="f" x="702" y="132" width="184" height="86" rx="10"/><text class="h" x="714" y="152">thread C-77:1</text><text class="s" x="716" y="176" text-anchor="start">Meera&#x27;s checkpoints</text><text class="s" x="716" y="194" text-anchor="start">store namespace (C-77, …)</text><text class="s" x="450" y="252" text-anchor="middle">Both asked for conversation 1 and got different threads. A request with an unknown token is refused before the agent runs.</text><text class="r" x="450" y="276" text-anchor="middle">The same rule covers caches and the long-term store: any key without the customer in it is a leak waiting for two users to collide.</text></svg></div><figcaption>Keeping customers apart in your own service. The customer comes from the verified token, never from the URL, and it becomes part of every key the agent&#x27;s storage uses.</figcaption></figure>
+<p>The thread ID is built from the authenticated customer and the conversation, never from the URL alone:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">meera = {&quot;Authorization&quot;: &quot;Bearer token-meera&quot;}
+r = api.post(&quot;/conversations/1/decision&quot;, json={&quot;approve&quot;: True}, headers=meera)       # same conversation id
+print(r.status_code, r.json())
+r = api.post(&quot;/conversations/1/messages&quot;, json={&quot;text&quot;: &quot;hi&quot;}, headers={&quot;Authorization&quot;: &quot;Bearer nope&quot;})
+print(r.status_code, r.json())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">409 {'detail': 'nothing is waiting for a decision'}
+401 {'detail': 'unknown token'}
+</code></pre></div></div></aside>
+<p>Meera used Ravi's conversation number and found nothing to approve, because her requests address <code>C-77:1</code>, not <code>C-42:1</code>. An unknown token is refused before the agent runs. This is the same rule as memory namespaces (<a class="xref" href="#l0614">Lesson 14.64</a>): identity comes from authentication, and every key that stores customer data includes it. On Agent Server, the equivalent is a custom auth handler (<code>@auth.authenticate</code> to identify the user, <code>@auth.on</code> to add an owner filter to threads), configured in <code>langgraph.json</code>.</p>
+<h2>Idea 3 · Front ends and the v3 event stream</h2>
+<p><span class="cx" data-c="327" tabindex="0">LangGraph</span> 1.2 added <code>stream_events(version="v3")</code>, which returns a run object with separate views over one event stream, instead of filtering chunks by mode yourself:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">plain = create_agent(chat, tools=[get_order_status])
+stream = plain.stream_events({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Status of A-1002?&quot;}]}, version=&quot;v3&quot;)
+for i, message in enumerate(stream.messages, start=1):        # one entry per model call
+    tokens = list(message.text)                                # the call's text, token by token
+    print(f&quot;model call {i}: {len(tokens)} tokens: {''.join(tokens)!r}&quot;)
+print(&quot;final:&quot;, stream.output[&quot;messages&quot;][-1].text)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">model call 1: 0 tokens: ''
+model call 2: 8 tokens: 'Here is what I found: A-1002 is processing '
+final: Here is what I found: A-1002 is processing 
+</code></pre></div></div></aside>
+<p>The first model call produced no text, because it only asked for a tool; the second streamed the answer. Other views include <code>values</code> (state snapshots), <code>tool_calls</code>, <code>subgraphs</code>, <code>interrupts</code> and <code>output</code>. In <code>langgraph</code> 1.2.24 this API prints a warning that it is experimental, so pin your version if you adopt it, and keep the stable <span class="cx" data-c="599" tabindex="0">stream modes</span> of <a class="xref" href="#l0615">Lesson 14.65</a> for code that must not change.</p>
+<p>Two things to know before you build on it. First, read each view as it arrives. A loop that reads all of a <span class="cx" data-c="495" tabindex="0">reasoning model</span>'s thinking before it starts reading the answer will show the answer only at the end, even though its tokens arrived on time; the LangChain manual measured an answer appearing about 9 seconds late this way. Read views concurrently, or iterate the raw events. Second, from <code>langchain-core</code> 1.7 (October 2026) a streaming <span class="cx" data-c="637" tabindex="0">tool call</span> arrives as <code>tool-call-delta</code> events that carry only the new part of the arguments, where older versions repeated all the arguments so far. Upgrade clients before servers: Python clients need <code>langchain-core</code> 1.6.13 or later, and the JavaScript framework packages (<code>@langchain/react</code> and its siblings) 1.2.6 or later.</p>
+<p>For <span class="cx" data-c="492" tabindex="0">React</span> front ends, LangGraph's <code>useStream</code> hook (from <code>@langchain/langgraph-sdk/react</code>) connects to an Agent Server or a compatible API, and gives the component the messages as they stream, the thread, interrupts waiting for approval, a <code>submit</code> function and loading state:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">const thread = useStream({ apiUrl: &quot;https://support.shopkart.example&quot;, assistantId: &quot;support&quot; });
+thread.submit({ messages: [{ type: &quot;human&quot;, content: &quot;Where is A-1002?&quot; }] });
+// thread.messages updates token by token; thread.interrupt holds a pending approval
+</code></pre></div>
+<p>LangChain's Agent Chat UI is a ready-made interface built on it, useful for internal tools and testing.</p>
+<h2>Idea 4 · Tests in CI: record once, replay forever</h2>
+<p>Tests that call a real model are slow and flaky; tests with hand-written scripts (<a class="xref" href="#l0608">Lesson 14.58</a>) drift from what the real model does. A <strong><mark class="term" id="term-l0621-0" title="Industry term: Cassette. Recorded model replies replayed in tests instead of calling the model">cassette</mark></strong> records the real model's replies once and replays them in CI:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import messages_to_dict, messages_from_dict
+
+class Replay(GenericFakeChatModel):
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+# 1. Record once, against the real model (here the lab rig), and save the model's replies.
+live = create_agent(chat, tools=[get_order_status])
+recorded = live.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is A-1001?&quot;}]})
+json.dump(messages_to_dict([m for m in recorded[&quot;messages&quot;] if m.type == &quot;ai&quot;]), open(&quot;cassette.json&quot;, &quot;w&quot;))
+
+# 2. In CI, replay them: no network, no cost, the same model behavior every time.
+replies = messages_from_dict(json.load(open(&quot;cassette.json&quot;)))
+replayed = create_agent(Replay(messages=iter(replies)), tools=[get_order_status])
+again = replayed.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where is A-1001?&quot;}]})
+print(&quot;recorded:&quot;, recorded[&quot;messages&quot;][-1].content)
+print(&quot;replayed:&quot;, again[&quot;messages&quot;][-1].content)
+print(&quot;tool ran again during replay:&quot;, [m.content for m in again[&quot;messages&quot;] if m.type == &quot;tool&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">recorded: Here is what I found: A-1001 is shipped
+replayed: Here is what I found: A-1001 is shipped
+tool ran again during replay: ['A-1001 is shipped']
+</code></pre></div></div></aside>
+<p>The replay used no network, but your tools ran again, so the test still checks your code. Re-record when you change the model or the prompt, and review the new cassette like code.</p>
+<h2>Idea 5 · Evals as a pull-request gate</h2>
+<p>The last check before a change is merged: run a fixed set of questions with known answers through the agent, compute the share it gets right, and fail the build if that share is under a threshold. Three cases are enough to show the mechanism; a real gate has dozens, drawn from past failures.</p>
+<figure class="xfig" id="fig-l0621-lg-experiment"><div class="xfig-frame"><img src="img/lg-experiment.webp" alt="A LangSmith experiment: one row per test example, one column per score" loading="lazy" decoding="async"></div><figcaption>An experiment in a tracing tool: one row per test example and one column per score. A pull-request gate runs this table and compares it with the last accepted run. <span class="xfig-credit">Figure: <a href="https://docs.langchain.com" target="_blank" rel="noopener">LangChain documentation</a>, <a href="https://opensource.org/license/mit" target="_blank" rel="noopener">MIT</a>.</span></figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">CASES = [(&quot;Where is A-1001?&quot;, &quot;A-1001 is shipped&quot;), (&quot;Where is A-1002?&quot;, &quot;A-1002 is processing&quot;),
+         (&quot;Where are A-1001 and A-1002?&quot;, &quot;A-1002 is processing&quot;)]
+THRESHOLD = 0.9
+
+
+def eval_gate(agent) -&gt; bool:
+    passed = sum(expected in agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: q}]})[&quot;messages&quot;][-1].content
+                 for q, expected in CASES)
+    score = passed / len(CASES)
+    print(f&quot;eval: {passed}/{len(CASES)} = {score:.0%} (gate {THRESHOLD:.0%}) -&gt;&quot;, &quot;PASS&quot; if score &gt;= THRESHOLD else &quot;FAIL&quot;)
+    return score &gt;= THRESHOLD
+
+ok = eval_gate(create_agent(chat, tools=[get_order_status]))
+# In CI: sys.exit(0 if ok else 1), so a pull request that lowers the score cannot be merged.
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">eval: 3/3 = 100% (gate 90%) -&gt; PASS
+</code></pre></div></div></aside>
+<p>Run the eval suite in CI on every pull request that touches prompts, tools, models or retrieval, and fail the build below the threshold. For real models, compare against the main branch's score on the same cases with several runs per case (<a class="xref" href="#l1211">Lesson 14.115</a>), rather than a fixed threshold alone, so noise does not block merges and regressions do not slip through.</p>
+<h2>Agent Server or your own service?</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>You need</th>
+<th>Agent Server (<a class="xref" href="#l0617">Lesson 14.67</a>)</th>
+<th>Your own service (this lesson)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Threads, runs, background workers, <span class="cx" data-c="190" tabindex="0">double-texting</span></td>
+<td>Built in</td>
+<td>You build them</td>
+</tr>
+<tr>
+<td>Streaming over HTTP</td>
+<td>Built in, all modes</td>
+<td>Your <span class="cx" data-c="601" tabindex="0">SSE</span> endpoint over <code>stream</code></td>
+</tr>
+<tr>
+<td>Auth</td>
+<td>Custom auth handlers</td>
+<td>Your framework's auth</td>
+</tr>
+<tr>
+<td>Studio, <span class="cx" data-c="328" tabindex="0">LangSmith</span> integration</td>
+<td>Built in</td>
+<td><span class="cx" data-c="649" tabindex="0">Tracing</span> works; Studio needs the server API</td>
+</tr>
+<tr>
+<td>Fits an existing platform and its rules</td>
+<td>Sometimes</td>
+<td>Always</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Streaming</em> (v3 event streaming), <em>Persistence</em>, <em>Authentication and access control</em> for Agent Server; LangChain docs: <em>Frontend</em> (<code>useStream</code>), <em>Agent Chat UI</em>.</li>
+<li><strong>Versions</strong>: <code>langgraph</code> 1.2.24, <code>langchain</code> 1.5.2, <code>fastapi</code> 0.162.0. The React example was not run here.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>stream_events(version="v3")</code></td>
+<td>New in LangGraph 1.2; still marked beta in 1.2.24</td>
+</tr>
+<tr>
+<td><code>useStream</code> (React)</td>
+<td>Documented</td>
+</tr>
+<tr>
+<td>Custom auth (<code>@auth.authenticate</code>, <code>@auth.on</code>) on Agent Server</td>
+<td>Documented</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Authentication is enough to keep customers apart."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Every thread ID, store namespace and cache key must also include the authenticated customer.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The client may choose the thread ID."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only from threads the server has confirmed belong to that customer; otherwise one customer can read another's conversation.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Recorded model replies make tests realistic forever."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> They go stale when prompts or models change; re-record deliberately.</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Ravi sends "Please cancel A-1002" twice before deciding. What does the second message do to the paused run, and what should the service do instead? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Delete <code>cassette.json</code> and run the replay part of Idea 4 on its own. What happens, and what should CI do when a cassette is missing? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: anyone can approve anyone&#x27;s cancellation</div><div class="co-body"><p>After a refactor, support staff report that a customer approved a cancellation in someone else's conversation:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def thread_buggy(customer: str, conversation: str) -&gt; dict:
+    return {&quot;configurable&quot;: {&quot;thread_id&quot;: conversation}}             # the bug is on this line
+
+thread = thread_buggy
+meera = {&quot;Authorization&quot;: &quot;Bearer token-meera&quot;}
+api.post(&quot;/conversations/7/messages&quot;, json={&quot;text&quot;: &quot;Please cancel A-1002&quot;}, headers=ravi)
+print(&quot;Meera approves Ravi's cancellation:&quot;, api.post(&quot;/conversations/7/decision&quot;, json={&quot;approve&quot;: True}, headers=meera).json())
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Meera approves Ravi's cancellation: {'status': 'answered', 'reply': 'Here is what I found: A-1002 cancelled'}
+</code></pre></div>
+<p>Find the bug, explain why it is a security incident, and fix it. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Add a <code>GET /conversations/{conversation}/pending</code> route that returns the action waiting for approval, if any, using the thread's state. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0621-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · A second message starts a new run</span></summary><div class="qa-a"><p>Sending new input to a paused thread starts a new run (<a class="xref" href="#l0613">Lesson 14.63</a>), which pauses again with a second interrupt; the first pending decision is effectively abandoned. The service should check <code>agent.get_state(cfg).next</code> before running a new message and either reject it ("a decision is pending"), queue it, or cancel the pending action explicitly: the double-texting choice from <a class="xref" href="#l0617">Lesson 14.67</a>.</p></div></details>
+<details class="qa" id="l0621-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · No cassette, no test</span></summary><div class="qa-a"><p><code>open("cassette.json")</code> raises <code>FileNotFoundError</code>, so the test fails. That is the right outcome: CI must never fall back to calling the real model silently. Commit cassettes, and make recording an explicit command run by a person.</p></div></details>
+<details class="qa" id="l0621-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · The thread ID forgot the customer</span></summary><div class="qa-a"><p><code>thread_buggy</code> builds the thread ID from the conversation number alone, so <code>/conversations/7</code> is the same thread for every customer, and Meera resumed Ravi's paused run. It is a security incident because one customer acted on another's order, and could also read their conversation. Scope every thread to the authenticated identity:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def thread(customer: str, conversation: str) -&gt; dict:
+    return {&quot;configurable&quot;: {&quot;thread_id&quot;: f&quot;{customer}:{conversation}&quot;}}
+
+api.post(&quot;/conversations/8/messages&quot;, json={&quot;text&quot;: &quot;Please cancel A-1002&quot;}, headers=ravi)
+print(&quot;Meera:&quot;, api.post(&quot;/conversations/8/decision&quot;, json={&quot;approve&quot;: True}, headers=meera).status_code)
+print(&quot;Ravi: &quot;, api.post(&quot;/conversations/8/decision&quot;, json={&quot;approve&quot;: True}, headers=ravi).json()[&quot;status&quot;])
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Meera: 409
+Ravi:  answered
+</code></pre></div>
+<p>Add a test with two customers for every route, and review all code that builds thread IDs and store namespaces.</p></div></details>
+<details class="qa" id="l0621-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · A pending-approval route</span></summary><div class="qa-a"><p>Read <code>state = agent.get_state(cfg)</code>; if <code>state.next</code> is empty, return <code>{"pending": None}</code>; otherwise take the interrupt from <code>state.tasks[0].interrupts[0].value["action_requests"][0]</code> and return its name and arguments. Scope <code>cfg</code> with the same <code>thread(customer_for(authorization), conversation)</code> helper, so the route cannot reveal another customer's pending action.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0621-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How would you serve a LangGraph agent from your own API?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> A web framework such as FastAPI with routes for messages and decisions, a database checkpointer (Postgres), thread IDs built from the authenticated user and the conversation, interrupts returned to the client as pending actions and resumed with <code>Command(resume=...)</code>, streaming over server-sent events from the graph's stream, and background workers for long runs. Plus tracing, rate limits and the double-texting policy. Agent Server provides most of this; building it yourself is for when it does not fit.</p>
+<p><strong>A plausible wrong answer.</strong> "Wrap <code>agent.invoke</code> in a POST route." That works until the first approval, deploy or second message.</p>
+<p><strong>Follow-ups.</strong> How would you stream tokens from a FastAPI route?</p></div></details>
+<details class="qa" id="l0621-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">Users occasionally see another user's conversation history. Where do you look?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> At how thread IDs are built and where they come from: from authentication, never from the URL or the client alone; then caching layers that might key responses without the user; then store namespaces. Reproduce with two test users on the same conversation number, and add that as a permanent test.</p>
+<p><strong>A plausible wrong answer.</strong> "The model leaked memory." The model has no memory; the application shared a thread.</p>
+<p><strong>Follow-ups.</strong> How would you detect cross-tenant access in logs?</p></div></details>
+<details class="qa" id="l0621-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Record-and-replay cassettes or live model calls in CI?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Cassettes for the tests that run on every commit: fast, free, deterministic, still exercising your tools and wiring. Live calls in a scheduled eval job and before releases, where the real model's behavior is the thing under test and variation is measured. Re-record cassettes when the model or prompt changes, and review the diff.</p>
+<p><strong>A plausible wrong answer.</strong> "Always live, to test the real thing." Then CI is slow, costly and flaky, and people start ignoring it.</p>
+<p><strong>Follow-ups.</strong> How do you know a cassette has gone stale?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Serve an agent with routes for messages and approvals, backed by a database checkpointer.</li>
+<li>Show that two customers with the same conversation number cannot reach each other's thread.</li>
+<li>Stream a run with <code>stream_events(version="v3")</code> and explain its views.</li>
+<li>Record a cassette, replay it in a test, and add an eval gate.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0621-q1"><p class="q-text"><span class="q-num">Q1</span>How should a service build a thread ID for a customer's conversation?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0621-q1-o0"><span class="opt-key">A</span><span>From the conversation number in the URL</span></button><button type="button" class="opt" data-correct="true" id="l0621-q1-o1"><span class="opt-key">B</span><span>From the authenticated customer's ID and the conversation number</span></button><button type="button" class="opt" data-correct="false" id="l0621-q1-o2"><span class="opt-key">C</span><span>From the model's reply</span></button><button type="button" class="opt" data-correct="false" id="l0621-q1-o3"><span class="opt-key">D</span><span>Randomly for each message</span></button></div><p class="q-explain" hidden>Otherwise customers can reach each other's threads.</p></div><div class="q" id="l0621-q2"><p class="q-text"><span class="q-num">Q2</span>What does a cassette give a CI test?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0621-q2-o0"><span class="opt-key">A</span><span>A recording of the user's voice</span></button><button type="button" class="opt" data-correct="true" id="l0621-q2-o1"><span class="opt-key">B</span><span>The real model's recorded replies, replayed without network or cost</span></button><button type="button" class="opt" data-correct="false" id="l0621-q2-o2"><span class="opt-key">C</span><span>A faster model</span></button><button type="button" class="opt" data-correct="false" id="l0621-q2-o3"><span class="opt-key">D</span><span>Automatic eval scores</span></button></div><p class="q-explain" hidden>Your tools still run, so the test checks your code.</p></div><div class="q" id="l0621-q3"><p class="q-text"><span class="q-num">Q3</span>What is the status of stream_events(version="v3") in langgraph 1.2.24?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0621-q3-o0"><span class="opt-key">A</span><span>Removed</span></button><button type="button" class="opt" data-correct="true" id="l0621-q3-o1"><span class="opt-key">B</span><span>New and marked experimental</span></button><button type="button" class="opt" data-correct="false" id="l0621-q3-o2"><span class="opt-key">C</span><span>The only stream API</span></button><button type="button" class="opt" data-correct="false" id="l0621-q3-o3"><span class="opt-key">D</span><span>Deprecated</span></button></div><p class="q-explain" hidden>Pin versions if you adopt it; the stable stream modes remain.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0621" id="done-l0621">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0621" id="undo-l0621" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0620"><span class="pn-dir">Previous</span><span class="pn-t">14.70 · Deep Agents: a harness on LangGraph</span></a><a class="pn next" href="#l0622"><span class="pn-dir">Next</span><span class="pn-t">14.72 · Capstone: the ShopKart desk in LangGraph, and Chapter 6 self-check</span></a></div></footer>

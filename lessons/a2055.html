@@ -1,0 +1,651 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-20">Phase 20 · Hands-On AI Projects</a></nav><h1>Keeping RAG Indexes Fresh: a Pipeline</h1><div class="m-meta"><span class="chip chip-num">Lesson 20.55</span><span class="chip">480 min</span><span class="chip chip-core">Project</span><span class="chip chip-done" data-done-chip="a2055" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Normalize documents and fingerprint content</li>
+<li>Plan inserts updates deletions and refreshes</li>
+<li>Persist an index with atomic replacement</li>
+<li>Exclude expired evidence at query time</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a href="#a0009">Data management</a>, <a href="#a1106">Retrieval augmented generation</a></li>
+<li><strong>Type</strong>: Project, level 3 (Engineer). <strong>Time</strong>: about 8 hours over 4 steps.</li>
+<li><strong>Code in</strong>: Python. <em>Why:</em> Stdlib data structures, explicit algorithms and deterministic local tests.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Build a content-addressed document index with deletion tracking, version checks, and freshness-aware retrieval.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A RAG system answers from an index of documents. When a policy changes from "tokens expire after 60 minutes" to "15 minutes", or a runbook is deleted, the index must change too, or the assistant keeps confidently citing the old text. This is one of the most common real RAG failures.</p>
+<p>This project builds a freshness pipeline. Documents are fingerprinted by normalized content. Each sync computes a full plan of inserts, updates, deletions and metadata refreshes before touching the index. The index is written atomically with a version check that rejects stale writers. And at query time, anything older than the allowed age is excluded, even if it matches perfectly.</p></div></aside>
+<p>A stale-answer incident lab proving an edited or deleted policy can no longer be cited.</p>
+<p>The Orchard policy keeps the same document id when its timeout changes. Normalize Unicode and line endings before hashing the body, and retain updated time separately. A later observation of unchanged content is a refresh, not a rewrite.</p>
+<p><strong>Where it stops:</strong> The importer expects the complete corpus, not a partial change feed.</p>
+<h2>Step 1 · Normalize documents and fingerprint content</h2>
+<p><em>Step 1 of 4 · about 2 hours · Python</em></p>
+<p>Canonically equivalent é encodings receive identical content hashes.</p>
+<p>Identity and content are different keys. Preserve the caller id while hashing normalized Unicode content, so equivalent encodings do not trigger unnecessary indexing. Timestamps remain metadata: changing a timestamp must not pretend that the document content changed.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-rag-freshness-pipeline-1"></div></figure></p>
+<p><strong>Implementation boundary.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def normalize(doc):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre></div>
+
+<p><strong>Worked Orchard case.</strong> Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html">Python data structures</a> and <a href="#a0009">Data management</a>.</p>
+<p>The Orchard policy keeps the same document id when its timeout changes. Normalize Unicode and line endings before hashing the body, and retain updated time separately. A later observation of unchanged content is a refresh, not a rewrite.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">id=orchard-auth
+text: tokens expire after 60 minutes
+updated: 100 -&gt; 200
+content hash: unchanged
+</code></pre></div>
+<p><strong>Build and inspect.</strong> Hash normalized UTF-8 bytes. Do not hash the timestamp into content identity.</p>
+<details class="qa" id="a2055-qa1"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_fingerprint.py</code> (29 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import unittest
+import tempfile
+from pathlib import Path
+from fingerprint import *
+
+
+class StageTests(unittest.TestCase):
+    def test_01(self):
+        self.assertEqual(normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot; x &quot;})[&quot;text&quot;], &quot;x&quot;)
+
+    def test_02(self):
+        self.assertEqual(
+            normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;é&quot;})[&quot;hash&quot;],
+            normalize({&quot;id&quot;: &quot;b&quot;, &quot;text&quot;: &quot;é&quot;})[&quot;hash&quot;],
+        )
+
+    def test_03(self):
+        self.assertNotEqual(
+            normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;})[&quot;hash&quot;],
+            normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;y&quot;})[&quot;hash&quot;],
+        )
+
+    def test_04(self):
+        with self.assertRaises(ValueError):
+            normalize({&quot;id&quot;: &quot;&quot;, &quot;text&quot;: &quot;x&quot;})
+
+    def test_05(self):
+        with self.assertRaises(ValueError):
+            normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot; &quot;})
+</code></pre></div></div></details>
+<h2>Step 2 · Plan inserts updates deletions and refreshes</h2>
+<p><em>Step 2 of 4 · about 2 hours · Python</em></p>
+<p>A removed document appears in delete, so stale chunks cannot remain searchable.</p>
+<p>Compute the whole plan before changing the index. A missing id is a deletion, a changed hash is an update, and unchanged content with new metadata is a refresh. Treat duplicate ids as an error because silently keeping one would make ingestion depend on input order.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-rag-freshness-pipeline-2"></div></figure></p>
+<p><strong>Implementation boundary.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def diff(previous,incoming):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre></div>
+
+<p><strong>Worked Orchard case.</strong> Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html">Python data structures</a> and <a href="#a0009">Data management</a>. Complete Step 1 first.</p>
+<p>Ingestion receives a complete corpus snapshot. The after fixture replaces a retired backup note and edits the token lifetime. Missing ids must be deleted so obsolete evidence cannot remain searchable.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">before ids: orchard-auth, retired-backup
+after ids: orchard-auth, restore-runbook
+update: orchard-auth; delete: retired-backup; insert: restore-runbook
+</code></pre></div>
+<p><strong>Build and inspect.</strong> Build the incoming id map before deciding any operation. A duplicate incoming id is an error, not last-write-wins.</p>
+<details class="qa" id="a2055-qa2"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_changes.py</code> (35 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import unittest
+import tempfile
+from pathlib import Path
+from changes import *
+
+
+class StageTests(unittest.TestCase):
+    def test_01(self):
+        self.assertEqual(diff({}, [{&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;}])[&quot;insert&quot;], [&quot;a&quot;])
+
+    def test_02(self):
+        self.assertEqual(
+            diff({&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;})}, [])[&quot;delete&quot;], [&quot;a&quot;]
+        )
+
+    def test_03(self):
+        self.assertEqual(
+            diff(
+                {&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;})}, [{&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;y&quot;}]
+            )[&quot;update&quot;],
+            [&quot;a&quot;],
+        )
+
+    def test_04(self):
+        self.assertEqual(
+            diff(
+                {&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;})},
+                [{&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;, &quot;updated&quot;: 2}],
+            )[&quot;refresh&quot;],
+            [&quot;a&quot;],
+        )
+
+    def test_05(self):
+        with self.assertRaises(ValueError):
+            diff({}, [{&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;}, {&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;x&quot;}])
+</code></pre></div></div></details>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A sync plan from fingerprints</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import hashlib, unicodedata
+fp = lambda t: hashlib.sha256(unicodedata.normalize(&quot;NFC&quot;, t).encode()).hexdigest()[:10]
+index = {&quot;orchard-auth&quot;: fp(&quot;Orchard guest tokens expire after 60 minutes.&quot;),
+         &quot;retired-backup&quot;: fp(&quot;Backups run nightly to the old bucket.&quot;)}
+source = {&quot;orchard-auth&quot;: &quot;Orchard guest tokens expire after 15 minutes.&quot;,
+          &quot;restore-runbook&quot;: &quot;Restore from the latest verified snapshot.&quot;}
+plan = {&quot;insert&quot;: sorted(set(source) - set(index)), &quot;delete&quot;: sorted(set(index) - set(source)),
+        &quot;update&quot;: sorted(i for i in set(source) &amp; set(index) if fp(source[i]) != index[i])}
+print(plan)
+print(&quot;café composed vs decomposed:&quot;, fp(&quot;café&quot;) == fp(&quot;café&quot;))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{&#x27;insert&#x27;: [&#x27;restore-runbook&#x27;], &#x27;delete&#x27;: [&#x27;retired-backup&#x27;], &#x27;update&#x27;: [&#x27;orchard-auth&#x27;]}
+café composed vs decomposed: True</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The new runbook is an insert, the edited token policy an update, and the retired backup note a delete: without the delete step, its old chunks would stay searchable forever. The last line shows why content is normalized before hashing: "café" typed as one character or as "e" plus a combining accent is the same text and must not look like a change.</p></div></aside>
+<h2>Step 3 · Persist an index with atomic replacement</h2>
+<p><em>Step 3 of 4 · about 2 hours · Python</em></p>
+<p>A stale writer is rejected and the last committed snapshot stays readable.</p>
+<p>Write the complete next snapshot beside the destination, flush it, then replace the destination atomically. A version precondition rejects stale writers. The persistent sibling lock uses POSIX flock to serialize local writer processes around the version check and replacement. Atomic replacement protects readers from partial files, not from every distributed race.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-rag-freshness-pipeline-3"></div></figure></p>
+<p><strong>Implementation boundary.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def read_snapshot(path):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre></div>
+
+<p><strong>Worked Orchard case.</strong> Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html">Python data structures</a> and <a href="#a0009">Data management</a>. Complete Step 2 first.</p>
+<p>Two ingestion processes can read version 1 simultaneously. A persistent sibling lock serializes their version checks and replacement writes. Exactly one may commit with expected_version=1; the next writer must reread.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">writer A expects 1 -&gt; commits version 2
+writer B expects 1 -&gt; stale index version
+index.json.lock remains as the stable lock inode
+</code></pre></div>
+<p><strong>Build and inspect.</strong> On POSIX, hold flock across read, compare, fsync and rename. Never unlink the lock after release: waiting processes could then lock different files.</p>
+<details class="qa" id="a2055-qa3"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_process_writers.py</code> (25 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import os, subprocess, sys, tempfile, unittest
+from pathlib import Path
+from snapshot import read_snapshot
+
+
+class Writers(unittest.TestCase):
+    def test_only_one_process_commits_expected_zero(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = str(Path(folder) / &quot;index.json&quot;)
+            code = &quot;from snapshot import commit;import sys;commit(sys.argv[1],{},0)&quot;
+            jobs = [
+                subprocess.Popen(
+                    [sys.executable, &quot;-c&quot;, code, path],
+                    env=os.environ.copy(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                for _ in range(4)
+            ]
+            exits = []
+            for job in jobs:
+                job.communicate(timeout=10)
+                exits.append(job.returncode)
+            self.assertEqual(exits.count(0), 1)
+            self.assertEqual(read_snapshot(path)[&quot;version&quot;], 1)
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa4"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_snapshot.py</code> (35 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import unittest
+import tempfile
+from pathlib import Path
+from snapshot import *
+
+
+class StageTests(unittest.TestCase):
+    def test_01(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(read_snapshot(Path(d) / &quot;x&quot;)[&quot;version&quot;], 0)
+
+    def test_02(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(commit(Path(d) / &quot;x&quot;, {}, 0)[&quot;version&quot;], 1)
+
+    def test_03(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / &quot;x&quot;
+            commit(p, {&quot;a&quot;: 1}, 0)
+            with self.assertRaises(ValueError):
+                commit(p, {}, 0)
+            self.assertEqual(read_snapshot(p)[&quot;documents&quot;], {&quot;a&quot;: 1})
+
+    def test_04(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / &quot;x&quot;
+            commit(p, {}, 0)
+            commit(p, {&quot;b&quot;: 2}, 1)
+            self.assertEqual(read_snapshot(p)[&quot;version&quot;], 2)
+
+    def test_05(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / &quot;x&quot;
+            commit(p, {}, 0)
+            self.assertEqual(sorted(q.name for q in Path(d).iterdir()), [&quot;x&quot;, &quot;x.lock&quot;])
+</code></pre></div></div></details>
+<h2>Step 4 · Exclude expired evidence at query time</h2>
+<p><em>Step 4 of 4 · about 2 hours · Python</em></p>
+<p>An expired matching note is excluded even when its keyword score is perfect.</p>
+<p>Freshness is a query-time contract as well as an ingestion concern. A background job can fail, so every candidate must satisfy the age limit before ranking. Inject the clock instead of calling the system clock inside tests, and reject future timestamps rather than treating them as extra fresh.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-rag-freshness-pipeline-4"></div></figure></p>
+<p><strong>Implementation boundary.</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def retrieve(documents,query,now,max_age=3600,k=3):
+    raise NotImplementedError(&quot;Implement the stage contract&quot;)
+</code></pre></div>
+
+<p><strong>Worked Orchard case.</strong> Before coding, review <a href="https://docs.python.org/3/tutorial/datastructures.html">Python data structures</a> and <a href="#a0009">Data management</a>. Complete Step 3 first.</p>
+<p>After the edit, a query must return the 15-minute policy and never the retired 60-minute text. Freshness is enforced when answering, even if no ingestion job has run since the last snapshot.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">updated=200; now=210; max_age=60 -&gt; age 10, eligible
+updated=200; now=500; max_age=60 -&gt; age 300, excluded
+</code></pre></div>
+<p><strong>Build and inspect.</strong> Read one committed snapshot for the query. Return its version and the source hash with each hit so callers can detect stale citations.</p>
+<p>The importer expects the complete corpus, not a partial change feed. POSIX flock coordinates local writers; it is not a distributed database lock. Retrieval is lexical and source timestamps are caller supplied.</p>
+<details class="qa" id="a2055-qa5"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_pipeline.py</code> (26 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import tempfile, unittest
+from pathlib import Path
+from cli import ingest, query
+
+
+class Lifecycle(unittest.TestCase):
+    def test_update_delete_expire(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / &quot;index.json&quot;
+            ingest(
+                path, [{&quot;id&quot;: &quot;old&quot;, &quot;text&quot;: &quot;tokens last 60 minutes&quot;, &quot;updated&quot;: 100}]
+            )
+            change = ingest(
+                path, [{&quot;id&quot;: &quot;new&quot;, &quot;text&quot;: &quot;tokens last 15 minutes&quot;, &quot;updated&quot;: 200}]
+            )
+            self.assertEqual(change[&quot;changes&quot;][&quot;delete&quot;], [&quot;old&quot;])
+            self.assertEqual(query(path, &quot;tokens&quot;, 210)[&quot;matches&quot;][0][&quot;id&quot;], &quot;new&quot;)
+            self.assertEqual(query(path, &quot;tokens&quot;, 500, max_age=10)[&quot;matches&quot;], [])
+
+    def test_stale_writer_preserves_snapshot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / &quot;index.json&quot;
+            ingest(path, [{&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;kept&quot;, &quot;updated&quot;: 1}])
+            with self.assertRaises(ValueError):
+                ingest(path, [], expected_version=0)
+            self.assertEqual(query(path, &quot;kept&quot;, 2)[&quot;matches&quot;][0][&quot;id&quot;], &quot;a&quot;)
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa6"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>test_retrieve.py</code> (44 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import unittest
+import tempfile
+from pathlib import Path
+from retrieve import *
+from fingerprint import normalize
+
+
+class StageTests(unittest.TestCase):
+    def test_01(self):
+        self.assertEqual(
+            retrieve(
+                {&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;kernel&quot;, &quot;updated&quot;: 10})},
+                &quot;kernel&quot;,
+                11,
+            )[0][&quot;age&quot;],
+            1,
+        )
+
+    def test_02(self):
+        self.assertEqual(
+            retrieve(
+                {&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;kernel&quot;, &quot;updated&quot;: 10})},
+                &quot;kernel&quot;,
+                5000,
+            ),
+            [],
+        )
+
+    def test_03(self):
+        self.assertEqual(
+            retrieve(
+                {&quot;a&quot;: normalize({&quot;id&quot;: &quot;a&quot;, &quot;text&quot;: &quot;kernel&quot;, &quot;updated&quot;: 10})},
+                &quot;kernel&quot;,
+                9,
+            ),
+            [],
+        )
+
+    def test_04(self):
+        self.assertEqual(retrieve({}, &quot;&quot;, 0), [])
+
+    def test_05(self):
+        with self.assertRaises(ValueError):
+            retrieve({}, &quot;x&quot;, 0, max_age=-1)
+</code></pre></div></div></details>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> A document missing from the source is deleted from the index.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Changing only a document's timestamp should trigger re-indexing.
+  Unchanged content with new metadata is a refresh, not an update.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A writer holding an old snapshot version is rejected.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> If the ingestion job ran successfully, query-time age checks are unnecessary.
+  Jobs fail and lag; the query enforces freshness itself.</li>
+</ul></div></aside>
+<h2>Run the finished project</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before the sync, "tokens" finds "Orchard guest tokens expire after 60 minutes." The sync updates that policy to 15 minutes, adds a runbook and deletes a retired note. Then the clock moves past the allowed age. What does each query return?</p></div></aside>
+<p>The finished reference runs with one command, from its <code>solution/</code> folder:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">python3 demo.py
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{
+  &quot;before&quot;: {
+    &quot;schema_version&quot;: 1,
+    &quot;snapshot_version&quot;: 1,
+    &quot;query&quot;: &quot;tokens&quot;,
+    &quot;matches&quot;: [
+      {
+        &quot;id&quot;: &quot;orchard-auth&quot;,
+        &quot;score&quot;: 1.0,
+        &quot;age&quot;: 10,
+        &quot;hash&quot;: &quot;b0d5ef32a4909ffaae75cfa8efc0a073c09214a8a3bb5100c72d8f06263a7f2b&quot;,
+        &quot;text&quot;: &quot;Orchard guest tokens expire after 60 minutes.&quot;
+      }
+    ]
+  },
+  &quot;changes&quot;: {
+    &quot;schema_version&quot;: 1,
+    &quot;version&quot;: 2,
+    &quot;changes&quot;: {
+      &quot;insert&quot;: [
+        &quot;restore-runbook&quot;
+      ],
+      &quot;update&quot;: [
+        &quot;orchard-auth&quot;
+      ],
+      &quot;refresh&quot;: [],
+      &quot;delete&quot;: [
+        &quot;retired-backup&quot;
+      ],
+      &quot;unchanged&quot;: []
+    }
+  },
+  &quot;after&quot;: {
+    &quot;schema_version&quot;: 1,
+    &quot;snapshot_version&quot;: 2,
+    &quot;query&quot;: &quot;tokens&quot;,
+    &quot;matches&quot;: [
+      {
+        &quot;id&quot;: &quot;orchard-auth&quot;,
+        &quot;score&quot;: 1.0,
+        &quot;age&quot;: 10,
+        &quot;hash&quot;: &quot;8180e886dc2c8e987dffcfe5628cc55675b7035a97a21e2c1e29affec056602f&quot;,
+        &quot;text&quot;: &quot;Orchard guest tokens expire after 15 minutes.&quot;
+      }
+    ]
+  },
+  &quot;expired&quot;: {
+    &quot;schema_version&quot;: 1,
+    &quot;snapshot_version&quot;: 2,
+    &quot;query&quot;: &quot;tokens&quot;,
+    &quot;matches&quot;: []
+  }
+}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><code>before</code>: the 60-minute text, snapshot version 1. <code>changes</code> (version 2): insert <code>restore-runbook</code>, update <code>orchard-auth</code>, delete <code>retired-backup</code>. <code>after</code>: the same query now returns "15 minutes", with a new content hash, so the old answer can no longer be cited. <code>expired</code>: with the injected clock moved forward, the match is older than the limit and the result is empty, even though its keyword score was perfect. An empty answer is better than a stale one here.</p></div></aside>
+<h2>Read the finished code</h2>
+<p>The complete reference, file by file. Open a file to read it; the stages above say which part each function belongs to.</p>
+<details class="qa" id="a2055-qa7"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/changes.py</code> (38 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Plan inserts updates deletions and refreshes.
+
+Lesson: projects/rag-freshness-pipeline/stages/02-changes/docs/en.md
+The implementation is original and uses explicit local data contracts.
+Run its tests through scripts/project_test.py.
+&quot;&quot;&quot;
+
+from fingerprint import normalize
+
+
+def diff(previous, incoming):
+    fresh = {}
+    for raw in incoming:
+        doc = normalize(raw)
+        if doc[&quot;id&quot;] in fresh:
+            raise ValueError(&quot;duplicate document id&quot;)
+        fresh[doc[&quot;id&quot;]] = doc
+    plan = {
+        &quot;insert&quot;: [],
+        &quot;update&quot;: [],
+        &quot;refresh&quot;: [],
+        &quot;delete&quot;: sorted(set(previous) - set(fresh)),
+        &quot;unchanged&quot;: [],
+        &quot;documents&quot;: fresh,
+    }
+    for key, doc in sorted(fresh.items()):
+        old = previous.get(key)
+        bucket = (
+            &quot;insert&quot;
+            if old is None
+            else &quot;update&quot;
+            if old[&quot;hash&quot;] != doc[&quot;hash&quot;]
+            else &quot;refresh&quot;
+            if old[&quot;updated&quot;] != doc[&quot;updated&quot;]
+            else &quot;unchanged&quot;
+        )
+        plan[bucket].append(key)
+    return plan
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa8"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/cli.py</code> (62 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;A complete-corpus ingestion contract, with durable POSIX snapshots.&quot;&quot;&quot;
+
+import argparse, json
+from pathlib import Path
+from changes import diff
+from snapshot import read_snapshot, commit
+from retrieve import retrieve
+
+
+def ingest(path, documents, expected_version=None):
+    previous = read_snapshot(path)
+    plan = diff(previous[&quot;documents&quot;], documents)
+    version = previous[&quot;version&quot;] if expected_version is None else expected_version
+    state = commit(path, plan[&quot;documents&quot;], version)
+    return {
+        &quot;schema_version&quot;: 1,
+        &quot;version&quot;: state[&quot;version&quot;],
+        &quot;changes&quot;: {k: v for k, v in plan.items() if k != &quot;documents&quot;},
+    }
+
+
+def query(path, text, now, max_age=3600, k=3):
+    state = read_snapshot(path)
+    hits = retrieve(state[&quot;documents&quot;], text, now, max_age, k)
+    return {
+        &quot;schema_version&quot;: 1,
+        &quot;snapshot_version&quot;: state[&quot;version&quot;],
+        &quot;query&quot;: text,
+        &quot;matches&quot;: [
+            {**hit, &quot;text&quot;: state[&quot;documents&quot;][hit[&quot;id&quot;]][&quot;text&quot;]} for hit in hits
+        ],
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest=&quot;command&quot;, required=True)
+    load = commands.add_parser(&quot;ingest&quot;)
+    load.add_argument(&quot;snapshot&quot;)
+    load.add_argument(&quot;documents&quot;)
+    load.add_argument(&quot;--expected-version&quot;, type=int)
+    find = commands.add_parser(&quot;query&quot;)
+    find.add_argument(&quot;snapshot&quot;)
+    find.add_argument(&quot;text&quot;)
+    find.add_argument(&quot;--now&quot;, type=int, required=True)
+    find.add_argument(&quot;--max-age&quot;, type=int, default=3600)
+    find.add_argument(&quot;--k&quot;, type=int, default=3)
+    args = parser.parse_args()
+    result = (
+        ingest(
+            args.snapshot,
+            json.loads(Path(args.documents).read_text()),
+            args.expected_version,
+        )
+        if args.command == &quot;ingest&quot;
+        else query(args.snapshot, args.text, args.now, args.max_age, args.k)
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+if __name__ == &quot;__main__&quot;:
+    main()
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa9"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/demo.py</code> (23 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from pathlib import Path
+import json, subprocess, tempfile, sys, shutil
+
+root = Path(__file__).resolve().parent
+examples = root.parent / &quot;examples&quot;
+from cli import ingest, query
+
+with tempfile.TemporaryDirectory(prefix=&quot;orchard-freshness-&quot;) as folder:
+    index = Path(folder) / &quot;index.json&quot;
+    before = ingest(index, json.loads((examples / &quot;before.json&quot;).read_text()))
+    old = query(index, &quot;tokens&quot;, 110, 60)
+    after = ingest(index, json.loads((examples / &quot;after.json&quot;).read_text()))
+    print(
+        json.dumps(
+            {
+                &quot;before&quot;: old,
+                &quot;changes&quot;: after,
+                &quot;after&quot;: query(index, &quot;tokens&quot;, 210, 60),
+                &quot;expired&quot;: query(index, &quot;tokens&quot;, 500, 60),
+            },
+            indent=2,
+        )
+    )
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa10"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/fingerprint.py</code> (25 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Normalize documents and fingerprint content.
+
+Lesson: projects/rag-freshness-pipeline/stages/01-fingerprint/docs/en.md
+The implementation is original and uses explicit local data contracts.
+Run its tests through scripts/project_test.py.
+&quot;&quot;&quot;
+
+import hashlib
+import unicodedata
+
+
+def normalize(doc):
+    if not isinstance(doc.get(&quot;id&quot;), str) or not doc[&quot;id&quot;].strip():
+        raise ValueError(&quot;document id required&quot;)
+    if not isinstance(doc.get(&quot;text&quot;), str):
+        raise ValueError(&quot;text must be a string&quot;)
+    text = unicodedata.normalize(&quot;NFC&quot;, doc[&quot;text&quot;]).replace(&quot;\r\n&quot;, &quot;\n&quot;).strip()
+    if not text:
+        raise ValueError(&quot;empty document&quot;)
+    return {
+        &quot;id&quot;: doc[&quot;id&quot;],
+        &quot;text&quot;: text,
+        &quot;updated&quot;: int(doc.get(&quot;updated&quot;, 0)),
+        &quot;hash&quot;: hashlib.sha256(text.encode()).hexdigest(),
+    }
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa11"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/retrieve.py</code> (30 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Exclude expired evidence at query time.
+
+Lesson: projects/rag-freshness-pipeline/stages/04-retrieve/docs/en.md
+The implementation is original and uses explicit local data contracts.
+Run its tests through scripts/project_test.py.
+&quot;&quot;&quot;
+
+import re
+
+
+def retrieve(documents, query, now, max_age=3600, k=3):
+    if max_age &lt; 0 or k &lt; 0:
+        raise ValueError(&quot;nonnegative age and k required&quot;)
+    terms = set(re.findall(r&quot;\w+&quot;, query.casefold()))
+    rows = []
+    for doc in documents.values():
+        age = now - doc[&quot;updated&quot;]
+        if age &lt; 0 or age &gt; max_age:
+            continue
+        found = terms &amp; set(re.findall(r&quot;\w+&quot;, doc[&quot;text&quot;].casefold()))
+        if found:
+            rows.append(
+                {
+                    &quot;id&quot;: doc[&quot;id&quot;],
+                    &quot;score&quot;: len(found) / len(terms),
+                    &quot;age&quot;: age,
+                    &quot;hash&quot;: doc[&quot;hash&quot;],
+                }
+            )
+    return sorted(rows, key=lambda r: (-r[&quot;score&quot;], r[&quot;age&quot;], r[&quot;id&quot;]))[:k]
+</code></pre></div></div></details>
+<details class="qa" id="a2055-qa12"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/snapshot.py</code> (52 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Persist an index with atomic replacement.
+
+Lesson: projects/rag-freshness-pipeline/stages/03-snapshot/docs/en.md
+The implementation is original and uses explicit local data contracts.
+Run its tests through scripts/project_test.py.
+&quot;&quot;&quot;
+
+import json
+import os
+from pathlib import Path
+import tempfile
+import threading
+import fcntl
+
+_LOCK = threading.Lock()
+
+
+def read_snapshot(path):
+    path = Path(path)
+    return (
+        json.loads(path.read_text())
+        if path.exists()
+        else {&quot;version&quot;: 0, &quot;documents&quot;: {}}
+    )
+
+
+def commit(path, documents, expected_version):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _LOCK, path.with_suffix(path.suffix + &quot;.lock&quot;).open(&quot;a+&quot;) as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        current = read_snapshot(path)
+        if current[&quot;version&quot;] != expected_version:
+            raise ValueError(&quot;stale index version&quot;)
+        next_state = {&quot;version&quot;: expected_version + 1, &quot;documents&quot;: documents}
+        payload = json.dumps(next_state, sort_keys=True)
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix=&quot;.index-&quot;)
+        try:
+            with os.fdopen(fd, &quot;w&quot;) as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(name, path)
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+    return next_state
+</code></pre></div></div></details>
+<h2>Where the project stops</h2>
+<p>The importer expects the complete corpus, not a partial change feed. POSIX flock coordinates local writers; it is not a distributed database lock. Retrieval is lexical and source timestamps are caller supplied.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An ingestion job only adds and updates documents; it never deletes. A product was discontinued six months ago and its page removed. What does the assistant still say about it, and which plan step fixes it? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this project</div><div class="co-body"><ul>
+<li>Fingerprint normalized content; identity and content are separate keys.</li>
+<li>Compute the whole plan (insert, update, delete, refresh) before writing.</li>
+<li>Replace the index atomically, with a version check.</li>
+<li>Enforce freshness at query time with an injected clock.</li>
+</ul></div></aside>
+<h2>Build it on your machine</h2>
+<p>Each step above is meant to be built, not only read. The source repository ships a starter and the checks for every step, and its test runner grades your own folder step by step:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">git clone https://github.com/rohitg00/ai-engineering-from-scratch
+cd ai-engineering-from-scratch
+python3 scripts/project_test.py rag-freshness-pipeline --init my-rag-freshness-pipeline
+python3 scripts/project_test.py rag-freshness-pipeline --stage 1 --path my-rag-freshness-pipeline
+</code></pre></div>
+<p>Write the step, run its checks, then move to the next step. The checks for each step are also shown above, under that step, so you can see what is expected before you start.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Why should two differently encoded versions of café produce the same fingerprint? <em>(step 1)</em></li>
+<li>How would the contract change if the importer received only a partial change feed? <em>(step 2)</em></li>
+<li>What happens if a process exits after writing the temporary file but before rename? <em>(step 3)</em></li>
+<li>Should a future-dated document receive a negative age and become the best result? <em>(step 4)</em></li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a2055-qa13"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol>
+<li>Two encodings of café</li>
+</ol></span></summary><div class="qa-a"><p>They are the same text to a reader. Different fingerprints would trigger needless re-indexing and could create duplicate entries for one document.</p></div></details>
+<details class="qa" id="a2055-qa14"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="2">
+<li>A partial change feed</li>
+</ol></span></summary><div class="qa-a"><p>A missing id would no longer mean "deleted". Deletions would have to arrive as explicit events, and a periodic full reconciliation would be needed to catch any that were lost.</p></div></details>
+<details class="qa" id="a2055-qa15"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="3">
+<li>A crash before rename</li>
+</ol></span></summary><div class="qa-a"><p>The temporary file is left behind and the destination still holds the last committed snapshot, which stays readable. The next run removes or overwrites the stale temporary file.</p></div></details>
+<details class="qa" id="a2055-qa16"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="4">
+<li>A future-dated document</li>
+</ol></span></summary><div class="qa-a"><p>No. A negative age means a clock or data error. Reject it or treat it as invalid; it must never become the freshest possible result.</p></div></details>
+<details class="qa" id="a2055-qa17"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Never deleting</span></summary><div class="qa-a"><p>It keeps answering from the discontinued product's page as if it were current. The plan's delete step, which removes ids missing from the source, takes those chunks out of the index.</p></div></details>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-rag-production"><span class="t" style="--cs-hue:160">PC</span>Cheat sheet · Freshness and Production RAG Chatbots</a></div>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.python.org/3/library/os.html#os.replace">Reference 1</a></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a2055" id="done-a2055">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a2055" id="undo-a2055" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a2054"><span class="pn-dir">Previous</span><span class="pn-t">20.54 · A Persistent Memory Server for Agents</span></a><a class="pn next" href="#a2056"><span class="pn-dir">Next</span><span class="pn-t">20.56 · An LLM-as-Judge for Reports</span></a></div></footer>

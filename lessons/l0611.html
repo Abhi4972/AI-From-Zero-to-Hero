@@ -1,0 +1,391 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Routing, loops and the agent as a graph</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.61</span><span class="chip">50 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0611" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Route a graph with conditional edges, and with nodes that choose the next node themselves</li>
+<li>Build a bounded retry loop, and stop runaway loops with the recursion limit</li>
+<li>Build the tool-calling agent loop yourself from a model node, <code>ToolNode</code> and <code>tools_condition</code></li>
+<li>Pass per-run context, such as a customer's tier, to nodes without putting it in the state</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l0610">Lesson 14.60</a>. <a class="xref" href="#l0605">Lessons 14.55</a> (<code>create_agent</code>) and 3.2 (the agent loop) for the agent part.</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 50 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langgraph</code> 1.2.24 and <code>langgraph-prebuilt</code> 1.1.1.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0611-0">Conditional edge</a></td>
+<td>An edge whose target is chosen by a router function after a node runs</td>
+<td>Idea 1</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0611-1">ToolNode</a></td>
+<td>A prebuilt LangGraph node that runs every tool call in the last message</td>
+<td>Idea 4</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0611-2">ReAct</a></td>
+<td>The reason, act, observe loop: model, then tools, then model again</td>
+<td>Idea 4</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0611-3">Runtime context</a></td>
+<td>Per-run values such as the user, passed to nodes but not saved in state</td>
+<td>Idea 5</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">What is real and what is a stand-in</div><div class="co-body"><p>The graphs are real <span class="cx" data-c="327" tabindex="0">LangGraph</span>. Most nodes are plain functions; the order service that fails twice is simulated with a counter. The agent in Idea 4 uses the lab rig (<a class="xref" href="#l0601">Lesson 14.51</a>) as its model.</p></div></aside>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Agents need to choose paths and repeat steps until done. Conditional edges, loops with limits and <code>Command</code> gave LangGraph explicit control flow, and the <span class="cx" data-c="20" tabindex="0">agent loop</span> itself became one small graph.</p></div></aside>
+<h2>The problem: real workflows branch and repeat</h2>
+<p>The refund workflow from <a class="xref" href="#l0609">Lesson 14.59</a> is not a straight line. A question that is not about a refund goes to a person. The order service sometimes fails, so the lookup is retried, but not forever. And the agent loop itself, model then tools then model again, is a cycle that ends when the model stops asking for tools. Edges that always go to the same node cannot express any of that.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">A dispatcher, a loop and a self-routing worker</div><div class="co-body"><p>Real workflows branch and repeat. A <strong><mark class="term" id="term-l0611-0" title="Industry term: Conditional edge. An edge whose target is chosen by a router function after a node runs">conditional edge</mark></strong> is a dispatcher after a node: it reads the state and names the next node. A loop is an edge back to an earlier node with a rule to stop. A node can also route itself by returning a <code>Command</code> (update the state and go there). And <strong>context</strong> carries per-run values such as the customer, which never change during the run and are never saved.</p></div></aside>
+<h2>Idea 1 · Conditional edges</h2>
+<p>An ordinary edge always goes to the same node. A <strong>conditional edge</strong> calls a small function, the <strong>router</strong>, which reads the state and returns the name of the node to run next. In this refund workflow a <code>classify</code> node records the customer's intent, and the router sends refund requests one way and everything else another:</p>
+<figure class="xfig" id="fig-l0611-hfa-lgflow"><div class="xfig-frame"><img src="img/hfa-lgflow.webp" alt="A graph with conditional edges: the document type decides which node runs next" loading="lazy" decoding="async"></div><figcaption>Conditional edges, drawn. A diamond is a function that reads the state and names the next node: here the document type picks one path, and a second check picks the tool. <span class="xfig-credit">Figure: <a href="https://huggingface.co/learn/agents-course" target="_blank" rel="noopener">Hugging Face, Agents Course</a>, <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">Apache 2.0</a>.</span></figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from typing import TypedDict, Literal
+from langgraph.graph import StateGraph, START, END
+
+
+class RefundState(TypedDict, total=False):
+    msg: str
+    intent: str
+    tries: int
+    order: dict
+    done: str
+
+def classify(state):
+    return {&quot;intent&quot;: &quot;refund&quot; if &quot;refund&quot; in state[&quot;msg&quot;].lower() else &quot;other&quot;}
+
+def route_intent(state) -&gt; Literal[&quot;lookup&quot;, &quot;handoff&quot;]:     # the return type lists the possible next nodes
+    return &quot;lookup&quot; if state[&quot;intent&quot;] == &quot;refund&quot; else &quot;handoff&quot;
+
+def lookup(state):
+    return {&quot;order&quot;: {&quot;id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999}}
+
+def refund(state):
+    return {&quot;done&quot;: f&quot;refunded INR {state['order']['amount']:,} on {state['order']['id']}&quot;}
+
+def handoff(state):
+    return {&quot;done&quot;: &quot;sent to a person&quot;}
+
+b = StateGraph(RefundState)
+for name, fn in [(&quot;classify&quot;, classify), (&quot;lookup&quot;, lookup), (&quot;refund&quot;, refund), (&quot;handoff&quot;, handoff)]:
+    b.add_node(name, fn)
+b.add_edge(START, &quot;classify&quot;)
+b.add_conditional_edges(&quot;classify&quot;, route_intent)
+b.add_edge(&quot;lookup&quot;, &quot;refund&quot;)
+b.add_edge(&quot;refund&quot;, END)
+b.add_edge(&quot;handoff&quot;, END)
+graph = b.compile()
+
+for msg in [&quot;I want a refund for A-1077&quot;, &quot;Do you sell gift cards?&quot;]:
+    print(f&quot;{msg:28} -&gt; {graph.invoke({'msg': msg})['done']}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">I want a refund for A-1077   -&gt; refunded INR 7,999 on A-1077
+Do you sell gift cards?      -&gt; sent to a person
+</code></pre></div></div></aside>
+<p><code>add_conditional_edges</code> takes a <strong>router</strong>: a function that reads the state and returns the name of the next node. The <code>Literal</code> return type is not decoration: it tells LangGraph which nodes the router can choose, so <code>compile()</code> can check them and the drawn graph shows both branches. (Without it, pass the possible targets as a third argument, the <code>path_map</code>.) Keep routers pure: read the state, return a name. Work goes in nodes, where it is checkpointed and visible in <span class="cx" data-c="649" tabindex="0">traces</span>.</p>
+<h2>Idea 2 · A loop with an exit</h2>
+<p>A conditional edge may point back to a node that has already run, which makes a loop. Every loop needs a way out. Here an order lookup fails twice before it works; the router sends the run back to try again, but only while a counter in the state is under a limit.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">FAILS = {&quot;count&quot;: 2}                                          # the order service fails twice, then works
+
+def flaky_lookup(state):
+    tries = state.get(&quot;tries&quot;, 0) + 1
+    if FAILS[&quot;count&quot;] &gt; 0:
+        FAILS[&quot;count&quot;] -= 1
+        return {&quot;tries&quot;: tries, &quot;order&quot;: None}
+    return {&quot;tries&quot;: tries, &quot;order&quot;: {&quot;id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999}}
+
+def route_lookup(state) -&gt; Literal[&quot;refund&quot;, &quot;lookup&quot;, &quot;handoff&quot;]:
+    if state[&quot;order&quot;]:
+        return &quot;refund&quot;
+    return &quot;lookup&quot; if state[&quot;tries&quot;] &lt; 3 else &quot;handoff&quot;
+
+def build(lookup_fn):
+    b = StateGraph(RefundState)
+    for name, fn in [(&quot;classify&quot;, classify), (&quot;lookup&quot;, lookup_fn), (&quot;refund&quot;, refund), (&quot;handoff&quot;, handoff)]:
+        b.add_node(name, fn)
+    b.add_edge(START, &quot;classify&quot;)
+    b.add_conditional_edges(&quot;classify&quot;, route_intent)
+    b.add_conditional_edges(&quot;lookup&quot;, route_lookup)            # a conditional edge back to itself: a loop
+    b.add_edge(&quot;refund&quot;, END)
+    b.add_edge(&quot;handoff&quot;, END)
+    return b.compile()
+
+loop_graph = build(flaky_lookup)
+for update in loop_graph.stream({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;}, stream_mode=&quot;updates&quot;):
+    print(update)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'classify': {'intent': 'refund'}}
+{'lookup': {'tries': 1, 'order': None}}
+{'lookup': {'tries': 2, 'order': None}}
+{'lookup': {'tries': 3, 'order': {'id': 'A-1077', 'amount': 7999}}}
+{'refund': {'done': 'refunded INR 7,999 on A-1077'}}
+</code></pre></div></div></aside>
+<p>The conditional edge from <code>lookup</code> can lead back to <code>lookup</code>. Two things make this loop safe. The counter is in the <strong>state</strong>, so each try sees the last one's count. And the router has an exit: after three tries, the case goes to a person. As a backstop for loops whose exit you got wrong, every run has a <strong><span class="cx" data-c="499" tabindex="0">recursion limit</span></strong>, the maximum number of steps:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.errors import GraphRecursionError
+
+FAILS[&quot;count&quot;] = 2
+try:
+    loop_graph.invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;}, {&quot;recursion_limit&quot;: 3})
+except GraphRecursionError as e:
+    print(&quot;GraphRecursionError:&quot;, str(e).split(&quot;.&quot;)[0])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">GraphRecursionError: Recursion limit of 3 reached without hitting a stop condition
+</code></pre></div></div></aside>
+<p>The run needed five steps; a limit of three stopped it with an error instead of letting it loop. Set the limit per run in config, from the longest legitimate run plus a margin (<a class="xref" href="#l0605">Lesson 14.55</a>).</p>
+<h2>Idea 3 · A node that routes itself</h2>
+<p>When the decision is made inside the node, return a <code>Command</code> with both the update and the next node:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.types import Command
+
+def classify_and_route(state) -&gt; Command[Literal[&quot;lookup&quot;, &quot;handoff&quot;]]:
+    intent = &quot;refund&quot; if &quot;refund&quot; in state[&quot;msg&quot;].lower() else &quot;other&quot;
+    return Command(update={&quot;intent&quot;: intent}, goto=&quot;lookup&quot; if intent == &quot;refund&quot; else &quot;handoff&quot;)
+
+b = StateGraph(RefundState)
+for name, fn in [(&quot;classify&quot;, classify_and_route), (&quot;lookup&quot;, lookup), (&quot;refund&quot;, refund), (&quot;handoff&quot;, handoff)]:
+    b.add_node(name, fn)
+b.add_edge(START, &quot;classify&quot;)                                  # no conditional edge: the node routes itself
+b.add_edge(&quot;lookup&quot;, &quot;refund&quot;); b.add_edge(&quot;refund&quot;, END); b.add_edge(&quot;handoff&quot;, END)
+print(b.compile().invoke({&quot;msg&quot;: &quot;refund please, A-1077&quot;})[&quot;done&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">refunded INR 7,999 on A-1077
+</code></pre></div></div></aside>
+<p>The <code>Command[Literal[...]]</code> return type plays the same role as the router's: it declares the possible targets. Use <code>Command</code> when the routing depends on work the node just did (here, the classification); use a conditional edge when routing is a separate, reusable rule. <code>Command</code> is also how a node hands control to another agent (<a class="xref" href="#l0616">Lesson 14.66</a>) and how a run resumes after an interrupt (<a class="xref" href="#l0613">Lesson 14.63</a>).</p>
+<h2>Idea 4 · The agent loop, built yourself</h2>
+<p>This is the graph <code>create_agent</code> built for you in <a class="xref" href="#l0605">Lesson 14.55</a>:</p>
+<figure class="xfig" id="fig-l0611-hfa-lgagent"><div class="xfig-frame"><img src="img/hfa-lgagent.webp" alt="An agent drawn as a graph: a model node, a tools node, and an edge that loops back" loading="lazy" decoding="async"></div><figcaption>The agent as a graph with two nodes. The model node either ends the run or sends the state to the tools node, and the tools node always returns to the model. <span class="xfig-credit">Figure: <a href="https://huggingface.co/learn/agents-course" target="_blank" rel="noopener">Hugging Face, Agents Course</a>, <a href="https://www.apache.org/licenses/LICENSE-2.0" target="_blank" rel="noopener">Apache 2.0</a>.</span></figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from mockllm import start                                      # the lab rig (Lesson 6.1)
+from langchain.chat_models import init_chat_model
+from langchain.tools import tool
+from langgraph.graph import MessagesState
+from langgraph.prebuilt import ToolNode, tools_condition
+
+ORDERS = {&quot;A-1001&quot;: &quot;shipped&quot;, &quot;A-1002&quot;: &quot;processing&quot;}
+
+@tool
+def get_order_status(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Return the shipping status for a ShopKart order ID like 'A-1001'.&quot;&quot;&quot;
+    return f&quot;{order_id} is {ORDERS.get(order_id, 'not found')}&quot;
+
+chat = init_chat_model(&quot;openai:mock-model&quot;, base_url=start(), api_key=&quot;mock&quot;)
+model = chat.bind_tools([get_order_status])
+
+def call_model(state: MessagesState):
+    return {&quot;messages&quot;: [model.invoke(state[&quot;messages&quot;])]}     # add_messages appends it
+
+b = StateGraph(MessagesState)
+b.add_node(&quot;model&quot;, call_model)
+b.add_node(&quot;tools&quot;, ToolNode([get_order_status]))              # runs every tool call in the last message
+b.add_edge(START, &quot;model&quot;)
+b.add_conditional_edges(&quot;model&quot;, tools_condition)              # tool calls -&gt; &quot;tools&quot;, otherwise -&gt; END
+b.add_edge(&quot;tools&quot;, &quot;model&quot;)
+react = b.compile()
+
+out = react.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Where are A-1001 and A-1002?&quot;}]})
+print([type(m).__name__ for m in out[&quot;messages&quot;]], &quot;|&quot;, out[&quot;messages&quot;][-1].content)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['HumanMessage', 'AIMessage', 'ToolMessage', 'ToolMessage', 'AIMessage'] | Here is what I found: A-1001 is shipped; A-1002 is processing
+</code></pre></div></div></aside>
+<p>Three pieces. <code>MessagesState</code> gives you a <code>messages</code> key with the <code>add_messages</code> reducer (<a class="xref" href="#l0610">Lesson 14.60</a>). <code><mark class="term" id="term-l0611-1" title="Industry term: ToolNode. A prebuilt LangGraph node that runs every tool call in the last message">ToolNode</mark></code> runs every <span class="cx" data-c="637" tabindex="0">tool call</span> in the last <code>AIMessage</code>, in parallel, and returns one <code>ToolMessage</code> per call, with errors turned into results. <code>tools_condition</code> is the router: tool calls go to <code>tools</code>, anything else goes to <code>END</code>. The edge from <code>tools</code> back to <code>model</code> closes the loop. This is the <strong><mark class="term" id="term-l0611-2" title="Industry term: ReAct. The reason, act, observe loop: model, then tools, then model again">ReAct</mark></strong> pattern (reason, act, observe, repeat). Build it yourself when you need something <code>create_agent</code>'s middleware cannot express, for example a node between the tools and the model that checks results against a policy.</p>
+<h2>Idea 5 · Per-run context</h2>
+<p>Some values belong to the run, not the state: who the customer is, their tier, a database connection. A <strong>context schema</strong> passes them to every node through <code>runtime</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from dataclasses import dataclass
+from langgraph.runtime import Runtime
+
+@dataclass
+class Customer:
+    tier: str
+
+def refund_limit(state, runtime: Runtime[Customer]):
+    limit = 10000 if runtime.context.tier == &quot;gold&quot; else 5000
+    amount = state[&quot;order&quot;][&quot;amount&quot;]
+    return {&quot;done&quot;: &quot;auto-refund&quot; if amount &lt;= limit else f&quot;needs approval (limit INR {limit:,})&quot;}
+
+b = StateGraph(RefundState, context_schema=Customer)
+b.add_node(&quot;lookup&quot;, lookup); b.add_node(&quot;decide&quot;, refund_limit)
+b.add_edge(START, &quot;lookup&quot;); b.add_edge(&quot;lookup&quot;, &quot;decide&quot;); b.add_edge(&quot;decide&quot;, END)
+policy = b.compile()
+for tier in [&quot;gold&quot;, &quot;silver&quot;]:
+    print(tier, &quot;-&gt;&quot;, policy.invoke({&quot;msg&quot;: &quot;refund&quot;}, context=Customer(tier=tier))[&quot;done&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">gold -&gt; auto-refund
+silver -&gt; needs approval (limit INR 5,000)
+</code></pre></div></div></aside>
+<p>Context is read-only and is not saved in checkpoints, so it is the right place for request-scoped values and dependencies, and the wrong place for anything the run must remember after a pause. (<code>create_agent</code> accepts a <code>context_schema</code> too, which middleware and tools can read.)</p>
+<p>Beginners often mix up the four things a node can be handed. Think of a clerk working on one case: <strong>state</strong> is the case file being worked on; <strong>config</strong> is the envelope the job arrived in (which case number, what limits); <strong>context</strong> is the badge the clerk wears (who they act for); the <strong>store</strong> is the office filing cabinet that outlives every case.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>State</th>
+<th>Config</th>
+<th>Context</th>
+<th>Store</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>What it is</td>
+<td>The data the graph works on</td>
+<td>Settings for this run</td>
+<td>Fixed per-run values: customer, tenant, clients</td>
+<td><span class="cx" data-c="355" tabindex="0">Long-term memory</span> across runs (<a class="xref" href="#l0614">Lesson 14.64</a>)</td>
+</tr>
+<tr>
+<td>Changes during the run?</td>
+<td>Yes</td>
+<td>No</td>
+<td>No</td>
+<td>When you write to it</td>
+</tr>
+<tr>
+<td>Saved in checkpoints?</td>
+<td>Yes</td>
+<td>Only the thread and checkpoint IDs, as the address</td>
+<td>Never</td>
+<td>Lives in its own database</td>
+</tr>
+<tr>
+<td>How a node gets it</td>
+<td>Its first parameter</td>
+<td><code>config: RunnableConfig</code></td>
+<td><code>runtime.context</code></td>
+<td><code>runtime.store</code></td>
+</tr>
+<tr>
+<td>Example</td>
+<td><code>order_id</code>, <code>amount</code>, messages</td>
+<td><code>thread_id</code>, <code>recursion_limit</code>, tags</td>
+<td><code>customer_id</code>, <code>tier</code></td>
+<td>"C-42 replies in Hindi"</td>
+</tr>
+</tbody>
+</table></div>
+<p>Inside config, <code>thread_id</code> sits under <code>"configurable"</code> because that is where components look up values by name; limits such as <code>recursion_limit</code> sit at the top level. A key in the wrong place is silently ignored.</p>
+<h2>What the library replaces</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Your <a class="xref" href="#l0609">Lesson 14.59</a> engine</th>
+<th>LangGraph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>branch(a, chooser, options)</code></td>
+<td><code>add_conditional_edges(a, router)</code> with a <code>Literal</code> return type</td>
+</tr>
+<tr>
+<td><code>assert nxt in options</code></td>
+<td>Checked at <code>compile()</code> from the declared targets</td>
+</tr>
+<tr>
+<td><code>max_steps</code> and "step budget exhausted"</td>
+<td><code>recursion_limit</code> and <code>GraphRecursionError</code></td>
+</tr>
+<tr>
+<td><a class="xref" href="#l0302">Lesson 14.3</a>'s <code>while</code> loop and <code>call_tools</code></td>
+<td><code>ToolNode</code>, <code>tools_condition</code> and an edge back to the model</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Graph API</em> (conditional edges, <code>Command</code>, recursion limit, <mark class="term" id="term-l0611-3" title="Industry term: Runtime context. Per-run values such as the user, passed to nodes but not saved in state">runtime context</mark>); <code>langgraph-prebuilt</code> reference for <code>ToolNode</code> and <code>tools_condition</code>.</li>
+<li><strong>Versions</strong>: <code>langgraph</code> 1.2.24, <code>langgraph-prebuilt</code> 1.1.1.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Conditional edges, <code>Command(goto=...)</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>ToolNode</code>, <code>tools_condition</code></td>
+<td>Stable (<code>langgraph.prebuilt</code>)</td>
+</tr>
+<tr>
+<td><code>context_schema</code> and <code>Runtime</code></td>
+<td>Stable; replaces passing values through <code>config["configurable"]</code></td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In Idea 2, how many steps does the run take when the service fails twice, and what is the smallest <code>recursion_limit</code> that lets it finish? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Delete the <code>-&gt; Literal[...]</code> return type from <code>route_intent</code> and compile again, then print the graph's edges. What does the picture show now? Then make the router return a misspelled name, <code>"lookupp"</code>, and run it. (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: the retry loop that never gives up</div><div class="co-body"><p>The order service is down. The workflow should hand off after three tries; instead it runs until the recursion limit:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def forgetful_lookup(state):
+    tries = 1                                                  # the bug is on this line
+    return {&quot;tries&quot;: tries, &quot;order&quot;: None}                     # the order service is down
+
+try:
+    build(forgetful_lookup).invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;}, {&quot;recursion_limit&quot;: 25})
+except GraphRecursionError as e:
+    print(&quot;GraphRecursionError:&quot;, str(e).split(&quot;.&quot;)[0])
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">GraphRecursionError: Recursion limit of 25 reached without hitting a stop condition
+</code></pre></div>
+<p>Find the bug. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Write <code>lookup_with_backoff</code>, a lookup node that waits longer before each retry (<a class="xref" href="#l0304">Lesson 14.5</a>'s <span class="cx" data-c="224" tabindex="0">exponential backoff</span>), and run it once with a service that fails once and once with one that fails five times. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0611-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Count every node run</span></summary><div class="qa-a"><p>Five steps: <code>classify</code>, <code>lookup</code> three times, <code>refund</code>. A limit of 5 is the smallest that finishes. Set the real limit with a margin, because the steps count every node, including ones you add later.</p></div></details>
+<details class="qa" id="l0611-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · The router's options disappear</span></summary><div class="qa-a"><p>Without a return type or a <code>path_map</code>, LangGraph cannot know where the router may go. The drawn graph shows <code>classify</code> going straight to <code>END</code>, which is wrong, and a misspelled return value such as <code>"lookupp"</code> does not even raise: LangGraph logs a warning that a task "wrote to unknown channel" and the run simply ends with no answer. With the targets declared, the drawing is right and <code>compile()</code> checks that every declared target exists. Declare the targets, and test every branch.</p></div></details>
+<details class="qa" id="l0611-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · The counter is reset every time</span></summary><div class="qa-a"><p><code>tries = 1</code> ignores the state, so every attempt reports the first try, the router always sees <code>tries &lt; 3</code>, and the loop never reaches its exit. Read the previous value from the state:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def counting_lookup(state):
+    return {&quot;tries&quot;: state.get(&quot;tries&quot;, 0) + 1, &quot;order&quot;: None}
+
+print(build(counting_lookup).invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;}))
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'msg': 'I want a refund for A-1077', 'intent': 'refund', 'tries': 3, 'order': None, 'done': 'sent to a person'}
+</code></pre></div>
+<p>The recursion limit did its job, turning an endless loop into an error. Add a test for the give-up path, which is the one most often wrong.</p></div></details>
+<details class="qa" id="l0611-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Backoff in a node</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time
+
+def lookup_with_backoff(state):
+    tries = state.get(&quot;tries&quot;, 0) + 1
+    if tries &gt; 1:
+        time.sleep(0.01 * 2 ** (tries - 2))                     # 10 ms, then 20 ms: Lesson 3.7's backoff, shortened
+    ok = FAILS[&quot;count&quot;] &lt;= 0
+    FAILS[&quot;count&quot;] -= 1
+    return {&quot;tries&quot;: tries, &quot;order&quot;: {&quot;id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999} if ok else None}
+
+for failures in [1, 5]:
+    FAILS[&quot;count&quot;] = failures
+    out = build(lookup_with_backoff).invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;})
+    print(f&quot;{failures} failure(s): {out['tries']} tries -&gt; {out['done']}&quot;)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1 failure(s): 2 tries -&gt; refunded INR 7,999 on A-1077
+5 failure(s): 3 tries -&gt; sent to a person
+</code></pre></div>
+<p>Sleeping inside a node blocks that run's thread. For long waits (minutes, not milliseconds), end the run and resume it later from its checkpoint, on a schedule or when the service is back (<a class="xref" href="#l0612">Lesson 14.62</a>), rather than holding a worker.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0611-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How does LangGraph express branches and loops?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> With conditional edges: after a node runs, a router function reads the state and returns the next node's name, and a node can also return <code>Command(goto=...)</code> to choose for itself. A loop is a conditional edge that can lead back to an earlier node; it needs its exit condition in the state, such as a retry counter, and the recursion limit stops a run that never reaches its exit. The tool-calling agent is the standard loop: model, then tools if there are tool calls, then back to the model.</p>
+<p><strong>A plausible wrong answer.</strong> "LangGraph graphs are DAGs." Cycles are the point; they are what make agents and retries possible.</p>
+<p><strong>Follow-ups.</strong> When would you use <code>Command</code> instead of a conditional edge?</p></div></details>
+<details class="qa" id="l0611-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">A graph sometimes ends with GraphRecursionError in production. How do you find the cause?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Pull the trace or the checkpoint history of a failing run and look for the repeating nodes. Then check what their exit condition reads: a counter that is not updated, a status that a failing service never changes, or an agent that keeps calling a tool because its result does not answer the question. Fix the exit, add the give-up path to tests, and set the limit from real run lengths so the error stays an alarm, not a normal outcome.</p>
+<p><strong>A plausible wrong answer.</strong> "Increase the recursion limit." That hides the loop and multiplies its cost.</p>
+<p><strong>Follow-ups.</strong> How would you alert on runs that come close to the limit?</p></div></details>
+<details class="qa" id="l0611-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">create_agent, or your own graph with ToolNode and tools_condition?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> <code>create_agent</code> by default: it is the same loop, and middleware covers approval, limits, summaries and retries. My own graph when the agent needs structure the middleware hooks cannot express: a validation node between tools and model, different models for different steps, or the agent as one branch of a larger workflow. Since both are LangGraph graphs, I can start with <code>create_agent</code> and replace it with a custom graph later without changing callers.</p>
+<p><strong>A plausible wrong answer.</strong> "Build the graph yourself so you understand it." Understanding it is the point of this lesson; in production, use the maintained version unless you need something it cannot do.</p>
+<p><strong>Follow-ups.</strong> Where would you put a check that a refund tool's result matches the order?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Add a conditional edge with a router that declares its targets.</li>
+<li>Build a retry loop with a counter in the state and an exit, and show the recursion limit catching a broken exit.</li>
+<li>Route from inside a node with <code>Command</code>.</li>
+<li>Build the agent loop from a model node, <code>ToolNode</code> and <code>tools_condition</code>, and compare it with <code>create_agent</code>'s graph.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0611-q1"><p class="q-text"><span class="q-num">Q1</span>What does a router passed to add_conditional_edges return?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0611-q1-o0"><span class="opt-key">A</span><span>The updated state</span></button><button type="button" class="opt" data-correct="true" id="l0611-q1-o1"><span class="opt-key">B</span><span>The name of the next node</span></button><button type="button" class="opt" data-correct="false" id="l0611-q1-o2"><span class="opt-key">C</span><span>A boolean</span></button><button type="button" class="opt" data-correct="false" id="l0611-q1-o3"><span class="opt-key">D</span><span>A Command with an update</span></button></div><p class="q-explain" hidden>Declare its possible targets with a Literal return type or a path_map.</p></div><div class="q" id="l0611-q2"><p class="q-text"><span class="q-num">Q2</span>A retry loop never reaches its exit. What stops the run?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0611-q2-o0"><span class="opt-key">A</span><span>Nothing; it runs forever</span></button><button type="button" class="opt" data-correct="true" id="l0611-q2-o1"><span class="opt-key">B</span><span>The recursion limit, which raises GraphRecursionError</span></button><button type="button" class="opt" data-correct="false" id="l0611-q2-o2"><span class="opt-key">C</span><span>The checkpointer</span></button><button type="button" class="opt" data-correct="false" id="l0611-q2-o3"><span class="opt-key">D</span><span>The model</span></button></div><p class="q-explain" hidden>Set the limit from the longest legitimate run plus a margin.</p></div><div class="q" id="l0611-q3"><p class="q-text"><span class="q-num">Q3</span>What does tools_condition do?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0611-q3-o0"><span class="opt-key">A</span><span>Runs the tools</span></button><button type="button" class="opt" data-correct="true" id="l0611-q3-o1"><span class="opt-key">B</span><span>Routes to the tools node when the last message has tool calls, otherwise to END</span></button><button type="button" class="opt" data-correct="false" id="l0611-q3-o2"><span class="opt-key">C</span><span>Validates tool arguments</span></button><button type="button" class="opt" data-correct="false" id="l0611-q3-o3"><span class="opt-key">D</span><span>Chooses which tools to bind</span></button></div><p class="q-explain" hidden>ToolNode runs the calls; tools_condition decides whether to go there.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0611" id="done-l0611">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0611" id="undo-l0611" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0610"><span class="pn-dir">Previous</span><span class="pn-t">14.60 · LangGraph StateGraph: state, nodes, edges and reducers</span></a><a class="pn next" href="#l0612"><span class="pn-dir">Next</span><span class="pn-t">14.62 · Persistence: checkpoints, threads, resume and time travel</span></a></div></footer>

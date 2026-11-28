@@ -1,0 +1,698 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-19">Phase 19 · Capstone Builds</a></nav><h1>A Tokenized Corpus in HDF5</h1><div class="m-meta"><span class="chip chip-num">Lesson 19.43</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1943" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Stream documents into a resizable HDF5 integer dataset with deterministic chunking.</li>
+<li>Shard the write across multiple HDF5 files so failure is bounded and parallelism is possible.</li>
+<li>Read tokens back through HDF5's page-cache-backed chunked layout so the dataloader copies into batch buffers only at batch time.</li>
+<li>Implement a sliding-window dataloader that emits fixed-length training sequences with explicit packing rules.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons 19.30 to 19.37</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>The downloaded corpus has to land in a layout the trainer can stream from at line speed. JSONL on disk does not survive 16 dataloader workers. HDF5 with a resizable, chunked integer dataset does. This lesson builds streaming tokenization into a resizable HDF5 dataset, sharded write across multiple files, chunked reads at training time, and a sliding-window dataloader that produces fixed-length sequences with the right packing.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resizable dataset</td>
+<td>"Append-only"</td>
+<td>An HDF5 dataset with <code>maxshape=(None,)</code> that grows via <code>resize</code> calls in chunk-sized strides</td>
+</tr>
+<tr>
+<td>Chunked layout</td>
+<td>"How HDF5 stores it"</td>
+<td>Fixed-size on-disk blocks that HDF5 reads and caches as one unit, so the dataloader can read a contiguous range cheaply</td>
+</tr>
+<tr>
+<td><code>swmr</code> mode</td>
+<td>"Read-while-write"</td>
+<td>Single-Writer-Multiple-Reader mode that lets dataloader workers share the file safely</td>
+</tr>
+<tr>
+<td>Shard index</td>
+<td>"shards.json"</td>
+<td>The durable index of all token shards with offsets and content hashes</td>
+</tr>
+<tr>
+<td>Sliding window</td>
+<td>"Training sample"</td>
+<td>A fixed-length slice of the global token stream that the trainer pairs with its shift-by-one target</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A training run reads tokens very fast, from many worker processes at once, so the tokenized corpus needs a layout that supports cheap random slices. <strong>HDF5</strong> can store one long, <strong>resizable</strong>, <strong>chunked</strong> array of token ids per shard: the file is divided into fixed-size chunks, and reading a slice touches only the chunks it overlaps. The write side must be careful: tokenize documents incrementally, buffer them, and append whole chunks at a time (one tiny append per document fragments the file), writing several <strong>shards</strong> with a recorded hash each so a crash loses at most one shard. The read side is a <strong>sliding-window</strong> loader that cuts fixed-length training windows out of the global token stream across shard boundaries.</p></div></aside>
+<p>A modern language-model training run reads tokens at hundreds of thousands of samples per second across dozens of workers. JSONL on disk dies at the first cold-cache page fault: the JSON parser is slow, the document boundaries are not addressable, and seeking to "sample 4,217,884" requires scanning the file. Even Parquet, which compresses well, is a poor fit because the trainer does not want columns; it wants a flat token stream with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span> random access.</p>
+<p>HDF5 fits because it offers a chunked, resizable, integer-only dataset whose chunks are page-cache friendly at read time. The trainer asks for a slice of <code>tokens[3_200_000 : 3_208_192]</code> and HDF5 copies the requested hyperslab from the page cache into a freshly allocated NumPy array. The cost is one open file handle and a chunk-sized page-cache footprint per worker, which is negligible compared to the cost of decoding JSONL.</p>
+<p>The build problem is making the write side honest. Resizable datasets are easy to misuse: write one document at a time and the HDF5 file is fragmented to the point of unusable. Write all documents in one resize and a process death loses the whole shard. The right discipline is buffer-then-extend, with a buffer size that matches the chunk size, and a sharded write that splits the workload across files so a crash loses at most one shard.</p>
+<h2>The idea</h2>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmcb6ea82561" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 578.648px; background-color: transparent;" viewBox="0 0 578.6484375 908.765625" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmcb6ea82561{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmcb6ea82561 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmcb6ea82561 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmcb6ea82561 .error-icon{fill:#f4efe7;}#mmcb6ea82561 .error-text{fill:#0b1018;stroke:#0b1018;}#mmcb6ea82561 .edge-thickness-normal{stroke-width:1px;}#mmcb6ea82561 .edge-thickness-thick{stroke-width:3.5px;}#mmcb6ea82561 .edge-pattern-solid{stroke-dasharray:0;}#mmcb6ea82561 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmcb6ea82561 .edge-pattern-dashed{stroke-dasharray:3;}#mmcb6ea82561 .edge-pattern-dotted{stroke-dasharray:2;}#mmcb6ea82561 .marker{fill:#6c6357;stroke:#6c6357;}#mmcb6ea82561 .marker.cross{stroke:#6c6357;}#mmcb6ea82561 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmcb6ea82561 p{margin:0;}#mmcb6ea82561 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmcb6ea82561 .cluster-label text{fill:#0b1018;}#mmcb6ea82561 .cluster-label span{color:#0b1018;}#mmcb6ea82561 .cluster-label span p{background-color:transparent;}#mmcb6ea82561 .label text,#mmcb6ea82561 span{fill:#211c16;color:#211c16;}#mmcb6ea82561 .node rect,#mmcb6ea82561 .node circle,#mmcb6ea82561 .node ellipse,#mmcb6ea82561 .node polygon,#mmcb6ea82561 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmcb6ea82561 .rough-node .label text,#mmcb6ea82561 .node .label text,#mmcb6ea82561 .image-shape .label,#mmcb6ea82561 .icon-shape .label{text-anchor:middle;}#mmcb6ea82561 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmcb6ea82561 .rough-node .label,#mmcb6ea82561 .node .label,#mmcb6ea82561 .image-shape .label,#mmcb6ea82561 .icon-shape .label{text-align:center;}#mmcb6ea82561 .node.clickable{cursor:pointer;}#mmcb6ea82561 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmcb6ea82561 .arrowheadPath{fill:#0b0b0b;}#mmcb6ea82561 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmcb6ea82561 .flowchart-link{stroke:#6c6357;fill:none;}#mmcb6ea82561 .edgeLabel{background-color:#ffffff;text-align:center;}#mmcb6ea82561 .edgeLabel p{background-color:#ffffff;}#mmcb6ea82561 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmcb6ea82561 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmcb6ea82561 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmcb6ea82561 .cluster text{fill:#0b1018;}#mmcb6ea82561 .cluster span{color:#0b1018;}#mmcb6ea82561 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmcb6ea82561 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmcb6ea82561 rect.text{fill:none;stroke-width:0;}#mmcb6ea82561 .icon-shape,#mmcb6ea82561 .image-shape{background-color:#ffffff;text-align:center;}#mmcb6ea82561 .icon-shape p,#mmcb6ea82561 .image-shape p{background-color:#ffffff;padding:2px;}#mmcb6ea82561 .icon-shape .label rect,#mmcb6ea82561 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmcb6ea82561 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmcb6ea82561 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmcb6ea82561 .node .neo-node{stroke:#b5521b;}#mmcb6ea82561 [data-look="neo"].node rect,#mmcb6ea82561 [data-look="neo"].cluster rect,#mmcb6ea82561 [data-look="neo"].node polygon{stroke:url(#mmcb6ea82561-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmcb6ea82561 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmcb6ea82561 [data-look="neo"].node path{stroke:url(#mmcb6ea82561-gradient);stroke-width:1px;}#mmcb6ea82561 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmcb6ea82561 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmcb6ea82561 [data-look="neo"].node circle{stroke:url(#mmcb6ea82561-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmcb6ea82561 [data-look="neo"].node circle .state-start{fill:#000000;}#mmcb6ea82561 [data-look="neo"].icon-shape .icon{fill:url(#mmcb6ea82561-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmcb6ea82561 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmcb6ea82561-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmcb6ea82561 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmcb6ea82561_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmcb6ea82561_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmcb6ea82561_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M183.754,59L183.754,63.167C183.754,67.333,183.754,75.667,183.754,83.333C183.754,91,183.754,98,183.754,101.5L183.754,105" id="mmcb6ea82561-L_JSONL_Tokenize_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_JSONL_Tokenize_0" data-points="W3sieCI6MTgzLjc1MzkwNjI1LCJ5Ijo1OX0seyJ4IjoxODMuNzUzOTA2MjUsInkiOjg0fSx7IngiOjE4My43NTM5MDYyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M255.538,160L267.267,164.167C278.997,168.333,302.455,176.667,314.185,184.333C325.914,192,325.914,199,325.914,202.5L325.914,206" id="mmcb6ea82561-L_Tokenize_Buffer_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Tokenize_Buffer_0" data-points="W3sieCI6MjU1LjUzNzc0NzUyNDc1MjUsInkiOjE2MH0seyJ4IjozMjUuOTE0MDYyNSwieSI6MTg1fSx7IngiOjMyNS45MTQwNjI1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M210.241,261L191.34,265.167C172.439,269.333,134.638,277.667,116.172,286.506C97.706,295.345,98.576,304.69,99.012,309.363L99.447,314.036" id="mmcb6ea82561-L_Buffer_Flush_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Buffer_Flush_0" data-points="W3sieCI6MjEwLjI0MDk0OTg3NjIzNzYsInkiOjI2MX0seyJ4Ijo5Ni44MzU5Mzc1LCJ5IjoyODZ9LHsieCI6OTkuODE3NjM0NjcxMzgxMDMsInkiOjMxOC4wMTgzMDI4Mjg2MTg5N31d" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M113.854,318.018L114.351,312.682C114.848,307.346,115.842,296.673,116.339,282.92C116.836,269.167,116.836,252.333,116.836,235.5C116.836,218.667,116.836,201.833,121.825,189.652C126.814,177.47,136.793,169.94,141.782,166.175L146.771,162.41" id="mmcb6ea82561-L_Flush_Tokenize_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Flush_Tokenize_0" data-points="W3sieCI6MTEzLjg1NDI0MDMyODYxODk3LCJ5IjozMTguMDE4MzAyODI4NjE4OTd9LHsieCI6MTE2LjgzNTkzNzUsInkiOjI4Nn0seyJ4IjoxMTYuODM1OTM3NSwieSI6MjM1LjV9LHsieCI6MTE2LjgzNTkzNzUsInkiOjE4NX0seyJ4IjoxNDkuOTYzNjQ0ODAxOTgwMiwieSI6MTYwfV0=" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M106.836,475.766L106.836,481.682C106.836,487.599,106.836,499.432,106.836,510.599C106.836,521.766,106.836,532.266,106.836,537.516L106.836,542.766" id="mmcb6ea82561-L_Flush_Resize_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Flush_Resize_0" data-points="W3sieCI6MTA2LjgzNTkzNzUsInkiOjQ3NS43NjU2MjV9LHsieCI6MTA2LjgzNTkzNzUsInkiOjUxMS4yNjU2MjV9LHsieCI6MTA2LjgzNTkzNzUsInkiOjU0Ni43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M106.836,597.766L106.836,601.932C106.836,606.099,106.836,614.432,111.825,622.364C116.814,630.296,126.793,637.826,131.782,641.591L136.771,645.356" id="mmcb6ea82561-L_Resize_Write_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Resize_Write_0" data-points="W3sieCI6MTA2LjgzNTkzNzUsInkiOjU5Ny43NjU2MjV9LHsieCI6MTA2LjgzNTkzNzUsInkiOjYyMi43NjU2MjV9LHsieCI6MTM5Ljk2MzY0NDgwMTk4MDIsInkiOjY0Ny43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M221.645,647.766L229.471,643.599C237.296,639.432,252.947,631.099,260.772,618.516C268.598,605.932,268.598,589.099,268.598,570.516C268.598,551.932,268.598,531.599,268.598,501.785C268.598,471.971,268.598,432.677,268.598,395.133C268.598,357.589,268.598,321.794,272.827,300.171C277.055,278.548,285.513,271.096,289.742,267.37L293.971,263.644" id="mmcb6ea82561-L_Write_Buffer_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Write_Buffer_0" data-points="W3sieCI6MjIxLjY0NTMwNDc2NDg1MTUsInkiOjY0Ny43NjU2MjV9LHsieCI6MjY4LjU5NzY1NjI1LCJ5Ijo2MjIuNzY1NjI1fSx7IngiOjI2OC41OTc2NTYyNSwieSI6NTcyLjI2NTYyNX0seyJ4IjoyNjguNTk3NjU2MjUsInkiOjUxMS4yNjU2MjV9LHsieCI6MjY4LjU5NzY1NjI1LCJ5IjozOTMuMzgyODEyNX0seyJ4IjoyNjguNTk3NjU2MjUsInkiOjI4Nn0seyJ4IjoyOTYuOTcyMTE0Nzg5NjAzOTUsInkiOjI2MX1d" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M389.66,261L400.076,265.167C410.492,269.333,431.324,277.667,441.74,294.814C452.156,311.961,452.156,337.922,452.156,350.902L452.156,363.883" id="mmcb6ea82561-L_Buffer_Close_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Buffer_Close_0" data-points="W3sieCI6Mzg5LjY2MDExNzU3NDI1NzQsInkiOjI2MX0seyJ4Ijo0NTIuMTU2MjUsInkiOjI4Nn0seyJ4Ijo0NTIuMTU2MjUsInkiOjM2Ny44ODI4MTI1fV0=" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M452.156,418.883L452.156,434.28C452.156,449.677,452.156,480.471,452.156,501.118C452.156,521.766,452.156,532.266,452.156,537.516L452.156,542.766" id="mmcb6ea82561-L_Close_ShardDone_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Close_ShardDone_0" data-points="W3sieCI6NDUyLjE1NjI1LCJ5Ijo0MTguODgyODEyNX0seyJ4Ijo0NTIuMTU2MjUsInkiOjUxMS4yNjU2MjV9LHsieCI6NDUyLjE1NjI1LCJ5Ijo1NDYuNzY1NjI1fV0=" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M452.156,597.766L452.156,601.932C452.156,606.099,452.156,614.432,452.156,622.099C452.156,629.766,452.156,636.766,452.156,640.266L452.156,643.766" id="mmcb6ea82561-L_ShardDone_MMapRead_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ShardDone_MMapRead_0" data-points="W3sieCI6NDUyLjE1NjI1LCJ5Ijo1OTcuNzY1NjI1fSx7IngiOjQ1Mi4xNTYyNSwieSI6NjIyLjc2NTYyNX0seyJ4Ijo0NTIuMTU2MjUsInkiOjY0Ny43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M452.156,698.766L452.156,702.932C452.156,707.099,452.156,715.432,452.156,723.099C452.156,730.766,452.156,737.766,452.156,741.266L452.156,744.766" id="mmcb6ea82561-L_MMapRead_Window_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_MMapRead_Window_0" data-points="W3sieCI6NDUyLjE1NjI1LCJ5Ijo2OTguNzY1NjI1fSx7IngiOjQ1Mi4xNTYyNSwieSI6NzIzLjc2NTYyNX0seyJ4Ijo0NTIuMTU2MjUsInkiOjc0OC43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/><path d="M452.156,799.766L452.156,803.932C452.156,808.099,452.156,816.432,452.156,824.099C452.156,831.766,452.156,838.766,452.156,842.266L452.156,845.766" id="mmcb6ea82561-L_Window_Train_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Window_Train_0" data-points="W3sieCI6NDUyLjE1NjI1LCJ5Ijo3OTkuNzY1NjI1fSx7IngiOjQ1Mi4xNTYyNSwieSI6ODI0Ljc2NTYyNX0seyJ4Ijo0NTIuMTU2MjUsInkiOjg0OS43NjU2MjV9XQ==" data-look="classic" marker-end="url(#mmcb6ea82561_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_JSONL_Tokenize_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Tokenize_Buffer_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Buffer_Flush_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel" transform="translate(116.8359375, 235.5)"><g class="label" data-id="L_Flush_Tokenize_0" transform="translate(0, -8.500000953674316)"><g><rect class="background" style="" x="-10.3359375" y="-1.9999990463256836" width="20.671875" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">no</tspan></tspan></text></g></g></g><g class="edgeLabel" transform="translate(106.8359375, 511.265625)"><g class="label" data-id="L_Flush_Resize_0" transform="translate(0, -8.500000953674316)"><g><rect class="background" style="" x="-13.578125" y="-1.9999990463256836" width="27.15625" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">yes</tspan></tspan></text></g></g></g><g class="edgeLabel"><g class="label" data-id="L_Resize_Write_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Write_Buffer_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Buffer_Close_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Close_ShardDone_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_ShardDone_MMapRead_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_MMapRead_Window_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Window_Train_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmcb6ea82561-flowchart-JSONL-0" data-look="classic" transform="translate(183.75390625, 33.5)"><rect class="basic label-container" style="" x="-91.9296875" y="-25.5" width="183.859375" height="51"/><g class="label" style="" transform="translate(-61.9296875, -10.5)"><rect/><foreignObject width="123.859375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>JSONL documents</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Tokenize-1" data-look="classic" transform="translate(183.75390625, 134.5)"><rect class="basic label-container" style="" x="-105.9765625" y="-25.5" width="211.953125" height="51"/><g class="label" style="" transform="translate(-75.9765625, -10.5)"><rect/><foreignObject width="151.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Tokenize incrementally</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Buffer-3" data-look="classic" transform="translate(325.9140625, 235.5)"><rect class="basic label-container" style="" x="-124.3515625" y="-25.5" width="248.703125" height="51"/><g class="label" style="" transform="translate(-94.3515625, -10.5)"><rect/><foreignObject width="188.703125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Append to in-memory buffer</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Flush-5" data-look="classic" transform="translate(106.8359375, 393.3828125)"><polygon points="82.3828125,0 164.765625,-82.3828125 82.3828125,-164.765625 0,-82.3828125" class="label-container" transform="translate(-81.8828125, 82.3828125)"/><g class="label" style="" transform="translate(-56.8828125, -10.5)"><rect/><foreignObject width="113.765625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>buffer &gt;= chunk?</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Resize-9" data-look="classic" transform="translate(106.8359375, 572.265625)"><rect class="basic label-container" style="" x="-98.8359375" y="-25.5" width="197.671875" height="51"/><g class="label" style="" transform="translate(-68.8359375, -10.5)"><rect/><foreignObject width="137.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Resize HDF5 dataset</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Write-11" data-look="classic" transform="translate(173.75390625, 673.265625)"><rect class="basic label-container" style="" x="-114.4375" y="-25.5" width="228.875" height="51"/><g class="label" style="" transform="translate(-84.4375, -10.5)"><rect/><foreignObject width="168.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Write buffer to new range</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Close-15" data-look="classic" transform="translate(452.15625, 393.3828125)"><rect class="basic label-container" style="" x="-90.0546875" y="-25.5" width="180.109375" height="51"/><g class="label" style="" transform="translate(-60.0546875, -10.5)"><rect/><foreignObject width="120.109375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Final flush + close</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-ShardDone-17" data-look="classic" transform="translate(452.15625, 572.265625)"><rect class="basic label-container" style="" x="-91.2421875" y="-25.5" width="182.484375" height="51"/><g class="label" style="" transform="translate(-61.2421875, -10.5)"><rect/><foreignObject width="122.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Shard file finalized</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-MMapRead-19" data-look="classic" transform="translate(452.15625, 673.265625)"><rect class="basic label-container" style="" x="-76.4375" y="-25.5" width="152.875" height="51"/><g class="label" style="" transform="translate(-46.4375, -10.5)"><rect/><foreignObject width="92.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Chunked read</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Window-21" data-look="classic" transform="translate(452.15625, 774.265625)"><rect class="basic label-container" style="" x="-118.4921875" y="-25.5" width="236.984375" height="51"/><g class="label" style="" transform="translate(-88.4921875, -10.5)"><rect/><foreignObject width="176.984375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Sliding-window dataloader</p></span></div></foreignObject></g></g><g class="node default" id="mmcb6ea82561-flowchart-Train-23" data-look="classic" transform="translate(452.15625, 875.265625)"><rect class="basic label-container" style="" x="-67.1328125" y="-25.5" width="134.265625" height="51"/><g class="label" style="" transform="translate(-37.1328125, -10.5)"><rect/><foreignObject width="74.265625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Train batch</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmcb6ea82561-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmcb6ea82561-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmcb6ea82561-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<h2>Idea 1 · Resizable HDF5 done right</h2>
+<p>The token dataset is created with <code>maxshape=(None,)</code> and a fixed <code>chunks=(chunk_size,)</code>. Writing proceeds by buffering tokens in a NumPy array of length <code>chunk_size</code>. When the buffer fills, the dataset is resized by exactly <code>chunk_size</code> and the buffer is written into the new range. At end-of-shard the residual buffer is written into a final partial range. Every write is contiguous and chunk-aligned except the last one, which the reader is told to truncate at the recorded <code>token_count</code> in the shard's HDF5 attributes.</p>
+<h2>Idea 2 · Sharded write</h2>
+<p>A single HDF5 file is a single point of failure. The pipeline writes shards in parallel: each input shard from Phase 19 lesson 42 produces one HDF5 output shard. A <code>shards.json</code> index records, per shard, the file path, the token count, the document count, and a sha256 over the tokens. The trainer reads <code>shards.json</code> to compute global offsets and to validate the corpus.</p>
+<h2>Idea 3 · Chunked read</h2>
+<p>At training time each worker opens its share of HDF5 files in <code>swmr=True</code> mode and asks for <code>tokens[start:stop]</code>. HDF5's chunk layout makes this a cheap read once the chunk is hot: h5py does not memory-map the file, it reads whole chunks through the HDF5 chunk cache and the OS page cache, then copies the requested hyperslab out. The worker never materialises the whole file: the slice is copied into the dataloader's batch buffer, which the dataloader then copies into a pinned-memory training tensor at batch time. The hot path has one syscall per chunk transition; everything else is RAM access.</p>
+<h2>Idea 4 · Sliding-window dataloader</h2>
+<p>The dataloader is the only stage that knows about training-sequence length. It picks a random start index in the global token stream, reads <code>window_size + 1</code> tokens, and returns <code>(input, target) = (tokens[:-1], tokens[1:])</code>. Document boundaries are not enforced: a window may straddle two documents, with an explicit <code>boundary_token_id</code> between them so the model learns to use the separator. This is the standard packing rule; it is also the rule a beginner forgets, ending up with a corpus that is 8 percent training boundary tokens and 92 percent natural text.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cc-hdf5-corpus"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Chunks touched by one window</div><div class="co-body"><p>Chunk size 4,096 tokens. A training window needs 2,049 tokens starting at global position 10,000.</p>
+<ol>
+<li>The window covers positions 10,000 to 12,048.</li>
+<li>Chunk numbers: 10,000 ÷ 4,096 = 2.44, so chunk 2; 12,048 ÷ 4,096 = 2.94, chunk 2. One chunk read.</li>
+<li>A window starting at 11,500 covers 11,500 to 13,548: chunks 2 and 3, so two reads for the same amount of data.</li>
+<li>When windows are much smaller than chunks, most reads touch one chunk; when chunks are smaller than windows, every read touches several. Matching chunk size to window size keeps reads cheap.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Reading a slice touches only the chunks it overlaps.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Appending one document at a time is the safest way to write.
+  It fragments the file; buffer and append in chunk-sized pieces.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Shards with recorded hashes can be validated before training.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Windows must stay inside one shard.
+  The loader maps global positions to shards and can cross a boundary.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with windows of 2,049 tokens at random starting positions, about what share of windows touch two chunks when chunks are 4,096 tokens? And when chunks are 2,048?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">How chunk size affects reads</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random
+random.seed(5)
+def chunks_touched(start, length, chunk): return (start + length - 1) // chunk - start // chunk + 1
+W, N = 2049, 1_000_000
+for chunk in (1024, 2048, 4096, 16384):
+    reads = [chunks_touched(random.randrange(N - W), W, chunk) for _ in range(20000)]
+    print(f&quot;chunk {chunk:6d}: mean chunks per window {sum(reads) / len(reads):.2f}, max {max(reads)}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">chunk   1024: mean chunks per window 3.00, max 3
+chunk   2048: mean chunks per window 2.00, max 2
+chunk   4096: mean chunks per window 1.50, max 2
+chunk  16384: mean chunks per window 1.12, max 2</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With 4,096-token chunks, a 2,049-token window touches 1.5 chunks on average (about half the windows cross a boundary); with 2,048-token chunks every window touches exactly 2; with 16,384 it is close to 1. Bigger chunks mean fewer reads per window but more unused data per read and worse behaviour for small random reads, which is why Exercise 4 asks you to measure the page-cache effect rather than guess.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>Tokenizer</code> - a byte-level deterministic tokenizer good enough for the demo. The interface is <code>encode(text) -&gt; list[int]</code> and <code>vocab_size</code>.</li>
+<li><code>HDF5ShardWriter</code> - opens a resizable integer dataset, buffers tokens to chunk size, resizes and writes in fixed-size strides, records <code>token_count</code> and <code>sha256</code> as HDF5 attributes on close.</li>
+<li><code>ShardedTokenizationPipeline</code> - iterates input documents, routes them to a writer, and emits a <code>shards.json</code> index.</li>
+<li><code>MmapTokenStore</code> - opens shard files for chunked reads (the name is a convenience; h5py reads chunks, it does not mmap the file), computes global offsets, exposes a single <code>get_slice(start, stop)</code> API.</li>
+<li><code>SlidingWindowDataloader</code> - picks random windows from the global stream and yields <code>(input_ids, target_ids)</code> NumPy arrays.</li>
+</ul>
+<p>A demo at the bottom of the file builds a tiny in-memory corpus, tokenizes into two shards, opens them for chunked reads, runs the dataloader for 10 batches, and prints the per-batch shape and a checksum.</p>
+<p>Run it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">python3 code/main.py
+</code></pre></div>
+<p>The script exits zero and prints batch checksums.</p>
+<h2>Production Patterns</h2>
+<p>Four patterns scale this lesson to a real training run.</p>
+<p><strong>Chunk size equals the typical read.</strong> The trainer reads <code>window_size + 1</code> tokens per sample. Set the HDF5 chunk to a multiple of <code>window_size</code> and reads are page-cache aligned. Mismatched chunks halve the throughput because every sample touches two chunks.</p>
+<p><strong>Token count in attributes, not in the dataset.</strong> The trailing slice of the dataset may be partially full because the chunk size does not divide the document boundary. Store the real <code>token_count</code> as an HDF5 attribute on the dataset and have the reader truncate at that value. Without this the reader walks off the end into zero-padded tokens and the model learns to predict zero.</p>
+<p><strong>Sharded sha256 with parallel verification.</strong> Each shard has its own sha256 over the token bytes. The trainer can verify all shards in parallel before training starts. A wrong sha256 fails the run early, not on epoch three after sixteen hours.</p>
+<p><strong><code>swmr=True</code> on both sides, with <code>libver="latest"</code> on the writer.</strong> Single-Writer-Multiple-Reader mode requires the writer to open with <code>libver="latest"</code>, create every dataset up front, then set <code>file.swmr_mode = True</code>. After that the writer must call <code>dataset.flush()</code> after each resize so reader workers (opened with <code>swmr=True</code>) see consistent data. Skipping <code>libver="latest"</code> or enabling SWMR after structural changes is a common source of "file is locked" failures.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>One HDF5 per source shard.</strong> The downloader (lesson 42) emits one shard per URL; tokenization (this lesson) emits one HDF5 per source shard. The 1:1 mapping makes resume and partial-failure recovery trivial.</li>
+<li><strong>Boundary token id.</strong> The boundary token is part of the tokenizer vocab and is the only token the dataloader injects. The training loss masks the boundary token if the model is supposed to ignore it; otherwise it learns to use it as a sequence separator.</li>
+<li><strong><code>shards.json</code> as the source of truth.</strong> Adding a new shard means writing the HDF5, computing its sha256, and appending an entry. The trainer reads the file once at startup and never touches the directory listing.</li>
+</ul>
+<p>Here is <code>code/main.py</code>, in 7 parts. Each part runs on this page, in order, in one Python session.</p>
+<p><strong>Part 1 of 7 · <code>ShardWriteResult</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Streaming tokenization into resizable, sharded HDF5 datasets with chunked reads.
+
+Implements:
+- A byte-level deterministic Tokenizer.
+- An HDF5ShardWriter that buffers tokens to chunk size and resizes the dataset
+  in fixed-size strides, recording token_count and sha256 as dataset attributes.
+- A ShardedTokenizationPipeline that emits one HDF5 per source shard and writes
+  a shards.json index.
+- An MmapTokenStore that opens shard files in swmr mode for read access.
+- A SlidingWindowDataloader that yields fixed-length (input, target) pairs.
+
+The demo at the bottom builds an in-memory corpus, tokenizes into shards, opens
+them for chunked reads, runs the dataloader for a few batches, and prints the
+per-batch shape and a checksum. Run: python3 code/main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import struct
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable, Iterator
+
+import numpy as np
+
+try:
+    import h5py
+except ImportError as exc:
+    raise SystemExit(
+        &quot;h5py is required for this lesson. Install with: pip install h5py&quot;
+    ) from exc
+
+
+DEFAULT_CHUNK_SIZE = 8192
+DEFAULT_WINDOW_SIZE = 64
+BOUNDARY_TOKEN_ID = 0
+TOKEN_DTYPE = np.uint16
+
+
+@dataclass
+class ShardWriteResult:
+    &quot;&quot;&quot;Per-shard write outcome.&quot;&quot;&quot;
+
+    shard_id: str
+    path: str
+    token_count: int
+    document_count: int
+    chunk_size: int
+    sha256: str
+
+    def to_dict(self) -&gt; dict[str, object]:
+        return asdict(self)
+</code></pre></div>
+
+<p><strong>Part 2 of 7 · <code>ShardIndexEntry</code>, <code>Tokenizer</code>, <code>HDF5ShardWriter</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class ShardIndexEntry:
+    &quot;&quot;&quot;Index row used by readers to locate a shard.&quot;&quot;&quot;
+
+    shard_id: str
+    path: str
+    token_count: int
+    document_count: int
+    sha256: str
+    global_start: int
+
+    def to_dict(self) -&gt; dict[str, object]:
+        return asdict(self)
+
+
+class Tokenizer:
+    &quot;&quot;&quot;Byte-level deterministic tokenizer.
+
+    Vocabulary:
+        0      boundary token (separator injected by the dataloader)
+        1..256 raw byte tokens (offset by one so 0 is reserved)
+
+    Real tokenizers use BPE or SentencePiece; this implementation is enough to
+    drive the streaming-write story without pulling a third-party tokenizer.
+    &quot;&quot;&quot;
+
+    BOUNDARY_TOKEN = BOUNDARY_TOKEN_ID
+    BYTE_OFFSET = 1
+
+    def __init__(self) -&gt; None:
+        self.vocab_size = 257
+
+    def encode(self, text: str) -&gt; list[int]:
+        if not text:
+            return []
+        data = text.encode(&quot;utf-8&quot;)
+        return [self.BYTE_OFFSET + b for b in data]
+
+    def decode(self, ids: Iterable[int]) -&gt; str:
+        byte_ids = [int(i) - self.BYTE_OFFSET for i in ids if int(i) &gt;= self.BYTE_OFFSET]
+        return bytes(byte_ids).decode(&quot;utf-8&quot;, errors=&quot;replace&quot;)
+
+
+class HDF5ShardWriter:
+    &quot;&quot;&quot;Stream tokens into a resizable HDF5 dataset with chunk-sized buffering.
+
+    Open in a `with` block to guarantee the residual buffer is flushed and the
+    closing attributes (token_count, sha256) are written.
+    &quot;&quot;&quot;
+
+    def __init__(
+        self,
+        path: Path,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+        dataset_name: str = &quot;tokens&quot;,
+    ) -&gt; None:
+        if chunk_size &lt;= 0:
+            raise ValueError(&quot;chunk_size must be positive&quot;)
+        self.path = Path(path)
+        self.chunk_size = chunk_size
+        self.dataset_name = dataset_name
+        self._buffer: list[int] = []
+        self._token_count = 0
+        self._document_count = 0
+        self._hasher = hashlib.sha256()
+        self._file: h5py.File | None = None
+        self._dataset: h5py.Dataset | None = None
+
+    def __enter__(self) -&gt; &quot;HDF5ShardWriter&quot;:
+        self._file = h5py.File(self.path, &quot;w&quot;, libver=&quot;latest&quot;)
+        self._dataset = self._file.create_dataset(
+            self.dataset_name,
+            shape=(0,),
+            maxshape=(None,),
+            chunks=(self.chunk_size,),
+            dtype=TOKEN_DTYPE,
+        )
+        self._file.swmr_mode = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -&gt; None:
+        try:
+            if self._dataset is not None and self._file is not None:
+                if self._buffer:
+                    self._flush_buffer(final=True)
+                self._dataset.attrs[&quot;token_count&quot;] = self._token_count
+                self._dataset.attrs[&quot;document_count&quot;] = self._document_count
+                self._dataset.attrs[&quot;sha256&quot;] = self._hasher.hexdigest()
+        finally:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+                self._dataset = None
+
+    def add_document(self, token_ids: Iterable[int]) -&gt; None:
+        self._document_count += 1
+        for token in token_ids:
+            self._buffer.append(int(token))
+            if len(self._buffer) &gt;= self.chunk_size:
+                self._flush_buffer(final=False)
+
+    def add_boundary(self) -&gt; None:
+        &quot;&quot;&quot;Inject the separator token between documents.&quot;&quot;&quot;
+
+        self._buffer.append(BOUNDARY_TOKEN_ID)
+        if len(self._buffer) &gt;= self.chunk_size:
+            self._flush_buffer(final=False)
+
+    def _flush_buffer(self, final: bool) -&gt; None:
+        if self._dataset is None:
+            raise RuntimeError(&quot;writer is not open&quot;)
+        if not self._buffer:
+            return
+        size = len(self._buffer) if final else self.chunk_size
+        chunk = np.asarray(self._buffer[:size], dtype=TOKEN_DTYPE)
+        new_total = self._token_count + size
+        self._dataset.resize((new_total,))
+        self._dataset[self._token_count : new_total] = chunk
+        self._dataset.flush()
+        self._hasher.update(chunk.tobytes())
+        self._token_count = new_total
+        self._buffer = self._buffer[size:]
+        if not final and len(self._buffer) &gt;= self.chunk_size:
+            self._flush_buffer(final=False)
+
+    @property
+    def token_count(self) -&gt; int:
+        return self._token_count
+
+    @property
+    def document_count(self) -&gt; int:
+        return self._document_count
+
+    def result(self, shard_id: str) -&gt; ShardWriteResult:
+        return ShardWriteResult(
+            shard_id=shard_id,
+            path=str(self.path),
+            token_count=self._token_count,
+            document_count=self._document_count,
+            chunk_size=self.chunk_size,
+            sha256=self._hasher.hexdigest(),
+        )
+</code></pre></div>
+
+<p><strong>Part 3 of 7 · <code>ShardedTokenizationPipeline</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ShardedTokenizationPipeline:
+    &quot;&quot;&quot;Tokenize iterable shard inputs into HDF5 files and write a shards.json.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        tokenizer: Tokenizer,
+        output_dir: Path,
+        chunk_size: int = DEFAULT_CHUNK_SIZE,
+    ) -&gt; None:
+        self.tokenizer = tokenizer
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.chunk_size = chunk_size
+
+    def write_shard(self, shard_id: str, documents: Iterable[str]) -&gt; ShardWriteResult:
+        shard_path = self.output_dir / f&quot;{shard_id}.h5&quot;
+        writer = HDF5ShardWriter(shard_path, chunk_size=self.chunk_size)
+        with writer:
+            for text in documents:
+                writer.add_document(self.tokenizer.encode(text))
+                writer.add_boundary()
+        return writer.result(shard_id)
+
+    def write_corpus(self, shards: dict[str, Iterable[str]]) -&gt; list[ShardIndexEntry]:
+        entries: list[ShardIndexEntry] = []
+        running_offset = 0
+        for shard_id, documents in shards.items():
+            result = self.write_shard(shard_id, documents)
+            entries.append(
+                ShardIndexEntry(
+                    shard_id=result.shard_id,
+                    path=result.path,
+                    token_count=result.token_count,
+                    document_count=result.document_count,
+                    sha256=result.sha256,
+                    global_start=running_offset,
+                )
+            )
+            running_offset += result.token_count
+        index_path = self.output_dir / &quot;shards.json&quot;
+        body = {
+            &quot;version&quot;: 1,
+            &quot;chunk_size&quot;: self.chunk_size,
+            &quot;total_tokens&quot;: running_offset,
+            &quot;shards&quot;: [entry.to_dict() for entry in entries],
+        }
+        index_path.write_text(json.dumps(body, sort_keys=True, indent=2), encoding=&quot;utf-8&quot;)
+        return entries
+</code></pre></div>
+
+<p><strong>Part 4 of 7 · <code>MmapTokenStore</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class MmapTokenStore:
+    &quot;&quot;&quot;Chunked read access to a sharded HDF5 token corpus.
+
+    The store opens each shard file once in SWMR mode. A request for
+    `get_slice(start, stop)` is routed across shards and the result is returned
+    as a flat NumPy uint16 array. Reads land in the page cache; the dataloader
+    pays one copy when it crosses into a training tensor.
+    &quot;&quot;&quot;
+
+    def __init__(self, shard_entries: list[ShardIndexEntry]) -&gt; None:
+        if not shard_entries:
+            raise ValueError(&quot;at least one shard entry is required&quot;)
+        self._entries = shard_entries
+        self._files: list[h5py.File] = []
+        self._datasets: list[h5py.Dataset] = []
+        try:
+            for entry in shard_entries:
+                self._files.append(h5py.File(entry.path, &quot;r&quot;, swmr=True))
+            self._datasets = [f[&quot;tokens&quot;] for f in self._files]
+        except Exception:
+            for opened in self._files:
+                try:
+                    opened.close()
+                except Exception:
+                    pass
+            self._files = []
+            self._datasets = []
+            raise
+        self._total_tokens = sum(entry.token_count for entry in shard_entries)
+
+    @property
+    def total_tokens(self) -&gt; int:
+        return self._total_tokens
+
+    def close(self) -&gt; None:
+        for file in self._files:
+            try:
+                file.close()
+            except Exception:
+                pass
+        self._files = []
+        self._datasets = []
+
+    def __enter__(self) -&gt; &quot;MmapTokenStore&quot;:
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -&gt; None:
+        self.close()
+
+    def get_slice(self, start: int, stop: int) -&gt; np.ndarray:
+        if start &lt; 0 or stop &lt; 0 or stop &lt; start:
+            raise ValueError(f&quot;bad slice: start={start} stop={stop}&quot;)
+        if stop &gt; self._total_tokens:
+            raise ValueError(f&quot;stop ({stop}) exceeds total tokens ({self._total_tokens})&quot;)
+        if stop == start:
+            return np.empty((0,), dtype=TOKEN_DTYPE)
+        out = np.empty((stop - start,), dtype=TOKEN_DTYPE)
+        cursor = 0
+        for entry, dataset in zip(self._entries, self._datasets):
+            shard_start = entry.global_start
+            shard_stop = shard_start + entry.token_count
+            if stop &lt;= shard_start:
+                break
+            if start &gt;= shard_stop:
+                continue
+            local_start = max(0, start - shard_start)
+            local_stop = min(entry.token_count, stop - shard_start)
+            length = local_stop - local_start
+            if length &lt;= 0:
+                continue
+            out[cursor : cursor + length] = dataset[local_start:local_stop]
+            cursor += length
+        if cursor != stop - start:
+            raise RuntimeError(
+                f&quot;slice read produced {cursor} tokens, expected {stop - start}&quot;
+            )
+        return out
+</code></pre></div>
+
+<p><strong>Part 5 of 7 · <code>SlidingWindowDataloader</code>, <code>JSONLSource</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class SlidingWindowDataloader:
+    &quot;&quot;&quot;Random sliding-window sampler over a flat token stream.&quot;&quot;&quot;
+
+    def __init__(
+        self,
+        store: MmapTokenStore,
+        window_size: int = DEFAULT_WINDOW_SIZE,
+        batch_size: int = 4,
+        seed: int = 0,
+    ) -&gt; None:
+        if window_size &lt;= 1:
+            raise ValueError(&quot;window_size must be greater than 1&quot;)
+        if batch_size &lt;= 0:
+            raise ValueError(&quot;batch_size must be positive&quot;)
+        if store.total_tokens &lt;= window_size:
+            raise ValueError(
+                f&quot;store has only {store.total_tokens} tokens; need more than {window_size}&quot;
+            )
+        self.store = store
+        self.window_size = window_size
+        self.batch_size = batch_size
+        self._random = random.Random(seed)
+        self._max_start = store.total_tokens - window_size - 1
+
+    def _sample_window(self) -&gt; tuple[np.ndarray, np.ndarray]:
+        start = self._random.randint(0, self._max_start)
+        chunk = self.store.get_slice(start, start + self.window_size + 1)
+        return chunk[:-1], chunk[1:]
+
+    def __iter__(self) -&gt; Iterator[tuple[np.ndarray, np.ndarray]]:
+        while True:
+            inputs = np.empty((self.batch_size, self.window_size), dtype=TOKEN_DTYPE)
+            targets = np.empty((self.batch_size, self.window_size), dtype=TOKEN_DTYPE)
+            for row in range(self.batch_size):
+                inputs[row], targets[row] = self._sample_window()
+            yield inputs, targets
+
+    def take(self, num_batches: int) -&gt; list[tuple[np.ndarray, np.ndarray]]:
+        iterator = iter(self)
+        return [next(iterator) for _ in range(num_batches)]
+
+
+class JSONLSource:
+    &quot;&quot;&quot;Adapter that yields documents from a JSONL file with a configurable key.
+
+    The downloader (Phase 19 · 42) emits JSONL where each line is a JSON object
+    with a `text` field. This adapter pulls the text out and skips lines that
+    are malformed or missing the field. Real pipelines log the dropped lines;
+    this adapter counts them so callers can audit dropout rate.
+    &quot;&quot;&quot;
+
+    def __init__(self, path: Path, text_field: str = &quot;text&quot;) -&gt; None:
+        self.path = Path(path)
+        self.text_field = text_field
+        self.dropped_lines = 0
+
+    def __iter__(self) -&gt; Iterator[str]:
+        with self.path.open(&quot;r&quot;, encoding=&quot;utf-8&quot;) as fh:
+            for line in fh:
+                line = line.rstrip(&quot;\n&quot;)
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    self.dropped_lines += 1
+                    continue
+                if not isinstance(record, dict):
+                    self.dropped_lines += 1
+                    continue
+                value = record.get(self.text_field)
+                if not isinstance(value, str) or not value:
+                    self.dropped_lines += 1
+                    continue
+                yield value
+</code></pre></div>
+
+<p><strong>Part 6 of 7 · <code>pack_documents</code>, <code>tokenize_jsonl_path</code>, <code>load_index</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def pack_documents(
+    tokenizer: Tokenizer,
+    documents: Iterable[str],
+    max_tokens: int,
+) -&gt; Iterator[list[int]]:
+    &quot;&quot;&quot;Pack tokenized documents into fixed-length groups with boundary tokens.
+
+    Yields lists of exactly max_tokens token ids. Long documents are split
+    across groups; short documents share a group separated by BOUNDARY_TOKEN_ID.
+    The final group may be shorter than max_tokens and is yielded as-is.
+    &quot;&quot;&quot;
+
+    if max_tokens &lt;= 1:
+        raise ValueError(&quot;max_tokens must be greater than 1&quot;)
+    buffer: list[int] = []
+    for text in documents:
+        token_ids = tokenizer.encode(text)
+        if buffer:
+            buffer.append(BOUNDARY_TOKEN_ID)
+        buffer.extend(token_ids)
+        while len(buffer) &gt;= max_tokens:
+            yield buffer[:max_tokens]
+            buffer = buffer[max_tokens:]
+    if buffer:
+        yield buffer
+
+
+def tokenize_jsonl_path(
+    jsonl_path: Path,
+    output_dir: Path,
+    shard_id: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    text_field: str = &quot;text&quot;,
+) -&gt; ShardWriteResult:
+    &quot;&quot;&quot;Convenience wrapper: tokenize one JSONL file into one HDF5 shard.&quot;&quot;&quot;
+
+    tokenizer = Tokenizer()
+    pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=output_dir, chunk_size=chunk_size)
+    source = JSONLSource(jsonl_path, text_field=text_field)
+    return pipeline.write_shard(shard_id, source)
+
+
+def load_index(index_path: Path) -&gt; list[ShardIndexEntry]:
+    &quot;&quot;&quot;Read shards.json and return ShardIndexEntry rows.&quot;&quot;&quot;
+
+    data = json.loads(Path(index_path).read_text(&quot;utf-8&quot;))
+    entries: list[ShardIndexEntry] = []
+    for row in data[&quot;shards&quot;]:
+        entries.append(
+            ShardIndexEntry(
+                shard_id=str(row[&quot;shard_id&quot;]),
+                path=str(row[&quot;path&quot;]),
+                token_count=int(row[&quot;token_count&quot;]),
+                document_count=int(row.get(&quot;document_count&quot;, 0)),
+                sha256=str(row[&quot;sha256&quot;]),
+                global_start=int(row[&quot;global_start&quot;]),
+            )
+        )
+    return entries
+</code></pre></div>
+
+<p><strong>Part 7 of 7 · <code>validate_corpus</code>, <code>build_demo_corpus</code>, <code>run_demo</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def validate_corpus(index_entries: list[ShardIndexEntry]) -&gt; list[str]:
+    &quot;&quot;&quot;Recompute each shard's sha256 over its on-disk tokens and report mismatches.&quot;&quot;&quot;
+
+    failures: list[str] = []
+    for entry in index_entries:
+        with h5py.File(entry.path, &quot;r&quot;, swmr=True) as fh:
+            dataset = fh[&quot;tokens&quot;]
+            recorded_count = int(dataset.attrs.get(&quot;token_count&quot;, entry.token_count))
+            tokens = np.asarray(dataset[:recorded_count], dtype=TOKEN_DTYPE)
+            recomputed = hashlib.sha256(tokens.tobytes()).hexdigest()
+            if recomputed != entry.sha256:
+                failures.append(entry.shard_id)
+    return failures
+
+
+def build_demo_corpus() -&gt; dict[str, list[str]]:
+    &quot;&quot;&quot;Two shards of synthetic documents long enough to exercise chunked reads.&quot;&quot;&quot;
+
+    base = [
+        &quot;the alignment problem is a story about reward functions and the things they fail to write down&quot;,
+        &quot;attention scales better with sequence length so transformers replaced recurrent networks during the language modeling era&quot;,
+        &quot;an evaluation harness keeps training honest by treating the test corpus as a contract that cannot drift&quot;,
+        &quot;deduplication is upstream of tokenization because every duplicate token costs the trainer twice in compute&quot;,
+        &quot;checkpoints record the optimizer state and the random seed so that a restart resumes exactly where it stopped&quot;,
+    ]
+    long_repeat = &quot; &quot;.join(base * 4)
+    shards: dict[str, list[str]] = {
+        &quot;shard-0000&quot;: [long_repeat, long_repeat, long_repeat],
+        &quot;shard-0001&quot;: [long_repeat, long_repeat, long_repeat],
+    }
+    return shards
+
+
+def run_demo() -&gt; int:
+    &quot;&quot;&quot;Build a demo corpus, tokenize it, validate it, and run the dataloader.
+
+    Designed to be self-terminating: the pipeline writes into a temporary
+    directory and the dataloader takes a small fixed number of batches so the
+    script exits without external input.
+    &quot;&quot;&quot;
+
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        tokenizer = Tokenizer()
+        pipeline = ShardedTokenizationPipeline(tokenizer, output_dir=out, chunk_size=512)
+        shards = build_demo_corpus()
+        entries = pipeline.write_corpus(shards)
+        for entry in entries:
+            print(
+                f&quot;[shard] {entry.shard_id} tokens={entry.token_count} &quot;
+                f&quot;sha256={entry.sha256[:12]} global_start={entry.global_start}&quot;
+            )
+        validation_failures = validate_corpus(entries)
+        if validation_failures:
+            print(f&quot;[validate] failed: {validation_failures}&quot;)
+            return 1
+        print(f&quot;[validate] all {len(entries)} shards match recorded sha256&quot;)
+        with MmapTokenStore(entries) as store:
+            loader = SlidingWindowDataloader(store, window_size=64, batch_size=4, seed=7)
+            for batch_index, (inputs, targets) in enumerate(loader.take(10)):
+                checksum = int(hashlib.blake2b(inputs.tobytes(), digest_size=4).hexdigest(), 16)
+                print(
+                    f&quot;[batch] step={batch_index} shape={tuple(inputs.shape)} &quot;
+                    f&quot;checksum={checksum:08x}&quot;
+                )
+    return 0
+</code></pre></div>
+
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The demo writes two shards of 6,456 tokens each, records a hash and global start offset for each, validates them, and then draws ten batches of shape (4, 64). Notice that both shards have the <em>same</em> hash: the demo corpus is the same text written twice, so their tokens are identical. In a real pipeline, two identical shard hashes would be a red flag for duplicated input, exactly the kind of thing the manifest makes visible.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A writer resizes the HDF5 dataset once at the end of each shard and writes all its tokens in one call. A crash during a long shard loses every token written so far for that shard, and the file is left in an inconsistent state. What should the writer do instead? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Store tokens as a resizable, chunked integer array per shard.</li>
+<li>Buffer and append chunk-sized pieces; never one document at a time.</li>
+<li>Record each shard's hash and global start; validate before training.</li>
+<li>The loader cuts windows from the global stream, across shards.</li>
+<li>Match chunk size to the window size and measure reads.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-pretraining-data"><span class="t" style="--cs-hue:28">PP</span>Cheat sheet · LLM Pre-Training Data Pipelines</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-hdf5-tokenized-corpus.md</code> would, on a real project, describe which tokenizer feeds the pipeline, what chunk size matches the trainer's window, where <code>shards.json</code> lives in version control, and how dataloader workers are sharded across files. This lesson ships the engine.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a <code>--compression gzip</code> flag to the HDF5 writer and measure the throughput cost on the demo corpus. Defend the chosen default.</li>
+<li>Add a deterministic seed to the sliding-window dataloader and verify two runs with the same seed produce identical batches.</li>
+<li>Add a <code>--validate</code> mode that reads every shard, recomputes the sha256 over its tokens, and compares against <code>shards.json</code>. CI should run this before training starts.</li>
+<li>Compare the dataloader throughput at chunk sizes equal to, half of, and twice the window size. Report the page-cache effect.</li>
+<li>Add a <code>--max-document-tokens</code> flag that truncates very long documents at write time. Defend the trade-off against deciding at read time.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1943-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P3 · A validate mode</span></summary><div class="qa-a"><p>Read every shard, recompute the sha256 over its token array, and compare with <code>shards.json</code>; also check that each shard's global start equals the previous start plus its token count. Exit non-zero on any mismatch so CI blocks training on corrupt or reordered data.</p></div></details>
+<details class="qa" id="a1943-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Append and flush in chunks</span></summary><div class="qa-a"><p>Append each full buffer (one chunk) as soon as it fills, flush the file, and record progress, so a crash loses at most the unflushed buffer. Write to a temporary file and rename it into place when the shard is complete, and add the shard to the manifest only after its hash is computed.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://support.hdfgroup.org/documentation/hdf5/latest/hdf5_chunking.html">HDF5 chunking documentation</a> - the chunked, resizable dataset layout this lesson uses</li>
+<li><a href="https://docs.h5py.org/en/stable/">h5py user guide</a> - Python bindings for HDF5</li>
+<li><a href="https://docs.h5py.org/en/stable/high/dataset.html#chunked-storage">h5py chunked storage</a> - how h5py reads chunked datasets and sizes the chunk cache</li>
+<li>Phase 19 · 42 - the downloader whose output this lesson tokenizes</li>
+<li>Phase 19 · 44 - the cosine schedule that consumes this dataloader</li>
+<li>Phase 19 · 45 - the AMP loop that wraps the training step</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1943" id="done-a1943">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1943" id="undo-a1943" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1942"><span class="pn-dir">Previous</span><span class="pn-t">19.42 · Downloading a Large Training Corpus</span></a><a class="pn next" href="#a1944"><span class="pn-dir">Next</span><span class="pn-t">19.44 · Linear Warmup with Cosine Learning Rate Decay</span></a></div></footer>

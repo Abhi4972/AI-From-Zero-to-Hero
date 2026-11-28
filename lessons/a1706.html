@@ -1,0 +1,407 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · LLM Inference, Infrastructure and LLMOps</a></nav><h1>KV Cache Reuse and RadixAttention for Prefix-Cache Serving</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.6</span><span class="chip">75 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1706" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Diagram RadixAttention: how prefixes are stored in a radix tree and how KV blocks are shared across sequences rooted at the same branch.</li>
+<li>Explain cache-aware scheduling and why FCFS is wrong for prefix-heavy traffic.</li>
+<li>Compute expected speedup for a workload given prefix-cache hit rate and prompt length distribution.</li>
+<li>Name the prompt-ordering discipline that makes the 6.4x number real vs a lost upside.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 17.4 (Serving Engine Internals), Phase 14 (Agentic RAG)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy radix-tree cache + cache-aware scheduler). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Treat the KV cache as a first-class, reusable resource stored in a radix tree, and scheduling changes with it: instead of FCFS (first-come, first-served) as vLLM schedules, a cache-aware scheduler prioritizes requests with longer shared prefixes — effectively a depth-first radix traversal so hot branches stay resident in HBM. SGLang is the engine that built serving around this idea. On Llama 3.1 8B with ShareGPT-like 1K prompts, SGLang hits ~16,200 tok/s to vLLM's ~12,500, a ~29% edge. On prefix-heavy RAG workloads the advantage reaches 6.4x. On voice-cloning-shaped workloads cache hit rate cleared 86%. Deployed on 400,000+ GPUs in 2026 across xAI, LinkedIn, Cursor, Oracle, GCP, Azure, AWS. The gotcha is that the 6.4x number evaporates when prefix ordering is inconsistent — ordering is the engineer's lever.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RadixAttention</td>
+<td>"the SGLang thing"</td>
+<td>KV cache indexed as a radix tree so shared prefixes reuse blocks</td>
+</tr>
+<tr>
+<td>Radix tree</td>
+<td>"compact trie"</td>
+<td>Tree where each node owns a token range and its KV blocks</td>
+</tr>
+<tr>
+<td>Cache-aware scheduler</td>
+<td>"hot-branch-first"</td>
+<td>Scheduler that prefers requests sharing the resident branch</td>
+</tr>
+<tr>
+<td>Prefix-cache hit rate</td>
+<td>"how much of your prompt was free"</td>
+<td>Fraction of prompt tokens served from reused KV blocks</td>
+</tr>
+<tr>
+<td>FCFS</td>
+<td>"first-come first-served"</td>
+<td>Default scheduling that breaks prefix locality</td>
+</tr>
+<tr>
+<td>Branch-level LRU</td>
+<td>"evict the leaf"</td>
+<td>Eviction policy matched to radix shape</td>
+</tr>
+<tr>
+<td>Prompt template ordering</td>
+<td>"the cache key"</td>
+<td>The prompt's component order determines what the tree can share</td>
+</tr>
+<tr>
+<td>System prompt pinning</td>
+<td>"resident prefix"</td>
+<td>Keep the immutable system portion pinned to avoid eviction thrash</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Many requests to the same model start with the same text: the same system prompt, the same tool descriptions, the same retrieved document. Reading that shared beginning (the <strong>prefix</strong>) costs the same work every time. <strong>Prefix caching</strong> keeps the KV cache computed for a prefix and reuses it, so only the new part of each prompt needs reading. SGLang's <strong>RadixAttention</strong> stores cached prefixes in a <strong>radix tree</strong>, a tree where each path from the root spells out a sequence of tokens. A new request walks down the tree as far as its tokens match and reuses everything on that path. Two things decide how much you save: whether your prompts put the shared parts first in a fixed order, and whether the scheduler serves requests that share a branch together, so that branch stays in memory.</p></div></aside>
+<p>Classic serving treats each request's prompt as opaque. Even when 5,000 RAG requests all start with the same 2,000-token system prompt plus same retrieval preamble, vLLM prefills that 2,000-token prefix 5,000 times. The GPU does the same work over and over.</p>
+<p>The observation: prompts in agentic and RAG workloads share long prefixes almost always. System prompt, tool schemas, few-shot examples, retrieval headers, conversation history — all repeat across requests. If you stored the KV cache for that prefix once and reused it, you would not prefill it again.</p>
+<p>RadixAttention does exactly this. Tokens are indexed in a radix tree; each node owns KV blocks for the token sequence on its path from root. A new request walks the tree: any node whose token matches re-uses that node's KV blocks. Prefill cost becomes proportional to the "new" suffix, not the full prompt.</p>
+<p>The challenge is scheduling. If two requests share a 2,000-token prefix and a third shares only 200 tokens of the same prefix, you want to serve the two long-shared requests together so the long prefix stays in HBM. FCFS does the opposite — it serves whoever arrived first, potentially evicting the hot branch before the next long-prefix request hits.</p>
+<h2>Idea 1 · The radix tree as a KV index</h2>
+<p>A radix tree (compact trie) stores token sequences. Each node owns a token range and the KV blocks computed for that range. Children extend the sequence one or more tokens.</p>
+<figure class="diagram mmfig" data-mmd="a1706" data-h="96e77c7a11"><div class="dg-scroll"><svg class="dg mm" id="mm96e77c7a11" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 504.344px; background-color: transparent;" viewBox="0 0 504.34375 677" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm96e77c7a11{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm96e77c7a11 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm96e77c7a11 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm96e77c7a11 .error-icon{fill:#f4efe7;}#mm96e77c7a11 .error-text{fill:#0b1018;stroke:#0b1018;}#mm96e77c7a11 .edge-thickness-normal{stroke-width:1px;}#mm96e77c7a11 .edge-thickness-thick{stroke-width:3.5px;}#mm96e77c7a11 .edge-pattern-solid{stroke-dasharray:0;}#mm96e77c7a11 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm96e77c7a11 .edge-pattern-dashed{stroke-dasharray:3;}#mm96e77c7a11 .edge-pattern-dotted{stroke-dasharray:2;}#mm96e77c7a11 .marker{fill:#6c6357;stroke:#6c6357;}#mm96e77c7a11 .marker.cross{stroke:#6c6357;}#mm96e77c7a11 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm96e77c7a11 p{margin:0;}#mm96e77c7a11 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm96e77c7a11 .cluster-label text{fill:#0b1018;}#mm96e77c7a11 .cluster-label span{color:#0b1018;}#mm96e77c7a11 .cluster-label span p{background-color:transparent;}#mm96e77c7a11 .label text,#mm96e77c7a11 span{fill:#211c16;color:#211c16;}#mm96e77c7a11 .node rect,#mm96e77c7a11 .node circle,#mm96e77c7a11 .node ellipse,#mm96e77c7a11 .node polygon,#mm96e77c7a11 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm96e77c7a11 .rough-node .label text,#mm96e77c7a11 .node .label text,#mm96e77c7a11 .image-shape .label,#mm96e77c7a11 .icon-shape .label{text-anchor:middle;}#mm96e77c7a11 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm96e77c7a11 .rough-node .label,#mm96e77c7a11 .node .label,#mm96e77c7a11 .image-shape .label,#mm96e77c7a11 .icon-shape .label{text-align:center;}#mm96e77c7a11 .node.clickable{cursor:pointer;}#mm96e77c7a11 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm96e77c7a11 .arrowheadPath{fill:#0b0b0b;}#mm96e77c7a11 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm96e77c7a11 .flowchart-link{stroke:#6c6357;fill:none;}#mm96e77c7a11 .edgeLabel{background-color:#ffffff;text-align:center;}#mm96e77c7a11 .edgeLabel p{background-color:#ffffff;}#mm96e77c7a11 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm96e77c7a11 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm96e77c7a11 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm96e77c7a11 .cluster text{fill:#0b1018;}#mm96e77c7a11 .cluster span{color:#0b1018;}#mm96e77c7a11 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm96e77c7a11 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm96e77c7a11 rect.text{fill:none;stroke-width:0;}#mm96e77c7a11 .icon-shape,#mm96e77c7a11 .image-shape{background-color:#ffffff;text-align:center;}#mm96e77c7a11 .icon-shape p,#mm96e77c7a11 .image-shape p{background-color:#ffffff;padding:2px;}#mm96e77c7a11 .icon-shape .label rect,#mm96e77c7a11 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm96e77c7a11 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm96e77c7a11 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm96e77c7a11 .node .neo-node{stroke:#b5521b;}#mm96e77c7a11 [data-look="neo"].node rect,#mm96e77c7a11 [data-look="neo"].cluster rect,#mm96e77c7a11 [data-look="neo"].node polygon{stroke:url(#mm96e77c7a11-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm96e77c7a11 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm96e77c7a11 [data-look="neo"].node path{stroke:url(#mm96e77c7a11-gradient);stroke-width:1px;}#mm96e77c7a11 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm96e77c7a11 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm96e77c7a11 [data-look="neo"].node circle{stroke:url(#mm96e77c7a11-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm96e77c7a11 [data-look="neo"].node circle .state-start{fill:#000000;}#mm96e77c7a11 [data-look="neo"].icon-shape .icon{fill:url(#mm96e77c7a11-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm96e77c7a11 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm96e77c7a11-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm96e77c7a11 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm96e77c7a11_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm96e77c7a11_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm96e77c7a11_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M248.547,59L248.547,63.167C248.547,67.333,248.547,75.667,248.547,83.333C248.547,91,248.547,98,248.547,101.5L248.547,105" id="mm96e77c7a11-L_R_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_W_0" data-points="W3sieCI6MjQ4LjU0Njg3NSwieSI6NTl9LHsieCI6MjQ4LjU0Njg3NSwieSI6ODR9LHsieCI6MjQ4LjU0Njg3NSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M248.547,181L248.547,185.167C248.547,189.333,248.547,197.667,248.547,205.333C248.547,213,248.547,220,248.547,223.5L248.547,227" id="mm96e77c7a11-L_W_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_M_0" data-points="W3sieCI6MjQ4LjU0Njg3NSwieSI6MTgxfSx7IngiOjI0OC41NDY4NzUsInkiOjIwNn0seyJ4IjoyNDguNTQ2ODc1LCJ5IjoyMzF9XQ==" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M169.119,303L159.926,307.167C150.733,311.333,132.347,319.667,123.154,327.333C113.961,335,113.961,342,113.961,345.5L113.961,349" id="mm96e77c7a11-L_M_RE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_RE_0" data-points="W3sieCI6MTY5LjExOTEwODYwNjU1NzM4LCJ5IjozMDN9LHsieCI6MTEzLjk2MDkzNzUsInkiOjMyOH0seyJ4IjoxMTMuOTYwOTM3NSwieSI6MzUzfV0=" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M327.975,303L337.168,307.167C346.361,311.333,364.747,319.667,373.94,327.333C383.133,335,383.133,342,383.133,345.5L383.133,349" id="mm96e77c7a11-L_M_NEW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_NEW_0" data-points="W3sieCI6MzI3Ljk3NDY0MTM5MzQ0MjY1LCJ5IjozMDN9LHsieCI6MzgzLjEzMjgxMjUsInkiOjMyOH0seyJ4IjozODMuMTMyODEyNSwieSI6MzUzfV0=" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M113.961,404L113.961,408.167C113.961,412.333,113.961,420.667,121.215,428.687C128.469,436.708,142.978,444.416,150.232,448.269L157.487,452.123" id="mm96e77c7a11-L_RE_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RE_S_0" data-points="W3sieCI6MTEzLjk2MDkzNzUsInkiOjQwNH0seyJ4IjoxMTMuOTYwOTM3NSwieSI6NDI5fSx7IngiOjE2MS4wMTg5NTc2MDQ4OTUxLCJ5Ijo0NTR9XQ==" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M383.133,404L383.133,408.167C383.133,412.333,383.133,420.667,375.879,428.687C368.624,436.708,354.116,444.416,346.862,448.269L339.607,452.123" id="mm96e77c7a11-L_NEW_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_NEW_S_0" data-points="W3sieCI6MzgzLjEzMjgxMjUsInkiOjQwNH0seyJ4IjozODMuMTMyODEyNSwieSI6NDI5fSx7IngiOjMzNi4wNzQ3OTIzOTUxMDQ5LCJ5Ijo0NTR9XQ==" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/><path d="M248.547,547L248.547,551.167C248.547,555.333,248.547,563.667,248.547,571.333C248.547,579,248.547,586,248.547,589.5L248.547,593" id="mm96e77c7a11-L_S_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_E_0" data-points="W3sieCI6MjQ4LjU0Njg3NSwieSI6NTQ3fSx7IngiOjI0OC41NDY4NzUsInkiOjU3Mn0seyJ4IjoyNDguNTQ2ODc1LCJ5Ijo1OTd9XQ==" data-look="classic" marker-end="url(#mm96e77c7a11_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R_W_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W_M_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_RE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_NEW_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RE_S_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_NEW_S_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm96e77c7a11-flowchart-R-0" data-look="classic" transform="translate(248.546875, 33.5)"><rect class="basic label-container" style="" x="-72.0234375" y="-25.5" width="144.046875" height="51"/><g class="label" style="" transform="translate(-42.0234375, -10.5)"><rect/><foreignObject width="84.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>New request</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-W-1" data-look="classic" transform="translate(248.546875, 145)"><rect class="basic label-container" style="" x="-91.7734375" y="-36" width="183.546875" height="72"/><g class="label" style="" transform="translate(-61.7734375, -21)"><rect/><foreignObject width="123.546875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Walk the radix tree<br />along its tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-M-3" data-look="classic" transform="translate(248.546875, 267)"><rect class="basic label-container" style="" x="-110.1328125" y="-36" width="220.265625" height="72"/><g class="label" style="" transform="translate(-80.1328125, -21)"><rect/><foreignObject width="160.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Longest matching prefix<br />e.g. system + document</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-RE-5" data-look="classic" transform="translate(113.9609375, 378.5)"><rect class="basic label-container" style="" x="-105.9609375" y="-25.5" width="211.921875" height="51"/><g class="label" style="" transform="translate(-75.9609375, -10.5)"><rect/><foreignObject width="151.921875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Reuse those KV blocks</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-NEW-7" data-look="classic" transform="translate(383.1328125, 378.5)"><rect class="basic label-container" style="" x="-113.2109375" y="-25.5" width="226.421875" height="51"/><g class="label" style="" transform="translate(-83.2109375, -10.5)"><rect/><foreignObject width="166.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Prefill only the new suffix</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-S-9" data-look="classic" transform="translate(248.546875, 500.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Scheduler serves requests<br />from the same branch together</p></span></div></foreignObject></g></g><g class="node default" id="mm96e77c7a11-flowchart-E-13" data-look="classic" transform="translate(248.546875, 633)"><rect class="basic label-container" style="" x="-105.1953125" y="-36" width="210.390625" height="72"/><g class="label" style="" transform="translate(-75.1953125, -21)"><rect/><foreignObject width="150.390625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Evict cold branches,<br />whole branch at a time</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm96e77c7a11-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm96e77c7a11-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm96e77c7a11-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">root
+ |- &quot;You are a helpful assistant...&quot;  (2,000 tokens, 124 KV blocks)
+      |- &quot;Context: &lt;doc A&gt;...&quot;        (500 tokens, 31 blocks)
+           |- &quot;Question: Alice...&quot;    (80 tokens, 5 blocks)
+           |- &quot;Question: Bob...&quot;      (95 tokens, 6 blocks)
+      |- &quot;Context: &lt;doc B&gt;...&quot;        (520 tokens, 33 blocks)
+</code></pre></div>
+<p>A new request comes in with system prompt + "Context: <doc A>" + "Question: Carol". The scheduler walks: system prefix matches (124 blocks reused), doc-A branch matches (31 blocks reused), then allocates fresh blocks only for "Question: Carol" (4 blocks). Prefill cost: 4 blocks of new tokens. Without the tree: 160 blocks. ~40x savings on prefill.</p>
+<h2>Idea 2 · Cache-aware scheduling</h2>
+<p>Radix-tree-backed reuse is pointless if the cache churns. Two key policies:</p>
+<ol>
+<li><strong>Depth-first dispatch</strong>. When picking the next request from the queue, prefer requests rooted at the same branch as the current running set. This keeps the hot branch pinned.</li>
+<li><strong>LRU at branch level, not block level</strong>. Evict whole branches (starting from shortest-used leaves) rather than individual blocks, so cache shape matches radix shape.</li>
+</ol>
+<p>FCFS violates both. A request sharing 2,000 tokens sits behind a request sharing 50, then the 2,000-token branch gets evicted to admit the 50-token one.</p>
+<h2>Idea 3 · Benchmark numbers you should memorize</h2>
+<ul>
+<li>Llama 3.1 8B, H100, ShareGPT 1K prompts: SGLang ~16,200 tok/s vs vLLM ~12,500 (~29% edge).</li>
+<li>Prefix-heavy RAG (same system + same doc, varying question): up to 6.4x on SGLang.</li>
+<li>Voice cloning workloads: 86.4% prefix-cache hit rate.</li>
+<li>Production hit rates across SGLang customers: 50-99% depending on prompt discipline.</li>
+<li>Deployed on 400,000+ GPUs in 2026.</li>
+</ul>
+<h2>Idea 4 · The ordering gotcha</h2>
+<p>The 6.4x number relies on consistent prompt-template ordering. If your client constructs prompts as <code>[system, tools, context, history, question]</code> in some requests and <code>[system, context, tools, history, question]</code> in others, the tree cannot find the shared prefix. What looks like a shared prefix to a human is two distinct sequences to the radix tree.</p>
+<p>Engineer's lever: your prompt template is a cache key. Fix the order. Put everything immutable (system, tools, schemas) first. Put retrieval context next. Put user question last. Do not interleave dynamic content into the prefix.</p>
+<p>Real case from the research: moving dynamic content out of the cacheable prefix took one deployment from 7% to 74% cache hit rate in one change.</p>
+<h2>Idea 5 · Where RadixAttention wins and loses</h2>
+<p>Wins:
+- RAG (same retrieval preamble, varying question).
+- Agents (same tool schemas, varying query).
+- Chat with long system prompt.
+- Voice / vision workloads with repeated preambles.</p>
+<p>Loses (returns to vLLM-level throughput):
+- Single-shot generation with unique prompts (code completion, open-ended chat without system prompt).
+- Dynamic prompts where every request interleaves unique content into the prefix.</p>
+<h2>Idea 6 · Why this is a scheduler problem, not just a kernel problem</h2>
+<p>You can implement KV reuse as a kernel trick. SGLang's insight is that reuse only pays if the scheduler keeps the hot branch resident. A naive "reuse if available" policy will churn the cache under mixed load. The radix-tree-indexed scheduler is what turns the kernel trick into a 29% production edge.</p>
+<h2>Idea 7 · Interplay with vLLM</h2>
+<p>The two systems are not strict competitors. In 2026 vLLM added prefix caching (<code>--enable-prefix-caching</code>) and a cache-aware router (vLLM Router in Rust). The gap closed but did not fully disappear — SGLang's whole stack is radix-first; vLLM grafted it on. For workloads dominated by prefix reuse, SGLang remains the default. For general-purpose serving without strong prefix patterns, vLLM remains equal or better.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="roofline"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">What a 2,000-token shared prefix saves</div><div class="co-body"><p>A RAG service sends 5,000 requests. Each prompt is a 2,000-token system prompt, a 500-token document (one of 10 documents) and an 80-token question.</p>
+<ol>
+<li>Without caching: 5,000 × 2,580 = 12.9 million prompt tokens to prefill.</li>
+<li>With a radix cache that keeps everything resident: the system prompt once (2,000), each document once (10 × 500 = 5,000), every question (5,000 × 80 = 400,000). About 407,000 tokens.</li>
+<li>Saving: 1 − 0.407 / 12.9 ≈ 97% of prefill work.</li>
+<li>If half the clients put the document <em>before</em> the system prompt, those requests share nothing with the others, and the saving for them drops to the document alone.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Your prompt template is a cache key: the order of its parts decides what can be shared.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Prefix caching helps code completion with unique prompts.
+  With no shared beginning there is nothing to reuse.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Evicting whole branches keeps the cache shaped like the tree.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Prefix reuse only needs a fast kernel.
+  It pays only if the scheduler keeps hot branches resident instead of churning them.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before you run the code below: if each request's three fixed parts (system, tools, context) arrive in a random order, what share of requests can reuse the full 3-part prefix of an earlier one?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Order decides what can be shared</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import itertools, random
+random.seed(1)
+parts = [&quot;system&quot;, &quot;tools&quot;, &quot;context&quot;]
+orders = [tuple(random.sample(parts, 3)) for _ in range(1000)]
+seen, full_hits = set(), 0
+for o in orders:
+    full_hits += o in seen
+    seen.add(o)
+print(&quot;distinct orders seen:&quot;, len(seen), &quot;of&quot;, len(list(itertools.permutations(parts))))
+print(f&quot;requests whose 3-part prefix was already cached: {full_hits / len(orders):.1%}&quot;)
+print(&quot;same requests with a fixed order:&quot;, f&quot;{(len(orders) - 1) / len(orders):.1%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">distinct orders seen: 6 of 6
+requests whose 3-part prefix was already cached: 99.4%
+same requests with a fixed order: 99.9%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With random order there are only six possible prefixes, so most requests still find one already cached. But each of the six is a separate branch holding its own copy of the same tokens, six times the memory, and once cache pressure evicts branches, the hit rate collapses. A fixed order needs one branch. Production systems see this as the jump from about 7% to 74% hit rate after moving dynamic content out of the prefix.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> implements a toy radix-tree KV cache plus a scheduler with two policies: FCFS and cache-aware. Runs the same workload through both, reports prefix-cache hit rate and throughput delta. Then runs a "scrambled ordering" workload to show the 6.4x collapse.</p>
+<p>The <a href="https://aiengineeringfromscratch.com/inside-an-llm-serving-gpu?workload=shared&amp;shared=4096">Inside an LLM Serving GPU</a> machine shows the radix cache on a real L4 run. Four groups each have their own 4,096-token system prompt. The first request of a group computes its prompt. While that prompt stays in the cache, later requests of the group compute only the 128-token question. Switch the radix cache off to see the median first token go from 479 ms to 14,706 ms.</p>
+<p>Here is <code>code/main.py</code>, in 4 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>token_count</code>, <code>Request</code>, <code>RadixCache</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy RadixAttention scheduler — stdlib Python.
+
+Simulate an SGLang-style radix-tree KV cache plus two schedulers:
+  FCFS         : naive first-come first-served
+  CACHE_AWARE  : depth-first dispatch on hottest branch
+
+Also show how scrambled prompt ordering collapses hit rate. Pedagogical
+constants — the shape matches the published numbers, not the absolute
+latencies.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from collections import defaultdict
+import random
+
+
+KV_BUDGET_BLOCKS = 160    # small budget so eviction bites under FCFS
+BLOCK_TOKENS = 16
+
+
+def token_count(seg: str) -&gt; int:
+    if seg == &quot;SYSTEM&quot;:
+        return 2000
+    if seg.startswith(&quot;DOC_&quot;):
+        return 500
+    if seg.startswith(&quot;Q_&quot;):
+        return 60
+    if seg == &quot;TOOLS&quot;:
+        return 300
+    return 100
+
+
+@dataclass
+class Request:
+    rid: int
+    segments: list[str]
+
+
+class RadixCache:
+    &quot;&quot;&quot;Represent the tree as a dict: path_tuple -&gt; blocks (last_used).&quot;&quot;&quot;
+
+    def __init__(self, budget_blocks: int = KV_BUDGET_BLOCKS):
+        self.budget = budget_blocks
+        self.used = 0
+        self.time = 0
+        # key: tuple of segments. value: (blocks, last_used)
+        self.nodes: dict[tuple[str, ...], list[int]] = {}
+
+    def walk(self, segments: list[str]) -&gt; int:
+        &quot;&quot;&quot;Return number of tokens that are already cached at the longest matching
+        prefix, bumping last_used along the path.&quot;&quot;&quot;
+        reused = 0
+        self.time += 1
+        for i in range(1, len(segments) + 1):
+            key = tuple(segments[:i])
+            if key in self.nodes:
+                reused += token_count(segments[i - 1])
+                self.nodes[key][1] = self.time
+            else:
+                break
+        return reused
+
+    def insert(self, segments: list[str]) -&gt; None:
+        &quot;&quot;&quot;Insert any missing segments on the path, evicting LRU leaves if over budget.&quot;&quot;&quot;
+        for i in range(1, len(segments) + 1):
+            key = tuple(segments[:i])
+            if key in self.nodes:
+                continue
+            blocks = (token_count(segments[i - 1]) + BLOCK_TOKENS - 1) // BLOCK_TOKENS
+            while self.used + blocks &gt; self.budget and self._evict_one():
+                pass
+            self.nodes[key] = [blocks, self.time]
+            self.used += blocks
+
+    def _evict_one(self) -&gt; bool:
+        leaves = [k for k in self.nodes if not any(
+            other != k and other[: len(k)] == k for other in self.nodes)]
+        if not leaves:
+            return False
+        victim = min(leaves, key=lambda k: self.nodes[k][1])
+        self.used -= self.nodes.pop(victim)[0]
+        return True
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>simulate</code>, <code>workload_rag</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simulate(requests: list[Request], scheduler: str) -&gt; dict:
+    cache = RadixCache()
+
+    if scheduler == &quot;CACHE_AWARE&quot;:
+        branch_count: dict[tuple[str, ...], int] = defaultdict(int)
+        for r in requests:
+            for i in range(1, len(r.segments) + 1):
+                branch_count[tuple(r.segments[:i])] += 1
+
+        def score(r: Request) -&gt; int:
+            return max(branch_count[tuple(r.segments[:i])] * sum(
+                token_count(s) for s in r.segments[:i])
+                for i in range(1, len(r.segments) + 1))
+        order = sorted(requests, key=score, reverse=True)
+    else:
+        order = list(requests)
+
+    saved = 0
+    total = 0
+    for r in order:
+        prompt_tokens = sum(token_count(s) for s in r.segments)
+        total += prompt_tokens
+        reused = cache.walk(r.segments)
+        saved += reused
+        cache.insert(r.segments)
+
+    return {
+        &quot;hit_rate&quot;: saved / total if total else 0,
+        &quot;saved&quot;: saved,
+        &quot;total&quot;: total,
+        &quot;reqs&quot;: len(requests),
+    }
+
+
+def workload_rag(n: int = 80, docs: int = 4, seed: int = 1) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    for i in range(n):
+        doc = f&quot;DOC_{rng.randrange(docs)}&quot;
+        q = f&quot;Q_{i}&quot;
+        reqs.append(Request(i, [&quot;SYSTEM&quot;, &quot;TOOLS&quot;, doc, q]))
+    rng.shuffle(reqs)
+    return reqs
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · <code>workload_scrambled</code>, <code>report</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def workload_scrambled(n: int = 80, docs: int = 4, seed: int = 1) -&gt; list[Request]:
+    &quot;&quot;&quot;Prompts reorder [SYSTEM, TOOLS, DOC] randomly. Tree cannot share the prefix.&quot;&quot;&quot;
+    rng = random.Random(seed)
+    reqs = []
+    for i in range(n):
+        doc = f&quot;DOC_{rng.randrange(docs)}&quot;
+        q = f&quot;Q_{i}&quot;
+        prefix = [&quot;SYSTEM&quot;, &quot;TOOLS&quot;, doc]
+        rng.shuffle(prefix)
+        reqs.append(Request(i, prefix + [q]))
+    rng.shuffle(reqs)
+    return reqs
+
+
+def report(label: str, res: dict) -&gt; None:
+    print(f&quot;{label:44}  hit_rate={res['hit_rate']:6.1%}   &quot;
+          f&quot;saved={res['saved']:&gt;6}/{res['total']:&lt;6} tok   reqs={res['reqs']}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 88)
+    print(&quot;TOY RADIX CACHE: cache hit rate across schedulers and orderings&quot;)
+    print(&quot;=&quot; * 88)
+
+    rag = workload_rag()
+    report(&quot;RAG workload | FCFS&quot;, simulate(rag, &quot;FCFS&quot;))
+    report(&quot;RAG workload | CACHE_AWARE&quot;, simulate(rag, &quot;CACHE_AWARE&quot;))
+
+    scrambled = workload_scrambled()
+    report(&quot;RAG scrambled prefix | FCFS&quot;, simulate(scrambled, &quot;FCFS&quot;))
+    report(&quot;RAG scrambled prefix | CACHE_AWARE&quot;, simulate(scrambled, &quot;CACHE_AWARE&quot;))
+
+    print()
+    print(&quot;=&quot; * 88)
+    print(&quot;KEY FINDING&quot;)
+    print(&quot;-&quot; * 88)
+    print(&quot;  Fixed ordering + cache-aware scheduler : hit rate clears 80% on RAG.&quot;)
+    print(&quot;  Scrambled prefix order : hit rate collapses: the tree cannot find shared paths.&quot;)
+    print(&quot;  Real cases: 7% -&gt; 74% hit rate by moving dynamic content out of the prefix.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">========================================================================================
+TOY RADIX CACHE: cache hit rate across schedulers and orderings
+========================================================================================
+RAG workload | FCFS                           hit_rate= 69.1%   saved=158000/228800 tok   reqs=80
+RAG workload | CACHE_AWARE                    hit_rate= 69.1%   saved=158000/228800 tok   reqs=80
+RAG scrambled prefix | FCFS                   hit_rate=  8.4%   saved= 19300/228800 tok   reqs=80
+RAG scrambled prefix | CACHE_AWARE            hit_rate= 26.5%   saved= 60700/228800 tok   reqs=80
+
+========================================================================================
+KEY FINDING
+----------------------------------------------------------------------------------------
+  Fixed ordering + cache-aware scheduler : hit rate clears 80% on RAG.
+  Scrambled prefix order : hit rate collapses: the tree cannot find shared paths.
+  Real cases: 7% -&gt; 74% hit rate by moving dynamic content out of the prefix.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Compare the four rows rather than the "Key finding" text. With fixed ordering, FCFS and cache-aware scheduling both reach 69.1%: in this small workload everything fits in the cache, so scheduling order cannot matter. With scrambled prefixes FCFS falls to 8.4%, and cache-aware scheduling recovers some of it (26.5%) by serving requests from the same branch together. The script's claim of "clears 80%" is not what it measured; the lesson is in the gap between the rows.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team enables prefix caching and sees an 8% hit rate. Their prompt starts with "Current time: 2026-04-22 15:30:02", then the system prompt and tools. What is wrong, and what is the fix? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Shared prefixes are common in RAG, agents and chat; reusing their KV cache skips most prefill.</li>
+<li>RadixAttention indexes cached prefixes in a radix tree and reuses the longest match.</li>
+<li>Fixed template order, immutable parts first, is the biggest lever.</li>
+<li>Cache-aware scheduling and branch-level eviction keep hot prefixes resident.</li>
+<li>vLLM's prefix caching narrows the gap; SGLang is radix-first throughout.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-serving-engines-compared"><span class="t" style="--cs-hue:262">SN</span>Cheat sheet · Comparing LLM Serving Engines</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-radix-scheduler-advisor.md</code>. Given a workload description (prompt-template shape, retrieval pattern, number of concurrent tenants), it produces a prompt-ordering prescription and a go/no-go for SGLang adoption.</p>
+<p><strong><code>outputs/skill-radix-scheduler-advisor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: radix-scheduler-advisor
+description: Advise on SGLang adoption and prompt-ordering discipline for prefix-heavy workloads that want RadixAttention's cache reuse.
+version: 1.0.0
+phase: 17
+lesson: 06
+tags: [sglang, radixattention, prefix-caching, scheduler, prompt-ordering]
+---
+
+Given a workload description (prompt-template shape, retrieval pattern, conversation length, number of concurrent tenants, hardware), produce an SGLang / RadixAttention adoption advisory.
+
+Produce:
+
+1. Workload fingerprint. Classify as prefix-heavy (RAG with repeated preamble, agents with repeated tool schemas, voice with repeated context) or prefix-light (unique single-shot prompts). Name the shared prefix length and the repetition rate.
+2. Prompt-ordering audit. Walk the current prompt template top to bottom. Flag any dynamic content interleaved into the immutable section. Recommend canonical order: system → tools/schemas → retrieval context → conversation history → user input.
+3. Expected hit rate. From workload fingerprint, estimate achievable cache hit rate. General chat 10-30%. RAG with consistent template 60-85%. Voice/vision with fixed preamble 80-95%.
+4. SGLang vs vLLM decision. If expected hit rate &gt; 40% and workload is not single-shot, recommend SGLang. If &lt; 30%, vLLM with `--enable-prefix-caching` is simpler. If 30-40%, run both on a sample and pick.
+5. Rollout plan. 48-hour shadow benchmark on SGLang with current prompt template. Log hit rate. Fix prompt-ordering issues. Re-benchmark. Ship if hit rate clears target.
+
+Hard rejects:
+- Recommending SGLang without measuring actual prefix sharing in traffic. Refuse.
+- Claiming the 6.4x number without citing workload shape. The number is workload-specific.
+- Ignoring prompt-ordering discipline. The template is the cache key; without it the scheduler cannot help.
+
+Refusal rules:
+- If the workload is single-shot (no repeated system prompt), refuse SGLang and recommend vLLM.
+- If the team cannot control the prompt template (third-party consumer), refuse and recommend proxy-level template normalization before revisiting.
+- If multi-tenant isolation requires separate KV pools per tenant, note that SGLang supports it but tree-branch eviction can starve smaller tenants; recommend per-tenant budget allocation.
+
+Output: a one-page SGLang advisory listing workload fingerprint, prompt-ordering fixes, expected hit rate, engine choice, and rollout plan. End with a &quot;what to read next&quot; paragraph pointing to the SGLang paper, vLLM prefix-caching docs, or the prompt-ordering exercise in this lesson depending on the biggest gap.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Compare FCFS and cache-aware on the same workload. Where does the delta come from — prefill savings, decode savings, or queue delay?</li>
+<li>Modify the workload so prompts randomly permute <code>[system, tools, context]</code>. Re-run. What happens to hit rate? Why?</li>
+<li>Compute the HBM cost of keeping a 2,000-token system prompt resident as one radix branch on Llama 3.1 8B. Compare to the cost of a 16-sequence batch without prefix reuse.</li>
+<li>Read the SGLang RadixAttention paper. Explain in three sentences why tree-shaped LRU eviction beats block-shaped LRU under prefix-heavy load.</li>
+<li>A customer reports only 8% cache hit rate. Name three likely causes and the diagnostic you would run for each.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1706-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · FCFS against cache-aware</span></summary><div class="qa-a"><p>On the fixed-order workload there is no delta: both reach 69.1%, because the whole working set fits in the toy cache. The delta appears only under pressure, on the scrambled workload (8.4% against 26.5%), and it comes from prefill savings: cache-aware scheduling serves requests from a branch while that branch is resident.</p></div></details>
+<details class="qa" id="a1706-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P5 · An 8% hit rate</span></summary><div class="qa-a"><p>Three likely causes: (1) dynamic content at the start of the prompt (timestamps, request IDs, user names), found by diffing two prompts token by token; (2) inconsistent ordering of system, tools and context between clients, found by grouping prompts by their first 200 tokens; (3) cache too small for the working set, found by checking eviction counts against the number of distinct prefixes.</p></div></details>
+<details class="qa" id="a1706-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A timestamp first</span></summary><div class="qa-a"><p>The timestamp changes every second, so no two requests share even their first token, and everything after it, system prompt and tools included, cannot be reused. Move the timestamp to the end, next to the user's question, or drop seconds. The fixed parts then form a shared prefix again.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://github.com/sgl-project/sglang">SGLang GitHub</a> — source and docs.</li>
+<li><a href="https://sgl-project.github.io/">SGLang documentation</a> — RadixAttention and scheduling details.</li>
+<li><a href="https://arxiv.org/abs/2312.07104">SGLang paper — Efficiently Programming Large Language Models (arXiv:2312.07104)</a> — the design reference.</li>
+<li><a href="https://www.lmsys.org/blog/2024-01-17-sglang/">LMSYS blog — SGLang with RadixAttention</a> — benchmark numbers and scheduler rationale.</li>
+<li><a href="https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/">vLLM — Prefix Caching</a> — vLLM's own radix-like implementation, for comparison.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1706" id="done-a1706">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1706" id="undo-a1706" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1705"><span class="pn-dir">Previous</span><span class="pn-t">17.5 · Speculative Decoding with EAGLE-3 in Production</span></a><a class="pn next" href="#a1707"><span class="pn-dir">Next</span><span class="pn-t">17.7 · FP8 and NVFP4 on Blackwell: Hardware-Specific Inference Compilation</span></a></div></footer>

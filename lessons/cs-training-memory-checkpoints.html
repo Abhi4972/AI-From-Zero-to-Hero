@@ -1,0 +1,279 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-10">Phase 10 · Build an LLM from Scratch</a></nav><h1>Checkpoints, Gradient Accumulation and Training Memory</h1><div class="m-meta"><span class="chip chip-num">Cheat sheet</span><span class="chip">Lessons <a href="#a1034">10.31</a></span><span class="chip chip-done" data-done-chip="cs-training-memory-checkpoints" hidden>Completed</span></div></header><div class="prose cs-page"><div class="cs-sheet" style="--cs-hue:20"><header class="cs-head"><span class="cs-code-tile">TM</span><div><h2>Checkpoints, Gradient Accumulation and Training Memory</h2><p class="cs-sub">Fix NaN steps, memory limits, accumulation scale and broken resumes. Clip, AMP, recompute, atomic checkpoints.</p><p class="cs-covers">Covers 10.34 Activation Recomputation and Gradient Checkpointing</p></div></header><div class="cs-grid"><section class="cs-block cs-red cs-span2"><h3>Training symptoms</h3><div class="cs-body cs-troubleshooting"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Loss goes vertical after one batch</td>
+<td>Gradient norm spike, no clip</td>
+<td><code>clip_grad_norm_</code> at <code>max_norm = 1.0</code></td>
+</tr>
+<tr>
+<td>Every weight is NaN after a step</td>
+<td>FP16 overflow gives Inf, then NaN</td>
+<td><code>torch.amp.GradScaler</code> skips the step</td>
+</tr>
+<tr>
+<td>Scaling factor never changes</td>
+<td>No <code>scaler.update()</code> on the skip path</td>
+<td>Call <code>scaler.update()</code> every step</td>
+</tr>
+<tr>
+<td>Clip acts on scaled gradients</td>
+<td>Clip runs before unscale</td>
+<td>Call <code>scaler.unscale_(optimizer)</code> first</td>
+</tr>
+<tr>
+<td>Hundreds of skips per epoch</td>
+<td>Model is past the FP16 range</td>
+<td>Alert on a skip rate above 5 percent</td>
+</tr>
+<tr>
+<td>Optimizer step 16 times too big</td>
+<td>Micro-batch loss not divided</td>
+<td>Divide the loss by <code>accum_steps</code></td>
+</tr>
+<tr>
+<td>Resumed loss curve differs</td>
+<td>No RNG state in the checkpoint</td>
+<td>Save <code>capture_rng_state()</code> output</td>
+</tr>
+<tr>
+<td>Activations do not fit in memory</td>
+<td>Backprop keeps every activation</td>
+<td><code>torch.utils.checkpoint.checkpoint(fn, input)</code></td>
+</tr>
+</tbody>
+</table></div></div></section><section class="cs-block cs-red cs-span2"><h3>Checkpoint load failures</h3><div class="cs-body cs-troubleshooting"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>world_size mismatch</code></td>
+<td>Resume on a different world size</td>
+<td>Resume on the same world size</td>
+</tr>
+<tr>
+<td><code>sha256 mismatch on rank</code></td>
+<td>Shard truncated mid-flush</td>
+<td>Write to .tmp, fsync, then rename</td>
+</tr>
+<tr>
+<td><code>shard file missing</code></td>
+<td>Fewer rank files than manifest shards</td>
+<td>Enumerate shards, verify each exists</td>
+</tr>
+<tr>
+<td><code>unknown schema</code></td>
+<td>Payload schema does not start with ckpt</td>
+<td>Branch migrations on the schema string</td>
+</tr>
+<tr>
+<td>Loss goes to NaN 100 steps after resume</td>
+<td>Partial shard behind a present manifest</td>
+<td>Atomic write plus sha256 on load</td>
+</tr>
+<tr>
+<td>Disk fills mid-run</td>
+<td>No rotation</td>
+<td><code>rotate_checkpoints</code> keeps the last K</td>
+</tr>
+</tbody>
+</table></div></div></section><section class="cs-block cs-ink cs-span2"><h3>Safe AMP step</h3><div class="cs-body cs-annotated-code"><div class="cs-code"><button type="button" class="cs-copy" data-copy="optimizer.zero_grad(set_to_none=True)
+with torch.amp.autocast(device_type=&quot;cuda&quot;):
+    loss = loss_fn(model(inputs), targets)
+if not torch.isfinite(loss).all().item():
+    return skip(&quot;non_finite_loss&quot;)
+scaler.scale(loss).backward()
+scaler.unscale_(optimizer)
+if has_non_finite_grad(model.parameters()):
+    scaler.update()
+    return skip(&quot;non_finite_grad&quot;)
+pre, post = clip_global_l2_norm(params, max_norm)
+scaler.step(optimizer)
+scaler.update()">Copy</button><pre><code><span class="cs-cc">optimizer.zero_grad(set_to_none=True)              </span><span class="cs-cm"># grads to None</span>
+<span class="cs-cc">with torch.amp.autocast(device_type=&quot;cuda&quot;):       </span><span class="cs-cm"># FP16 forward</span>
+<span class="cs-cc">    loss = loss_fn(model(inputs), targets)</span><span class="cs-cm"></span>
+<span class="cs-cc">if not torch.isfinite(loss).all().item():          </span><span class="cs-cm"># check before backward</span>
+<span class="cs-cc">    return skip(&quot;non_finite_loss&quot;)                 </span><span class="cs-cm"># no scaler.update here</span>
+<span class="cs-cc">scaler.scale(loss).backward()                      </span><span class="cs-cm"># scaled backward</span>
+<span class="cs-cc">scaler.unscale_(optimizer)                         </span><span class="cs-cm"># unscale before the clip</span>
+<span class="cs-cc">if has_non_finite_grad(model.parameters()):</span><span class="cs-cm"></span>
+<span class="cs-cc">    scaler.update()                                </span><span class="cs-cm"># halves the factor</span>
+<span class="cs-cc">    return skip(&quot;non_finite_grad&quot;)</span><span class="cs-cm"></span>
+<span class="cs-cc">pre, post = clip_global_l2_norm(params, max_norm)</span><span class="cs-cm"></span>
+<span class="cs-cc">scaler.step(optimizer)</span><span class="cs-cm"></span>
+<span class="cs-cc">scaler.update()                                    </span><span class="cs-cm"># doubles or halves</span></code></pre></div></div></section><section class="cs-block cs-ink cs-span2"><h3>Accumulate, sync on the last</h3><div class="cs-body cs-annotated-code"><div class="cs-code"><button type="button" class="cs-copy" data-copy="accum_steps = len(micro_batches)
+zero_grads(model)
+for i, (x, y) in enumerate(micro_batches):
+    is_last = i == accum_steps - 1
+    if no_sync_until_last and not is_last:
+        with no_sync_context(model):
+            loss = loss_scaled_for_accum(model(x), y, accum_steps, loss_fn)
+            loss.backward()
+    else:
+        loss = loss_scaled_for_accum(model(x), y, accum_steps, loss_fn)
+        loss.backward()
+optimizer.step()">Copy</button><pre><code><span class="cs-cc">accum_steps = len(micro_batches)</span><span class="cs-cm"></span>
+<span class="cs-cc">zero_grads(model)</span><span class="cs-cm"></span>
+<span class="cs-cc">for i, (x, y) in enumerate(micro_batches):</span><span class="cs-cm"></span>
+<span class="cs-cc">    is_last = i == accum_steps - 1</span><span class="cs-cm"></span>
+<span class="cs-cc">    if no_sync_until_last and not is_last:</span><span class="cs-cm"></span>
+<span class="cs-cc">        with no_sync_context(model):                                         </span><span class="cs-cm"># DDP skips the all-reduce</span>
+<span class="cs-cc">            loss = loss_scaled_for_accum(model(x), y, accum_steps, loss_fn)</span><span class="cs-cm"></span>
+<span class="cs-cc">            loss.backward()                                                  </span><span class="cs-cm"># grads add into param.grad</span>
+<span class="cs-cc">    else:</span><span class="cs-cm"></span>
+<span class="cs-cc">        loss = loss_scaled_for_accum(model(x), y, accum_steps, loss_fn)</span><span class="cs-cm"></span>
+<span class="cs-cc">        loss.backward()                                                      </span><span class="cs-cm"># one sync per effective step</span>
+<span class="cs-cc">optimizer.step()                                                             </span><span class="cs-cm"># once per effective batch</span></code></pre></div></div></section><section class="cs-block cs-blue cs-span2"><h3>Tasks in code</h3><div class="cs-body cs-task-table"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Task</th>
+<th>Code</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Clip to a global L2 norm</td>
+<td><code>clip_grad_norm_(parameters, max_norm)</code></td>
+</tr>
+<tr>
+<td>Log the scaling factor</td>
+<td><code>scaler.get_scale()</code></td>
+</tr>
+<tr>
+<td>Scale a micro-batch loss</td>
+<td><code>loss_scaled_for_accum(logits, target, accum_steps, loss_fn)</code></td>
+</tr>
+<tr>
+<td>Recompute a segment in backward</td>
+<td><code>checkpoint(fn, input)</code></td>
+</tr>
+<tr>
+<td>Save the full state atomically</td>
+<td><code>save_checkpoint(model, optimizer, scheduler, state, out_path)</code></td>
+</tr>
+<tr>
+<td>Load an untrusted file</td>
+<td><code>torch.load(path, map_location="cpu", weights_only=True)</code></td>
+</tr>
+<tr>
+<td>Save and load per-rank shards</td>
+<td><code>save_sharded(per_rank_state, dest_dir, step)</code></td>
+</tr>
+<tr>
+<td>Resume and verify every shard</td>
+<td><code>load_sharded(src_dir, expected_world_size)</code></td>
+</tr>
+</tbody>
+</table></div></div></section><section class="cs-block cs-teal cs-span2"><h3>Sharded atomic save</h3><div class="cs-body cs-architecture"><svg class="cs-arch" viewBox="0 0 930 180" role="img" aria-label="Architecture diagram"><defs><marker id="csa32-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="cs-arrowhead"/></marker></defs><line x1="184" y1="36" x2="254" y2="36" class="cs-edge" marker-end="url(#csa32-arr)"/><line x1="184" y1="144" x2="254" y2="144" class="cs-edge" marker-end="url(#csa32-arr)"/><line x1="430" y1="36" x2="500" y2="36" class="cs-edge" marker-end="url(#csa32-arr)"/><text x="465" y="31" class="cs-elabel" text-anchor="middle">sha256</text><line x1="406" y1="116" x2="524" y2="64" class="cs-edge" marker-end="url(#csa32-arr)"/><text x="465" y="85" class="cs-elabel" text-anchor="middle">sha256</text><line x1="588" y1="64" x2="588" y2="116" class="cs-edge" marker-end="url(#csa32-arr)"/><line x1="652" y1="116" x2="770" y2="64" class="cs-edge" marker-end="url(#csa32-arr)"/><text x="711" y="85" class="cs-elabel" text-anchor="middle">resume</text><rect x="8" y="8" width="176" height="56" rx="8" class="cs-node"/><text x="96.0" y="32" class="cs-nlabel" text-anchor="middle">rank 0 state</text><text x="96.0" y="50" class="cs-nsub" text-anchor="middle">param and optimiser shard</text><text x="175" y="23" class="cs-nkind" text-anchor="end">▦<title>gpu</title></text><rect x="8" y="116" width="176" height="56" rx="8" class="cs-node"/><text x="96.0" y="140" class="cs-nlabel" text-anchor="middle">rank 1 state</text><text x="96.0" y="158" class="cs-nsub" text-anchor="middle">one file per rank</text><text x="175" y="131" class="cs-nkind" text-anchor="end">▦<title>gpu</title></text><rect x="254" y="8" width="176" height="56" rx="8" class="cs-node"/><text x="342.0" y="32" class="cs-nlabel" text-anchor="middle">rank0.bin.tmp</text><text x="342.0" y="50" class="cs-nsub" text-anchor="middle">write, flush, fsync</text><text x="421" y="23" class="cs-nkind" text-anchor="end">▤<title>store</title></text><rect x="254" y="116" width="176" height="56" rx="8" class="cs-node"/><text x="342.0" y="140" class="cs-nlabel" text-anchor="middle">rank1.bin.tmp</text><text x="342.0" y="158" class="cs-nsub" text-anchor="middle">write, flush, fsync</text><text x="421" y="131" class="cs-nkind" text-anchor="end">▤<title>store</title></text><rect x="500" y="8" width="176" height="56" rx="8" class="cs-node"/><text x="588.0" y="32" class="cs-nlabel" text-anchor="middle">manifest.json.tmp</text><text x="588.0" y="50" class="cs-nsub" text-anchor="middle">world_size, step, shards</text><text x="667" y="23" class="cs-nkind" text-anchor="end">▤<title>store</title></text><rect x="500" y="116" width="176" height="56" rx="8" class="cs-node"/><text x="588.0" y="140" class="cs-nlabel" text-anchor="middle">os.replace</text><text x="588.0" y="158" class="cs-nsub" text-anchor="middle">shards first, manifest last</text><text x="667" y="131" class="cs-nkind" text-anchor="end">⚙<title>process</title></text><rect x="746" y="8" width="176" height="56" rx="8" class="cs-node"/><text x="834.0" y="32" class="cs-nlabel" text-anchor="middle">load_sharded</text><text x="834.0" y="50" class="cs-nsub" text-anchor="middle">sha256 check per shard</text><text x="913" y="23" class="cs-nkind" text-anchor="end">⚙<title>process</title></text></svg></div></section><section class="cs-block cs-teal cs-span1"><h3>Save and resume mid epoch</h3><div class="cs-body cs-flow"><ol class="cs-flow"><li><strong>save_checkpoint</strong>: packs model, optimizer, scheduler, counters and RNG.</li><li><strong>atomic_save</strong>: writes a temp file, then calls <code>os.replace</code>.</li><li><strong>load_checkpoint</strong>: calls <code>torch.load</code> with <code>weights_only=True</code>.</li><li><strong>restore_rng_state</strong>: restores Python, NumPy and torch RNG.</li><li><strong>Training loop</strong>: continues from <code>batch_in_epoch</code>. Loss diff under 1e-4.</li></ol></div></section><section class="cs-block cs-blue cs-span1"><h3>Run the lessons</h3><div class="cs-body cs-command-table"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>python3 code/main.py</code></td>
+<td>Lesson 45: 20 steps, rows tagged STEP or SKIP</td>
+</tr>
+<tr>
+<td><code>--num-steps 100</code></td>
+<td>Lesson 46: longer sweep for the curve</td>
+</tr>
+<tr>
+<td><code>--accum-grid 1,2,4,8,16</code></td>
+<td>Lesson 46: accumulation steps to sweep</td>
+</tr>
+<tr>
+<td><code>--total-steps 24 --interrupt-at 10</code></td>
+<td>Lesson 47: resume demo window</td>
+</tr>
+<tr>
+<td><code>python3 code/main.py</code></td>
+<td>Lesson 80: 4 shards plus manifest, byte-equal reload</td>
+</tr>
+<tr>
+<td><code>python3 code/main.py</code></td>
+<td>Lesson 81: 20 steps, 4 ranks, RESUME VERIFIED</td>
+</tr>
+</tbody>
+</table></div></div></section><section class="cs-block cs-amber cs-span2"><h3>Defaults in the code</h3><div class="cs-body cs-defaults"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Setting</th>
+<th>Default</th>
+<th>Note</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DEFAULT_MAX_NORM</code></td>
+<td>1.0</td>
+<td>Clip threshold of <code>AmpTrainState</code></td>
+</tr>
+<tr>
+<td><code>amp_dtype</code> on cpu</td>
+<td><code>torch.bfloat16</code></td>
+<td><code>torch.float16</code> on cuda</td>
+</tr>
+<tr>
+<td><code>window</code></td>
+<td>1000</td>
+<td>Steps in <code>rolling_skip_rate</code></td>
+</tr>
+<tr>
+<td><code>k</code></td>
+<td>4</td>
+<td>Layers per checkpoint segment</td>
+</tr>
+<tr>
+<td><code>attention_fraction</code></td>
+<td>0.15</td>
+<td>Recompute share, selective mode</td>
+</tr>
+<tr>
+<td><code>keep_last</code></td>
+<td>5</td>
+<td>Checkpoints that <code>rotate_checkpoints</code> keeps</td>
+</tr>
+<tr>
+<td><code>CHECKPOINT_SCHEMA</code></td>
+<td>ckpt.v1</td>
+<td>Schema string in the payload</td>
+</tr>
+<tr>
+<td><code>CHECKPOINT_STEP</code></td>
+<td>10</td>
+<td>Sharded save step of lesson 81</td>
+</tr>
+</tbody>
+</table></div></div></section><section class="cs-block cs-violet cs-span1"><h3>Memory and cost numbers</h3><div class="cs-body cs-concepts"><ul>
+<li><strong>Activations per layer</strong>: about <code>12 * B * L * d</code> floats.</li>
+<li><strong>d=8192, L=8192, B=1</strong>: about 1.6 GB per layer in BF16. 64 layers is about 103 GB.</li>
+<li><strong>Full checkpointing</strong>: about 33% more FLOPs. A step is 4 units, not 3.</li>
+<li><strong>Selective checkpointing</strong>: recompute attention only. About 5% overhead.</li>
+<li><strong>sqrt(L) rule</strong>: one checkpoint every sqrt(L) layers. 8 checkpoints for L=64.</li>
+<li><strong>Effective batch</strong>: <code>micro_batch * accum_steps</code>, times the data parallel world size.</li>
+<li><strong>ZeRO-1 optimiser memory</strong>: 12P/N bytes per rank.</li>
+</ul></div></section><section class="cs-block cs-green cs-span1"><h3>Q&amp;A</h3><div class="cs-body cs-qa"><ul>
+<li><strong>Why does the CPU GradScaler do nothing?</strong> CPU autocast uses BF16. It does not need loss scaling.</li>
+<li><strong>When does the factor change?</strong> It doubles after clean stretches. It halves on every skip.</li>
+<li><strong>Does accumulation save time?</strong> No. Double <code>accum_steps</code> and the wall time per step doubles.</li>
+<li><strong>Why <code>weights_only=True</code>?</strong> A <code>.pt</code> file is a pickle. Unpickling runs code. Use torch 2.6 or newer.</li>
+<li><strong>Why one file per rank?</strong> Write bandwidth scales. 4 hours on one rank is 4 minutes on 64.</li>
+</ul></div></section><section class="cs-block cs-green cs-span1"><h3>Tips</h3><div class="cs-body cs-tips"><ul>
+<li>Match the autocast device to the optimizer device.</li>
+<li>Raise <code>ValueError</code>, not assert. <code>python -O</code> strips asserts.</li>
+<li>On a loss jump above 2x, roll back to the previous checkpoint.</li>
+</ul></div></section></div></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="cs-training-memory-checkpoints" id="done-cs-training-memory-checkpoints">Mark complete and continue</button><button type="button" class="undo-btn" data-id="cs-training-memory-checkpoints" id="undo-cs-training-memory-checkpoints" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#cs-tokenization-v3"><span class="pn-dir">Previous</span><span class="pn-t">Cheat sheet · BPE and Tokenization: Quick Reference</span></a><a class="pn next" href="#l0201"><span class="pn-dir">Next</span><span class="pn-t">11.1 · Your first API call: messages, roles and responses</span></a></div></footer>

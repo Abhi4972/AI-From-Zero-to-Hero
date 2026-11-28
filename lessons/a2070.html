@@ -1,0 +1,666 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-20">Phase 20 · Hands-On AI Projects</a></nav><h1>Hedged Requests: a Tail Latency Lab</h1><div class="m-meta"><span class="chip chip-num">Lesson 20.70</span><span class="chip">480 min</span><span class="chip chip-core">Project</span><span class="chip chip-done" data-done-chip="a2070" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Measure safe-read latency</li>
+<li>Schedule delayed duplicate attempts</li>
+<li>Validate winners and account for late work</li>
+<li>Export latency and duplicate-work tradeoffs</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: nothing beyond the earlier phases.</li>
+<li><strong>Type</strong>: Project, level 4 (). <strong>Time</strong>: about 8 hours over 4 steps.</li>
+<li><strong>Code in</strong>: Go.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Measure the extra work required to escape a slow read request.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Most requests are fast, but a few are very slow, and in a system that makes many calls, those few dominate how slow it feels. Hedging is a classic remedy: if the first request has not answered after a short delay, send a second copy to another replica and take whichever answers first. It works, and it costs extra requests. This project measures both sides.</p>
+<p>It summarizes latency with nearest-rank percentiles, launches a duplicate only when the delay expires, lets only a valid response win (a fast error is not a winner), records the losing request even after cancellation, and exports latency and extra work side by side.</p></div></aside>
+<p>Help client developers evaluate delayed duplicate requests for safe reads. Send a second attempt only after a configurable delay, accept the first valid response, and record cancellation, late completion and duplicate service work separately. Export a bounded HTTP client and a latency-versus-work report from controlled local endpoints.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. Go implementations are exercised by the grader.</p>
+<p><strong>What you will build:</strong> Hedged-read client, controllable endpoint fixtures and latency/work comparison receipt</p>
+<h2>Step 1 · Measure safe-read latency</h2>
+<p><em>Step 1 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Summarize observed samples without inventing a performance guarantee.</p>
+</blockquote>
+<p><strong>What you build.</strong> Summarize nonnegative finite latency samples using nearest-rank percentiles. Keep the sample count and maximum so a tiny experiment does not masquerade as a stable distribution. The library adapter performs GET requests only.</p>
+<p><strong>Worked example.</strong> Samples [2,4,10,20,80] have P50=10, P95=80, maximum=80 and sample count 5. Sorting must not mutate the caller's array.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-hedged-request-lab-1"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Summarize([]float64)(Distribution,error)</code> returns samples, p50Ms, p95Ms and maxMs. Reject empty, negative, NaN and infinite values. <code>SafeURL(string)error</code> accepts HTTP(S) URLs without credentials or fragments.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<details class="qa" id="a2070-qa1"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (42 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;math&quot;
+    &quot;testing&quot;
+)
+
+func TestPercentiles(t *testing.T) {
+    d, e := Summarize([]float64{80, 2, 10, 4, 20})
+    if e != nil || d.P50MS != 10 || d.P95MS != 80 || d.Samples != 5 {
+        t.Fatal(d, e)
+    }
+}
+func TestEmpty(t *testing.T) {
+    if _, e := Summarize(nil); e == nil {
+        t.Fatal(&quot;empty&quot;)
+    }
+}
+func TestInvalidSamples(t *testing.T) {
+    for _, v := range []float64{-1, math.Inf(1), math.NaN()} {
+        if _, e := Summarize([]float64{v}); e == nil {
+            t.Fatal(v)
+        }
+    }
+}
+func TestNoMutation(t *testing.T) {
+    v := []float64{9, 1}
+    Summarize(v)
+    if v[0] != 9 {
+        t.Fatal(v)
+    }
+}
+func TestSafeURL(t *testing.T) {
+    for _, u := range []string{&quot;file:///etc/passwd&quot;, &quot;https://user:pass@example.com&quot;, &quot;ftp://example.com&quot;} {
+        if SafeURL(u) == nil {
+            t.Fatal(u)
+        }
+    }
+    if SafeURL(&quot;http://127.0.0.1/read&quot;) != nil {
+        t.Fatal(&quot;valid URL&quot;)
+    }
+}
+</code></pre></div></div></details>
+<h2>Step 2 · Schedule delayed duplicate attempts</h2>
+<p><em>Step 2 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Launch a second safe read only when the delay expires before a winner.</p>
+</blockquote>
+<p><strong>What you build.</strong> Start the primary request and a delay timer. A valid primary result before the timer prevents the hedge. Otherwise launch at most one secondary. Apply a two-second ceiling under the parent context and perform GET only.</p>
+<p><strong>Worked example.</strong> The local primary sleeps 80ms; the secondary sleeps 5ms. A 10ms hedge delay can return around 15ms while creating a second service request. Exact observed times depend on the local scheduler.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-hedged-request-lab-2"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Hedged(parent context.Context,client *http.Client,endpoints []string,delay time.Duration)(Receipt,error)</code>. Accept one or two endpoints and delay from 0 to 1 second. Receipt contains launched attempt count, winner index, value and winner latency. Response validation is provided scaffolding for this stage.</p>
+<details class="qa" id="a2070-qa2"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (61 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;net/http&quot;
+    &quot;net/http/httptest&quot;
+    &quot;testing&quot;
+    &quot;time&quot;
+)
+
+func endpoint(delay time.Duration, status int, body string) *httptest.Server {
+    return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        time.Sleep(delay)
+        w.WriteHeader(status)
+        fmt.Fprint(w, body)
+    }))
+}
+
+func TestFastPrimaryNoHedge(t *testing.T) {
+    a := endpoint(0, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer a.Close()
+    b := endpoint(0, 200, `{&quot;value&quot;:&quot;y&quot;}`)
+    defer b.Close()
+    r, e := Hedged(context.Background(), a.Client(), []string{a.URL, b.URL}, 200*time.Millisecond)
+    if e != nil || r.Launched != 1 || r.Winner != 0 {
+        t.Fatal(r, e)
+    }
+}
+func TestSlowPrimaryHedges(t *testing.T) {
+    a := endpoint(100*time.Millisecond, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer a.Close()
+    b := endpoint(0, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer b.Close()
+    r, e := Hedged(context.Background(), a.Client(), []string{a.URL, b.URL}, time.Millisecond)
+    if e != nil || r.Launched != 2 || r.Winner != 1 {
+        t.Fatal(r, e)
+    }
+}
+func TestSingleEndpoint(t *testing.T) {
+    a := endpoint(0, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer a.Close()
+    r, e := Hedged(context.Background(), a.Client(), []string{a.URL}, 0)
+    if e != nil || r.Launched != 1 {
+        t.Fatal(r, e)
+    }
+}
+func TestTooMany(t *testing.T) {
+    if _, e := Hedged(context.Background(), http.DefaultClient, []string{&quot;a&quot;, &quot;b&quot;, &quot;c&quot;}, 0); e == nil {
+        t.Fatal(&quot;unbounded attempts&quot;)
+    }
+}
+func TestParentCancelled(t *testing.T) {
+    ctx, cancel := context.WithCancel(context.Background())
+    cancel()
+    a := endpoint(0, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer a.Close()
+    if _, e := Hedged(ctx, a.Client(), []string{a.URL}, 0); e == nil {
+        t.Fatal(&quot;ignored cancellation&quot;)
+    }
+}
+</code></pre></div></div></details>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Hedging on a simulated slow replica</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random
+rng = random.Random(1)
+def replica(): return 80 if rng.random() &lt; 0.1 else rng.uniform(8, 12)   # 10 % of reads are slow (80 ms)
+def hedged(delay=10):
+    first = replica()
+    if first &lt;= delay: return first, 1
+    second = delay + replica()
+    return min(first, second), 2
+base = [replica() for _ in range(1000)]; hedge = [hedged() for _ in range(1000)]
+p = lambda xs, q: sorted(xs)[int(q * len(xs)) - 1]
+print(f&quot;baseline p50 {p(base, .5):5.1f} ms  p95 {p(base, .95):5.1f} ms  calls 1000&quot;)
+print(f&quot;hedged   p50 {p([t for t, _ in hedge], .5):5.1f} ms  p95 {p([t for t, _ in hedge], .95):5.1f} ms  calls {sum(n for _, n in hedge)}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">baseline p50  10.3 ms  p95  80.0 ms  calls 1000
+hedged   p50  10.2 ms  p95  20.5 ms  calls 1541</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With 10 % of reads stuck at 80 ms, the baseline's p95 is 80 ms. Hedging after 10 ms cuts the p95 to about 20 ms, because a slow first read is rescued by a fast second one most of the time. The price is in the last column: far more requests, since every read that has not answered by 10 ms, slow or merely average, gets a duplicate. The delay is the dial between the two.</p></div></aside>
+<h2>Step 3 · Validate winners and account for late work</h2>
+<p><em>Step 3 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>A fast error cannot win, and cancellation is an observation rather than a billing guarantee.</p>
+</blockquote>
+<p><strong>What you build.</strong> Only HTTP 200 with a nonempty JSON value can win. Read at most 64KiB. After a winner, request cancellation and collect outstanding client observations for at most 100ms. Record unobserved attempts if that grace expires. An attempt arriving after the winner is marked late even when it ended through cancellation.</p>
+<p><strong>Worked example.</strong> A primary returning HTTP 500 at 1ms does not beat a secondary returning valid JSON at 15ms. The winner is index 1. The fixture may still complete primary service work after the client has cancelled it.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-hedged-request-lab-3"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>ValidBody(status int,body []byte)(string,error)</code>; <code>Read(ctx,client,endpoint,index) Attempt</code>. Attempt records status, valid, cancelled, late, elapsedMs and optional value/error. Receipt distinguishes cancelRequested and unobserved. No client result can prove service computation stopped.</p>
+<details class="qa" id="a2070-qa3"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (62 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;fmt&quot;
+    &quot;net/http&quot;
+    &quot;net/http/httptest&quot;
+    &quot;testing&quot;
+    &quot;time&quot;
+)
+
+func endpoint(delay time.Duration, status int, body string) *httptest.Server {
+    return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        time.Sleep(delay)
+        w.WriteHeader(status)
+        fmt.Fprint(w, body)
+    }))
+}
+
+func TestValidJSON(t *testing.T) {
+    v, e := ValidBody(200, []byte(`{&quot;value&quot;:&quot;heldout&quot;}`))
+    if e != nil || v != &quot;heldout&quot; {
+        t.Fatal(v, e)
+    }
+}
+func TestErrorCannotWin(t *testing.T) {
+    if _, e := ValidBody(503, []byte(`{&quot;value&quot;:&quot;x&quot;}`)); e == nil {
+        t.Fatal(&quot;error winner&quot;)
+    }
+}
+func TestEmptyAndMalformed(t *testing.T) {
+    for _, b := range []string{`{}`, `{&quot;value&quot;:&quot;&quot;}`, `{`} {
+        if _, e := ValidBody(200, []byte(b)); e == nil {
+            t.Fatal(b)
+        }
+    }
+}
+func TestBodyLimit(t *testing.T) {
+    if _, e := ValidBody(200, make([]byte, 65537)); e == nil {
+        t.Fatal(&quot;unbounded&quot;)
+    }
+}
+func TestFastInvalidLoses(t *testing.T) {
+    a := endpoint(0, 500, `{&quot;value&quot;:&quot;bad&quot;}`)
+    defer a.Close()
+    b := endpoint(0, 200, `{&quot;value&quot;:&quot;good&quot;}`)
+    defer b.Close()
+    r, e := Hedged(context.Background(), a.Client(), []string{a.URL, b.URL}, time.Millisecond)
+    if e != nil || r.Winner != 1 || r.Value != &quot;good&quot; {
+        t.Fatal(r, e)
+    }
+}
+func TestLateCancellationAccounted(t *testing.T) {
+    a := endpoint(100*time.Millisecond, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer a.Close()
+    b := endpoint(0, 200, `{&quot;value&quot;:&quot;x&quot;}`)
+    defer b.Close()
+    r, e := Hedged(context.Background(), a.Client(), []string{a.URL, b.URL}, time.Millisecond)
+    if e != nil || r.CancelRequested != 1 || len(r.Attempts)+r.Unobserved != r.Launched {
+        t.Fatal(r, e)
+    }
+}
+</code></pre></div></div></details>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Only a successful, valid response can win; a fast 500 cannot.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Cancelling the losing request means the server stops working on it.
+  Cancellation is a request; the fixture server keeps working, and the report counts it.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Hedging is only safe for reads (or other idempotent requests).</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Nearest-rank p95 on five samples estimates the production tail.
+  On five samples it is just the maximum.</li>
+</ul></div></aside>
+<h2>Step 4 · Export latency and duplicate-work tradeoffs</h2>
+<p><em>Step 4 of 4 · about 2 hours · Go</em></p>
+<blockquote>
+<p>Report both faster responses and the extra requests that produced them.</p>
+</blockquote>
+<p><strong>What you build.</strong> Run baseline and hedged samples sequentially against the same controlled endpoints. Export distributions, launched call counts, individual hedge receipts and independently measured fixture work. The local fixture deliberately continues sleeping after client cancellation.</p>
+<p><strong>Worked example.</strong> Three baseline samples launch three calls; three hedged samples normally launch six. The fixture records all nine started and completed calls, while observed client cancellation is reported separately. Faster winner latency does not erase duplicate work.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-hedged-request-lab-4"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>Compare(samples int,delay time.Duration)(Comparison,error)</code> runs loopback fixtures. <code>CompareEndpoints(samples,delay,client,primary,secondary,workCallback)</code> reuses the runner. Samples must be 1..100. JSON schemaVersion is 1.</p>
+<details class="qa" id="a2070-qa4"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (42 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;encoding/json&quot;
+    &quot;testing&quot;
+    &quot;time&quot;
+)
+
+func TestComparisonCounts(t *testing.T) {
+    r, e := Compare(1, 5*time.Millisecond)
+    if e != nil || r.BaselineCalls != 1 || r.HedgedCalls != 2 {
+        t.Fatal(r, e)
+    }
+}
+func TestWorkContinues(t *testing.T) {
+    r, e := Compare(1, time.Millisecond)
+    if e != nil || r.Work.Started != 3 || r.Work.Completed != 3 {
+        t.Fatal(r, e)
+    }
+}
+func TestSampleBounds(t *testing.T) {
+    if _, e := Compare(0, time.Millisecond); e == nil {
+        t.Fatal(&quot;zero samples&quot;)
+    }
+}
+func TestReceiptConsumer(t *testing.T) {
+    r, e := Compare(1, time.Millisecond)
+    if e != nil {
+        t.Fatal(e)
+    }
+    b, _ := json.Marshal(r)
+    var x Comparison
+    if json.Unmarshal(b, &amp;x) != nil || x.SchemaVersion != 1 || len(x.Receipts) != 1 {
+        t.Fatal(string(b))
+    }
+}
+func TestDelayNoDuplicates(t *testing.T) {
+    r, e := Compare(1, 200*time.Millisecond)
+    if e != nil || r.HedgedCalls != 1 || r.Work.Started != 2 {
+        t.Fatal(r, e)
+    }
+}
+</code></pre></div></div></details>
+<h2>Run the finished project</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Three baseline reads go to a slow endpoint (about 80 ms). Three hedged reads send a second copy to a fast endpoint after a short delay. Roughly what will the hedged p50 be, and how many calls will each mode make?</p></div></aside>
+<p>The finished reference runs with one command, from its <code>solution/</code> folder:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">go run .
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{
+  &quot;schemaVersion&quot;: 1,
+  &quot;scope&quot;: &quot;local fixture; server deliberately continues work after client cancellation&quot;,
+  &quot;baseline&quot;: {
+    &quot;samples&quot;: 3,
+    &quot;p50Ms&quot;: 81.255053,
+    &quot;p95Ms&quot;: 82.786409,
+    &quot;maxMs&quot;: 82.786409
+  },
+  &quot;hedged&quot;: {
+    &quot;samples&quot;: 3,
+    &quot;p50Ms&quot;: 19.934858,
+    &quot;p95Ms&quot;: 20.973684,
+    &quot;maxMs&quot;: 20.973684
+  },
+  &quot;baselineCalls&quot;: 3,
+  &quot;hedgedCalls&quot;: 6,
+  &quot;fixtureWork&quot;: {
+    &quot;started&quot;: 9,
+    &quot;completed&quot;: 9,
+    &quot;cancellationObserved&quot;: 3
+  },
+  &quot;receipts&quot;: [
+    {
+      &quot;schemaVersion&quot;: 1,
+      &quot;winner&quot;: 1,
+      &quot;value&quot;: &quot;same versioned read&quot;,
+      &quot;latencyMs&quot;: 19.934858,
+      &quot;launched&quot;: 2,
+      &quot;cancelRequested&quot;: 1,
+      &quot;unobserved&quot;: 0,
+      &quot;attempts&quot;: [
+        {
+          &quot;index&quot;: 1,
+          &quot;status&quot;: 200,
+          &quot;valid&quot;: true,
+          &quot;cancelled&quot;: false,
+          &quot;late&quot;: false,
+…
+(56 lines left out here)
+…
+          &quot;cancelled&quot;: false,
+          &quot;late&quot;: false,
+          &quot;elapsedMs&quot;: 6.319906,
+          &quot;value&quot;: &quot;same versioned read&quot;
+        },
+        {
+          &quot;index&quot;: 0,
+          &quot;status&quot;: 0,
+          &quot;valid&quot;: false,
+          &quot;cancelled&quot;: true,
+          &quot;late&quot;: true,
+          &quot;elapsedMs&quot;: 16.694394,
+          &quot;error&quot;: &quot;Get \&quot;http://127.0.0.1:34511/slow\&quot;: context canceled&quot;
+        }
+      ]
+    }
+  ]
+}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Baseline p50 81 ms with 3 calls; hedged p50 20 ms with 6 calls: each hedged read launched a second attempt, which won (status 200, a valid value) while the slow first attempt was cancelled late. The <code>fixtureWork</code> counter is the honest part: 9 requests started and all 9 completed on the server, including the 3 "cancelled" ones, because this server deliberately ignores cancellation. Faster for the caller, more work for the service.</p></div></aside>
+<h2>Read the finished code</h2>
+<p>The complete reference, file by file. Open a file to read it; the stages above say which part each function belongs to.</p>
+<details class="qa" id="a2070-qa5"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/main.go</code> (267 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;context&quot;
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;flag&quot;
+    &quot;fmt&quot;
+    &quot;io&quot;
+    &quot;math&quot;
+    &quot;net/http&quot;
+    &quot;net/http/httptest&quot;
+    &quot;net/url&quot;
+    &quot;os&quot;
+    &quot;sort&quot;
+    &quot;sync/atomic&quot;
+    &quot;time&quot;
+)
+
+type Distribution struct {
+    Samples int     `json:&quot;samples&quot;`
+    P50MS   float64 `json:&quot;p50Ms&quot;`
+    P95MS   float64 `json:&quot;p95Ms&quot;`
+    MaxMS   float64 `json:&quot;maxMs&quot;`
+}
+
+func Summarize(values []float64) (Distribution, error) {
+    d := Distribution{}
+    if len(values) == 0 {
+        return d, errors.New(&quot;at least one sample required&quot;)
+    }
+    copyValues := append([]float64{}, values...)
+    for _, v := range copyValues {
+        if math.IsNaN(v) || math.IsInf(v, 0) || v &lt; 0 {
+            return d, errors.New(&quot;latencies must be finite and nonnegative&quot;)
+        }
+    }
+    sort.Float64s(copyValues)
+    at := func(p float64) float64 { return copyValues[int(math.Ceil(p*float64(len(copyValues))))-1] }
+    return Distribution{len(values), at(.5), at(.95), copyValues[len(copyValues)-1]}, nil
+}
+
+type Attempt struct {
+    Index     int     `json:&quot;index&quot;`
+    Status    int     `json:&quot;status&quot;`
+    Valid     bool    `json:&quot;valid&quot;`
+    Cancelled bool    `json:&quot;cancelled&quot;`
+    Late      bool    `json:&quot;late&quot;`
+    ElapsedMS float64 `json:&quot;elapsedMs&quot;`
+    Value     string  `json:&quot;value,omitempty&quot;`
+    Error     string  `json:&quot;error,omitempty&quot;`
+}
+type Receipt struct {
+    SchemaVersion   int       `json:&quot;schemaVersion&quot;`
+    Winner          int       `json:&quot;winner&quot;`
+    Value           string    `json:&quot;value,omitempty&quot;`
+    LatencyMS       float64   `json:&quot;latencyMs&quot;`
+    Launched        int       `json:&quot;launched&quot;`
+    CancelRequested int       `json:&quot;cancelRequested&quot;`
+    Unobserved      int       `json:&quot;unobserved&quot;`
+    Attempts        []Attempt `json:&quot;attempts&quot;`
+}
+
+func SafeURL(s string) error {
+    u, e := url.Parse(s)
+    if e != nil || u.Host == &quot;&quot; || (u.Scheme != &quot;http&quot; &amp;&amp; u.Scheme != &quot;https&quot;) || u.User != nil || u.Fragment != &quot;&quot; {
+        return errors.New(&quot;expected HTTP(S) URL without userinfo or fragment&quot;)
+    }
+    return nil
+}
+func ValidBody(status int, body []byte) (string, error) {
+    if status != 200 {
+        return &quot;&quot;, errors.New(&quot;winner requires HTTP 200&quot;)
+    }
+    if len(body) &gt; 65536 {
+        return &quot;&quot;, errors.New(&quot;body exceeds 64 KiB&quot;)
+    }
+    var x struct {
+        Value string `json:&quot;value&quot;`
+    }
+    if e := json.Unmarshal(body, &amp;x); e != nil || x.Value == &quot;&quot; {
+        return &quot;&quot;, errors.New(&quot;expected JSON with nonempty value&quot;)
+    }
+    return x.Value, nil
+}
+func Read(ctx context.Context, client *http.Client, endpoint string, index int) Attempt {
+    start := time.Now()
+    a := Attempt{Index: index}
+    req, e := http.NewRequestWithContext(ctx, &quot;GET&quot;, endpoint, nil)
+    if e == nil {
+        var r *http.Response
+        r, e = client.Do(req)
+        if e == nil {
+            a.Status = r.StatusCode
+            body, err := io.ReadAll(io.LimitReader(r.Body, 65537))
+            r.Body.Close()
+            if err != nil {
+                e = err
+            } else {
+                a.Value, e = ValidBody(r.StatusCode, body)
+            }
+        }
+    }
+    a.ElapsedMS = float64(time.Since(start)) / float64(time.Millisecond)
+    a.Valid = e == nil
+    if e != nil {
+        a.Error = e.Error()
+    }
+    a.Cancelled = ctx.Err() != nil
+    return a
+}
+func Hedged(parent context.Context, client *http.Client, endpoints []string, delay time.Duration) (Receipt, error) {
+    receipt := Receipt{SchemaVersion: 1, Winner: -1, Attempts: []Attempt{}}
+    if len(endpoints) &lt; 1 || len(endpoints) &gt; 2 || delay &lt; 0 || delay &gt; time.Second {
+        return receipt, errors.New(&quot;one or two read endpoints and delay 0..1s required&quot;)
+    }
+    for _, e := range endpoints {
+        if err := SafeURL(e); err != nil {
+            return receipt, err
+        }
+    }
+    ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+    defer cancel()
+    start := time.Now()
+    results := make(chan Attempt, 2)
+    launch := func(i int) { receipt.Launched++; go func() { results &lt;- Read(ctx, client, endpoints[i], i) }() }
+    launch(0)
+    timer := time.NewTimer(delay)
+    defer timer.Stop()
+    launchedSecond := len(endpoints) == 1
+    received := 0
+    for {
+        if ctx.Err() != nil {
+            cancel()
+            receipt.LatencyMS = float64(time.Since(start)) / float64(time.Millisecond)
+            receipt.Unobserved = receipt.Launched - received
+            return receipt, ctx.Err()
+        }
+        select {
+        case a := &lt;-results:
+            received++
+            receipt.Attempts = append(receipt.Attempts, a)
+            if a.Valid {
+                receipt.Winner = a.Index
+                receipt.Value = a.Value
+                receipt.LatencyMS = float64(time.Since(start)) / float64(time.Millisecond)
+                receipt.CancelRequested = receipt.Launched - received
+                cancel()
+                grace := time.NewTimer(100 * time.Millisecond)
+                for received &lt; receipt.Launched {
+                    select {
+                    case late := &lt;-results:
+                        late.Late = true
+                        receipt.Attempts = append(receipt.Attempts, late)
+                        received++
+                    case &lt;-grace.C:
+                        receipt.Unobserved = receipt.Launched - received
+                        return receipt, nil
+                    }
+                }
+                grace.Stop()
+                return receipt, nil
+            }
+            if received == len(endpoints) {
+                receipt.LatencyMS = float64(time.Since(start)) / float64(time.Millisecond)
+                return receipt, errors.New(&quot;no valid response&quot;)
+            }
+        case &lt;-timer.C:
+            if !launchedSecond &amp;&amp; ctx.Err() == nil {
+                launch(1)
+                launchedSecond = true
+            }
+        case &lt;-ctx.Done():
+        }
+    }
+}
+
+type Work struct {
+    Started              int32 `json:&quot;started&quot;`
+    Completed            int32 `json:&quot;completed&quot;`
+    CancellationObserved int32 `json:&quot;cancellationObserved&quot;`
+}
+type Comparison struct {
+    SchemaVersion int          `json:&quot;schemaVersion&quot;`
+    Scope         string       `json:&quot;scope&quot;`
+    Baseline      Distribution `json:&quot;baseline&quot;`
+    Hedged        Distribution `json:&quot;hedged&quot;`
+    BaselineCalls int          `json:&quot;baselineCalls&quot;`
+    HedgedCalls   int          `json:&quot;hedgedCalls&quot;`
+    Work          Work         `json:&quot;fixtureWork&quot;`
+    Receipts      []Receipt    `json:&quot;receipts&quot;`
+}
+
+func Compare(samples int, delay time.Duration) (Comparison, error) {
+    var started, completed, cancelled atomic.Int32
+    server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        started.Add(1)
+        d := 80 * time.Millisecond
+        if r.URL.Path == &quot;/fast&quot; {
+            d = 5 * time.Millisecond
+        }
+        time.Sleep(d)
+        if r.Context().Err() != nil {
+            cancelled.Add(1)
+        }
+        completed.Add(1)
+        w.Header().Set(&quot;Content-Type&quot;, &quot;application/json&quot;)
+        fmt.Fprint(w, `{&quot;value&quot;:&quot;same versioned read&quot;}`)
+    }))
+    defer server.Close()
+    return CompareEndpoints(samples, delay, server.Client(), server.URL+&quot;/slow&quot;, server.URL+&quot;/fast&quot;, func() Work { server.Close(); return Work{started.Load(), completed.Load(), cancelled.Load()} })
+}
+func CompareEndpoints(samples int, delay time.Duration, client *http.Client, primary, secondary string, work func() Work) (Comparison, error) {
+    c := Comparison{SchemaVersion: 1, Scope: &quot;controlled read comparison&quot;, Receipts: []Receipt{}}
+    if samples &lt; 1 || samples &gt; 100 {
+        return c, errors.New(&quot;samples must be 1..100&quot;)
+    }
+    base, hedges := []float64{}, []float64{}
+    for i := 0; i &lt; samples; i++ {
+        a, e := Hedged(context.Background(), client, []string{primary}, delay)
+        if e != nil {
+            return c, e
+        }
+        base = append(base, a.LatencyMS)
+        c.BaselineCalls += a.Launched
+        b, e := Hedged(context.Background(), client, []string{primary, secondary}, delay)
+        if e != nil {
+            return c, e
+        }
+        hedges = append(hedges, b.LatencyMS)
+        c.HedgedCalls += b.Launched
+        c.Receipts = append(c.Receipts, b)
+    }
+    c.Baseline, _ = Summarize(base)
+    c.Hedged, _ = Summarize(hedges)
+    if work != nil {
+        c.Work = work()
+        c.Scope = &quot;local fixture; server deliberately continues work after client cancellation&quot;
+    }
+    return c, nil
+}
+func main() {
+    delay := flag.Int(&quot;delay-ms&quot;, 10, &quot;hedge delay&quot;)
+    samples := flag.Int(&quot;samples&quot;, 3, &quot;samples per policy&quot;)
+    primary := flag.String(&quot;primary&quot;, &quot;&quot;, &quot;optional safe read endpoint&quot;)
+    secondary := flag.String(&quot;secondary&quot;, &quot;&quot;, &quot;optional duplicate safe read endpoint&quot;)
+    out := flag.String(&quot;out&quot;, &quot;/tmp/aiefs-hedge-report.json&quot;, &quot;receipt file&quot;)
+    flag.Parse()
+    var c Comparison
+    var e error
+    if *primary == &quot;&quot; &amp;&amp; *secondary == &quot;&quot; {
+        c, e = Compare(*samples, time.Duration(*delay)*time.Millisecond)
+    } else {
+        client := &amp;http.Client{Timeout: 2 * time.Second, CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+        c, e = CompareEndpoints(*samples, time.Duration(*delay)*time.Millisecond, client, *primary, *secondary, nil)
+    }
+    if e != nil {
+        fmt.Fprintln(os.Stderr, e)
+        os.Exit(1)
+    }
+    b, _ := json.MarshalIndent(c, &quot;&quot;, &quot;  &quot;)
+    if e = os.WriteFile(*out, append(b, '\n'), 0600); e != nil {
+        fmt.Fprintln(os.Stderr, e)
+        os.Exit(1)
+    }
+    fmt.Println(string(b))
+}
+</code></pre></div></div></details>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team hedges every request after 1 ms to make dashboards look fast. Backend load doubles and the slow tail gets worse. What happened, and how should the delay be chosen? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this project</div><div class="co-body"><ul>
+<li>Measure latency with stated percentiles and sample counts.</li>
+<li>Launch a duplicate only after the delay, for safe reads.</li>
+<li>Only valid responses win; record the losers.</li>
+<li>Cancellation is not a guarantee that work stopped.</li>
+<li>Report latency and extra work together.</li>
+</ul></div></aside>
+<h2>Build it on your machine</h2>
+<p>Each step above is meant to be built, not only read. The source repository ships a starter and the checks for every step, and its test runner grades your own folder step by step:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">git clone https://github.com/rohitg00/ai-engineering-from-scratch
+cd ai-engineering-from-scratch
+python3 scripts/project_test.py hedged-request-lab --init my-hedged-request-lab
+python3 scripts/project_test.py hedged-request-lab --stage 1 --path my-hedged-request-lab
+</code></pre></div>
+<p>Write the step, run its checks, then move to the next step. The checks for each step are also shown above, under that step, so you can see what is expected before you start.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Collect repeated controlled runs. Nearest-rank P95 on five points is simply the maximum; it is not a tail estimate for production. <em>(step 1)</em></li>
+<li>Set delay above the primary latency. The second endpoint should receive no request, and launched must remain one. <em>(step 2)</em></li>
+<li>Use an endpoint that deliberately ignores request cancellation. Compare client cancelled with the fixture's completed-work counter. <em>(step 3)</em></li>
+<li>Consume the exported JSON and compute hedgedCalls/baselineCalls. Repeat with several delays to sketch the latency versus work curve; do not extrapolate local endpoints to a remote service. <em>(step 4)</em></li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a2070-qa6"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol>
+<li>Five samples</li>
+</ol></span></summary><div class="qa-a"><p>With five samples the nearest-rank p95 is the largest value. Run many repetitions before saying anything about tails, and report the sample count with every percentile.</p></div></details>
+<details class="qa" id="a2070-qa7"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="2">
+<li>A long delay</li>
+</ol></span></summary><div class="qa-a"><p>If the delay is longer than the primary's latency, the primary always wins first, no second request is launched, and <code>launched</code> stays 1. Hedging only acts on requests slower than the delay.</p></div></details>
+<details class="qa" id="a2070-qa8"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="3">
+<li>Ignored cancellation</li>
+</ol></span></summary><div class="qa-a"><p>The client reports its request as cancelled, but the fixture's completed-work counter still goes up: the server finished the work anyway. Count server work, not client cancellations, when estimating cost.</p></div></details>
+<details class="qa" id="a2070-qa9"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="4">
+<li>The latency-work curve</li>
+</ol></span></summary><div class="qa-a"><p>Compute hedgedCalls / baselineCalls for several delays and plot it against p95. Short delays buy a lower p95 with many extra calls; long delays cost little and help little. Local endpoints show the shape, not a remote service's numbers.</p></div></details>
+<details class="qa" id="a2070-qa10"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Hedging everything</span></summary><div class="qa-a"><p>With a 1 ms delay almost every request is duplicated, doubling load; the extra load slows the replicas, which makes more requests slow. Set the delay near the 95th percentile of normal latency, so only the slowest few percent are hedged.</p></div></details>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-inference-load-testing"><span class="t" style="--cs-hue:352">IM</span>Cheat sheet · Load Testing and LLM Inference Metrics</a><a href="#cs-llm-routing-gateways"><span class="t" style="--cs-hue:28">LR</span>Cheat sheet · Comparing LLM Routers and AI Gateways</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a2070" id="done-a2070">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a2070" id="undo-a2070" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a2069"><span class="pn-dir">Previous</span><span class="pn-t">20.69 · Durable Jobs for Agents</span></a><a class="pn next" href="#a2071"><span class="pn-dir">Next</span><span class="pn-t">20.71 · Discovering MCP Tools</span></a></div></footer>

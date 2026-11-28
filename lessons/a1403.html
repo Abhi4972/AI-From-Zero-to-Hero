@@ -1,0 +1,503 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Reflexion and Verbal Reinforcement Learning</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.18</span><span class="chip">60 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1403" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Name the three components of Reflexion (Actor, Evaluator, Self-Reflector) and the role of episodic memory.</li>
+<li>Implement a stdlib Reflexion loop with binary evaluator, reflection buffer, and fresh re-attempts.</li>
+<li>Choose between scalar, heuristic, and self-evaluated feedback sources for a given task.</li>
+<li>Explain why verbal reinforcement catches errors that gradient-based RL would need thousands of trials to fix.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 14.16 (Agent Loop), Lesson 14.17 (ReWOO)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Gradient-based RL needs thousands of trials and a GPU cluster to fix a failure mode. Reflexion (Shinn et al., NeurIPS 2023) does it in natural language: after each failed trial, the agent writes a reflection, stores it in episodic memory, and conditions the next trial on that memory. This is the pattern behind Letta's sleep-time compute, Claude Code's CLAUDE.md learnings, and pro-workflow's learn-rule.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Reflexion</td>
+<td>"Self-correction"</td>
+<td>Shinn et al. 2023 — Actor, Evaluator, Self-Reflector plus episodic memory</td>
+</tr>
+<tr>
+<td>Verbal reinforcement</td>
+<td>"Learning without gradients"</td>
+<td>Natural-language reflection prepended to the next trial's prompt</td>
+</tr>
+<tr>
+<td>Episodic memory</td>
+<td>"Per-task reflections"</td>
+<td>Bounded buffer of prior reflections for one task class</td>
+</tr>
+<tr>
+<td>Scalar evaluator</td>
+<td>"Binary success signal"</td>
+<td>Pass/fail or numeric score from ground truth</td>
+</tr>
+<tr>
+<td>Heuristic evaluator</td>
+<td>"Pattern-based detector"</td>
+<td>Predefined failure signatures (e.g. stuck-loop, too-many-steps)</td>
+</tr>
+<tr>
+<td>Self-evaluator</td>
+<td>"LLM-as-judge on own trace"</td>
+<td>Lower-signal fallback when no ground truth — pair with tool-grounded verification</td>
+</tr>
+<tr>
+<td>Memory rot</td>
+<td>"Stale reflections"</td>
+<td>Episodic buffer fills with obsolete entries; fix with compaction/TTL</td>
+</tr>
+<tr>
+<td>Sleep-time reflection</td>
+<td>"Async self-reflection"</td>
+<td>Run Self-Reflector off the hot path so primary agent stays fast</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">Build up to this</div><div class="co-title">Lessons that cover the basics first</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0308">Lesson 14.9 · Planning and reasoning patterns: ReAct, plan-and-execute, reflection and search</a></li></ul></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When an agent fails, the usual machine-learning fix is to train it more, which is slow and expensive. <strong>Reflexion</strong> tries something cheaper. After a failed attempt, the agent writes a short note to itself about what went wrong ("I forgot that y counts as a vowel only at the end"), keeps the note in a small memory, and tries again with the note in its prompt. The model itself never changes; only the text it reads does. Three parts make it work: an <strong>actor</strong> that attempts the task, an <strong>evaluator</strong> that says pass or fail, and a <strong>self-reflector</strong> that writes the note. This lesson builds it with a scripted actor, then lets a real small model write code, be graded by real unit tests, and reflect on its failures.</p></div></aside>
+<p>An agent fails a task. In standard RL you would run thousands more trials, compute gradients, update weights. Expensive, slow, and most production agents do not have a training budget for every failure.</p>
+<p>Reflexion (Shinn et al., arXiv:2303.11366) asks a different question: what if the agent just thought about why it failed and tried again with that thought in its prompt? No weight updates. No gradient. Just natural language stored between trials.</p>
+<p>The result: on ALFWorld it beats ReAct and other non-fine-tuned baselines. On HotpotQA it improves over ReAct. On code generation it reached 91% pass@1 on HumanEval, above GPT-4's 80% at the time, though it did not lead on every coding benchmark. All without a single gradient step.</p>
+<h2>Idea 1 · The three components</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Actor         : generates a trajectory (ReAct-style loop)
+Evaluator     : scores the trajectory — binary, heuristic, or self-eval
+Self-Reflector: writes a natural-language reflection on the failure
+</code></pre></div>
+<p>Plus one data structure:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Episodic memory: list of prior reflections, prepended to the next trial's prompt
+</code></pre></div>
+<p>One trial runs the Actor. Evaluator scores it. If the score is low, Self-Reflector produces a reflection ("I picked the wrong tool because I misread the question as asking about X when it was asking about Y"). The reflection goes into episodic memory. Next trial starts fresh but sees the reflection.</p>
+<figure class="diagram mmfig" data-mmd="a1403" data-h="c195077c28"><div class="dg-scroll"><svg class="dg mm" id="mmc195077c28" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 537.422px; background-color: transparent;" viewBox="0 0 537.421875 563.1653442382812" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmc195077c28{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmc195077c28 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmc195077c28 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmc195077c28 .error-icon{fill:#f4efe7;}#mmc195077c28 .error-text{fill:#0b1018;stroke:#0b1018;}#mmc195077c28 .edge-thickness-normal{stroke-width:1px;}#mmc195077c28 .edge-thickness-thick{stroke-width:3.5px;}#mmc195077c28 .edge-pattern-solid{stroke-dasharray:0;}#mmc195077c28 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmc195077c28 .edge-pattern-dashed{stroke-dasharray:3;}#mmc195077c28 .edge-pattern-dotted{stroke-dasharray:2;}#mmc195077c28 .marker{fill:#6c6357;stroke:#6c6357;}#mmc195077c28 .marker.cross{stroke:#6c6357;}#mmc195077c28 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmc195077c28 p{margin:0;}#mmc195077c28 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmc195077c28 .cluster-label text{fill:#0b1018;}#mmc195077c28 .cluster-label span{color:#0b1018;}#mmc195077c28 .cluster-label span p{background-color:transparent;}#mmc195077c28 .label text,#mmc195077c28 span{fill:#211c16;color:#211c16;}#mmc195077c28 .node rect,#mmc195077c28 .node circle,#mmc195077c28 .node ellipse,#mmc195077c28 .node polygon,#mmc195077c28 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmc195077c28 .rough-node .label text,#mmc195077c28 .node .label text,#mmc195077c28 .image-shape .label,#mmc195077c28 .icon-shape .label{text-anchor:middle;}#mmc195077c28 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmc195077c28 .rough-node .label,#mmc195077c28 .node .label,#mmc195077c28 .image-shape .label,#mmc195077c28 .icon-shape .label{text-align:center;}#mmc195077c28 .node.clickable{cursor:pointer;}#mmc195077c28 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmc195077c28 .arrowheadPath{fill:#0b0b0b;}#mmc195077c28 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmc195077c28 .flowchart-link{stroke:#6c6357;fill:none;}#mmc195077c28 .edgeLabel{background-color:#ffffff;text-align:center;}#mmc195077c28 .edgeLabel p{background-color:#ffffff;}#mmc195077c28 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmc195077c28 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmc195077c28 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmc195077c28 .cluster text{fill:#0b1018;}#mmc195077c28 .cluster span{color:#0b1018;}#mmc195077c28 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmc195077c28 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmc195077c28 rect.text{fill:none;stroke-width:0;}#mmc195077c28 .icon-shape,#mmc195077c28 .image-shape{background-color:#ffffff;text-align:center;}#mmc195077c28 .icon-shape p,#mmc195077c28 .image-shape p{background-color:#ffffff;padding:2px;}#mmc195077c28 .icon-shape .label rect,#mmc195077c28 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmc195077c28 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmc195077c28 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmc195077c28 .node .neo-node{stroke:#b5521b;}#mmc195077c28 [data-look="neo"].node rect,#mmc195077c28 [data-look="neo"].cluster rect,#mmc195077c28 [data-look="neo"].node polygon{stroke:url(#mmc195077c28-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc195077c28 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmc195077c28 [data-look="neo"].node path{stroke:url(#mmc195077c28-gradient);stroke-width:1px;}#mmc195077c28 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc195077c28 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmc195077c28 [data-look="neo"].node circle{stroke:url(#mmc195077c28-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc195077c28 [data-look="neo"].node circle .state-start{fill:#000000;}#mmc195077c28 [data-look="neo"].icon-shape .icon{fill:url(#mmc195077c28-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc195077c28 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmc195077c28-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc195077c28 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmc195077c28_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmc195077c28_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmc195077c28_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M251.703,59L251.703,63.167C251.703,67.333,251.703,75.667,251.703,83.333C251.703,91,251.703,98,251.703,101.5L251.703,105" id="mmc195077c28-L_T_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_A_0" data-points="W3sieCI6MjUxLjcwMzEyNSwieSI6NTl9LHsieCI6MjUxLjcwMzEyNSwieSI6ODR9LHsieCI6MjUxLjcwMzEyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/><path d="M210.045,160L203.238,164.167C196.431,168.333,182.817,176.667,176.08,184.417C169.344,192.167,169.484,199.334,169.554,202.917L169.625,206.501" id="mmc195077c28-L_A_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_E_0" data-points="W3sieCI6MjEwLjA0NDcwOTE1ODQxNTg2LCJ5IjoxNjB9LHsieCI6MTY5LjIwMzEyNSwieSI6MTg1fSx7IngiOjE2OS43MDMxMjUsInkiOjIxMC41fV0=" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/><path d="M131.437,246.5L118.776,252.333C106.114,258.167,80.792,269.833,68.13,284.417C55.469,299,55.469,316.5,55.469,325.25L55.469,334" id="mmc195077c28-L_E_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_D_0" data-points="W3sieCI6MTMxLjQzNzM1Mzk3MTk2MjYsInkiOjI0Ni41fSx7IngiOjU1LjQ2ODc1LCJ5IjoyODEuNX0seyJ4Ijo1NS40Njg3NSwieSI6MzM4fV0=" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/><path d="M207.969,246.5L220.464,252.333C232.958,258.167,257.948,269.833,270.443,280.917C282.938,292,282.938,302.5,282.938,307.75L282.938,313" id="mmc195077c28-L_E_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_R_0" data-points="W3sieCI6MjA3Ljk2ODg5NjAyODAzNzQsInkiOjI0Ni41fSx7IngiOjI4Mi45Mzc1LCJ5IjoyODEuNX0seyJ4IjoyODIuOTM3NSwieSI6MzE3fV0=" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/><path d="M282.938,410L282.938,414.167C282.938,418.333,282.938,426.667,287.221,435.465C291.504,444.263,300.071,453.526,304.354,458.157L308.637,462.788" id="mmc195077c28-L_R_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_M_0" data-points="W3sieCI6MjgyLjkzNzUsInkiOjQxMH0seyJ4IjoyODIuOTM3NSwieSI6NDM1fSx7IngiOjMxMS4zNTMzNzYwODQxNzY3LCJ5Ijo0NjUuNzI1MDA0MTMwMDIzN31d" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/><path d="M419.522,465.725L424.258,460.604C428.994,455.483,438.466,445.242,443.202,428.204C447.938,411.167,447.938,387.333,447.938,361.75C447.938,336.167,447.938,308.833,447.938,286.25C447.938,263.667,447.938,245.833,447.938,229.75C447.938,213.667,447.938,199.333,429.992,187.548C412.046,175.764,376.155,166.527,358.21,161.909L340.264,157.291" id="mmc195077c28-L_M_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_A_0" data-points="W3sieCI6NDE5LjUyMTYyMzkxNTgyMzMsInkiOjQ2NS43MjUwMDQxMzAwMjM3fSx7IngiOjQ0Ny45Mzc1LCJ5Ijo0MzV9LHsieCI6NDQ3LjkzNzUsInkiOjM2My41fSx7IngiOjQ0Ny45Mzc1LCJ5IjoyODEuNX0seyJ4Ijo0NDcuOTM3NSwieSI6MjI4fSx7IngiOjQ0Ny45Mzc1LCJ5IjoxODV9LHsieCI6MzM2LjM5MDYyNSwieSI6MTU2LjI5MzkzMjYzNzk0ODg3fV0=" data-look="classic" marker-end="url(#mmc195077c28_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_T_A_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_A_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(55.46875, 281.5)"><g class="label" data-id="L_E_D_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(282.9375, 281.5)"><g class="label" data-id="L_E_R_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_R_M_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(447.9375, 281.5)"><g class="label" data-id="L_M_A_0" transform="translate(-81.484375, -10.5)"><foreignObject width="162.96875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>read before the next trial</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmc195077c28-flowchart-T-0" data-look="classic" transform="translate(251.703125, 33.5)"><rect class="basic label-container" style="" x="-45.4765625" y="-25.5" width="90.953125" height="51"/><g class="label" style="" transform="translate(-15.4765625, -10.5)"><rect/><foreignObject width="30.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Task</p></span></div></foreignObject></g></g><g class="node default" id="mmc195077c28-flowchart-A-1" data-look="classic" transform="translate(251.703125, 134.5)"><rect class="basic label-container" style="" x="-84.6875" y="-25.5" width="169.375" height="51"/><g class="label" style="" transform="translate(-54.6875, -10.5)"><rect/><foreignObject width="109.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Actor runs a trial</p></span></div></foreignObject></g></g><g class="node default" id="mmc195077c28-flowchart-E-3" data-look="classic" transform="translate(169.203125, 228)"><polygon points="9,0 155.453125,0 164.453125,-18 155.453125,-36 9,-36 0,-18" class="label-container" transform="translate(-82.2265625,18)"/><g class="label" style="" transform="translate(-65.7265625, -10.5)"><rect/><foreignObject width="131.453125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Evaluator: success?</p></span></div></foreignObject></g></g><g class="node default" id="mmc195077c28-flowchart-D-5" data-look="classic" transform="translate(55.46875, 363.5)"><rect class="basic label-container" style="" x="-47.46875" y="-25.5" width="94.9375" height="51"/><g class="label" style="" transform="translate(-17.46875, -10.5)"><rect/><foreignObject width="34.9375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Done</p></span></div></foreignObject></g></g><g class="node default" id="mmc195077c28-flowchart-R-7" data-look="classic" transform="translate(282.9375, 363.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Self-reflector writes a lesson<br />'I picked the wrong tool because…'</p></span></div></foreignObject></g></g><g class="node default" id="mmc195077c28-flowchart-M-9" data-look="classic" transform="translate(365.4375, 507.5826644897461)"><path d="M0,12.72177543127264 a64.7578125,12.72177543127264 0,0,0 129.515625,0 a64.7578125,12.72177543127264 0,0,0 -129.515625,0 l0,69.72177543127265 a64.7578125,12.72177543127264 0,0,0 129.515625,0 l0,-69.72177543127265" class="basic label-container outer-path" style="" transform="translate(-64.7578125, -47.58266314690896)"/><g class="label" style="" transform="translate(-57.2578125, -11)"><rect/><foreignObject width="114.515625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Episodic memory<br />of reflections</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmc195077c28-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmc195077c28-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmc195077c28-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<h2>Idea 2 · Three evaluator types</h2>
+<ol>
+<li><strong>Scalar</strong> — an external binary signal. ALFWorld succeeds or fails. HumanEval tests pass or fail. Simplest, highest-signal.</li>
+<li><strong>Heuristic</strong> — predefined failure signatures. "If the agent produced the same action twice in a row, mark as stuck." "If the trajectory exceeds 50 steps, mark as inefficient."</li>
+<li><strong>Self-evaluated</strong> — the LLM scores its own trajectory. Needed when no ground truth is available. Weaker signal; pairs well with tool-grounded verification (<a href="#a1405">Lesson 14.20</a> — CRITIC).</li>
+</ol>
+<p>The 2026 default is a mix: scalar when available, self-eval when not, heuristics as safety rails.</p>
+<h2>Idea 3 · Why this generalizes</h2>
+<p>Reflexion is not a new algorithm so much as a named pattern. Almost every production "self-healing" agent runs some variant:</p>
+<ul>
+<li>Letta's sleep-time compute (<a href="#a1408">Lesson 14.23</a>): a separate agent reflects on past conversations and writes to memory blocks.</li>
+<li>Claude Code's <code>CLAUDE.md</code> / "save memory" pattern: reflections captured as learnings, prepended to future sessions.</li>
+<li>pro-workflow's <code>/learn-rule</code> command: corrections captured as explicit rules.</li>
+<li>LangGraph's reflection nodes: a node that scores output and routes to refine if needed.</li>
+</ul>
+<p>All derive from the same insight: natural language is a rich-enough medium to carry "what I learned from failure" between runs.</p>
+<h2>Idea 4 · When it works and when it does not</h2>
+<p>Reflexion works when:</p>
+<ul>
+<li>There is a clear failure signal (test failure, tool error, wrong answer).</li>
+<li>The task class is reproducible (the same type of question can be asked again).</li>
+<li>The reflection has room to improve on the trajectory (enough action budget).</li>
+</ul>
+<p>Reflexion does not help when:</p>
+<ul>
+<li>The agent already succeeds on the first try.</li>
+<li>The failure is external (network down, tool broken) — reflection on "the network was down" does not help future runs.</li>
+<li>The reflection turns into superstition — storing a narrative about a one-off flaky run.</li>
+</ul>
+<p>2026 pitfall: memory rot. Reflections accumulate; some are obsolete or wrong; re-runs get slower as the episodic buffer grows. Mitigation: periodic compaction (<a href="#a1406">Lesson 14.21</a>), TTL on reflections, or a separate sleep-time cleanup agent (Letta).</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="react-trace"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>One trial.</strong> With task <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">x</span></span></span></span>, episodic memory <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (the reflections so far), actor <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span></span></span></span>, evaluator <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span></span></span></span> and reflector <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span></span></span></span>:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">E</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mclose">}</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7056em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">m</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∪</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="mopen">(</span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)}</span><span class="mspace"> </span><span class="mord text"><span class="mord"> if </span></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.02778em;">r</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0278em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.</span></span></span></span></span></div>
+The weights of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">π</span></span></span></span> never change; only <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> does.</p>
+<p><strong>Why plain retries are not enough.</strong> If the actor is deterministic (greedy decoding) and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">m</span></span></span></span> does not change, then <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6389em;vertical-align:-0.2083em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1132em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: the retry is the same attempt. With sampling, independent retries succeed with probability
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">P</span><span class="mopen">(</span><span class="mord text"><span class="mord">pass within </span></span><span class="mord mathnormal" style="margin-right:0.07153em;">K</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1413em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mclose"><span class="mclose">)</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8913em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight" style="margin-right:0.07153em;">K</span></span></span></span></span></span></span></span></span></span></span></span></div>
+for a per-try pass rate <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>. Reflexion hopes to do better than this by making later tries depend on what earlier ones learned.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">What memory adds on top of sampling</div><div class="co-body"><ul>
+<li>Suppose a model passes a task 20% of the time with sampling, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.2</span></span></span></span>.</li>
+<li>Three independent tries: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">8</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.512</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.488</span></span></span></span>, just under half.</li>
+<li>If a correct reflection after a failure raised the next try to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span></span></span></span>, three tries would give <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.5</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span>.</li>
+<li>If the reflection is wrong and lowers the next try to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span></span></span></span>, three tries give <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.9</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.352</span></span></span></span>, worse than not reflecting.</li>
+<li>So the value of Reflexion is exactly the quality of the notes. The second block below shows a wrong one.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Reflexion trains the model."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It changes only the prompt; the same weights read a longer memory.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Any failure signal works."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A clear external signal (tests, a checker) is what makes the notes useful; self-scored failures are weaker.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Retrying is the same as reflecting."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A greedy retry repeats itself exactly; only new information in the prompt changes the next attempt.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Every stored reflection is a lesson."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Some are wrong; a wrong note in memory steers every later attempt.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Three small coding tasks, graded by hidden unit tests, three trials each. With greedy decoding, what does "retry without memory" do after a failure, and on how many of the three tasks will Reflexion end with a pass? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Reflexion with real code, real tests and a real reflector</div><div class="co-body"><p>The actor and the self-reflector are Qwen2.5-0.5B-Instruct (greedy, CPU). The evaluator runs hidden <code>assert</code> tests on the actor's function in a fresh Python process: a scalar, external signal. Reflections go into the lesson's own <code>EpisodicMemory</code> and are pasted into the next attempt's prompt. Each failed Reflexion trial is printed with its reflection. About three minutes on two CPU cores.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Reflexion with a real model and a real scalar evaluator: Qwen2.5-0.5B-Instruct (greedy, CPU) writes a
+# Python function, hidden unit tests judge it, and on failure the same model writes a one-line reflection
+# that goes into the lesson's EpisodicMemory for the next trial.
+import ast, os, re, subprocess, sys, tempfile, textwrap, time, torch
+os.environ.setdefault(&quot;HF_HUB_OFFLINE&quot;, &quot;1&quot;)            # the model is already in the local cache
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+from main import EpisodicMemory, Reflection
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); llm = AutoModelForCausalLM.from_pretrained(M).eval()
+def chat(text, max_new=160):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: text}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=max_new, do_sample=False)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+TASKS = {   # name: (specification, hidden tests)
+    &quot;vowels_count&quot;: (&quot;vowels_count(s) returns how many vowels the string s has. Vowels are a, e, i, o, u &quot;
+                     &quot;(either case), and y counts as a vowel only when it is the last letter of s.&quot;,
+                     [&quot;vowels_count('abcde') == 2&quot;, &quot;vowels_count('ACEDY') == 3&quot;, &quot;vowels_count('key') == 2&quot;,
+                      &quot;vowels_count('yellow') == 2&quot;, &quot;vowels_count('') == 0&quot;]),
+    &quot;second_largest&quot;: (&quot;second_largest(nums) returns the second largest distinct value in the list nums, &quot;
+                       &quot;or None if there are fewer than two distinct values.&quot;,
+                       [&quot;second_largest([3, 1, 2]) == 2&quot;, &quot;second_largest([5, 5, 4]) == 4&quot;,
+                        &quot;second_largest([7, 7]) is None&quot;, &quot;second_largest([]) is None&quot;, &quot;second_largest([-1, -2]) == -2&quot;]),
+    &quot;rle&quot;: (&quot;rle(s) run-length encodes s: each run of a character becomes the character followed by the run &quot;
+            &quot;length, so rle('aaabcc') == 'a3b1c2'.&quot;,
+            [&quot;rle('aaabcc') == 'a3b1c2'&quot;, &quot;rle('') == ''&quot;, &quot;rle('z') == 'z1'&quot;, &quot;rle('aabbaa') == 'a2b2a2'&quot;]),
+}
+def extract(text):
+    &quot;&quot;&quot;The code block, keeping only imports and definitions (models often append their own asserts).&quot;&quot;&quot;
+    m = re.search(r&quot;```(?:python)?\n(.*?)```&quot;, text, re.S)
+    code = m.group(1) if m else text
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return code
+    keep = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.ClassDef))]
+    return &quot;\n\n&quot;.join(ast.unparse(n) for n in keep) + &quot;\n&quot;
+def evaluate(code, tests):
+    &quot;&quot;&quot;Scalar evaluator: run the hidden tests in a fresh interpreter; return (passed, first failure).&quot;&quot;&quot;
+    body = code + &quot;\n\n&quot; + &quot;\n&quot;.join(f&quot;assert {t}, {t!r}&quot; for t in tests) + &quot;\nprint('ALL PASS')\n&quot;
+    with tempfile.NamedTemporaryFile(&quot;w&quot;, suffix=&quot;.py&quot;, delete=False) as f:
+        f.write(body)
+    r = subprocess.run([sys.executable, f.name], capture_output=True, text=True, timeout=10)
+    if &quot;ALL PASS&quot; in r.stdout:
+        return True, &quot;&quot;
+    lines = [l for l in r.stderr.strip().splitlines() if l.strip()]
+    return False, lines[-1][:160] if lines else &quot;no output&quot;
+ACT = &quot;Write a Python function. {spec}\nReply with only the code in one ```python block.{memory}&quot;
+REFLECT = (&quot;Your function failed a test.\nTask: {spec}\nYour code:\n```python\n{code}```\nTest result: {error}\n&quot;
+           &quot;In one sentence, say what was wrong and what to do differently next time. Do not write code.&quot;)
+def run(name, use_memory, trials=3):
+    spec, tests = TASKS[name]; memory = EpisodicMemory()
+    history, history_code = [], []
+    for trial in range(1, trials + 1):
+        notes = memory.as_prompt() if use_memory and memory.items else &quot;&quot;
+        code = extract(chat(ACT.format(spec=spec, memory=f&quot;\n\nLessons from earlier attempts:\n{notes}&quot; if notes else &quot;&quot;)))
+        ok, error = evaluate(code, tests)
+        if not use_memory and history_code and code == history_code[-1]:     # greedy decoding repeats itself
+            history.append(&quot;same code&quot;); break
+        history_code.append(code)
+        history.append(&quot;pass&quot; if ok else &quot;fail&quot;)
+        if ok: break
+        if use_memory:
+            reflection = chat(REFLECT.format(spec=spec, code=code, error=error), max_new=60)
+            memory.add(Reflection(trial=trial, text=&quot; &quot;.join(reflection.split())))
+            print(f&quot;   {name} trial {trial} failed: {error}\n      reflection: {' '.join(reflection.split())[:150]}&quot;)
+    MEMORIES[name, use_memory] = memory
+    return history
+MEMORIES = {}
+started = time.perf_counter()
+print(f&quot;{'task':&lt;16}{'retry, no memory':&lt;26}{'Reflexion'}&quot;)
+results = {}
+for name in TASKS:
+    results[name] = (run(name, False), run(name, True))
+for name, (plain, reflexion) in results.items():
+    print(f&quot;{name:&lt;16}{' '.join(plain):&lt;26}{' '.join(reflexion)}&quot;)
+print(f&quot;seconds {time.perf_counter() - started:.0f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">task            retry, no memory          Reflexion
+   vowels_count trial 1 failed: AssertionError: vowels_count(&#x27;ACEDY&#x27;) == 3
+      reflection: The assertion `assert vowels_count(&#x27;ACEDY&#x27;) == 3` indicates that the function does not correctly identify all vowels in the string &#x27;ACEDY&#x27;. To
+   vowels_count trial 2 failed: SyntaxError: invalid syntax
+      reflection: The provided Python code contains an error because the variable name `count` should be `vowel_count`. The correct line of code should be `vowe
+   vowels_count trial 3 failed: AssertionError: vowels_count(&#x27;ACEDY&#x27;) == 3
+      reflection: The assertion `assert vowels_count(&#x27;ACEDY&#x27;) == 3` failed because the function did not correctly count the vowels in &quot;ACEDY&quot;. The correct count
+   rle trial 1 failed: AssertionError: rle(&#x27;&#x27;) == &#x27;&#x27;
+      reflection: The assertion `rle(&#x27;&#x27;) == &#x27;&#x27;` is failing because the function does not handle empty strings correctly. The issue arises from how the function 
+vowels_count    fail same code            fail fail fail
+second_largest  pass                      pass
+rle             fail same code            fail pass
+seconds 165</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A greedy retry is the same attempt.</strong> In the "retry, no memory" column the second attempt for <code>vowels_count</code> and <code>rle</code> produced exactly the same code as the first, so the loop stopped ("same code"). Without new text in the prompt a deterministic model cannot do anything different.</p>
+<p><strong>Reflexion fixed one of the two failures.</strong> For <code>rle</code>, the first attempt failed <code>rle('') == ''</code>; the reflection named the empty-string case, and the second attempt passed. <code>second_largest</code> passed on the first try in both columns, so there was nothing to reflect on.</p>
+<p><strong>For <code>vowels_count</code> the notes did not help.</strong> The first reflection is vague ("does not correctly identify all vowels"), the second attempt did not even parse (<code>SyntaxError</code>), and its reflection blames a variable name. The third attempt failed the same uppercase test as the first. The evaluator was precise; the reflector was not.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Test feedback without reflection, and what the memory holds</div><div class="co-body"><p>This block continues from the one above. The Reflexion paper's ablation: the next attempt sees the failed code and the failing assertion, but no reflection. Then the three notes Reflexion stored for <code>vowels_count</code>. About a minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The paper's ablation: is the reflection doing the work, or just the test failure? The same loop with
+# the raw failing assertion in the prompt and no reflection. Then a look at what Reflexion stored.
+# Continues from the block above (chat, extract, evaluate, TASKS, MEMORIES).
+FEEDBACK = &quot;Write a Python function. {spec}\nReply with only the code in one ```python block.{last}&quot;
+def run_feedback(name, trials=3):
+    spec, tests = TASKS[name]; last, history = &quot;&quot;, []
+    for trial in range(1, trials + 1):
+        code = extract(chat(FEEDBACK.format(spec=spec, last=last)))
+        ok, error = evaluate(code, tests)
+        history.append(&quot;pass&quot; if ok else &quot;fail&quot;)
+        if ok: break
+        last = f&quot;\n\nYour previous attempt:\n```python\n{code}```\nfailed with: {error}&quot;
+    return history
+for name in (&quot;vowels_count&quot;, &quot;rle&quot;):
+    print(f&quot;{name:&lt;14} test feedback only: {' '.join(run_feedback(name))}&quot;)
+print(&quot;\nWhat Reflexion kept in EpisodicMemory for vowels_count (the next prompt's 'Lessons'):&quot;)
+for line in MEMORIES[&quot;vowels_count&quot;, True].as_prompt().splitlines():
+    print(&quot;  &quot; + line[:170])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">vowels_count   test feedback only: fail fail fail
+rle            test feedback only: fail fail fail
+
+What Reflexion kept in EpisodicMemory for vowels_count (the next prompt&#x27;s &#x27;Lessons&#x27;):
+  - trial 1: The assertion `assert vowels_count(&#x27;ACEDY&#x27;) == 3` indicates that the function does not correctly identify all vowels in the string &#x27;ACEDY&#x27;. To fix 
+  - trial 2: The provided Python code contains an error because the variable name `count` should be `vowel_count`. The correct line of code should be `vowel_cou
+  - trial 3: The assertion `assert vowels_count(&#x27;ACEDY&#x27;) == 3` failed because the function did not correctly count the vowels in &quot;ACEDY&quot;. The correct count shou</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Feedback alone fixed nothing here.</strong> With the failed code and the failing assertion in the prompt but no reflection, both tasks failed all three trials, including <code>rle</code>, which Reflexion fixed. On this one example the written diagnosis ("handle the empty string") was the useful part, which matches the paper's ablation. One model and two tasks are an illustration, not a measurement.</p>
+<p><strong>The memory now holds a false lesson.</strong> The third note says "The correct count should be 2" for <code>'ACEDY'</code>; the test says 3 (A, E and the final Y). Any later attempt that reads this memory is told something wrong in confident language. This is the "superstition" failure from Idea 4, produced in three trials.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements Reflexion on a toy puzzle: produce a 3-element list that sums to a target. The Actor emits candidate lists; the Evaluator checks the sum; the Self-Reflector writes a line about what went wrong. The reflection goes into episodic memory for the next trial.</p>
+<p>Components:</p>
+<ul>
+<li><code>Actor</code> — a scripted policy that improves when it sees reflections.</li>
+<li><code>Evaluator.binary()</code> — pass/fail on the target sum.</li>
+<li><code>SelfReflector</code> — generates a one-line diagnosis of the failure.</li>
+<li><code>EpisodicMemory</code> — a bounded list with TTL semantics.</li>
+</ul>
+<p>Run it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>The trace shows three trials. Trial 1 fails, a reflection is stored, trial 2 sees the reflection and improves but still fails, trial 3 succeeds. Compare with a baseline run (no reflection) — it stays stuck at trial 1's answer.</p>
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>Reflection</code>, <code>EpisodicMemory</code>, <code>Actor</code>, <code>binary_evaluator</code>, <code>SelfReflector</code>, <code>TrialResult</code>, <code>TARGET</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy Reflexion loop — Actor, Evaluator, Self-Reflector, Episodic memory.
+
+Task: pick three integers from 1..9 that sum to a target. The Actor is
+scripted to start with a bad strategy and adapt when reflections are present.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+TARGET = 20
+
+
+@dataclass
+class Reflection:
+    trial: int
+    text: str
+
+
+@dataclass
+class EpisodicMemory:
+    items: list[Reflection] = field(default_factory=list)
+    max_len: int = 6
+
+    def add(self, r: Reflection) -&gt; None:
+        self.items.append(r)
+        if len(self.items) &gt; self.max_len:
+            self.items.pop(0)
+
+    def as_prompt(self) -&gt; str:
+        if not self.items:
+            return &quot;(no prior reflections)&quot;
+        lines = [f&quot;- trial {r.trial}: {r.text}&quot; for r in self.items]
+        return &quot;\n&quot;.join(lines)
+
+
+class Actor:
+    &quot;&quot;&quot;Scripted policy. Without reflections it stays on bad choices; with
+    at least one reflection it moves toward the target sum.&quot;&quot;&quot;
+
+    def act(self, memory: EpisodicMemory) -&gt; list[int]:
+        n = len(memory.items)
+        if n == 0:
+            return [1, 2, 3]
+        if n == 1:
+            return [5, 6, 7]
+        if n == 2:
+            return [6, 7, 7]
+        return [6, 7, 7]
+
+
+def binary_evaluator(attempt: list[int], target: int) -&gt; tuple[bool, int]:
+    total = sum(attempt)
+    return total == target, total - target
+
+
+class SelfReflector:
+    def reflect(self, attempt: list[int], delta: int) -&gt; str:
+        if delta &lt; 0:
+            return f&quot;sum {sum(attempt)} is {-delta} short; pick larger values&quot;
+        if delta &gt; 0:
+            return f&quot;sum {sum(attempt)} overshoots by {delta}; pick smaller values&quot;
+        return &quot;succeeded&quot;
+
+
+@dataclass
+class TrialResult:
+    trial: int
+    attempt: list[int]
+    success: bool
+    delta: int
+    reflection: str
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>run_reflexion</code>, <code>summarize</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_reflexion(max_trials: int, use_memory: bool) -&gt; list[TrialResult]:
+    actor = Actor()
+    reflector = SelfReflector()
+    memory = EpisodicMemory()
+    trials: list[TrialResult] = []
+    for t in range(1, max_trials + 1):
+        attempt = actor.act(memory if use_memory else EpisodicMemory())
+        success, delta = binary_evaluator(attempt, TARGET)
+        text = reflector.reflect(attempt, delta)
+        trials.append(TrialResult(t, attempt, success, delta, text))
+        if success:
+            break
+        memory.add(Reflection(trial=t, text=text))
+    return trials
+
+
+def summarize(trials: list[TrialResult], name: str) -&gt; None:
+    print(f&quot;\n{name}&quot;)
+    print(&quot;-&quot; * 60)
+    for r in trials:
+        mark = &quot;OK &quot; if r.success else &quot;...&quot;
+        print(f&quot;  trial {r.trial}: {r.attempt} sum={sum(r.attempt)} &quot;
+              f&quot;delta={r.delta:+d} {mark} -&gt; {r.reflection}&quot;)
+    last = trials[-1]
+    print(f&quot;  final: {'success' if last.success else 'failed'} &quot;
+          f&quot;at trial {last.trial}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 70)
+    print(f&quot;REFLEXION: pick three ints in [1..9] summing to {TARGET}&quot;)
+    print(&quot;Phase 14, Lesson 03&quot;)
+    print(&quot;=&quot; * 70)
+
+    trials_no_mem = run_reflexion(max_trials=4, use_memory=False)
+    summarize(trials_no_mem, &quot;BASELINE (no episodic memory)&quot;)
+
+    trials_mem = run_reflexion(max_trials=4, use_memory=True)
+    summarize(trials_mem, &quot;REFLEXION (episodic memory on)&quot;)
+
+    baseline_steps = len(trials_no_mem)
+    reflex_steps = len(trials_mem)
+    print()
+    print(f&quot;baseline used {baseline_steps} trials; reflexion used {reflex_steps}.&quot;)
+    print(&quot;Without a reflection in the prompt, the scripted actor never adapts.&quot;)
+    print(&quot;With one reflection, the actor corrects; with two, it converges.&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">======================================================================
+REFLEXION: pick three ints in [1..9] summing to 20
+Phase 14, Lesson 03
+======================================================================
+
+BASELINE (no episodic memory)
+------------------------------------------------------------
+  trial 1: [1, 2, 3] sum=6 delta=-14 ... -&gt; sum 6 is 14 short; pick larger values
+  trial 2: [1, 2, 3] sum=6 delta=-14 ... -&gt; sum 6 is 14 short; pick larger values
+  trial 3: [1, 2, 3] sum=6 delta=-14 ... -&gt; sum 6 is 14 short; pick larger values
+  trial 4: [1, 2, 3] sum=6 delta=-14 ... -&gt; sum 6 is 14 short; pick larger values
+  final: failed at trial 4
+
+REFLEXION (episodic memory on)
+------------------------------------------------------------
+  trial 1: [1, 2, 3] sum=6 delta=-14 ... -&gt; sum 6 is 14 short; pick larger values
+  trial 2: [5, 6, 7] sum=18 delta=-2 ... -&gt; sum 18 is 2 short; pick larger values
+  trial 3: [6, 7, 7] sum=20 delta=+0 OK  -&gt; succeeded
+  final: success at trial 3
+
+baseline used 4 trials; reflexion used 3.
+Without a reflection in the prompt, the scripted actor never adapts.
+With one reflection, the actor corrects; with two, it converges.</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>LangGraph ships reflection as a node pattern. Claude Code's <code>/memory</code> command and pro-workflow's <code>/learn-rule</code> externalize the episodic buffer as a markdown file. Letta's sleep-time compute runs the Self-Reflector on downtime so the primary agent stays latency-bound. OpenAI Agents SDK does not ship Reflexion directly; you build it with a custom Guardrail that rejects trajectories by score and a memory <code>Session</code> that survives across runs.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Keep every reflection forever, across all tasks of a kind, with no check on whether a note is true. After a few weeks the memory holds hundreds of notes, including the wrong one above ("The correct count should be 2"). What happens to new attempts, and what would you add? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Reflection as memory files.</strong> Coding agents keep learnings in files the agent reads at the start of each session: <code>CLAUDE.md</code> in Claude Code (edited with <code>/memory</code>), <code>AGENTS.md</code> across several coding agents, rules files in Cursor. These are episodic memory with a person as the evaluator.</li>
+<li><strong>Sleep-time reflection.</strong> Letta's sleep-time agents rewrite memory blocks between conversations, off the user's critical path (lesson 14.23).</li>
+<li><strong>Graph nodes.</strong> LangGraph reflection recipes route an output to a critic node and back; the OpenAI Agents SDK's guardrails and sessions can be combined the same way.</li>
+<li><strong>What works best in practice</strong> is reflection grounded in an external signal: failing tests, a linter, a type checker, a schema validator. Self-judged reflection alone drifts.</li>
+<li><strong>On your laptop</strong>: the loop is cheap; the model's quality decides the notes. A 0.5B model writes wrong ones, as here. A 7B to 8B coding model in 4-bit on the RTX 4060 writes far better reflections and runs this lab in a few minutes.</li>
+</ul>
+<p>Sources: <a href="https://arxiv.org/abs/2303.11366">Reflexion (arXiv:2303.11366)</a>, <a href="https://code.claude.com/docs/en/memory">Claude Code memory</a>, <a href="https://agents.md/">AGENTS.md</a>, <a href="https://www.letta.com/blog/sleep-time-compute/">Letta, sleep-time compute</a>, <a href="https://langchain-ai.github.io/langgraph/tutorials/reflection/reflection/">LangGraph reflection tutorial</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Reflexion: attempt, grade, write a note, retry with the note.</li>
+<li>No weights change; only the prompt does.</li>
+<li>A greedy retry without new information repeats itself.</li>
+<li>The method is as good as its evaluator and its notes.</li>
+<li>Wrong notes persist: give memory a check, an expiry and a size limit.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-agent-reasoning-patterns-v5"><span class="t" style="--cs-hue:280">RR</span>Cheat sheet · Agent Reasoning Patterns: ReAct, ReWOO, Reflexion and ToT</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-reflexion-buffer.md</code> creates and maintains an episodic buffer with reflection capture, TTL, and deduplication. Given a task class and a failure, it emits a reflection that actually helps the next trial (not a generic "be more careful").</p>
+<p><strong><code>outputs/skill-reflexion-buffer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: reflexion-buffer
+description: Maintain an episodic-memory buffer of reflections for verbal RL with TTL, dedup, and scoped scope.
+version: 1.0.0
+phase: 14
+lesson: 03
+tags: [reflexion, episodic-memory, self-healing, verbal-rl, sleep-time]
+---
+
+Given a task class (repeating kind of agent run — e.g. &quot;refactor a function,&quot; &quot;close a support ticket&quot;), maintain an episodic-memory buffer of reflections. Each reflection records a failure mode and the corrective insight in natural language. The buffer is prepended to the next trial of the same task class.
+
+Produce:
+
+1. Reflection capture. After a trial ends with an evaluator score below threshold, emit a one-line reflection in the shape &quot;I failed to do X because Y; next time, Z.&quot; Discard reflections on external failures (network, upstream 500s) unless they are reproducible.
+2. TTL and dedup. Reflections expire after N trials by default (10 suggested). Exact duplicates collapse. Near-duplicates (&gt;0.9 cosine on a small embedding model, or shared substring &gt;= 80%) keep only the most recent.
+3. Scope policy. Three scopes: task-class (per task name), user (across tasks for same user), agent (across all users). Default is task-class. Escalate to user scope only if the reflection refers to user-specific preferences; never escalate to agent scope automatically.
+4. Compaction. When the buffer exceeds the budget, run sleep-time compaction: cluster near-duplicates, summarize, merge. Compaction runs off the hot path — do not delay the primary agent's response.
+5. Prompt integration. Emit a single block titled &quot;What I learned from prior trials&quot; with a bulleted list. Cap at 6 items in the prompt; overflow goes to a separate summary item (&quot;... and 4 older reflections about timeouts&quot;).
+
+Hard rejects:
+
+- Writing reflections as &quot;be more careful next time.&quot; That is not actionable. Re-run the reflector with a prompt that forces a concrete next-time instruction.
+- Expiring reflections based on wall-clock time rather than trial count. TTL should be trial-scoped, not time-scoped, for offline-replayable runs.
+- Storing reflections that reference secrets (API keys, tokens, PII). Reject with a specific &quot;contains secret&quot;-class error before committing to the buffer.
+
+Refusal rules:
+
+- If no evaluator is attached, refuse and recommend Lesson 05 (Self-Refine/CRITIC) — reflection requires a signal, not a gut feeling.
+- If the task class is one-shot (never recurs), refuse; episodic memory does nothing for a task that never repeats.
+
+Output: a structured buffer file (JSON with reflection objects: trial id, task class, scope, text, created_at, ttl_remaining), a prompt block for the next trial, and a &quot;stale reflections&quot; report listing entries that will expire soon.
+
+End with a &quot;what to read next&quot; note pointing to Lesson 06 (context compression) if the buffer keeps hitting its cap, or Lesson 08 (Letta sleep-time compute) to move compaction off the hot path.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Switch from binary to scalar evaluator that returns a distance metric (how far from target). Does it converge faster?</li>
+<li>Add a TTL of 10 trials to reflections. Do older reflections hurt or help after that point?</li>
+<li>Implement heuristic evaluator: mark the trial as stuck if the same action repeats. How does this interact with Self-Reflector?</li>
+<li>Run Reflexion with an adversarial Actor that ignores reflections. What is the minimum reflection prompt engineering that forces the Actor to notice them?</li>
+<li>Read Section 4 of the Reflexion paper on AlfWorld. Reproduce the 130% success-rate improvement conceptually: what is the key delta vs vanilla ReAct?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1403-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Identical retries; one task fixed</span></summary><div class="qa-a"><p>With greedy decoding, a retry without memory sees the same prompt and writes the same code, so it fails the same way; the lab stops it after the second identical attempt. Reflexion ends with two passes out of three tasks: <code>second_largest</code> passes on the first try, <code>rle</code> passes on the second after a reflection about the empty string, and <code>vowels_count</code> fails all three trials because the reflections are vague or wrong.</p></div></details>
+<details class="qa" id="a1403-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Memory that only grows</span></summary><div class="qa-a"><p>Every new attempt starts with a long list of notes, some outdated, some contradictory, and some false, like "The correct count should be 2". The model has no way to tell which ones to trust, so a single wrong note can steer many later attempts. The prompt also grows with every failure, which costs tokens and pushes the task itself further from the model's attention.</p>
+<p>Treat memory as data with a lifecycle. Keep a note only if the next attempt that used it passed (or a person approved it); attach the task type and date; expire notes after a time or a number of uses; cap the number of notes per task type (the lesson's <code>EpisodicMemory</code> keeps 6); and periodically compact or review them, which is the job Letta gives a sleep-time agent.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2303.11366">Shinn et al., Reflexion: Language Agents with Verbal Reinforcement Learning (arXiv:2303.11366)</a> — the canonical paper</li>
+<li><a href="https://www.letta.com/blog/sleep-time-compute">Letta, Sleep-time Compute</a> — async reflection in production</li>
+<li><a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents">Anthropic, Effective context engineering for AI agents</a> — managing the episodic buffer as part of context</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/overview">LangGraph overview</a> — reflection node pattern</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1403" id="done-a1403">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1403" id="undo-a1403" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1402"><span class="pn-dir">Previous</span><span class="pn-t">14.17 · Plan-and-Execute Agents and ReWOO</span></a><a class="pn next" href="#a1404"><span class="pn-dir">Next</span><span class="pn-t">14.19 · Deliberate Search with Tree of Thoughts and LATS</span></a></div></footer>

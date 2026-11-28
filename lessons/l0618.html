@@ -1,0 +1,462 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Reliability inside LangGraph: retries, timeouts, error handlers, caching and graceful endings</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.68</span><span class="chip">50 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0618" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Retry a failing node with a <code>RetryPolicy</code> that retries only the errors a retry can fix</li>
+<li>Put a timeout on a node, and recover from failures with an error handler instead of crashing the run</li>
+<li>Undo earlier steps when a later one fails (the saga pattern), and park unrecoverable runs in a dead-letter queue</li>
+<li>Cache an expensive node, and end a long loop gracefully with <code>RemainingSteps</code> before the recursion limit</li>
+<li>Time out long work by inactivity with heartbeats, and drain runs cleanly for a deploy</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons <a class="xref" href="#l0611">14.61</a> and <a class="xref" href="#l0612">14.62</a>. <a class="xref" href="#l0304">Lesson 14.5</a> built retries, deadlines and idempotency by hand; <a class="xref" href="#l1207">Lesson 14.111</a> covers reliability for whole systems.</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 50 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langgraph</code> 1.2.24.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0618-0">Retry policy</a></td>
+<td>Per-node settings for retrying failures: attempts, backoff, jitter and which errors</td>
+<td>Idea 1</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0618-1">Error handler</a></td>
+<td>A function that runs when a node fails and decides what happens next</td>
+<td>Idea 2</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0618-2">Saga</a></td>
+<td>Undoing earlier steps with compensating actions when a later step fails</td>
+<td>Idea 4</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0618-3">Dead-letter queue</a></td>
+<td>A record of failed runs kept for a person to fix and re-run</td>
+<td>Reliability in production</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">2</span><span class="lb-names">Retry storm, Durable execution</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>Retry storm</td><td>Retries from many callers multiplying load on a dependency that is trying to recover</td><td><a class="xref" href="#l1207">Lesson 14.111</a></td></tr><tr><td>Durable execution</td><td>Running a long task so that every completed step is saved and a crash resumes from the last one</td><td><a class="xref" href="#l1208">Lesson 14.112</a></td></tr></tbody></table></div></details>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">No model on this page</div><div class="co-body"><p>The failing services are plain functions that raise on purpose. Retries, timeouts, handlers and caching are the real <span class="cx" data-c="327" tabindex="0">LangGraph</span> features.</p></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import asyncio
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import RetryPolicy, CachePolicy, Command
+from langgraph.errors import NodeError
+
+class Refund(TypedDict, total=False):
+    order_id: str
+    amount: int
+    status: str
+    log: list
+</code></pre></div>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Agents in production met flaky APIs, slow tools and partial failures. LangGraph added declarative retries, timeouts, error handlers and caching per node, bringing reliability patterns from distributed systems into the graph.</p></div></aside>
+<h2>The problem: one flaky service fails the whole run</h2>
+<p>ShopKart's refund workflow calls a payment service that fails now and then, an order service that sometimes hangs, and a courier API that can be down for an hour. In <a class="xref" href="#l0304">Lesson 14.5</a> you wrote retry loops with backoff, deadlines and an <span class="cx" data-c="293" tabindex="0">idempotency key</span> around each call. In a LangGraph graph, each of those is a setting on a node, so the policy is visible in the graph definition and applied the same way every time.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Plans for when things go wrong</div><div class="co-body"><p>Every outside service fails sometimes. Each failure needs its own response, the way a careful person handles a bad phone line: <strong>retry</strong> if the line dropped, wait a little longer each time; hang up after a <strong>timeout</strong>; when retries run out, an <strong><mark class="term" id="term-l0618-1" title="Industry term: Error handler. A function that runs when a node fails and decides what happens next">error handler</mark></strong> does something sensible instead of crashing; a <strong><mark class="term" id="term-l0618-2" title="Industry term: Saga. Undoing earlier steps with compensating actions when a later step fails">saga</mark></strong> undoes steps already done when a later step fails; a <strong>cache</strong> avoids paying twice for the same work; and a <strong>graceful ending</strong> stops before a step limit with the best answer so far.</p></div></aside>
+<h2>Idea 1 · Retry the errors a retry can fix</h2>
+<p>A <code>RetryPolicy</code> attached to a node tells LangGraph to run the node again when it raises one of the listed errors, waiting a little longer each time. The node below fails twice with a connection error and then succeeds, so the policy has something to do:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">attempts = {&quot;n&quot;: 0}
+
+def call_payments(state):
+    attempts[&quot;n&quot;] += 1
+    if attempts[&quot;n&quot;] &lt; 3:
+        raise ConnectionError(&quot;payment service unavailable&quot;)          # fails twice, then works
+    return {&quot;status&quot;: f&quot;refund of INR {state['amount']:,} sent&quot;}
+
+fast_retry = RetryPolicy(max_attempts=4, initial_interval=0.01, backoff_factor=2.0, jitter=False,
+                         retry_on=ConnectionError)                     # only errors a retry can fix
+graph = (StateGraph(Refund)
+         .add_node(&quot;call_payments&quot;, call_payments, retry_policy=fast_retry)
+         .add_edge(START, &quot;call_payments&quot;).add_edge(&quot;call_payments&quot;, END).compile())
+
+print(graph.invoke({&quot;order_id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999}), &quot;| attempts:&quot;, attempts[&quot;n&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'order_id': 'A-1077', 'amount': 7999, 'status': 'refund of INR 7,999 sent'} | attempts: 3
+</code></pre></div></div></aside>
+<p>The node failed twice with a <code>ConnectionError</code>, and LangGraph ran it again after a short wait each time (<code>initial_interval</code>, multiplied by <code>backoff_factor</code> after each failure, capped by <code>max_interval</code>; <code>jitter</code> adds randomness so many runs do not retry at the same moment). The third attempt succeeded. The important argument is <code>retry_on</code>: a dropped connection may work a second later, but a bad request never will. By default LangGraph retries most exceptions except obvious programming errors; be explicit for anything with side effects.</p>
+<h2>Idea 2 · When retries run out: an error handler</h2>
+<p>Some failures will not pass however often you retry. For those, a node can name an <strong>error handler</strong>: a function that receives the state and the error, and returns a <code>Command</code> that updates the state and chooses where the run goes next. Here a rejected payment routes to a node that tells the customer, and the run finishes normally:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def charge_back(state):
+    raise RuntimeError(&quot;payment gateway rejected the request&quot;)
+
+def on_payment_failure(state, error: NodeError) -&gt; Command:
+    return Command(update={&quot;status&quot;: f&quot;{error.node} failed ({type(error.error).__name__}); customer told, ticket opened&quot;},
+                   goto=&quot;notify&quot;)
+
+def notify(state):
+    return {&quot;log&quot;: [f&quot;notified customer: {state['status']}&quot;]}
+
+graph = (StateGraph(Refund)
+         .add_node(&quot;charge_back&quot;, charge_back, retry_policy=fast_retry, error_handler=on_payment_failure)
+         .add_node(&quot;notify&quot;, notify)
+         .add_edge(START, &quot;charge_back&quot;).add_edge(&quot;notify&quot;, END).compile())
+print(graph.invoke({&quot;order_id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999}))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'order_id': 'A-1077', 'amount': 7999, 'status': 'charge_back failed (RuntimeError); customer told, ticket opened', 'log': ['notified customer: charge_back failed (RuntimeError); customer told, ticket opened']}
+</code></pre></div></div></aside>
+<p>A <code>RuntimeError</code> is not in <code>retry_on</code>, so there was no retry; the <strong>error handler</strong> received the state and a <code>NodeError</code> (which node failed, and the exception), and returned a <code>Command</code> that recorded what happened and moved on to <code>notify</code>. The run finished with a useful state instead of an exception. Handlers are where you decide between "tell the customer", "try another route" and "park it for a person".</p>
+<h2>Idea 3 · Timeouts, and why sync nodes cannot have them</h2>
+<p>A hanging service is worse than a failing one: the run waits forever. Try a timeout on an ordinary function:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import time
+
+def slow_lookup(state):
+    time.sleep(2)
+    return {&quot;status&quot;: &quot;found&quot;}
+
+try:
+    StateGraph(Refund).add_node(&quot;slow_lookup&quot;, slow_lookup, timeout=0.1).add_edge(START, &quot;slow_lookup&quot;).compile()
+except ValueError as e:
+    print(&quot;ValueError:&quot;, str(e).split(&quot; because&quot;)[0])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ValueError: Node timeouts are only supported for async nodes
+</code></pre></div></div></aside>
+<p>LangGraph refuses at compile time, because Python cannot safely stop a running synchronous function from the outside. Make the node <code>async</code>, and the timeout works, with the same error handler mechanism:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">async def slow_lookup(state):
+    await asyncio.sleep(2)                                  # an order service that hangs
+    return {&quot;status&quot;: &quot;found&quot;}
+
+def on_timeout(state, error: NodeError) -&gt; Command:
+    return Command(update={&quot;status&quot;: f&quot;lookup timed out ({type(error.error).__name__}); try again later&quot;}, goto=END)
+
+graph = (StateGraph(Refund)
+         .add_node(&quot;slow_lookup&quot;, slow_lookup, timeout=0.2, error_handler=on_timeout)
+         .add_edge(START, &quot;slow_lookup&quot;).add_edge(&quot;slow_lookup&quot;, END).compile())
+print(asyncio.run(graph.ainvoke({&quot;order_id&quot;: &quot;A-1077&quot;})))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'order_id': 'A-1077', 'status': 'lookup timed out (NodeTimeoutError); try again later'}
+</code></pre></div></div></aside>
+<p>For synchronous code, set a timeout on the client inside the node instead (the HTTP library's or the <span class="cx" data-c="554" tabindex="0">SDK</span>'s <code>timeout</code>), so the call itself gives up.</p>
+<h2>Idea 4 · The saga: undo what already happened</h2>
+<p>A return takes three steps: reserve a pickup slot, send the refund, book the courier. If the courier fails after the refund was sent, stopping is the worst outcome: money gone, nothing collected. A <strong>saga</strong> gives the failing step a handler that runs <strong>compensating actions</strong> for the steps before it, in reverse order:</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 900 290" role="img" aria-label="The saga pattern on a product return. Each step that changes the outside world has a matching undo. When a later step fails, the handler runs the undos for the completed steps in reverse order, so nothing is left half done." style="min-width:560px"><defs><marker id="ah151" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah151a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah151p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah151k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah151r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah151w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><rect class="ok" x="60" y="50" width="220" height="52" rx="8"/><text x="170.0" y="72.5" text-anchor="middle">Reserve pickup slot</text><text class="s" x="170.0" y="88.5" text-anchor="middle">done</text><path class="l k" d="M 282.0 76.0 L 338.0 76.0" marker-end="url(#ah151k)"/><rect class="ok" x="340" y="50" width="220" height="52" rx="8"/><text x="450.0" y="72.5" text-anchor="middle">Send refund</text><text class="s" x="450.0" y="88.5" text-anchor="middle">done</text><path class="l k" d="M 562.0 76.0 L 618.0 76.0" marker-end="url(#ah151k)"/><rect class="bad" x="620" y="50" width="220" height="52" rx="8"/><text x="730.0" y="72.5" text-anchor="middle">Book courier</text><text class="s" x="730.0" y="88.5" text-anchor="middle">fails</text><text class="h" x="14" y="80" text-anchor="start">do</text><path class="l r" d="M 730.0 104.0 L 730.0 176.0 L 504.0 176.0" marker-end="url(#ah151r)"/><text class="s" x="640" y="168" text-anchor="middle">the error handler takes over</text><rect class="w" x="340" y="150" width="220" height="52" rx="8"/><text x="450.0" y="172.5" text-anchor="middle">Reverse the refund</text><text class="s" x="450.0" y="188.5" text-anchor="middle">undo of step 2</text><path class="l r" d="M 338.0 176.0 L 282.0 176.0" marker-end="url(#ah151r)"/><rect class="w" x="60" y="150" width="220" height="52" rx="8"/><text x="170.0" y="172.5" text-anchor="middle">Release the pickup slot</text><text class="s" x="170.0" y="188.5" text-anchor="middle">undo of step 1</text><text class="h" x="14" y="180" text-anchor="start">undo</text><text class="s" x="450" y="238" text-anchor="middle">Undo runs last-done first. Each undo must be safe to repeat, because a crash in the middle of it will run it again on resume.</text><text class="s" x="450" y="262" text-anchor="middle">A retry suits a failure that may pass. A saga suits a failure after side effects, when stopping would leave money or stock in the wrong place.</text></svg></div><figcaption>The saga pattern on a product return. Each step that changes the outside world has a matching undo. When a later step fails, the handler runs the undos for the completed steps in reverse order, so nothing is left half done.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">done = []
+def reserve_return_slot(s): done.append(&quot;slot reserved&quot;);     return {&quot;log&quot;: [&quot;slot R-1&quot;]}
+def refund_payment(s):      done.append(&quot;refund sent&quot;);       return {&quot;log&quot;: [&quot;refund RF-1&quot;]}
+def book_pickup(s):         raise ConnectionError(&quot;courier API down&quot;)
+
+def undo_everything(state, error: NodeError) -&gt; Command:
+    undone = [f&quot;undo: {step}&quot; for step in reversed(done)]  # compensate in reverse order
+    return Command(update={&quot;status&quot;: &quot;return cancelled, refund reversed&quot;, &quot;log&quot;: undone}, goto=END)
+
+import operator
+from typing import Annotated
+class Saga(TypedDict, total=False):
+    status: str
+    log: Annotated[list, operator.add]
+
+graph = (StateGraph(Saga)
+         .add_node(&quot;reserve_return_slot&quot;, reserve_return_slot)
+         .add_node(&quot;refund_payment&quot;, refund_payment)
+         .add_node(&quot;book_pickup&quot;, book_pickup, retry_policy=RetryPolicy(max_attempts=2, initial_interval=0.01, jitter=False),
+                   error_handler=undo_everything)
+         .add_edge(START, &quot;reserve_return_slot&quot;).add_edge(&quot;reserve_return_slot&quot;, &quot;refund_payment&quot;)
+         .add_edge(&quot;refund_payment&quot;, &quot;book_pickup&quot;).add_edge(&quot;book_pickup&quot;, END).compile())
+out = graph.invoke({&quot;log&quot;: []})
+print(out[&quot;status&quot;]); print(out[&quot;log&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">return cancelled, refund reversed
+['slot R-1', 'refund RF-1', 'undo: refund sent', 'undo: slot reserved']
+</code></pre></div></div></aside>
+<p>Each compensation must itself be safe to repeat (<a class="xref" href="#l0304">Lesson 14.5</a>'s idempotency), because a crash during the undo will run it again on resume (<a class="xref" href="#l0612">Lesson 14.62</a>).</p>
+<h2>Idea 5 · Cache expensive nodes</h2>
+<p>If a node is expensive and gives the same answer for the same input, give it a <code>CachePolicy</code>. LangGraph then stores the node's result, keyed by its input, and skips the node while the entry is fresh. The list <code>lookups</code> records every real execution, so you can count how many calls the cache saved:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.cache.memory import InMemoryCache
+
+lookups = []
+def policy_lookup(state):
+    lookups.append(state[&quot;order_id&quot;])                       # an expensive call: a search or a model
+    return {&quot;status&quot;: f&quot;policy for {state['order_id']}: refundable&quot;}
+
+graph = (StateGraph(Refund)
+         .add_node(&quot;policy_lookup&quot;, policy_lookup, cache_policy=CachePolicy(ttl=300))
+         .add_edge(START, &quot;policy_lookup&quot;).add_edge(&quot;policy_lookup&quot;, END)
+         .compile(cache=InMemoryCache()))
+for oid in [&quot;A-1077&quot;, &quot;A-1077&quot;, &quot;A-1078&quot;, &quot;A-1077&quot;]:
+    graph.invoke({&quot;order_id&quot;: oid})
+print(&quot;node ran for:&quot;, lookups)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">node ran for: ['A-1077', 'A-1078']
+</code></pre></div></div></aside>
+<p>Four runs, two node executions: the second and fourth runs for A-1077 reused the cached result, keyed by the node's input. <code>ttl</code> (seconds) sets how long a result stays valid; pass a <code>key_func</code> to choose what the key is built from. Cache only nodes whose output depends on their input alone, such as a policy lookup or a classification, never one with side effects.</p>
+<h2>Idea 6 · End gracefully before the recursion limit</h2>
+<p>The <span class="cx" data-c="499" tabindex="0">recursion limit</span> (<a class="xref" href="#l0611">Lesson 14.61</a>) stops a runaway loop with an exception. Sometimes you would rather wrap up with the best answer so far. A <code>RemainingSteps</code> key is a <strong>managed value</strong>: LangGraph fills it with the number of steps left, and a router can act on it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.managed import RemainingSteps
+
+class Search(TypedDict, total=False):
+    tries: int
+    answer: str
+    remaining_steps: RemainingSteps                         # filled in by LangGraph, never by your nodes
+
+def search(state):
+    return {&quot;tries&quot;: state.get(&quot;tries&quot;, 0) + 1}             # never finds anything, to show the ending
+
+def route(state):
+    if state[&quot;remaining_steps&quot;] &lt;= 2:                       # nearly out of steps: wrap up instead of crashing
+        return &quot;best_effort&quot;
+    return &quot;search&quot;
+
+def best_effort(state):
+    return {&quot;answer&quot;: f&quot;I could not confirm this after {state['tries']} searches; a colleague will follow up.&quot;}
+
+graph = (StateGraph(Search).add_node(&quot;search&quot;, search).add_node(&quot;best_effort&quot;, best_effort)
+         .add_edge(START, &quot;search&quot;).add_conditional_edges(&quot;search&quot;, route, [&quot;search&quot;, &quot;best_effort&quot;])
+         .add_edge(&quot;best_effort&quot;, END).compile())
+print(graph.invoke({}, {&quot;recursion_limit&quot;: 8}))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'tries': 6, 'answer': 'I could not confirm this after 6 searches; a colleague will follow up.'}
+</code></pre></div></div></aside>
+<p>With a limit of 8, the loop searched six times and then ended with an honest message rather than a <code>GraphRecursionError</code>.</p>
+<h2>Idea 7 · Long work: idle timeouts and heartbeats</h2>
+<p>A hard timeout is the wrong tool for work that is slow but healthy, such as exporting thousands of orders. LangGraph 1.2 adds <code>TimeoutPolicy</code> with two limits: <code>run_timeout</code>, a hard cap that never resets, and <code>idle_timeout</code>, which resets every time the node shows progress. Writes, stream output and callbacks count as progress, and a node can say so itself with <code>runtime.heartbeat()</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.types import TimeoutPolicy
+from langgraph.runtime import Runtime
+from langgraph.errors import NodeTimeoutError
+
+async def export_orders(state, runtime: Runtime):
+    for chunk in range(4):                       # long work that reports progress
+        await asyncio.sleep(0.15)
+        runtime.heartbeat()                      # &quot;still alive&quot;: resets the idle timer
+    await asyncio.sleep(5)                       # then it hangs, with no heartbeat
+    return {&quot;status&quot;: &quot;exported&quot;}
+
+graph = (StateGraph(Refund)
+         .add_node(&quot;export_orders&quot;, export_orders, timeout=TimeoutPolicy(idle_timeout=0.4, run_timeout=3))
+         .add_edge(START, &quot;export_orders&quot;).compile())
+try:
+    asyncio.run(graph.ainvoke({&quot;order_id&quot;: &quot;batch-7&quot;}))
+except NodeTimeoutError as e:
+    print(&quot;NodeTimeoutError:&quot;, str(e).split(&quot; (elapsed&quot;)[0])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">NodeTimeoutError: Node 'export_orders' exceeded its idle timeout of 0.400s without making progress
+</code></pre></div></div></aside>
+<p>Four chunks of 0.15 seconds each passed, because every heartbeat reset the 0.4-second idle timer; the hang after them was caught 0.4 seconds later, long before the 3-second hard cap. A <code>NodeTimeoutError</code> goes to the <mark class="term" id="term-l0618-0" title="Industry term: Retry policy. Per-node settings for retrying failures: attempts, backoff, jitter and which errors">retry policy</mark> and then to the error handler like any other failure. Use <code>refresh_on="heartbeat"</code> in the policy when only your own heartbeats should count as progress.</p>
+<h2>Idea 8 · Stop cleanly for a deploy: drain</h2>
+<p>A deploy sends your process a shutdown signal while runs are in the middle of their work. Killing them leaves each run wherever it was. LangGraph 1.2 lets a run stop at the next superstep boundary instead: pass a <code>RunControl</code> to the run, and call <code>request_drain()</code> from your shutdown handler. The run saves a checkpoint, raises <code>GraphDrained</code>, and resumes later from exactly that point:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import operator
+from typing import Annotated
+from langgraph.runtime import RunControl
+from langgraph.errors import GraphDrained
+from langgraph.checkpoint.memory import InMemorySaver
+
+def step(name):
+    async def node(state):
+        await asyncio.sleep(0.2)
+        return {&quot;log&quot;: [name]}
+    return node
+
+class Nightly(TypedDict, total=False):
+    log: Annotated[list, operator.add]
+
+saver = InMemorySaver()
+nightly = (StateGraph(Nightly).add_node(&quot;fetch&quot;, step(&quot;fetch&quot;)).add_node(&quot;reconcile&quot;, step(&quot;reconcile&quot;))
+           .add_node(&quot;report&quot;, step(&quot;report&quot;)).add_edge(START, &quot;fetch&quot;).add_edge(&quot;fetch&quot;, &quot;reconcile&quot;)
+           .add_edge(&quot;reconcile&quot;, &quot;report&quot;).add_edge(&quot;report&quot;, END).compile(checkpointer=saver))
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;nightly-2026-11-22&quot;}}
+
+async def main():
+    control = RunControl()
+    asyncio.get_running_loop().call_later(0.3, control.request_drain, &quot;deploy&quot;)   # a SIGTERM handler would do this
+    try:
+        await nightly.ainvoke({&quot;log&quot;: []}, cfg, control=control)
+    except GraphDrained as e:
+        state = nightly.get_state(cfg)
+        print(&quot;GraphDrained:&quot;, e.reason, &quot;| saved:&quot;, state.values[&quot;log&quot;], &quot;| next:&quot;, state.next)
+    out = await nightly.ainvoke(None, cfg)               # after the deploy, on any worker
+    print(&quot;resumed:&quot;, out[&quot;log&quot;])
+
+asyncio.run(main())
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">GraphDrained: deploy | saved: ['fetch', 'reconcile'] | next: ('report',)
+resumed: ['fetch', 'reconcile', 'report']
+</code></pre></div></div></aside>
+<p>The drain was requested while <code>reconcile</code> was running. LangGraph let that step finish, saved the checkpoint, and stopped before <code>report</code>. The resumed run, which in production starts on a new worker after the deploy, ran only <code>report</code>. Drain needs a checkpointer, and it waits for the current step, so give nodes timeouts shorter than your platform's shutdown grace period.</p>
+<h2>Putting it together</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>LangGraph tool</th>
+<th><a class="xref" href="#l0304">Lesson 14.5</a>'s hand-built version</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A <span class="cx" data-c="654" tabindex="0">transient error</span></td>
+<td><code>retry_policy=RetryPolicy(retry_on=...)</code></td>
+<td>Retry loop with backoff and jitter</td>
+</tr>
+<tr>
+<td>A call that hangs</td>
+<td><code>timeout=</code> on an async node, or a client timeout</td>
+<td><code>deadline</code></td>
+</tr>
+<tr>
+<td>Retries used up</td>
+<td><code>error_handler=</code> returning a <code>Command</code></td>
+<td><code>except</code> and a fallback branch</td>
+</tr>
+<tr>
+<td>A failure after side effects</td>
+<td>Saga: a handler that compensates</td>
+<td>Manual undo code</td>
+</tr>
+<tr>
+<td>Repeated identical work</td>
+<td><code>cache_policy=CachePolicy(ttl=...)</code> with a cache on <code>compile</code></td>
+<td>A dictionary cache</td>
+</tr>
+<tr>
+<td>Too many steps</td>
+<td><code>RemainingSteps</code> and a best-effort node</td>
+<td><code>max_steps</code> with a final message</td>
+</tr>
+<tr>
+<td>Slow but healthy work</td>
+<td><code>TimeoutPolicy(idle_timeout=..., run_timeout=...)</code> and <code>runtime.heartbeat()</code></td>
+<td>A deadline you extend by hand</td>
+</tr>
+<tr>
+<td>A deploy in the middle of a run</td>
+<td><code>RunControl().request_drain()</code>, then resume</td>
+<td>Stop taking work and hope runs finish</td>
+</tr>
+<tr>
+<td>Every node needs the same policy</td>
+<td><code>set_node_defaults(retry_policy=..., error_handler=...)</code></td>
+<td>Copying the wrapper everywhere</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-prod"><div class="co-label">In production</div><div class="co-title">Reliability in production</div><div class="co-body"><ul>
+<li><strong><span class="cx cx-later" data-c="522" tabindex="0">Retry storms</span><a class="cx-pill" href="#l1207" title="Taught later, in Lesson 12.7">later · 14.111</a></strong>: retries multiply across layers. A model client retrying 6 times inside a node retrying 3 times inside middleware retrying 2 times makes 36 calls for one failure. Retry in one layer, usually the outermost that knows whether the step is safe to repeat.</li>
+<li><strong>Graceful shutdown</strong>: on deploys, stop taking new runs and call <code>request_drain()</code> on every running run, so each stops at a step boundary with a checkpoint; resume them on the new workers (<a class="xref" href="#l1208">Lesson 14.112</a>).</li>
+<li><strong>Bulkheads</strong>: cap parallel work per run (<code>max_concurrency</code> in config) and rate-limit model calls so one big job cannot use the whole provider quota.</li>
+<li><strong>Dead-letter queues</strong>: unrecoverable runs must be recorded with their thread ID, so a person can fix the cause and re-run from the last checkpoint (the modify exercise). Alert on the queue's growth.</li>
+</ul></div></aside>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Graph API</em> (retry policies, node caching, error handlers, timeouts), <em><span class="cx cx-later" data-c="196" tabindex="0">Durable execution</span><a class="cx-pill" href="#l1208" title="Taught later, in Lesson 12.8">later · 14.112</a></em>; <code>langgraph</code> 1.2.24 API reference for <code>add_node</code>, <code>RetryPolicy</code>, <code>CachePolicy</code>, <code>RemainingSteps</code>.</li>
+<li><strong>Versions</strong>: <code>langgraph</code> 1.2.24.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>RetryPolicy</code>, <code>CachePolicy</code>, <code>RemainingSteps</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>error_handler</code> and <code>NodeError</code></td>
+<td>Documented in LangGraph 1.2</td>
+</tr>
+<tr>
+<td>Node <code>timeout</code></td>
+<td>Documented; async nodes only</td>
+</tr>
+<tr>
+<td><code>set_node_defaults</code></td>
+<td>Documented in LangGraph 1.2</td>
+</tr>
+<tr>
+<td><code>TimeoutPolicy</code>, <code>runtime.heartbeat()</code>, <code>RunControl</code>, <code>GraphDrained</code></td>
+<td>Added in LangGraph 1.2; async nodes only for timeouts</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Retries fix every failure."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only temporary ones. Retrying a declined payment or a bug just wastes time.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A timeout stops any slow node."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only async nodes can be cancelled; blocking calls must be moved to a thread or made async.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The error handler runs on the first error."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It runs after the retry policy has given up.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Caching is safe for any node."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only for nodes whose result depends only on their input and that change nothing outside.</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In Idea 1, how long does the run wait in total before the third attempt, with <code>initial_interval=0.01</code>, <code>backoff_factor=2.0</code> and no jitter? What would it be with the defaults (0.5 seconds, factor 2)? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Run Idea 3's first block. Read the message, and say why LangGraph refuses at compile time instead of trying and failing at run time. (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: one bad refund, four attempts</div><div class="co-body"><p>A refund with amount 0 is rejected by validation, as it should be, but the logs show the node ran four times:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">sent = []
+def send_refund(state):
+    sent.append(state[&quot;order_id&quot;])
+    if state[&quot;amount&quot;] &lt;= 0:
+        raise ValueError(&quot;refund amount must be positive&quot;)   # bad input: no retry can fix it
+
+retry_all = RetryPolicy(max_attempts=4, initial_interval=0.01, jitter=False, retry_on=Exception)   # the bug is here
+graph = (StateGraph(Refund).add_node(&quot;send_refund&quot;, send_refund, retry_policy=retry_all)
+         .add_edge(START, &quot;send_refund&quot;).add_edge(&quot;send_refund&quot;, END).compile())
+try:
+    graph.invoke({&quot;order_id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 0})
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+print(&quot;send_refund ran&quot;, len(sent), &quot;times&quot;)
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ValueError: refund amount must be positive
+send_refund ran 4 times
+</code></pre></div>
+<p>Explain why it matters that it ran four times, and fix the policy. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Make every node in a graph retry connection errors and, when retries are used up, park the run in a dead-letter list with the node, the error and the order ID. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0618-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Backoff adds up</span></summary><div class="qa-a"><p>0.01 + 0.02 = 0.03 seconds before the third attempt. With the defaults, 0.5 + 1.0 = 1.5 seconds; a fourth attempt would wait another 2 seconds. Long backoffs keep a run (and its worker) busy, so for waits of minutes, end the run and resume it later instead (<a class="xref" href="#l0612">Lesson 14.62</a>).</p></div></details>
+<details class="qa" id="l0618-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Synchronous code cannot be cancelled safely</span></summary><div class="qa-a"><p>A synchronous Python function cannot be interrupted from outside without risking corrupted state, so LangGraph cannot honor a timeout on it, and it says so when the graph is built rather than letting you believe the node is protected. Make the node async, or put the timeout on the client the node calls.</p></div></details>
+<details class="qa" id="l0618-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Retry only what a retry can fix</span></summary><div class="qa-a"><p><code>retry_on=Exception</code> retried a validation error that will fail every time, so the node ran four times, and every side effect before the error ran four times too (here <code>sent</code> recorded four sends). Retry only transient errors:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">sent.clear()
+graph = (StateGraph(Refund).add_node(&quot;send_refund&quot;, send_refund, retry_policy=fast_retry)   # ConnectionError only
+         .add_edge(START, &quot;send_refund&quot;).add_edge(&quot;send_refund&quot;, END).compile())
+try:
+    graph.invoke({&quot;order_id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 0})
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+print(&quot;send_refund ran&quot;, len(sent), &quot;time&quot;)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ValueError: refund amount must be positive
+send_refund ran 1 time
+</code></pre></div></div></details>
+<details class="qa" id="l0618-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · A <mark class="term" id="term-l0618-3" title="Industry term: Dead-letter queue. A record of failed runs kept for a person to fix and re-run">dead-letter queue</mark> for every node</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">dead_letters = []
+
+def to_dead_letter(state, error: NodeError) -&gt; Command:
+    dead_letters.append({&quot;node&quot;: error.node, &quot;error&quot;: repr(error.error)[:80], &quot;order_id&quot;: state.get(&quot;order_id&quot;)})
+    return Command(update={&quot;status&quot;: &quot;parked for a person to re-run&quot;}, goto=END)
+
+def always_down(state):
+    raise ConnectionError(&quot;ledger unavailable&quot;)
+
+builder = StateGraph(Refund).set_node_defaults(retry_policy=fast_retry, error_handler=to_dead_letter)  # every node
+graph = builder.add_node(&quot;record&quot;, always_down).add_edge(START, &quot;record&quot;).add_edge(&quot;record&quot;, END).compile()
+print(graph.invoke({&quot;order_id&quot;: &quot;A-1080&quot;}))
+print(dead_letters)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'order_id': 'A-1080', 'status': 'parked for a person to re-run'}
+[{'node': 'record', 'error': &quot;ConnectionError('ledger unavailable')&quot;, 'order_id': 'A-1080'}]
+</code></pre></div>
+<p><code>set_node_defaults</code> applies the policy and the handler to every node unless a node sets its own. In production, write the dead letter to a table with the thread ID, so a fix can be followed by resuming the run from the checkpoint before the failed node.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0618-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How do you make a LangGraph workflow resilient to failing services?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Per node: a <code>RetryPolicy</code> with backoff, jitter and an explicit <code>retry_on</code> list of transient errors; timeouts on async nodes or on clients; an error handler that returns a <code>Command</code> to recover, notify, compensate or park the run; caching for expensive pure nodes. Across the graph: checkpoints so runs resume after crashes, <code>RemainingSteps</code> or limits so loops end gracefully, idempotent side effects so retries and resumes are safe, and a dead-letter queue for runs nothing can fix.</p>
+<p><strong>A plausible wrong answer.</strong> "Wrap the whole <code>invoke</code> in a try/except and retry it." That repeats completed steps and their side effects.</p>
+<p><strong>Follow-ups.</strong> When would you use a saga instead of a retry?</p></div></details>
+<details class="qa" id="l0618-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">A provider outage turned into a 40-times spike in requests to that provider. Why?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Retries at several layers multiplied: the SDK's own retries, a node <code>RetryPolicy</code>, and middleware or application retries. Keep retries in one layer, use backoff with jitter, add a <span class="cx" data-c="108" tabindex="0">circuit breaker</span> that stops calling a failing provider for a while (<a class="xref" href="#l0304">Lesson 14.5</a>), and fall back or fail fast when it is open.</p>
+<p><strong>A plausible wrong answer.</strong> "Increase max_attempts so more requests succeed." That makes the storm bigger.</p>
+<p><strong>Follow-ups.</strong> Which layer should own retries in a LangGraph agent?</p></div></details>
+<details class="qa" id="l0618-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Error handlers in the graph, or exceptions handled by the caller?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> In the graph when recovery is part of the business process: notifying the customer, compensating earlier steps, routing to a person. The decision is then checkpointed and visible in <span class="cx" data-c="649" tabindex="0">traces</span>. Leave to the caller only failures the graph cannot handle meaningfully, such as configuration errors, which should fail loudly.</p>
+<p><strong>A plausible wrong answer.</strong> "Never let a graph fail; handle everything." Hiding bugs as handled states makes them harder to find.</p>
+<p><strong>Follow-ups.</strong> How would you test an error handler?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Add a <code>RetryPolicy</code> that retries only connection errors, and show it working.</li>
+<li>Add a timeout to an async node and recover with an error handler.</li>
+<li>Write a saga that undoes two steps when the third fails.</li>
+<li>Cache a pure node, and end a loop with <code>RemainingSteps</code>.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0618-q1"><p class="q-text"><span class="q-num">Q1</span>What does retry_on control in a RetryPolicy?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0618-q1-o0"><span class="opt-key">A</span><span>How long to wait between attempts</span></button><button type="button" class="opt" data-correct="true" id="l0618-q1-o1"><span class="opt-key">B</span><span>Which exceptions cause a retry</span></button><button type="button" class="opt" data-correct="false" id="l0618-q1-o2"><span class="opt-key">C</span><span>How many nodes are retried</span></button><button type="button" class="opt" data-correct="false" id="l0618-q1-o3"><span class="opt-key">D</span><span>Whether the cache is used</span></button></div><p class="q-explain" hidden>Retry only errors that a second attempt can fix.</p></div><div class="q" id="l0618-q2"><p class="q-text"><span class="q-num">Q2</span>Why does LangGraph refuse a timeout on a synchronous node?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0618-q2-o0"><span class="opt-key">A</span><span>Timeouts are a paid feature</span></button><button type="button" class="opt" data-correct="true" id="l0618-q2-o1"><span class="opt-key">B</span><span>A synchronous Python function cannot be safely cancelled from outside</span></button><button type="button" class="opt" data-correct="false" id="l0618-q2-o2"><span class="opt-key">C</span><span>Synchronous nodes never hang</span></button><button type="button" class="opt" data-correct="false" id="l0618-q2-o3"><span class="opt-key">D</span><span>It needs a checkpointer</span></button></div><p class="q-explain" hidden>Make the node async, or set a timeout on the client it calls.</p></div><div class="q" id="l0618-q3"><p class="q-text"><span class="q-num">Q3</span>What is a saga?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0618-q3-o0"><span class="opt-key">A</span><span>A long conversation</span></button><button type="button" class="opt" data-correct="true" id="l0618-q3-o1"><span class="opt-key">B</span><span>Undoing earlier steps with compensating actions when a later step fails</span></button><button type="button" class="opt" data-correct="false" id="l0618-q3-o2"><span class="opt-key">C</span><span>A retry with backoff</span></button><button type="button" class="opt" data-correct="false" id="l0618-q3-o3"><span class="opt-key">D</span><span>A kind of subgraph</span></button></div><p class="q-explain" hidden>Compensations must themselves be safe to repeat.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0618" id="done-l0618">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0618" id="undo-l0618" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0617"><span class="pn-dir">Previous</span><span class="pn-t">14.67 · Deploying and debugging LangGraph: Agent Server, Studio and LangSmith</span></a><a class="pn next" href="#l0619"><span class="pn-dir">Next</span><span class="pn-t">14.69 · Tools that change state, MCP tools and advanced middleware</span></a></div></footer>

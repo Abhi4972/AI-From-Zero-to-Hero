@@ -1,0 +1,389 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · LLM Inference, Infrastructure and LLMOps</a></nav><h1>Mitigating Cold Starts in Serverless LLM Inference</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.10</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1710" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Enumerate the five layers of cold-start mitigation and name one tool or pattern at each layer.</li>
+<li>Compute total cold-start time as a sum of (node provision) + (weights download) + (weights load into HBM) + (engine init) for a 70B model.</li>
+<li>Explain why live migration transfers input tokens (KB) not KV cache (GB) and what the penalty is (recomputation).</li>
+<li>Name the warm-pool trade-off (pay for idle GPU or accept cold-start tail) and the SLA threshold at which <code>min_workers &gt; 0</code> becomes mandatory.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 17.2 (Inference Platform Economics), Lesson 17.3 (GPU Autoscaling)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy cold-start path simulator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A large model takes minutes to go from cold to serving: a 70B model on a fresh node needs roughly 3-8 minutes before the first token. In a true serverless world, that is not a warm-up — it is an outage. Mitigations operate at five layers: pre-seeded node images (Bottlerocket on AWS, dual-volume arch), model streaming (NVIDIA Run:ai Model Streamer, native in vLLM), GPU memory snapshots (Modal checkpoints, up to 10x faster restart), warm pools (<code>min_workers=1</code>), tiered loading (ServerlessLLM's NVMe→DRAM→HBM pipeline, 10-200x latency reduction), plus a bonus sixth pattern, live migration that moves input tokens (KB) rather than KV cache (GB). Modal publishes 2-4s cold starts as a floor; Baseten 5-10s default, sub-second with pre-warming. This lesson teaches you to measure, budget, and stack the five layers.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cold start</td>
+<td>"the big pause"</td>
+<td>Time from request to first token on a fresh replica</td>
+</tr>
+<tr>
+<td>Warm pool</td>
+<td>"always-on minimum"</td>
+<td><code>min_workers &gt;= 1</code> to keep at least one replica ready</td>
+</tr>
+<tr>
+<td>Pre-seeded image</td>
+<td>"baked AMI"</td>
+<td>Node image with container weights pre-resident</td>
+</tr>
+<tr>
+<td>Bottlerocket</td>
+<td>"AWS node OS"</td>
+<td>AWS container-optimized OS with dual-volume snapshot support</td>
+</tr>
+<tr>
+<td>Model streamer</td>
+<td>"streaming load"</td>
+<td>Overlap weights I/O with compute setup</td>
+</tr>
+<tr>
+<td>GPU snapshot</td>
+<td>"checkpoint to HBM"</td>
+<td>Serialize post-load GPU state; deserialize on restart</td>
+</tr>
+<tr>
+<td>Tiered loading</td>
+<td>"NVMe + DRAM + HBM"</td>
+<td>Hierarchy of storage tiers; load on demand</td>
+</tr>
+<tr>
+<td>Live migration</td>
+<td>"move tokens"</td>
+<td>Transfer input (KB), recompute KV on destination</td>
+</tr>
+<tr>
+<td><code>min_workers</code></td>
+<td>"warm replicas"</td>
+<td>Serverless minimum keep-alive count</td>
+</tr>
+<tr>
+<td>Scale-to-zero</td>
+<td>"full serverless"</td>
+<td>No cost when idle; accept full cold-start tax</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A <strong>cold start</strong> is the wait when a request arrives and no copy of the model is running: a GPU machine must be found, the software image downloaded, tens of gigabytes of weights loaded into GPU memory and the engine started. For a 70B model that can take several minutes. <strong>Scaling to zero</strong> (running nothing when nobody is using the model) saves money but makes the next user pay that wait. The fixes attack each step: machine images with the model already on disk, <strong>streaming</strong> weights onto the GPU while loading, <strong>GPU snapshots</strong> that restore a running model in seconds, and <strong>warm pools</strong>, which keep one copy always running at the cost of paying for it all day.</p></div></aside>
+<p>Your serverless LLM endpoint scales to zero overnight. At 8 a.m. traffic spikes. The first request waits while:</p>
+<ol>
+<li>Karpenter provisions a GPU node: 45-60s.</li>
+<li>The container pulls a 30 GB image with weights: 120-300s.</li>
+<li>The engine loads weights into HBM: 45-120s depending on model size and storage speed.</li>
+<li>vLLM or TRT-LLM initializes CUDA graphs, KV cache pool, tokenizer: 10-30s.</li>
+</ol>
+<p>Total: 220-510s (roughly 3-8 minutes) before one token comes back. Your SLA is 2s. You ship a warm-pool (<code>min_workers=1</code>) and the problem seems to vanish — but now you pay for one idle GPU 24x7. If your service has 5 products each with one warm replica, that's 5 × 24 × 30 = 3,600 GPU-hours/month whether or not a single user called.</p>
+<p>Cold-start mitigation is how to keep the serverless economics while approximating the latency of always-on.</p>
+<h2>Idea 1 · Layer 1 — pre-seeded node images (Bottlerocket)</h2>
+<p>On AWS, Bottlerocket's dual-volume architecture separates OS from data. Snapshot the data volume with your container image pre-pulled; reference the snapshot ID in your <code>EC2NodeClass</code>. New nodes boot with weights already on local NVMe — steps 2 and part of 3 vanish. Works with Karpenter natively. Typical savings: 2-4 minutes per cold start for large models.</p>
+<figure class="diagram mmfig" data-mmd="a1710" data-h="ecabb8e983"><div class="dg-scroll"><svg class="dg mm" id="mmecabb8e983" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 680.898px; background-color: transparent;" viewBox="0 0 680.8984375 677" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmecabb8e983{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmecabb8e983 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmecabb8e983 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmecabb8e983 .error-icon{fill:#f4efe7;}#mmecabb8e983 .error-text{fill:#0b1018;stroke:#0b1018;}#mmecabb8e983 .edge-thickness-normal{stroke-width:1px;}#mmecabb8e983 .edge-thickness-thick{stroke-width:3.5px;}#mmecabb8e983 .edge-pattern-solid{stroke-dasharray:0;}#mmecabb8e983 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmecabb8e983 .edge-pattern-dashed{stroke-dasharray:3;}#mmecabb8e983 .edge-pattern-dotted{stroke-dasharray:2;}#mmecabb8e983 .marker{fill:#6c6357;stroke:#6c6357;}#mmecabb8e983 .marker.cross{stroke:#6c6357;}#mmecabb8e983 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmecabb8e983 p{margin:0;}#mmecabb8e983 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmecabb8e983 .cluster-label text{fill:#0b1018;}#mmecabb8e983 .cluster-label span{color:#0b1018;}#mmecabb8e983 .cluster-label span p{background-color:transparent;}#mmecabb8e983 .label text,#mmecabb8e983 span{fill:#211c16;color:#211c16;}#mmecabb8e983 .node rect,#mmecabb8e983 .node circle,#mmecabb8e983 .node ellipse,#mmecabb8e983 .node polygon,#mmecabb8e983 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmecabb8e983 .rough-node .label text,#mmecabb8e983 .node .label text,#mmecabb8e983 .image-shape .label,#mmecabb8e983 .icon-shape .label{text-anchor:middle;}#mmecabb8e983 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmecabb8e983 .rough-node .label,#mmecabb8e983 .node .label,#mmecabb8e983 .image-shape .label,#mmecabb8e983 .icon-shape .label{text-align:center;}#mmecabb8e983 .node.clickable{cursor:pointer;}#mmecabb8e983 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmecabb8e983 .arrowheadPath{fill:#0b0b0b;}#mmecabb8e983 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmecabb8e983 .flowchart-link{stroke:#6c6357;fill:none;}#mmecabb8e983 .edgeLabel{background-color:#ffffff;text-align:center;}#mmecabb8e983 .edgeLabel p{background-color:#ffffff;}#mmecabb8e983 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmecabb8e983 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmecabb8e983 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmecabb8e983 .cluster text{fill:#0b1018;}#mmecabb8e983 .cluster span{color:#0b1018;}#mmecabb8e983 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmecabb8e983 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmecabb8e983 rect.text{fill:none;stroke-width:0;}#mmecabb8e983 .icon-shape,#mmecabb8e983 .image-shape{background-color:#ffffff;text-align:center;}#mmecabb8e983 .icon-shape p,#mmecabb8e983 .image-shape p{background-color:#ffffff;padding:2px;}#mmecabb8e983 .icon-shape .label rect,#mmecabb8e983 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmecabb8e983 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmecabb8e983 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmecabb8e983 .node .neo-node{stroke:#b5521b;}#mmecabb8e983 [data-look="neo"].node rect,#mmecabb8e983 [data-look="neo"].cluster rect,#mmecabb8e983 [data-look="neo"].node polygon{stroke:url(#mmecabb8e983-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmecabb8e983 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmecabb8e983 [data-look="neo"].node path{stroke:url(#mmecabb8e983-gradient);stroke-width:1px;}#mmecabb8e983 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmecabb8e983 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmecabb8e983 [data-look="neo"].node circle{stroke:url(#mmecabb8e983-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmecabb8e983 [data-look="neo"].node circle .state-start{fill:#000000;}#mmecabb8e983 [data-look="neo"].icon-shape .icon{fill:url(#mmecabb8e983-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmecabb8e983 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmecabb8e983-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmecabb8e983 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmecabb8e983_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmecabb8e983_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmecabb8e983_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M138,59L138,63.167C138,67.333,138,75.667,138,83.333C138,91,138,98,138,101.5L138,105" id="mmecabb8e983-L_R_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_N_0" data-points="W3sieCI6MTM4LCJ5Ijo1OX0seyJ4IjoxMzgsInkiOjg0fSx7IngiOjEzOCwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M138,181L138,185.167C138,189.333,138,197.667,138,205.333C138,213,138,220,138,223.5L138,227" id="mmecabb8e983-L_N_I_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_N_I_0" data-points="W3sieCI6MTM4LCJ5IjoxODF9LHsieCI6MTM4LCJ5IjoyMDZ9LHsieCI6MTM4LCJ5IjoyMzF9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M138,324L138,328.167C138,332.333,138,340.667,138,348.333C138,356,138,363,138,366.5L138,370" id="mmecabb8e983-L_I_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_I_W_0" data-points="W3sieCI6MTM4LCJ5IjozMjR9LHsieCI6MTM4LCJ5IjozNDl9LHsieCI6MTM4LCJ5IjozNzR9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M138,446L138,450.167C138,454.333,138,462.667,138,470.333C138,478,138,485,138,488.5L138,492" id="mmecabb8e983-L_W_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_E_0" data-points="W3sieCI6MTM4LCJ5Ijo0NDZ9LHsieCI6MTM4LCJ5Ijo0NzF9LHsieCI6MTM4LCJ5Ijo0OTZ9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M138,568L138,572.167C138,576.333,138,584.667,160.814,594.439C183.627,604.212,229.254,615.424,252.068,621.03L274.881,626.636" id="mmecabb8e983-L_E_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_F_0" data-points="W3sieCI6MTM4LCJ5Ijo1Njh9LHsieCI6MTM4LCJ5Ijo1OTN9LHsieCI6Mjc4Ljc2NTYyNSwieSI6NjI3LjU5MDcyNDE5NjkyMDd9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M343.508,568L343.508,572.167C343.508,576.333,343.508,584.667,343.508,592.333C343.508,600,343.508,607,343.508,610.5L343.508,614" id="mmecabb8e983-L_S_F_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_F_0" data-points="W3sieCI6MzQzLjUwNzgxMjUsInkiOjU2OH0seyJ4IjozNDMuNTA3ODEyNSwieSI6NTkzfSx7IngiOjM0My41MDc4MTI1LCJ5Ijo2MTh9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/><path d="M578.789,568L578.789,572.167C578.789,576.333,578.789,584.667,551.018,594.794C523.246,604.922,467.704,616.843,439.932,622.804L412.161,628.765" id="mmecabb8e983-L_WP_F_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_WP_F_0" data-points="W3sieCI6NTc4Ljc4OTA2MjUsInkiOjU2OH0seyJ4Ijo1NzguNzg5MDYyNSwieSI6NTkzfSx7IngiOjQwOC4yNSwieSI6NjI5LjYwMzk0ODA2NzQ3MjR9XQ==" data-look="classic" marker-end="url(#mmecabb8e983_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R_N_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_N_I_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_I_W_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_W_E_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_E_F_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_F_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_WP_F_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmecabb8e983-flowchart-R-0" data-look="classic" transform="translate(138, 33.5)"><rect class="basic label-container" style="" x="-127.5234375" y="-25.5" width="255.046875" height="51"/><g class="label" style="" transform="translate(-97.5234375, -10.5)"><rect/><foreignObject width="195.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>First request, nothing running</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-N-1" data-look="classic" transform="translate(138, 145)"><rect class="basic label-container" style="" x="-80.03125" y="-36" width="160.0625" height="72"/><g class="label" style="" transform="translate(-50.03125, -21)"><rect/><foreignObject width="100.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Node provision<br />~50 s</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-I-3" data-look="classic" transform="translate(138, 277.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Image pull<br />~180 s → 0 with pre-seeded image</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-W-5" data-look="classic" transform="translate(138, 410)"><rect class="basic label-container" style="" x="-125.734375" y="-36" width="251.46875" height="72"/><g class="label" style="" transform="translate(-95.734375, -21)"><rect/><foreignObject width="191.46875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Weights to GPU<br />~75 s → halved by streaming</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-E-7" data-look="classic" transform="translate(138, 532)"><rect class="basic label-container" style="" x="-64.3359375" y="-36" width="128.671875" height="72"/><g class="label" style="" transform="translate(-34.3359375, -21)"><rect/><foreignObject width="68.671875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Engine init<br />~20 s</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-F-9" data-look="classic" transform="translate(343.5078125, 643.5)"><rect class="basic label-container" style="" x="-64.7421875" y="-25.5" width="129.484375" height="51"/><g class="label" style="" transform="translate(-34.7421875, -10.5)"><rect/><foreignObject width="69.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>First token</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-S-10" data-look="classic" transform="translate(343.5078125, 532)"><rect class="basic label-container" style="" x="-91.171875" y="-36" width="182.34375" height="72"/><g class="label" style="" transform="translate(-61.171875, -21)"><rect/><foreignObject width="122.34375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>GPU snapshot:<br />restore in seconds</p></span></div></foreignObject></g></g><g class="node default" id="mmecabb8e983-flowchart-WP-12" data-look="classic" transform="translate(578.7890625, 532)"><rect class="basic label-container" style="" x="-94.109375" y="-36" width="188.21875" height="72"/><g class="label" style="" transform="translate(-64.109375, -21)"><rect/><foreignObject width="128.21875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Warm pool:<br />skip it all, pay 24×7</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmecabb8e983-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmecabb8e983-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmecabb8e983-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>Equivalent on GCP: custom VM images with pre-baked container layers. On Azure: managed disk snapshots with the same pattern.</p>
+<h2>Idea 2 · Layer 2 — model streaming (Run:ai Model Streamer)</h2>
+<p>Instead of loading the full file before answering the first request, stream weights into GPU memory layer-by-layer and start processing as soon as the first transformer block is resident. The NVIDIA Run:ai Model Streamer ships native in vLLM 2026. Works with S3, GCS, and local NVMe. Cuts weight-load time roughly in half for large models by overlapping I/O with compute setup.</p>
+<h2>Idea 3 · Layer 3 — GPU memory snapshots (Modal)</h2>
+<p>Modal takes a checkpoint of the GPU state (weights, CUDA graphs, KV cache region) after first load. Subsequent restarts deserialize directly into HBM — 10x faster than re-initializing. This is the closest thing to "boot a warm GPU in 2 seconds." Trade-off: snapshots are per-GPU-topology, so if Karpenter migrates you to a different SKU, you re-checkpoint.</p>
+<h2>Idea 4 · Layer 4 — warm pools (min_workers=1)</h2>
+<p>Simplest mitigation: keep one replica always ready. Cost is one GPU's hourly rate 24x7. The arithmetic is brutal on small models (you pay $0.85-$1.50/hr to avoid a 30s cold start) and kind to large ones (pay $4/hr to avoid a 5-minute cold start). The SLA threshold where warm pools become mandatory: typically TTFT P99 &lt; 60s on a 70B+ model.</p>
+<h2>Idea 5 · Layer 5 — tiered loading (ServerlessLLM)</h2>
+<p>ServerlessLLM treats storage as a hierarchy: NVMe (fast but big), DRAM (medium but tiered), HBM (tiny but instant). Weights are pre-loaded to DRAM; load-on-demand into HBM. Paper reports 10-200x latency reduction on cold loads versus naive disk-to-HBM. Production adoption is early but integrations with vLLM exist.</p>
+<h2>Idea 6 · Layer 6 — live migration (bonus pattern)</h2>
+<p>When a node becomes unavailable (spot eviction, node drain), traditional pattern is cold-start another replica and drain request queue. Live migration moves the input tokens (kilobytes) to a destination that has the model loaded and recomputes KV cache on the destination. Recomputation is cheaper than transferring GB of KV cache over the network. Applicable to disaggregated deployments.</p>
+<h2>Idea 7 · The warm-pool math</h2>
+<p>For a service with P99 TTFT SLA of 2s, the question is not "warm pool yes/no" but "how many warm replicas, and which paths get them."</p>
+<ul>
+<li>High-value interactive paths (live chat, voice agent): <code>min_workers=1-2</code>.</li>
+<li>Background batch paths (nightly classification): scale-to-zero accepted, 5-10 minute cold start tolerable.</li>
+<li>Premium tier: <code>min_workers</code> per tenant with dedicated capacity.</li>
+</ul>
+<h2>Idea 8 · Measure before optimizing</h2>
+<p>Cold-start anatomy for a 70B model on a fresh node (illustrative):</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Phase</th>
+<th>Time</th>
+<th>Mitigation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Node provision</td>
+<td>50s</td>
+<td>Bottlerocket + pre-seeded image, warm pool</td>
+</tr>
+<tr>
+<td>Image pull</td>
+<td>180s</td>
+<td>Pre-seeded data volume (eliminate)</td>
+</tr>
+<tr>
+<td>Weights to HBM</td>
+<td>75s</td>
+<td>Model streamer (halve); GPU snapshot (eliminate)</td>
+</tr>
+<tr>
+<td>Engine init</td>
+<td>20s</td>
+<td>Persistent CUDA graph cache</td>
+</tr>
+<tr>
+<td>First forward</td>
+<td>3s</td>
+<td>Min inherent latency</td>
+</tr>
+<tr>
+<td><strong>Total cold</strong></td>
+<td><strong>328s</strong></td>
+<td></td>
+</tr>
+<tr>
+<td><strong>Total with mitigations</strong></td>
+<td><strong>~15s</strong></td>
+<td>22x reduction</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Idea 9 · Numbers you should remember</h2>
+<ul>
+<li>Modal cold start: 2-4s (with GPU snapshots).</li>
+<li>Baseten default cold start: 5-10s; sub-second with pre-warming.</li>
+<li>Raw 70B cold start: 3-8 minutes.</li>
+<li>Run:ai Model Streamer: ~2x weight-load speedup.</li>
+<li>ServerlessLLM tiered loading: 10-200x latency reduction (paper numbers).</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cold-start-pipeline"></div></figure></p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Is one warm replica worth it?</div><div class="co-body"><p>A warm H100 replica costs $4.50 an hour, $3,240 a month. Without it, every request that arrives after the model has scaled down waits 328 s (5.5 minutes).</p>
+<ol>
+<li>At 1 request an hour, the model is cold for almost every request: about 20 cold starts a day. With a budget of 5 tolerated slow requests a day, 15 are over budget; at a premium product, each is a lost user. The warm replica is worth it.</li>
+<li>At 10 requests an hour, the model rarely scales down: about 2 cold starts a day, under budget. The warm replica buys little.</li>
+<li>The decision is about how often traffic <em>gaps</em> are longer than the scale-down timer, not about average traffic.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Pre-seeded node images remove the image pull, the largest step for big models.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A warm pool is free once the model is popular.
+  You pay for the warm replica every hour; popularity only means it is rarely idle.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> GPU memory snapshots can restore a loaded model in a few seconds.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Cold-start time is mostly the GPU node starting up.
+  For a 70B model, image pull and weight loading take most of the time.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: the cold path is 50 s node + 180 s image + 75 s weights + 20 s engine + 3 s first forward. Which single fix saves the most: pre-seeded images, the model streamer (halves weight loading), or a persistent CUDA graph cache (removes engine init)?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Which step to fix first</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">steps = {&quot;node&quot;: 50, &quot;image pull&quot;: 180, &quot;weights to HBM&quot;: 75, &quot;engine init&quot;: 20, &quot;first forward&quot;: 3}
+fixes = {&quot;pre-seeded image&quot;: {&quot;image pull&quot;: 0}, &quot;model streamer&quot;: {&quot;weights to HBM&quot;: 37.5},
+         &quot;CUDA graph cache&quot;: {&quot;engine init&quot;: 0}, &quot;pre-seeded + streamer&quot;: {&quot;image pull&quot;: 0, &quot;weights to HBM&quot;: 37.5}}
+print(f&quot;{'raw':24s} {sum(steps.values()):6.1f} s&quot;)
+for name, change in fixes.items():
+    total = sum({**steps, **change}.values())
+    print(f&quot;{name:24s} {total:6.1f} s  (saves {sum(steps.values()) - total:5.1f} s)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">raw                       328.0 s
+pre-seeded image          148.0 s  (saves 180.0 s)
+model streamer            290.5 s  (saves  37.5 s)
+CUDA graph cache          308.0 s  (saves  20.0 s)
+pre-seeded + streamer     110.5 s  (saves 217.5 s)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The pre-seeded image saves 180 s, more than any other single fix, because the image pull is the longest step. Streaming saves 37.5 s and the CUDA graph cache 20 s. Fix the longest step first, which is why the lesson starts with measuring the anatomy of your own cold start.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> models a cold-start path with and without each mitigation. Reports total cold-start time, warm-pool cost, and the break-even request rate above which warm pool pays for itself.</p>
+<p>Here is <code>code/main.py</code>, in 3 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>Phase</code>, <code>total_for_stack</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Cold-start mitigation path simulator — stdlib Python.
+
+Models a 70B model cold-start with different mitigation stacks:
+  RAW              : no mitigations (nominal baseline)
+  PRE_SEEDED       : + Bottlerocket pre-seeded node image
+  STREAMER         : + NVIDIA Run:ai Model Streamer
+  GPU_SNAPSHOT     : + Modal-style GPU snapshots
+  WARM_POOL        : min_workers=1 (no cold start at all on warm path)
+
+Reports per-layer seconds and totals. Also computes warm-pool break-even.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass
+class Phase:
+    name: str
+    raw_sec: float
+    pre_seeded_sec: float    # 0 if eliminated
+    streamer_sec: float      # replaces raw if streamer active
+    snapshot_sec: float      # replaces all if snapshot active
+
+
+PHASES_70B = [
+    Phase(&quot;node provision&quot;,   50.0, 50.0,  50.0,  0.5),
+    Phase(&quot;image pull&quot;,      180.0,  0.0, 180.0,  0.0),
+    Phase(&quot;weights to HBM&quot;,   75.0, 75.0,  35.0,  0.0),
+    Phase(&quot;engine init&quot;,      20.0, 20.0,  20.0,  2.0),
+    Phase(&quot;first forward&quot;,     3.0,  3.0,   3.0,  0.5),
+]
+
+
+def total_for_stack(stack: set[str]) -&gt; float:
+    seconds = 0.0
+    for phase in PHASES_70B:
+        if &quot;gpu_snapshot&quot; in stack:
+            seconds += phase.snapshot_sec
+        elif &quot;streamer&quot; in stack and &quot;pre_seeded&quot; in stack:
+            used = phase.pre_seeded_sec
+            if phase.name == &quot;weights to HBM&quot;:
+                used = phase.streamer_sec
+            seconds += used
+        elif &quot;pre_seeded&quot; in stack:
+            seconds += phase.pre_seeded_sec
+        elif &quot;streamer&quot; in stack:
+            seconds += phase.streamer_sec if phase.name == &quot;weights to HBM&quot; else phase.raw_sec
+        else:
+            seconds += phase.raw_sec
+    return seconds
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>report_stack</code>, <code>warm_pool_break_even</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def report_stack(label: str, stack: set[str]) -&gt; None:
+    total = total_for_stack(stack)
+    mins = total / 60
+    print(f&quot;{label:20}  {total:6.1f} s  ({mins:4.1f} min)  stack={sorted(stack) if stack else '{baseline}'}&quot;)
+
+
+def warm_pool_break_even(gpu_hourly: float, cold_seconds: float, sla_tolerated_drops_per_day: int) -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 80)
+    print(&quot;WARM POOL BREAK-EVEN&quot;)
+    print(&quot;=&quot; * 80)
+    print(f&quot;GPU cost: ${gpu_hourly:.2f}/hr  |  cold start: {cold_seconds:.0f}s  |  drop budget: {sla_tolerated_drops_per_day}/day\n&quot;)
+    warm_monthly = gpu_hourly * 24 * 30
+    print(f&quot;Warm pool (min_workers=1) monthly cost: ${warm_monthly:.2f}&quot;)
+    print()
+    print(f&quot;{'Req/hr':&gt;8}  {'Expected cold starts/day':&gt;24}  {'Drops over budget':&gt;20}  {'Warm better?':&gt;15}&quot;)
+    for rate in (1, 5, 10, 25, 50, 100, 250):
+        cold_starts_per_day = 24 / max(rate, 1) if rate &lt; 1 else 1
+        cold_starts_per_day = min(20, max(1, int(24 * 3600 / (rate * 3600))))
+        drops = cold_starts_per_day
+        warm_better = &quot;yes&quot; if drops &gt; sla_tolerated_drops_per_day else &quot;no&quot;
+        print(f&quot;{rate:&gt;8}  {cold_starts_per_day:&gt;24}  {max(0, drops - sla_tolerated_drops_per_day):&gt;20}  {warm_better:&gt;15}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 80)
+    print(&quot;COLD START MITIGATION: 70B model on fresh H100 node&quot;)
+    print(&quot;=&quot; * 80)
+    print(f&quot;{'Stack':20}  {'Total':&gt;8}             Stack composition&quot;)
+    print(&quot;-&quot; * 80)
+
+    report_stack(&quot;RAW&quot;,                      set())
+    report_stack(&quot;+ PRE_SEEDED&quot;,             {&quot;pre_seeded&quot;})
+    report_stack(&quot;+ STREAMER&quot;,               {&quot;streamer&quot;})
+    report_stack(&quot;+ PRE_SEEDED + STREAMER&quot;,  {&quot;pre_seeded&quot;, &quot;streamer&quot;})
+    report_stack(&quot;+ GPU_SNAPSHOT&quot;,           {&quot;gpu_snapshot&quot;})
+
+    print(&quot;\n(WARM_POOL avoids cold start entirely on the warm path; cost is 24x7 GPU rental)&quot;)
+
+    warm_pool_break_even(gpu_hourly=4.50, cold_seconds=328, sla_tolerated_drops_per_day=5)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">================================================================================
+COLD START MITIGATION: 70B model on fresh H100 node
+================================================================================
+Stack                    Total             Stack composition
+--------------------------------------------------------------------------------
+RAW                    328.0 s  ( 5.5 min)  stack={baseline}
++ PRE_SEEDED           148.0 s  ( 2.5 min)  stack=[&#x27;pre_seeded&#x27;]
++ STREAMER             288.0 s  ( 4.8 min)  stack=[&#x27;streamer&#x27;]
++ PRE_SEEDED + STREAMER   108.0 s  ( 1.8 min)  stack=[&#x27;pre_seeded&#x27;, &#x27;streamer&#x27;]
++ GPU_SNAPSHOT           3.0 s  ( 0.1 min)  stack=[&#x27;gpu_snapshot&#x27;]
+
+(WARM_POOL avoids cold start entirely on the warm path; cost is 24x7 GPU rental)
+
+================================================================================
+WARM POOL BREAK-EVEN
+================================================================================
+GPU cost: $4.50/hr  |  cold start: 328s  |  drop budget: 5/day
+
+Warm pool (min_workers=1) monthly cost: $3240.00
+
+  Req/hr  Expected cold starts/day     Drops over budget     Warm better?
+       1                        20                    15              yes
+       5                         4                     0               no
+      10                         2                     0               no
+      25                         1                     0               no
+      50                         1                     0               no
+     100                         1                     0               no
+     250                         1                     0               no</code></pre></div></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team gives every one of its 12 internal tools a warm replica on its own H100 to "fix cold starts". The cloud bill rises by $39,000 a month, and most tools get a few requests a day. What should they have done instead? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A raw 70B cold start is 3–8 minutes: node, image pull, weight load, engine init.</li>
+<li>Measure the anatomy, then fix the longest step first.</li>
+<li>Pre-seeded images, streaming, GPU snapshots and tiered loading each remove a step.</li>
+<li>Warm pools buy latency with 24×7 cost; give them to the paths whose users will not wait.</li>
+<li>Batch paths can scale to zero.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-gpu-kubernetes"><span class="t" style="--cs-hue:212">GP</span>Cheat sheet · Kubernetes GPU Autoscaling: Quick Reference</a><a href="#cs-managed-llm-platforms"><span class="t" style="--cs-hue:28">MN</span>Cheat sheet · Self-Hosting vs Managed LLM Platforms</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-cold-start-planner.md</code>. Given SLA, model size, and traffic shape, picks which mitigations to stack.</p>
+<p><strong><code>outputs/skill-cold-start-planner.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: cold-start-planner
+description: Pick and stack cold-start mitigations for serverless LLM deployments. Budget phases (node, image, weights, engine, first forward) and match mitigations to SLA.
+version: 1.0.0
+phase: 17
+lesson: 10
+tags: [cold-start, serverless, bottlerocket, model-streamer, gpu-snapshot, warm-pool, serverlessllm]
+---
+
+Given model size, SLA (TTFT P99), traffic shape (steady vs bursty), and budget posture, produce a cold-start mitigation plan.
+
+Produce:
+
+1. Cold-start budget. Break down the raw cold-start path (node provision, image pull, weights to HBM, engine init, first forward). Use 2026 nominal seconds for the stated model size.
+2. Layer selection. Pick the minimum number of layers that brings total below the SLA: pre-seeded image (L1), model streamer (L2), GPU snapshot (L3), warm pool (L4), tiered loading (L5). Justify each layer against the specific phase it attacks.
+3. Warm-pool sizing. State `min_workers` for the primary path. If SLA is TTFT P99 &lt; 60s on a 70B+ model, make warm pool mandatory regardless of cost.
+4. Cost estimate. Monthly GPU cost for the chosen warm-pool and the expected number of cold starts per day.
+5. Tail policy. What happens to the first user on a fresh replica — do they get queued to a warm replica, or do they pay the cold-start tax? Name a specific policy (e.g., &quot;route first request to any warm replica within 10s; fall through to cold&quot;).
+6. Failure mode. What happens if a warm replica dies mid-session. Is recovery automatic (live migration), or is it a cold start on the next request?
+
+Hard rejects:
+- Proposing &quot;just add warm pool&quot; without computing the monthly cost.
+- Claiming a mitigation without a specific phase it attacks (e.g., &quot;use Bottlerocket&quot; without saying it eliminates the 180s image pull).
+- Ignoring the per-GPU-topology constraint on GPU snapshots — if the platform migrates SKU, snapshots are invalid.
+
+Refusal rules:
+- If SLA is TTFT P99 &lt; 5s on a fresh 70B cold start with no warm pool, refuse — mathematically impossible at 2026 infrastructure speeds.
+- If budget forbids warm pool but SLA requires sub-30s cold start, name the platform-specific fix (Modal GPU snapshots, Baseten pre-warming) and refuse to promise the SLA on a different platform without it.
+- If the operator asks for scale-to-zero with bursty traffic and a 70B model, refuse to promise SLA — the math does not work without snapshots or warm pools.
+
+Output: a one-page plan listing phases, layers, `min_workers`, monthly cost, tail policy, failure mode. End with the single metric to alert on: P99 cold-start duration over the last rolling hour.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Compute the break-even request rate above which a warm replica is cheaper than paying the cold-start tax via extra request drops at SLO.</li>
+<li>You deploy a 13B model with P99 TTFT SLA of 3s. Pick the minimum mitigation stack (fewest layers) that achieves it.</li>
+<li>Bottlerocket pre-seeding eliminates image pull but weights still load from snapshot to HBM. Compute wall-clock for a 70B model if the snapshot-backed NVMe reads at 7 GB/s.</li>
+<li>Your serverless provider offers GPU snapshots (Modal) and your team refuses because "snapshots leak PII." Argue both sides — what is the realistic risk, and what is the mitigation (ephemeral snapshots, encryption, namespace isolation)?</li>
+<li>Design a tiered warm-pool policy: how many warm replicas for paid users, trial users, and batch workloads? Show the math.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1710-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Break-even request rate</span></summary><div class="qa-a"><p>In <code>code/main.py</code> the warm replica costs $3,240 a month. At 1 request an hour there are about 20 cold starts a day, 15 over the drop budget, so the warm replica wins; from about 5 requests an hour the model rarely goes cold and the drops stay within budget. The break-even sits between 1 and 5 requests an hour for this scale-down timer.</p></div></details>
+<details class="qa" id="a1710-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P3 · Weights from NVMe</span></summary><div class="qa-a"><p>70B in BF16 is 140 GB. At 7 GB/s: 140 / 7 = 20 s to read, plus GPU transfer and allocation, so roughly 25–30 s. In FP8 (70 GB) about 10–15 s. Streaming overlaps this with the first forward passes.</p></div></details>
+<details class="qa" id="a1710-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Twelve warm replicas</span></summary><div class="qa-a"><p>Most of those tools have long idle gaps, so a warm replica each is paid for and unused. Better: group the tools onto one shared server (several small models, or LoRA adapters on one base), keep one warm replica for the few latency-critical ones, and let the rest scale to zero with pre-seeded images and a GPU snapshot so their cold start is seconds, not minutes.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://modal.com/docs/guide/cold-start">Modal — Cold start performance</a> — Modal's published benchmarks and checkpoint architecture.</li>
+<li><a href="https://github.com/bottlerocket-os/bottlerocket">AWS Bottlerocket</a> — pre-seeded data volume snapshot pattern.</li>
+<li><a href="https://github.com/run-ai/runai-model-streamer">NVIDIA Run:ai Model Streamer</a> — overlap weights load with compute setup.</li>
+<li><a href="https://docs.baseten.co/deployment/autoscaling/cold-starts">Baseten — Cold starts</a> — pre-warming playbook.</li>
+<li><a href="https://www.usenix.org/conference/osdi24/presentation/fu">ServerlessLLM paper (USENIX OSDI'24)</a> — tiered loading design.</li>
+<li><a href="https://developer.nvidia.com/blog/deploying-disaggregated-llm-inference-workloads-on-kubernetes/">NVIDIA — Disaggregated LLM Inference on Kubernetes</a> — live migration for disaggregated deployments.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1710" id="done-a1710">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1710" id="undo-a1710" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1709"><span class="pn-dir">Previous</span><span class="pn-t">17.9 · Quantization in Production: AWQ, GPTQ, GGUF K-Quants, FP8 and MXFP4/NVFP4</span></a><a class="pn next" href="#a1711"><span class="pn-dir">Next</span><span class="pn-t">17.11 · KV Cache Locality and Multi-Region LLM Serving</span></a></div></footer>

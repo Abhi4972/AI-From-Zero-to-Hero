@@ -1,0 +1,415 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tool Use, MCP and Agent Protocols</a></nav><h1>Streaming and Parallel Tool Calls</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.3</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1303" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why <code>parallel_tool_calls: true</code> exists and when to disable it.</li>
+<li>Correlate streamed argument chunks to the right tool-call id during parallel fan-out.</li>
+<li>Reassemble partial <code>arguments</code> strings into complete JSON without parsing early.</li>
+<li>Run a three-city weather benchmark that demonstrates sequential vs parallel latency.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 13.2 (function calling deep dive)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, thread pool + streaming harness). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Three independent weather lookups serialized is three round trips. Run them in parallel and total time collapses to the slowest single call. Every frontier provider now emits multiple tool calls in a single turn. The payoff is real; the plumbing is subtle. This lesson walks both halves: the parallel fan-out and the streamed-argument reassembly, with emphasis on the id-correlation trap.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Parallel tool calls</td>
+<td>"Fan-out in one turn"</td>
+<td>Model emits multiple tool calls in a single assistant message</td>
+</tr>
+<tr>
+<td><code>parallel_tool_calls</code></td>
+<td>"OpenAI's flag"</td>
+<td>Enable or disable multi-call emission</td>
+</tr>
+<tr>
+<td><code>disable_parallel_tool_use</code></td>
+<td>"Anthropic's inverse"</td>
+<td>Opt-out flag; default is parallel enabled</td>
+</tr>
+<tr>
+<td>Tool call id</td>
+<td>"Correlation handle"</td>
+<td>Per-call identifier the result message must echo</td>
+</tr>
+<tr>
+<td>Accumulator</td>
+<td>"Stream buffer"</td>
+<td>Per-id string buffer for partial <code>arguments</code> chunks</td>
+</tr>
+<tr>
+<td>Out-of-order completion</td>
+<td>"Fastest first"</td>
+<td>Parallel calls finish in unpredictable order; ids are the glue</td>
+</tr>
+<tr>
+<td>Dependency graph</td>
+<td>"Ordering constraints"</td>
+<td>Tools whose outputs feed into inputs of other tools; cannot parallelize</td>
+</tr>
+<tr>
+<td>Parse-early trap</td>
+<td>"JSON.parse exploded"</td>
+<td>Attempting to parse an incomplete <code>arguments</code> string</td>
+</tr>
+<tr>
+<td><code>stream_function_call_arguments</code></td>
+<td>"Vertex AI option"</td>
+<td>Streams one call's arguments in <code>partial_args</code> pieces; not supported in the Gemini API</td>
+</tr>
+<tr>
+<td>Completion-order reply</td>
+<td>"Don't wait for all"</td>
+<td>Reply with results as they arrive, keyed by id</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>"What's the weather in Bengaluru, Tokyo and Zurich?" needs three tool calls. If the model asks for them one at a time, the program waits for each answer before the model asks for the next. Modern models can instead ask for all three in one turn (parallel tool calls), and the program runs them at the same time, so the wait is the slowest call, not the sum. Two things then need care. Every result must carry the id of the call it answers, because results come back in any order. And when the model's output streams in, each call's arguments arrive in small pieces that must be put back together before they can be parsed. This lesson streams a real 0.5B model that asks for three calls in one turn, runs each call as soon as it is complete, and reassembles interleaved argument pieces from OpenAI-style and Anthropic-style streams. No model is trained.</p></div></aside>
+<p>Without parallel calls, an agent answering "what is the weather in Bengaluru, Tokyo, and Zurich" does this:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Tokyo)
+host -&gt; run executor, reply with result
+LLM -&gt; call get_weather(Zurich)
+host -&gt; run executor, reply with result
+LLM -&gt; final text answer
+</code></pre></div>
+<p>Three LLM round trips, each of which also pays the executor latency. Roughly 4x the ideal wall-clock time.</p>
+<p>With parallel calls:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">user -&gt; LLM
+LLM -&gt; call get_weather(Bengaluru); call get_weather(Tokyo); call get_weather(Zurich)
+host -&gt; run all three executors concurrently, reply with three results
+LLM -&gt; final text answer
+</code></pre></div>
+<p>One LLM round trip. Executor time is the maximum of the three, not the sum. How much this saves depends on how many calls fan out and how slow they are; with several slow tools, it is most of the wait.</p>
+<p>The price is correlation complexity. When the three calls complete out of order, your results must carry the matching <code>tool_call_id</code> so the model can line them up. When results stream, you must assemble partial argument fragments into complete JSON before executing. Without ids, two parallel calls to the same tool can only be told apart by their order, which is fragile.</p>
+<h2>Idea 1 · Enabling parallel</h2>
+<ul>
+<li><strong>OpenAI.</strong> <code>parallel_tool_calls: true</code> on by default. Set <code>false</code> to force serial.</li>
+<li><strong>Anthropic.</strong> Parallel by default. Set <code>disable_parallel_tool_use: true</code> (inside <code>tool_choice</code>) for at most one call per turn.</li>
+<li><strong>Gemini.</strong> Always parallel-capable; <code>tool_config.function_calling_config.mode = "AUTO"</code> lets the model decide.</li>
+</ul>
+<p>Disable parallel when tools have ordering dependencies (<code>create_file</code> then <code>write_file</code>), when one call's output informs another's input, or when the rate limiter cannot handle fan-out.</p>
+<figure class="diagram mmfig" data-mmd="a1303" data-h="7c0aaef43e"><div class="dg-scroll"><svg class="dg mm" id="mm7c0aaef43e" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 591.703px; background-color: transparent;" viewBox="0 0 591.703125 555" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm7c0aaef43e{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm7c0aaef43e .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm7c0aaef43e .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm7c0aaef43e .error-icon{fill:#f4efe7;}#mm7c0aaef43e .error-text{fill:#0b1018;stroke:#0b1018;}#mm7c0aaef43e .edge-thickness-normal{stroke-width:1px;}#mm7c0aaef43e .edge-thickness-thick{stroke-width:3.5px;}#mm7c0aaef43e .edge-pattern-solid{stroke-dasharray:0;}#mm7c0aaef43e .edge-thickness-invisible{stroke-width:0;fill:none;}#mm7c0aaef43e .edge-pattern-dashed{stroke-dasharray:3;}#mm7c0aaef43e .edge-pattern-dotted{stroke-dasharray:2;}#mm7c0aaef43e .marker{fill:#6c6357;stroke:#6c6357;}#mm7c0aaef43e .marker.cross{stroke:#6c6357;}#mm7c0aaef43e svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm7c0aaef43e p{margin:0;}#mm7c0aaef43e .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm7c0aaef43e .cluster-label text{fill:#0b1018;}#mm7c0aaef43e .cluster-label span{color:#0b1018;}#mm7c0aaef43e .cluster-label span p{background-color:transparent;}#mm7c0aaef43e .label text,#mm7c0aaef43e span{fill:#211c16;color:#211c16;}#mm7c0aaef43e .node rect,#mm7c0aaef43e .node circle,#mm7c0aaef43e .node ellipse,#mm7c0aaef43e .node polygon,#mm7c0aaef43e .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm7c0aaef43e .rough-node .label text,#mm7c0aaef43e .node .label text,#mm7c0aaef43e .image-shape .label,#mm7c0aaef43e .icon-shape .label{text-anchor:middle;}#mm7c0aaef43e .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm7c0aaef43e .rough-node .label,#mm7c0aaef43e .node .label,#mm7c0aaef43e .image-shape .label,#mm7c0aaef43e .icon-shape .label{text-align:center;}#mm7c0aaef43e .node.clickable{cursor:pointer;}#mm7c0aaef43e .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm7c0aaef43e .arrowheadPath{fill:#0b0b0b;}#mm7c0aaef43e .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm7c0aaef43e .flowchart-link{stroke:#6c6357;fill:none;}#mm7c0aaef43e .edgeLabel{background-color:#ffffff;text-align:center;}#mm7c0aaef43e .edgeLabel p{background-color:#ffffff;}#mm7c0aaef43e .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm7c0aaef43e .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm7c0aaef43e .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm7c0aaef43e .cluster text{fill:#0b1018;}#mm7c0aaef43e .cluster span{color:#0b1018;}#mm7c0aaef43e div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm7c0aaef43e .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm7c0aaef43e rect.text{fill:none;stroke-width:0;}#mm7c0aaef43e .icon-shape,#mm7c0aaef43e .image-shape{background-color:#ffffff;text-align:center;}#mm7c0aaef43e .icon-shape p,#mm7c0aaef43e .image-shape p{background-color:#ffffff;padding:2px;}#mm7c0aaef43e .icon-shape .label rect,#mm7c0aaef43e .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm7c0aaef43e .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm7c0aaef43e .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm7c0aaef43e .node .neo-node{stroke:#b5521b;}#mm7c0aaef43e [data-look="neo"].node rect,#mm7c0aaef43e [data-look="neo"].cluster rect,#mm7c0aaef43e [data-look="neo"].node polygon{stroke:url(#mm7c0aaef43e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7c0aaef43e [data-look="neo"].swimlane.cluster rect{filter:none;}#mm7c0aaef43e [data-look="neo"].node path{stroke:url(#mm7c0aaef43e-gradient);stroke-width:1px;}#mm7c0aaef43e [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7c0aaef43e [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm7c0aaef43e [data-look="neo"].node circle{stroke:url(#mm7c0aaef43e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7c0aaef43e [data-look="neo"].node circle .state-start{fill:#000000;}#mm7c0aaef43e [data-look="neo"].icon-shape .icon{fill:url(#mm7c0aaef43e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7c0aaef43e [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm7c0aaef43e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7c0aaef43e :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm7c0aaef43e_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm7c0aaef43e_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M340.186,90.5L329.006,96.417C317.826,102.333,295.466,114.167,271.497,124.864C247.528,135.561,221.95,145.121,209.161,149.901L196.372,154.682" id="mm7c0aaef43e-L_M_C1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_C1_0" data-points="W3sieCI6MzQwLjE4NTgwNjM4MTExODksInkiOjkwLjV9LHsieCI6MjczLjEwNTQ2ODc1LCJ5IjoxMjZ9LHsieCI6MTkyLjYyNSwieSI6MTU2LjA4MjE1NTE0NDk5NjY4fV0=" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M385.86,90.5L382.187,96.417C378.514,102.333,371.167,114.167,367.494,123.583C363.82,133,363.82,140,363.82,143.5L363.82,147" id="mm7c0aaef43e-L_M_C2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_C2_0" data-points="W3sieCI6Mzg1Ljg2MDQxMzAyNDQ3NTUsInkiOjkwLjV9LHsieCI6MzYzLjgyMDMxMjUsInkiOjEyNn0seyJ4IjozNjMuODIwMzEyNSwieSI6MTUxfV0=" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M468.103,90.5L477.947,96.417C487.79,102.333,507.477,114.167,517.321,123.583C527.164,133,527.164,140,527.164,143.5L527.164,147" id="mm7c0aaef43e-L_M_C3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_C3_0" data-points="W3sieCI6NDY4LjEwMzQyMDAxNzQ4MjUsInkiOjkwLjV9LHsieCI6NTI3LjE2NDA2MjUsInkiOjEyNn0seyJ4Ijo1MjcuMTY0MDYyNSwieSI6MTUxfV0=" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M138,202L138,206.167C138,210.333,138,218.667,161.773,228.983C185.545,239.299,233.09,251.597,256.863,257.746L280.635,263.896" id="mm7c0aaef43e-L_C1_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C1_R_0" data-points="W3sieCI6MTM4LCJ5IjoyMDJ9LHsieCI6MTM4LCJ5IjoyMjd9LHsieCI6Mjg0LjUwNzgxMjUsInkiOjI2NC44OTczOTkzNzA1NDgyN31d" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M363.82,202L363.82,206.167C363.82,210.333,363.82,218.667,364.396,226.342C364.971,234.018,366.121,241.035,366.696,244.544L367.272,248.053" id="mm7c0aaef43e-L_C2_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C2_R_0" data-points="W3sieCI6MzYzLjgyMDMxMjUsInkiOjIwMn0seyJ4IjozNjMuODIwMzEyNSwieSI6MjI3fSx7IngiOjM2Ny45MTg2NzMxNTU3Mzc3LCJ5IjoyNTJ9XQ==" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M527.164,202L527.164,206.167C527.164,210.333,527.164,218.667,517.112,226.832C507.059,234.998,486.954,242.995,476.902,246.994L466.85,250.993" id="mm7c0aaef43e-L_C3_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C3_R_0" data-points="W3sieCI6NTI3LjE2NDA2MjUsInkiOjIwMn0seyJ4Ijo1MjcuMTY0MDYyNSwieSI6MjI3fSx7IngiOjQ2My4xMzI4MTI1LCJ5IjoyNTIuNDcxNTcxMjI0NzgwOTJ9XQ==" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M373.82,324L373.82,328.167C373.82,332.333,373.82,340.667,373.82,348.333C373.82,356,373.82,363,373.82,366.5L373.82,370" id="mm7c0aaef43e-L_R_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_B_0" data-points="W3sieCI6MzczLjgyMDMxMjUsInkiOjMyNH0seyJ4IjozNzMuODIwMzEyNSwieSI6MzQ5fSx7IngiOjM3My44MjAzMTI1LCJ5IjozNzR9XQ==" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M373.82,446L373.82,450.167C373.82,454.333,373.82,462.667,373.82,470.333C373.82,478,373.82,485,373.82,488.5L373.82,492" id="mm7c0aaef43e-L_B_M2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_M2_0" data-points="W3sieCI6MzczLjgyMDMxMjUsInkiOjQ0Nn0seyJ4IjozNzMuODIwMzEyNSwieSI6NDcxfSx7IngiOjM3My44MjAzMTI1LCJ5Ijo0OTZ9XQ==" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/><path d="M138,101L138,105.167C138,109.333,138,117.667,138,125.333C138,133,138,140,138,143.5L138,147" id="mm7c0aaef43e-L_S_C1_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_C1_0" data-points="W3sieCI6MTM4LCJ5IjoxMDF9LHsieCI6MTM4LCJ5IjoxMjZ9LHsieCI6MTM4LCJ5IjoxNTF9XQ==" data-look="classic" marker-end="url(#mm7c0aaef43e_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_M_C1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_C2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_M_C3_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C1_R_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C2_R_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_C3_R_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_R_B_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_B_M2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_S_C1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm7c0aaef43e-flowchart-M-0" data-look="classic" transform="translate(408.2109375, 54.5)"><rect class="basic label-container" style="" x="-90.2109375" y="-36" width="180.421875" height="72"/><g class="label" style="" transform="translate(-60.2109375, -21)"><rect/><foreignObject width="120.421875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>One assistant turn<br />emits three calls</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-C1-1" data-look="classic" transform="translate(138, 176.5)"><rect class="basic label-container" style="" x="-54.625" y="-25.5" width="109.25" height="51"/><g class="label" style="" transform="translate(-24.625, -10.5)"><rect/><foreignObject width="49.25" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>call id_1</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-C2-3" data-look="classic" transform="translate(363.8203125, 176.5)"><rect class="basic label-container" style="" x="-56.8046875" y="-25.5" width="113.609375" height="51"/><g class="label" style="" transform="translate(-26.8046875, -10.5)"><rect/><foreignObject width="53.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>call id_2</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-C3-5" data-look="classic" transform="translate(527.1640625, 176.5)"><rect class="basic label-container" style="" x="-56.5390625" y="-25.5" width="113.078125" height="51"/><g class="label" style="" transform="translate(-26.5390625, -10.5)"><rect/><foreignObject width="53.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>call id_3</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-R-7" data-look="classic" transform="translate(373.8203125, 288)"><rect class="basic label-container" style="" x="-89.3125" y="-36" width="178.625" height="72"/><g class="label" style="" transform="translate(-59.3125, -21)"><rect/><foreignObject width="118.625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Run concurrently<br />finish in any order</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-B-13" data-look="classic" transform="translate(373.8203125, 410)"><rect class="basic label-container" style="" x="-91.4140625" y="-36" width="182.828125" height="72"/><g class="label" style="" transform="translate(-61.4140625, -21)"><rect/><foreignObject width="122.828125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Reply: every result<br />carries its call id</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-M2-15" data-look="classic" transform="translate(373.8203125, 521.5)"><rect class="basic label-container" style="" x="-84.921875" y="-25.5" width="169.84375" height="51"/><g class="label" style="" transform="translate(-54.921875, -10.5)"><rect/><foreignObject width="109.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Model continues</p></span></div></foreignObject></g></g><g class="node default" id="mm7c0aaef43e-flowchart-S-16" data-look="classic" transform="translate(138, 54.5)"><rect class="basic label-container" style="" x="-130" y="-46.5" width="260" height="93"/><g class="label" style="" transform="translate(-100, -31.5)"><rect/><foreignObject width="200" height="63"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Streaming: arguments arrive in pieces;<br />parse only when complete</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm7c0aaef43e-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm7c0aaef43e-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm7c0aaef43e-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<h2>Idea 2 · Id correlation</h2>
+<p>Every call the model emits has an <code>id</code>. Every result the host returns must include the same id. Without this, results are ambiguous.</p>
+<ul>
+<li><strong>OpenAI.</strong> <code>tool_call_id</code> on each tool-role message.</li>
+<li><strong>Anthropic.</strong> <code>tool_use_id</code> on each <code>tool_result</code> block.</li>
+<li><strong>Gemini.</strong> <code>id</code> on each <code>functionResponse</code>, matching the <code>id</code> of its <code>functionCall</code>. Open models served without ids (Qwen's chat template, for example) match results to calls by order, which is exactly the fragility ids remove.</li>
+</ul>
+<h2>Idea 3 · Running calls concurrently</h2>
+<p>The host runs each call's executor on its own thread, coroutine, or remote worker. The simplest harness uses a thread pool; production uses asyncio with <code>asyncio.gather</code> or structured concurrency. Order of completion is unpredictable — the id is the identifier.</p>
+<p>One common bug: reply with results in call-list order instead of completion order. This usually works because the model only cares about <code>tool_call_id</code>, but if a result is dropped or duplicated, a reply list that is reordered away from the order the results arrived in makes the gap harder to find in logs. Prefer to reply in completion order with explicit ids.</p>
+<h2>Idea 4 · Streaming tool calls</h2>
+<p>When the model streams, <code>arguments</code> arrive in pieces. Three separate streams of chunks for three parallel calls interleave on the wire. You need one accumulator per id.</p>
+<p>Shape by provider:</p>
+<ul>
+<li><strong>OpenAI.</strong> Each chunk is <code>choices[0].delta.tool_calls[i].function.arguments</code> (partial string). The chunk carries <code>index</code> (position in the call list). You accumulate per-index, read <code>id</code> when it first appears, and parse JSON when <code>finish_reason = "tool_calls"</code>.</li>
+<li><strong>Anthropic.</strong> Stream events are <code>message_start</code>, then one <code>content_block_start</code> per block with type <code>tool_use</code> (containing id, name, empty input). <code>content_block_delta</code> events carry <code>input_json_delta</code> chunks. <code>content_block_stop</code> closes each block.</li>
+<li><strong>Gemini.</strong> Each function call normally arrives whole within the stream. Streaming one call's arguments in pieces (<code>stream_function_call_arguments</code>, returned in <code>partial_args</code>) is a Vertex AI option that the Gemini API does not support.</li>
+</ul>
+<h2>Idea 5 · Partial JSON and the parse-early trap</h2>
+<p>You cannot parse <code>arguments</code> until it is complete. Partial JSON such as <code>{"city": "Beng</code> is not valid and will raise. The correct gate is the provider's end-of-call signal: OpenAI's <code>finish_reason = "tool_calls"</code>, Anthropic's <code>content_block_stop</code>, or Gemini's stream-end event. Only then attempt <code>json.loads</code>. A more robust approach uses an incremental JSON parser that yields events as structure completes; OpenAI's streaming guide recommends this for UX that shows a live "thinking" indicator. Brace-counting is unreliable as a completeness test (braces inside quoted strings or escaped content cause false positives) and should only be used as an informal debug heuristic.</p>
+<h2>Idea 6 · Out-of-order completion</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">call_A: fast API, returns first
+call_B: slow API, returns second
+call_C: median API, returns third
+</code></pre></div>
+<p>The host reply must still cite the ids:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[{role: &quot;tool&quot;, tool_call_id: &quot;call_A&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_B&quot;, content: ...},
+ {role: &quot;tool&quot;, tool_call_id: &quot;call_C&quot;, content: ...}]
+</code></pre></div>
+<p>Order in the reply does not matter for correctness on OpenAI or Anthropic. Gemini accepts any order so long as ids match.</p>
+<h2>Idea 7 · Benchmark: sequential vs parallel</h2>
+<p>The harness in <code>code/main.py</code> simulates three executors with 400, 600, and 800 ms latency. Sequential runs it in 1800 ms total. Parallel runs it in max(400, 600, 800) = 800 ms. The difference is constant, not proportional, so the savings grow with tool count.</p>
+<p>Real-world caveat: parallel calls stress downstream APIs. A 10-way fan-out to a rate-limited service will fail. Phase 13 · 17 covers gateway-level backpressure; retry semantics are planned for a future phase.</p>
+<h2>Idea 8 · Streaming fan-out wall-clock</h2>
+<p>If the model itself streams, you can start executing as soon as one call's arguments are complete, rather than waiting for all calls to finalize. This is an optimization OpenAI documents but not all SDKs expose. The harness in this lesson does it: as soon as the simulated stream yields a complete argument object, the host kicks off that call.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tp-parallel-fanout"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>Let call <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span> have executor latency <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, let one model turn take <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">g</span></span></span></span> to generate, and let <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> be the moment call <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6595em;"></span><span class="mord mathnormal">i</span></span></span></span>'s arguments are complete in the stream (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.786em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">g</span></span></span></span>).</p>
+<p><strong>One call per turn</strong> (no parallelism), with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> calls: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">seq</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.104em;vertical-align:-0.2997em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8043em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mrel mtight">=</span><span class="mord mtight">1</span></span></span></span><span style="top:-3.2029em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">n</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">final</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>One turn, calls run in parallel after the stream ends:</strong> <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">par</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7333em;vertical-align:-0.15em;"></span><span class="mop"><span class="mop">max</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">final</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>.</p>
+<p><strong>One turn, each call dispatched as soon as it is complete in the stream:</strong>
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">stream</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.8777em;vertical-align:-0.7277em;"></span><span class="mop">max</span><span class="mspace" style="margin-right:-0.1667em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="delimsizing size2">(</span></span><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3723em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7277em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.8em;vertical-align:-0.65em;"></span><span class="mord"><span class="mord mathnormal">e</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord"><span class="delimsizing size2">)</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">g</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">final</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>Completeness test.</strong> A prefix <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> of an argument string is safe to parse only after the provider's end-of-call signal; <code>json.loads(b)</code> succeeding earlier, or braces balancing, does not prove the string is finished.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Three cities, three ways</div><div class="co-body"><p>Executor latencies 0.4, 0.6 and 0.8 s, as in the run below.
+- Parallel tools after the stream: the slowest call, 0.8 s, instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.4</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.6</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.8</span></span></span></span> s one after another. Saved: 1.0 s.
+- Dispatch on completion: in the run, the three calls complete in the stream at about 2.6, 4.7 and 6.9 s. Their results are ready at about 3.0, 5.3 and 7.7 s, so only the last call's 0.8 s extends past the stream.
+- One call per turn would add two more model turns, each with a prefill and a generated call: with about 2 s per call on this CPU, roughly 4 s or more, plus the tool waits.
+- So on a slow model, parallel calls save mostly model turns; on a fast model with slow tools, they save mostly tool time.</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Parallel tool calls mean the model generates the calls simultaneously."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The model writes them one after another in one turn; the host runs them at the same time.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Results must go back in the order of the calls."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Any order works when each result carries its call's id.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "When the braces balance, the arguments are complete."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Braces inside strings fool that test; wait for the end-of-call signal.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Parallel is always better."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Not when one call depends on another's result, or when fan-out overwhelms a rate-limited API.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 0.5B open model is asked for the weather in three cities, and its output is streamed. Will it ask for all three in one turn? If each call is started the moment it appears in the stream, how much of the 1.8 s of total tool latency will the user still wait for? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Parallel calls from a real model, dispatched while it streams</div><div class="co-body"><p>Qwen2.5-0.5B-Instruct streams its reply through <code>TextIteratorStreamer</code>. The host watches the text, and the moment a <code>&lt;tool_call&gt;</code> block closes it parses the call and submits it to a thread pool. The weather executors sleep 0.4, 0.6 and 0.8 s to stand in for real APIs. Then all results go back and the model writes the final answer. Timing depends on the machine, so the block is not run on this page; the output below was recorded from a run of exactly this code on a 2-core CPU.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, re, time, threading, torch
+from concurrent.futures import ThreadPoolExecutor
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer, logging
+logging.set_verbosity_error(); torch.manual_seed(0)
+
+M = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(M); model = AutoModelForCausalLM.from_pretrained(M).eval()
+LATENCY = {&quot;Bengaluru&quot;: 0.4, &quot;Tokyo&quot;: 0.6, &quot;Zurich&quot;: 0.8}       # seconds each weather API takes
+TEMP = {&quot;Bengaluru&quot;: 28, &quot;Tokyo&quot;: 12, &quot;Zurich&quot;: 4}
+def get_weather(city, units=&quot;celsius&quot;):
+    time.sleep(LATENCY.get(city, 0.5))
+    return {&quot;city&quot;: city, &quot;temp&quot;: TEMP.get(city, 20)}
+spec = [{&quot;type&quot;: &quot;function&quot;, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot;, &quot;description&quot;: &quot;Current temperature in one city.&quot;,
+         &quot;parameters&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {&quot;city&quot;: {&quot;type&quot;: &quot;string&quot;}}, &quot;required&quot;: [&quot;city&quot;]}}}]
+msgs = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the weather in Bengaluru, Tokyo and Zurich?&quot;}]
+ids = tok.apply_chat_template(msgs, tools=spec, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+
+# Stream the model's output; dispatch each call the moment its &lt;tool_call&gt; block closes.
+streamer = TextIteratorStreamer(tok, skip_prompt=True, skip_special_tokens=False)
+threading.Thread(target=model.generate, kwargs=dict(input_ids=ids, max_new_tokens=150, do_sample=False,
+                                                     streamer=streamer)).start()
+pool, futures, buf, t0, n_chunks = ThreadPoolExecutor(8), {}, &quot;&quot;, time.time(), 0
+for piece in streamer:
+    buf += piece; n_chunks += 1
+    while (m := re.search(r&quot;&lt;tool_call&gt;\s*(\{.*?\})\s*&lt;/tool_call&gt;&quot;, buf, re.S)):
+        call = json.loads(m.group(1)); buf = buf[m.end():]
+        cid = f&quot;call_{len(futures)}&quot;
+        futures[cid] = (call, time.time() - t0, pool.submit(get_weather, **call[&quot;arguments&quot;]))
+        print(f&quot;{time.time() - t0:5.2f}s  {cid} complete in the stream -&gt; dispatched {call['arguments']}&quot;)
+t_stream = time.time() - t0
+print(f&quot;{t_stream:5.2f}s  stream ended ({n_chunks} text chunks)&quot;)
+for cid, (call, t_disp, fut) in futures.items():
+    res = fut.result()
+    print(f&quot;{time.time() - t0:5.2f}s  {cid} result {res}  (dispatched at {t_disp:.2f}s)&quot;)
+t_par = time.time() - t0
+
+print(f&quot;\none turn with {len(futures)} parallel calls, overlapped with generation: {t_par:.2f}s total&quot;)
+lat = [LATENCY[c[0]['arguments']['city']] for c in futures.values()]
+print(f&quot;tools run one after another after the stream: {t_stream:.2f} + {sum(lat):.1f} = {t_stream + sum(lat):.2f}s&quot;)
+print(f&quot;tools run in parallel after the stream:       {t_stream:.2f} + {max(lat):.1f} = {t_stream + max(lat):.2f}s&quot;)
+
+# Observe: one assistant turn with all calls, then one tool message per call (any order, ids attached).
+calls_text = &quot;\n&quot;.join(f&quot;&lt;tool_call&gt;\n{json.dumps(c)}\n&lt;/tool_call&gt;&quot; for c, _, _ in futures.values())
+msgs += [{&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: calls_text}] + \
+        [{&quot;role&quot;: &quot;tool&quot;, &quot;content&quot;: json.dumps(f.result())} for _, _, f in futures.values()]
+ids = tok.apply_chat_template(msgs, tools=spec, add_generation_prompt=True, return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+t1 = time.time()
+with torch.no_grad():
+    out = model.generate(ids, max_new_tokens=80, do_sample=False)
+print(f&quot;\nfinal answer after {time.time() - t1:.1f}s more: {tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)}&quot;)
+</code></pre></div>
+<p><strong>Recorded output</strong> (2-core CPU):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext"> 2.61s  call_0 complete in the stream -&gt; dispatched {'city': 'Bengaluru'}
+ 4.72s  call_1 complete in the stream -&gt; dispatched {'city': 'Tokyo'}
+ 6.85s  call_2 complete in the stream -&gt; dispatched {'city': 'Zurich'}
+ 6.85s  stream ended (67 text chunks)
+ 6.85s  call_0 result {'city': 'Bengaluru', 'temp': 28}  (dispatched at 2.61s)
+ 6.85s  call_1 result {'city': 'Tokyo', 'temp': 12}  (dispatched at 4.72s)
+ 7.65s  call_2 result {'city': 'Zurich', 'temp': 4}  (dispatched at 6.85s)
+
+one turn with 3 parallel calls, overlapped with generation: 7.65s total
+tools run one after another after the stream: 6.85 + 1.8 = 8.65s
+tools run in parallel after the stream:       6.85 + 0.8 = 7.65s
+
+final answer after 5.9s more: The current temperatures in these cities are as follows:
+
+- In Bengaluru: The current temperature is 28 degrees Celsius.
+- In Tokyo: The current temperature is 12 degrees Celsius.
+- In Zurich: The current temperature is 4 degrees Celsius.
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The model asked for all three cities in one turn.</strong> Three <code>&lt;tool_call&gt;</code> blocks came out of a single generation. Each took about 2 seconds of generation on this CPU, so the calls completed in the stream at about 2.6, 4.7 and 6.9 s.</p>
+<p><strong>Each call started while the model was still writing.</strong> Bengaluru's call was dispatched at 2.6 s and its 0.4 s of tool time was over long before the stream ended; the same for Tokyo. Only Zurich's call, the last one written, ran after the stream: its 0.8 s is the only tool time the user waited for (7.65 s in total).</p>
+<p><strong>Compared with the alternatives:</strong> running the three tools one after another after the stream would have taken 8.65 s, and running them in parallel after the stream 7.65 s, the same as here because the last call was also the slowest. With a slow first call, dispatching mid-stream would win clearly.</p>
+<p><strong>Qwen's template has no call ids.</strong> The results went back as three <code>tool</code> messages in call order, and the model matched them by position, correctly this time. Provider APIs attach ids so that order stops mattering. The final answer then took another 5.9 s of generation: on a slow model, model turns dominate, which is why one turn with three calls beats three turns.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Reassembling interleaved argument pieces</div><div class="co-body"><p>Three calls' argument strings are cut into pieces and interleaved on one stream, in the exact <code>chat.completion.chunk</code> format of the OpenAI SDK (validated by its <code>ChatCompletionChunk</code> model). One accumulator per index rebuilds them. Then the same pieces show why brace counting and early <code>json.loads</code> are unreliable. Last, an Anthropic <code>tool_use</code> block streamed as start, <code>input_json_delta</code> pieces and stop, validated by the Anthropic SDK's event types. Instant.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, random
+from pydantic import TypeAdapter
+from openai.types.chat import ChatCompletionChunk
+from anthropic.types import RawMessageStreamEvent
+
+# Three parallel calls, their argument strings cut into small pieces and interleaved on one stream,
+# exactly as OpenAI's chat.completion.chunk deltas carry them (index = position in the call list).
+calls = [(&quot;call_A&quot;, '{&quot;city&quot;: &quot;Bengaluru&quot;}'), (&quot;call_B&quot;, '{&quot;city&quot;: &quot;Tokyo&quot;, &quot;note&quot;: &quot;say \\&quot;}\\&quot; twice&quot;}'),
+         (&quot;call_C&quot;, '{&quot;city&quot;: &quot;Zurich&quot;}')]
+pieces = []
+for i, (cid, args) in enumerate(calls):
+    cuts = [0] + sorted(random.Random(i).sample(range(1, len(args)), 3)) + [len(args)]
+    parts = [args[a:b] for a, b in zip(cuts, cuts[1:])]
+    pieces.append([(i, cid if k == 0 else None, p) for k, p in enumerate(parts)])
+order = []                                           # round-robin: A1 B1 C1 A2 B2 ...
+while any(pieces):
+    for q in pieces:
+        if q: order.append(q.pop(0))
+chunks = [ChatCompletionChunk.model_validate({&quot;id&quot;: &quot;x&quot;, &quot;object&quot;: &quot;chat.completion.chunk&quot;, &quot;created&quot;: 0, &quot;model&quot;: &quot;m&quot;,
+          &quot;choices&quot;: [{&quot;index&quot;: 0, &quot;finish_reason&quot;: None, &quot;delta&quot;: {&quot;tool_calls&quot;: [{&quot;index&quot;: i, &quot;id&quot;: cid,
+          &quot;type&quot;: &quot;function&quot; if cid else None, &quot;function&quot;: {&quot;name&quot;: &quot;get_weather&quot; if cid else None, &quot;arguments&quot;: p}}]}}]})
+          for i, cid, p in order]
+print(f&quot;{len(chunks)} chunks on the wire, interleaved: &quot; + &quot; &quot;.join(f&quot;{c.choices[0].delta.tool_calls[0].index}&quot;
+                                                                   for c in chunks))
+
+acc = {}                                             # one accumulator per index (the id appears only once)
+for c in chunks:
+    d = c.choices[0].delta.tool_calls[0]
+    a = acc.setdefault(d.index, {&quot;id&quot;: None, &quot;args&quot;: &quot;&quot;})
+    a[&quot;id&quot;] = a[&quot;id&quot;] or d.id
+    a[&quot;args&quot;] += d.function.arguments
+# finish_reason &quot;tool_calls&quot; arrives last: only now is every argument string known to be complete.
+print(&quot;\nafter finish_reason = 'tool_calls':&quot;)
+for i, a in sorted(acc.items()):
+    print(f&quot;  index {i}  id {a['id']}  args {json.loads(a['args'])}&quot;)
+
+# The parse-early trap and the brace-counting trap, on call_B's pieces.
+b = &quot;&quot;
+for _, cid, p in [x for x in order if x[0] == 1]:
+    b += p
+    depth = b.count(&quot;{&quot;) - b.count(&quot;}&quot;)
+    try:
+        json.loads(b); verdict = &quot;valid JSON&quot;
+    except json.JSONDecodeError as e:
+        verdict = f&quot;JSONDecodeError ({e.msg})&quot;
+    print(f&quot;\n  call_B so far: {b!r}\n    brace count says {'complete' if depth == 0 else 'incomplete'}; json.loads: {verdict}&quot;,
+          end=&quot;&quot;)
+print()
+
+# Anthropic streams each tool_use block as start -&gt; input_json_delta pieces -&gt; stop, one block at a time.
+events = [{&quot;type&quot;: &quot;content_block_start&quot;, &quot;index&quot;: 1, &quot;content_block&quot;: {&quot;type&quot;: &quot;tool_use&quot;, &quot;id&quot;: &quot;toolu_1&quot;,
+           &quot;name&quot;: &quot;get_weather&quot;, &quot;input&quot;: {}}}] + \
+         [{&quot;type&quot;: &quot;content_block_delta&quot;, &quot;index&quot;: 1, &quot;delta&quot;: {&quot;type&quot;: &quot;input_json_delta&quot;, &quot;partial_json&quot;: p}}
+          for p in ('{&quot;ci', 'ty&quot;: &quot;Tok', 'yo&quot;}')] + [{&quot;type&quot;: &quot;content_block_stop&quot;, &quot;index&quot;: 1}]
+blocks = {}
+for e in (TypeAdapter(RawMessageStreamEvent).validate_python(x) for x in events):
+    if e.type == &quot;content_block_start&quot;:
+        blocks[e.index] = {&quot;id&quot;: e.content_block.id, &quot;json&quot;: &quot;&quot;}
+    elif e.type == &quot;content_block_delta&quot;:
+        blocks[e.index][&quot;json&quot;] += e.delta.partial_json
+    elif e.type == &quot;content_block_stop&quot;:
+        print(f&quot;\nAnthropic block {e.index} stopped -&gt; {blocks[e.index]['id']} {json.loads(blocks[e.index]['json'])}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">12 chunks on the wire, interleaved: 0 1 2 0 1 2 0 1 2 0 1 2
+
+after finish_reason = &#x27;tool_calls&#x27;:
+  index 0  id call_A  args {&#x27;city&#x27;: &#x27;Bengaluru&#x27;}
+  index 1  id call_B  args {&#x27;city&#x27;: &#x27;Tokyo&#x27;, &#x27;note&#x27;: &#x27;say &quot;}&quot; twice&#x27;}
+  index 2  id call_C  args {&#x27;city&#x27;: &#x27;Zurich&#x27;}
+
+  call_B so far: &#x27;{&quot;cit&#x27;
+    brace count says incomplete; json.loads: JSONDecodeError (Unterminated string starting at)
+  call_B so far: &#x27;{&quot;city&quot;: &#x27;
+    brace count says incomplete; json.loads: JSONDecodeError (Expecting value)
+  call_B so far: &#x27;{&quot;city&quot;: &quot;Tokyo&quot;, &quot;note&quot;: &quot;say \\&quot;}\\&quot; &#x27;
+    brace count says complete; json.loads: JSONDecodeError (Unterminated string starting at)
+  call_B so far: &#x27;{&quot;city&quot;: &quot;Tokyo&quot;, &quot;note&quot;: &quot;say \\&quot;}\\&quot; twice&quot;}&#x27;
+    brace count says incomplete; json.loads: valid JSON
+
+Anthropic block 1 stopped -&gt; toolu_1 {&#x27;city&#x27;: &#x27;Tokyo&#x27;}</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The pieces arrive interleaved.</strong> The 12 chunks alternate between calls 0, 1 and 2, as parallel calls can on OpenAI's stream. The call id appears only in each call's first chunk; later chunks carry only the <code>index</code>. One accumulator per index, filled until <code>finish_reason</code> says the calls are done, rebuilds all three argument objects exactly, including the awkward <code>"say \"}\" twice"</code>.</p>
+<p><strong>Brace counting is wrong in both directions.</strong> On call B's pieces, after <code>{"city": "Tokyo", "note": "say \"}\"</code> the braces balance, so a brace counter says "complete", but the string is unfinished and <code>json.loads</code> fails. On the final, complete string the counter says "incomplete", because the <code>}</code> inside the quoted text unbalanced it. Only the provider's end-of-call signal is reliable.</p>
+<p><strong>Anthropic streams one block at a time.</strong> The <code>tool_use</code> block opens with its id and name, its <code>input_json_delta</code> pieces build <code>{"city": "Tokyo"}</code>, and <code>content_block_stop</code> marks the moment it is safe to parse.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> has two halves. The first runs three simulated weather calls sequentially and in parallel using <code>concurrent.futures.ThreadPoolExecutor</code> and prints wall-clock time. The second half replays a fake streaming response — chunks of <code>arguments</code> for three parallel calls interleaved on one stream — and reassembles them per-id with <code>StreamAccumulator</code>. No LLM, no network, just the reassembly logic.</p>
+<p>What to look at:</p>
+<ul>
+<li>The sequential timer hits 1.8 seconds. The parallel timer hits 0.8 seconds on the same fake latencies.</li>
+<li>The accumulator handles chunks arriving out of order by buffering per-id and parsing only when each call's JSON is complete.</li>
+<li>The executor kicks off as soon as an id's arguments finalize, not after all streams end.</li>
+</ul>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An agent has two tools, <code>create_file(path)</code> and <code>write_file(path, text)</code>, and the model emits both in one turn for the same new file. The host runs them in parallel. What can happen, and what should the host or the API settings do about it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Parallel calls are on by default</strong> in the OpenAI, Anthropic and Gemini APIs; each offers a switch to turn them off (<code>parallel_tool_calls: false</code>, <code>disable_parallel_tool_use: true</code>).</li>
+<li><strong>Streamed tool arguments</strong>: OpenAI sends <code>function.arguments</code> deltas per call index (and <code>response.function_call_arguments.delta</code> events in the Responses API); Anthropic sends <code>input_json_delta</code> events per content block; the SDKs' stream helpers reassemble them for you.</li>
+<li><strong>Async executors</strong> (<code>asyncio.gather</code>, task groups) are the usual way to run a fan-out; agent SDKs such as the OpenAI Agents SDK and LangGraph's <code>ToolNode</code> run parallel calls concurrently.</li>
+<li><strong>Open models</strong> on a laptop (Qwen2.5 and Qwen3, Llama 3.2) can emit several calls in one turn through their chat templates, as shown here; serving stacks such as vLLM and llama.cpp parse them into OpenAI-style <code>tool_calls</code> with ids.</li>
+</ul>
+<p>Sources: <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use">Claude parallel tool use</a>, <a href="https://platform.openai.com/docs/guides/function-calling">OpenAI function calling</a>, <a href="https://docs.anthropic.com/en/api/messages-streaming">Anthropic streaming</a>, <a href="https://ai.google.dev/gemini-api/docs/function-calling">Gemini function calling</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Parallel calls: one model turn, several calls, run at the same time.</li>
+<li>Results can come back in any order; the id ties each to its call.</li>
+<li>Streamed arguments arrive in pieces, interleaved by call: one buffer per call.</li>
+<li>Parse only after the end-of-call signal; brace counting is not a test.</li>
+<li>Keep dependent or rate-limited tools sequential.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-tool-calling"><span class="t" style="--cs-hue:30">TC</span>Cheat sheet · Function Calling and Structured Outputs</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-parallel-call-safety-check.md</code>. Given a tool registry, the skill audits which tools are safe to parallelize, which have ordering dependencies, and which would overwhelm downstream rate limits — returning a revised registry with per-tool <code>parallel_safe</code> flags.</p>
+<p><strong><code>outputs/skill-parallel-call-safety-check.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: parallel-call-safety-check
+description: Audit a tool registry for safe parallelization. Mark each tool parallel_safe, note ordering dependencies, and flag downstream rate-limit risk.
+version: 1.0.0
+phase: 13
+lesson: 03
+tags: [parallel-tool-calls, streaming, correlation, rate-limits]
+---
+
+Given a tool registry (list of tools with names, descriptions, and executors), return an annotated copy with `parallel_safe: bool`, `ordering_deps: [tool_name]`, and `rate_limit_group: name` fields added.
+
+Produce:
+
+1. Per-tool classification. For each tool, decide: safe to run in parallel within the same turn (pure reads, different resources); unsafe (mutations, shared resources, external rate limits).
+2. Dependency graph. Identify pairs where one tool's output should feed another's input. Cannot parallelize within a turn. Mark with `ordering_deps`.
+3. Rate-limit grouping. Tools that hit the same downstream API share a group. Host should cap per-group concurrency, not per-tool.
+4. Safety recommendations. For each unsafe tool, state whether to disable parallel for that turn, queue, or shard by resource.
+5. Provider-specific flags. Recommend `parallel_tool_calls=false` on OpenAI or `disable_parallel_tool_use=true` on Anthropic when any unsafe tool is in the set.
+
+Hard rejects:
+- Any registry with no classification after the audit. Default-deny; unknown means unsafe.
+- Any write-path tool on a shared resource marked `parallel_safe: true`. Race conditions.
+- Any tool that hits a rate-limited external API without a `rate_limit_group`.
+
+Refusal rules:
+- If asked to mark all tools parallel-safe without inspection, refuse.
+- If the registry includes consequential tools on the same resource (`delete_file` and `write_file` on the same path), refuse to parallelize and direct to Phase 14 · 09 for sandbox-level serialization.
+- If the user argues that their tools never race, refuse and ask for the proof (tests, logs, or a formal argument). Racing happens silently in production.
+
+Output: a revised registry as a JSON blob with the three new fields per tool, followed by a short summary naming the highest-risk parallelization choice and the recommended mitigation. End with a suggested `tool_choice` override for the current turn.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Run <code>code/main.py</code> and vary the simulated latencies. Confirm that the parallel-to-sequential ratio is approximately <code>max/sum</code> (real runs deviate slightly from the ideal because of thread scheduling, serialization, and harness overhead). At what latency distribution does parallel stop mattering?</p>
+</li>
+<li>
+<p>Extend the accumulator to handle a "call was cancelled mid-stream" case by dropping its buffer and emitting a <code>cancelled</code> event. What provider documents this case explicitly? Check Anthropic's <code>content_block_stop</code> semantics and OpenAI's <code>finish_reason: "length"</code> behavior.</p>
+</li>
+<li>
+<p>Replace the thread pool with <code>asyncio.gather</code>. Benchmark both. You should see small wins on async because of lower context-switch cost, but only if executors do real I/O.</p>
+</li>
+<li>
+<p>Pick two tools that should NOT parallelize (e.g. <code>create_file</code> then <code>write_file</code>). Add an <code>ordering_dependency</code> graph to the registry and gate the parallel fan-out on that graph. This is the minimum machinery for dependency-aware scheduling, which a future agent-engineering phase formalizes.</p>
+</li>
+<li>
+<p>Read OpenAI's parallel-function-calling section and Anthropic's <code>disable_parallel_tool_use</code> docs. Identify the one real-world tool type where Anthropic recommends disabling parallelism. (Hint: consequential mutations on the same resource.)</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1303-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · All three in one turn; only the last call's wait remains</span></summary><div class="qa-a"><p>Yes: the model wrote three <code>&lt;tool_call&gt;</code> blocks in one turn. Dispatching each as soon as it appeared hid the first two calls' tool time inside the model's own generation, so of the 1.8 s of total tool latency the user waited only for Zurich's 0.8 s, because that call came last in the stream.</p>
+<p>On this CPU the model's generation (about 2 s per call, about 6 s for the final answer) costs far more than the tools. That is the stronger argument for parallel calls here: one model turn instead of three.</p></div></details>
+<details class="qa" id="a1303-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A race on the same file</span></summary><div class="qa-a"><p>Run in parallel, the two calls race. If <code>write_file</code> runs first, it may fail because the file does not exist yet, or create the file itself and then have <code>create_file</code> truncate or reject it. The outcome depends on thread timing, so it changes from run to run: the worst kind of bug to debug.</p>
+<p>What to do:</p>
+<ul>
+<li><strong>Declare the dependency</strong>: mark tools that touch the same resource as not parallel-safe, and have the host run calls on the same resource in the order the model wrote them.</li>
+<li><strong>Turn off parallel calls for such agents</strong>: <code>parallel_tool_calls: false</code> on OpenAI, <code>disable_parallel_tool_use: true</code> on Anthropic, so the model issues one call, sees the result, then issues the next.</li>
+<li><strong>Design better tools</strong>: one <code>write_file(path, text, create=True)</code> removes the dependency altogether.</li>
+</ul></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://platform.openai.com/docs/guides/function-calling#parallel-function-calling">OpenAI — Parallel function calling</a> — default behavior and the opt-out flag</li>
+<li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use">Anthropic — Parallel tool use</a> — <code>disable_parallel_tool_use</code> and result batching</li>
+<li><a href="https://ai.google.dev/gemini-api/docs/function-calling">Google — Gemini function calling parallel section</a> — id-correlated parallel calls from Gemini 3</li>
+<li><a href="https://platform.openai.com/docs/api-reference/responses-streaming">OpenAI — Streaming responses with tools</a> — chunked argument reassembly for OpenAI streams</li>
+<li><a href="https://docs.anthropic.com/en/api/messages-streaming">Anthropic — Streaming messages</a> — <code>content_block_delta</code> with <code>input_json_delta</code></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1303" id="done-a1303">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1303" id="undo-a1303" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1302"><span class="pn-dir">Previous</span><span class="pn-t">13.2 · Function Calling across OpenAI, Anthropic and Gemini</span></a><a class="pn next" href="#a1304"><span class="pn-dir">Next</span><span class="pn-t">13.4 · Structured Outputs with JSON Schema, Pydantic, Zod and Constrained Decoding</span></a></div></footer>

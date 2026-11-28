@@ -1,0 +1,814 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-11">Phase 11 · LLM Engineering and Applications</a></nav><h1>Context Engineering: Token Budgets, Memory and Retrieval</h1><div class="m-meta"><span class="chip chip-num">Lesson 11.14</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1105" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Calculate token budgets across all context window components (system prompt, tools, history, retrieved docs, generation headroom)</li>
+<li>Implement context window management strategies: truncation, summarization, and sliding window for conversation history</li>
+<li>Prioritize and order context components to maximize the model's attention on the most relevant information</li>
+<li>Build a context assembler that dynamically allocates tokens based on query type and available window space</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 10 (Build an LLM from Scratch), Lessons 11.10 to 11.11</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Prompt engineering is a subset. Context engineering is the whole game. A prompt is a string you type. Context is everything that goes into the model's window: system instructions, retrieved documents, tool definitions, conversation history, few-shot examples, and the prompt itself. The best AI engineers in 2026 are context engineers. They decide what goes in, what stays out, and in what order.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Context window</td>
+<td>"How much the model can read"</td>
+<td>The maximum number of tokens (input + output) the model can attend to in one request -- about 1M for the current Claude, GPT and Gemini flagships, 32K for the small open model used in this lesson</td>
+</tr>
+<tr>
+<td>Context engineering</td>
+<td>"Advanced prompt engineering"</td>
+<td>The discipline of deciding what goes into the context window, in what order, and at what priority -- encompasses retrieval, compression, tool selection, and memory management</td>
+</tr>
+<tr>
+<td>Lost-in-the-middle</td>
+<td>"Models forget stuff in the middle"</td>
+<td>Empirical finding that LLMs use information at the beginning and end of the context better than in the middle; 22 points lower for GPT-3.5-Turbo with 20 documents in the original study</td>
+</tr>
+<tr>
+<td>Token budget</td>
+<td>"How many tokens you have left"</td>
+<td>An explicit allocation of context window capacity across components (system prompt, tools, history, retrieval, generation) with per-component limits</td>
+</tr>
+<tr>
+<td>Dynamic context</td>
+<td>"Loading stuff on the fly"</td>
+<td>Assembling the context window differently for each query based on intent classification, relevant tool selection, and retrieval results</td>
+</tr>
+<tr>
+<td>History summarization</td>
+<td>"Compressing the conversation"</td>
+<td>Replacing verbatim old conversation turns with a concise summary, reducing token cost while preserving key information</td>
+</tr>
+<tr>
+<td>Tool pruning</td>
+<td>"Only including relevant tools"</td>
+<td>Classifying query intent and only including tool definitions that match, reducing tool token cost by 60-80%</td>
+</tr>
+<tr>
+<td>Long-term memory</td>
+<td>"Remembering across sessions"</td>
+<td>Facts and preferences stored in a database and retrieved at session start -- CLAUDE.md, ChatGPT Memory, and similar systems</td>
+</tr>
+<tr>
+<td>Episodic memory</td>
+<td>"Remembering specific past events"</td>
+<td>Past interactions stored as embeddings and retrieved when the current query is similar to a past conversation</td>
+</tr>
+<tr>
+<td>Generation budget</td>
+<td>"Room for the answer"</td>
+<td>Tokens reserved for the model's output -- if the context fills the window completely, the model has no room to respond</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Everything a model knows about your request has to be in its context window: instructions, tool definitions, retrieved documents, the conversation so far, and room for the answer. The window is large but not free: every token costs money and time on every call, and models use long contexts unevenly, finding facts at the start and end more reliably than in the middle. Context engineering is deciding what goes in, in what order, and what gets summarised or left out. This lesson builds a token budget, a reordering step, a history compressor and a tool selector, then measures two things on real models: how wrong the usual "words × 1.3" token estimate is for code, JSON and other languages, and where in a long context a 0.5B model can still find a fact. No model is trained.</p></div></aside>
+<p>Claude Opus 5.5 has a 1M token window. OpenAI's GPT-6.2 models take 1.05M, Google's Gemini 4 Argon 1M, and some open models advertise more. These numbers sound enormous until you fill them, and pay for them on every call.</p>
+<p>Here is a real breakdown for a coding assistant. System prompt: 500 tokens. Tool definitions for 50 tools: 8,000 tokens. Retrieved documentation: 4,000 tokens. Conversation history (10 turns): 6,000 tokens. Current user query: 200 tokens. Generation budget (max output): 4,000 tokens. Total: 22,700 tokens. That is only 18% of a 128K window.</p>
+<p>But attention does not scale linearly with context length. A model with 128K tokens of context pays quadratic attention cost (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> in vanilla transformers, though most production models use efficient attention variants). More importantly, retrieval accuracy degrades. The "Needle in a Haystack" test shows that models struggle to find information placed in the middle of long contexts. Research by Liu et al. (2023) showed that models answer best when the relevant information sits at the start or end of a long context and worst when it sits in the middle: for GPT-3.5-Turbo with 20 documents, 75.8% with the answer document first, 53.8% with it in the middle and 63.2% with it last. The effect varies by model and has shrunk in newer long-context models, but performance still falls as contexts fill up with distractors, so test your own model at your own lengths.</p>
+<p>The practical lesson: having 200K tokens available does not mean using 200K tokens is effective. A carefully curated 10K token context often outperforms a dumped 100K token context. Context engineering is the discipline of maximizing signal-to-noise ratio within the context window.</p>
+<p>Every token you put in the window displaces a token that could carry more relevant information. Every irrelevant tool definition, every stale conversation turn, every chunk of retrieved text that does not answer the question -- each one makes the model slightly worse at the task.</p>
+<h2>Idea 1 · The Context Window is a Scarce Resource</h2>
+<p>Think of the context window as RAM, not disk. It is fast and directly accessible, but limited. You cannot fit everything. You must choose.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm83a4b097ef" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 284.922px; background-color: transparent;" viewBox="0 0 284.921875 1045" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm83a4b097ef{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm83a4b097ef .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm83a4b097ef .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm83a4b097ef .error-icon{fill:#f4efe7;}#mm83a4b097ef .error-text{fill:#0b1018;stroke:#0b1018;}#mm83a4b097ef .edge-thickness-normal{stroke-width:1px;}#mm83a4b097ef .edge-thickness-thick{stroke-width:3.5px;}#mm83a4b097ef .edge-pattern-solid{stroke-dasharray:0;}#mm83a4b097ef .edge-thickness-invisible{stroke-width:0;fill:none;}#mm83a4b097ef .edge-pattern-dashed{stroke-dasharray:3;}#mm83a4b097ef .edge-pattern-dotted{stroke-dasharray:2;}#mm83a4b097ef .marker{fill:#6c6357;stroke:#6c6357;}#mm83a4b097ef .marker.cross{stroke:#6c6357;}#mm83a4b097ef svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm83a4b097ef p{margin:0;}#mm83a4b097ef .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm83a4b097ef .cluster-label text{fill:#0b1018;}#mm83a4b097ef .cluster-label span{color:#0b1018;}#mm83a4b097ef .cluster-label span p{background-color:transparent;}#mm83a4b097ef .label text,#mm83a4b097ef span{fill:#211c16;color:#211c16;}#mm83a4b097ef .node rect,#mm83a4b097ef .node circle,#mm83a4b097ef .node ellipse,#mm83a4b097ef .node polygon,#mm83a4b097ef .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm83a4b097ef .rough-node .label text,#mm83a4b097ef .node .label text,#mm83a4b097ef .image-shape .label,#mm83a4b097ef .icon-shape .label{text-anchor:middle;}#mm83a4b097ef .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm83a4b097ef .rough-node .label,#mm83a4b097ef .node .label,#mm83a4b097ef .image-shape .label,#mm83a4b097ef .icon-shape .label{text-align:center;}#mm83a4b097ef .node.clickable{cursor:pointer;}#mm83a4b097ef .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm83a4b097ef .arrowheadPath{fill:#0b0b0b;}#mm83a4b097ef .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm83a4b097ef .flowchart-link{stroke:#6c6357;fill:none;}#mm83a4b097ef .edgeLabel{background-color:#ffffff;text-align:center;}#mm83a4b097ef .edgeLabel p{background-color:#ffffff;}#mm83a4b097ef .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm83a4b097ef .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm83a4b097ef .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm83a4b097ef .cluster text{fill:#0b1018;}#mm83a4b097ef .cluster span{color:#0b1018;}#mm83a4b097ef div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm83a4b097ef .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm83a4b097ef rect.text{fill:none;stroke-width:0;}#mm83a4b097ef .icon-shape,#mm83a4b097ef .image-shape{background-color:#ffffff;text-align:center;}#mm83a4b097ef .icon-shape p,#mm83a4b097ef .image-shape p{background-color:#ffffff;padding:2px;}#mm83a4b097ef .icon-shape .label rect,#mm83a4b097ef .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm83a4b097ef .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm83a4b097ef .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm83a4b097ef .node .neo-node{stroke:#b5521b;}#mm83a4b097ef [data-look="neo"].node rect,#mm83a4b097ef [data-look="neo"].cluster rect,#mm83a4b097ef [data-look="neo"].node polygon{stroke:url(#mm83a4b097ef-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm83a4b097ef [data-look="neo"].swimlane.cluster rect{filter:none;}#mm83a4b097ef [data-look="neo"].node path{stroke:url(#mm83a4b097ef-gradient);stroke-width:1px;}#mm83a4b097ef [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm83a4b097ef [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm83a4b097ef [data-look="neo"].node circle{stroke:url(#mm83a4b097ef-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm83a4b097ef [data-look="neo"].node circle .state-start{fill:#000000;}#mm83a4b097ef [data-look="neo"].icon-shape .icon{fill:url(#mm83a4b097ef-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm83a4b097ef [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm83a4b097ef-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm83a4b097ef :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm83a4b097ef_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm83a4b097ef_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm83a4b097ef_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mm83a4b097ef-Window" data-look="classic"><rect style="" x="8" y="8" width="268.921875" height="1029"/><g class="cluster-label" transform="translate(40.6171875, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Context</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Window</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> (128K</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> tokens)</tspan></tspan></text></g></g></g></g><g class="edgePaths"><path d="M142.461,117.5L142.461,123.75C142.461,130,142.461,142.5,142.461,154.333C142.461,166.167,142.461,177.333,142.461,182.917L142.461,188.5" id="mm83a4b097ef-L_S_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_T_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjExNy41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5IjoxNTV9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjE5Mi41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/><path d="M142.461,264.5L142.461,270.75C142.461,277,142.461,289.5,142.461,301.333C142.461,313.167,142.461,324.333,142.461,329.917L142.461,335.5" id="mm83a4b097ef-L_T_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_T_R_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjI2NC41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5IjozMDJ9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjMzOS41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/><path d="M142.461,411.5L142.461,417.75C142.461,424,142.461,436.5,142.461,448.333C142.461,460.167,142.461,471.333,142.461,476.917L142.461,482.5" id="mm83a4b097ef-L_R_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_H_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjQxMS41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5Ijo0NDl9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjQ4Ni41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/><path d="M142.461,558.5L142.461,564.75C142.461,571,142.461,583.5,142.461,595.333C142.461,607.167,142.461,618.333,142.461,623.917L142.461,629.5" id="mm83a4b097ef-L_H_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_F_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjU1OC41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5Ijo1OTZ9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjYzMy41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/><path d="M142.461,705.5L142.461,711.75C142.461,718,142.461,730.5,142.461,742.333C142.461,754.167,142.461,765.333,142.461,770.917L142.461,776.5" id="mm83a4b097ef-L_F_Q_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_Q_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjcwNS41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5Ijo3NDN9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjc4MC41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/><path d="M142.461,852.5L142.461,858.75C142.461,865,142.461,877.5,142.461,889.333C142.461,901.167,142.461,912.333,142.461,917.917L142.461,923.5" id="mm83a4b097ef-L_Q_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_G_0" data-points="W3sieCI6MTQyLjQ2MDkzNzUsInkiOjg1Mi41fSx7IngiOjE0Mi40NjA5Mzc1LCJ5Ijo4OTB9LHsieCI6MTQyLjQ2MDkzNzUsInkiOjkyNy41fV0=" data-look="classic" marker-end="url(#mm83a4b097ef_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_S_T_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_T_R_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_R_H_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_H_F_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_F_Q_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q_G_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm83a4b097ef-flowchart-S-0" data-look="classic" transform="translate(142.4609375, 81.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#e94560 !important" x="-80.421875" y="-36" width="160.84375" height="72"/><g class="label" style="color:#fff !important" transform="translate(-50.421875, -21)"><rect/><foreignObject width="100.84375" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>System Prompt<br />~500 tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-T-1" data-look="classic" transform="translate(142.4609375, 228.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#0f3460 !important" x="-81.296875" y="-36" width="162.59375" height="72"/><g class="label" style="color:#fff !important" transform="translate(-51.296875, -21)"><rect/><foreignObject width="102.59375" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Tool Definitions<br />~2K-8K tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-R-3" data-look="classic" transform="translate(142.4609375, 375.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#ffa500 !important" x="-89.1328125" y="-36" width="178.265625" height="72"/><g class="label" style="color:#fff !important" transform="translate(-59.1328125, -21)"><rect/><foreignObject width="118.265625" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Retrieved Context<br />~2K-10K tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-H-5" data-look="classic" transform="translate(142.4609375, 522.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-99.4609375" y="-36" width="198.921875" height="72"/><g class="label" style="color:#fff !important" transform="translate(-69.4609375, -21)"><rect/><foreignObject width="138.921875" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Conversation History<br />~2K-20K tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-F-7" data-look="classic" transform="translate(142.4609375, 669.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#9b59b6 !important" x="-94.8984375" y="-36" width="189.796875" height="72"/><g class="label" style="color:#fff !important" transform="translate(-64.8984375, -21)"><rect/><foreignObject width="129.796875" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Few-shot Examples<br />~1K-3K tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-Q-9" data-look="classic" transform="translate(142.4609375, 816.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#e94560 !important" x="-86.6015625" y="-36" width="173.203125" height="72"/><g class="label" style="color:#fff !important" transform="translate(-56.6015625, -21)"><rect/><foreignObject width="113.203125" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>User Query<br />~100-500 tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm83a4b097ef-flowchart-G-11" data-look="classic" transform="translate(142.4609375, 963.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#0f3460 !important" x="-92.046875" y="-36" width="184.09375" height="72"/><g class="label" style="color:#fff !important" transform="translate(-62.046875, -21)"><rect/><foreignObject width="124.09375" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Generation Budget<br />~2K-8K tokens</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mm83a4b097ef-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm83a4b097ef-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm83a4b097ef-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>Each component competes for space. Adding more tool definitions means less room for conversation history. Adding more retrieved context means less room for few-shot examples. Context engineering is the art of allocating this budget to maximize task performance.</p>
+<h2>Idea 2 · Lost-in-the-Middle</h2>
+<p>The most important empirical finding in context engineering. Models attend better to information at the beginning and end of the context. Information in the middle gets lower attention scores and is more likely to be ignored.</p>
+<p>Liu et al. (2023) tested this systematically. They placed the document containing the answer among 20 documents at various positions and measured answer accuracy. For GPT-3.5-Turbo it was 75.8% with the document first, 63.2% with it last and 53.8% with it in the middle (position 10), below the 56.1% the model scored with no documents at all.</p>
+<p>This has direct engineering implications:</p>
+<ul>
+<li>Put the most important information first (system prompt, critical instructions)</li>
+<li>Put the current query and most relevant context last (recency bias helps)</li>
+<li>Treat the middle of the context as the lowest-priority zone</li>
+<li>If you must include information in the middle, duplicate the key point at the end</li>
+</ul>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm3daa279ece" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 268.771px; background-color: transparent;" viewBox="0 0 268.771484375 709" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm3daa279ece{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm3daa279ece .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm3daa279ece .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm3daa279ece .error-icon{fill:#f4efe7;}#mm3daa279ece .error-text{fill:#0b1018;stroke:#0b1018;}#mm3daa279ece .edge-thickness-normal{stroke-width:1px;}#mm3daa279ece .edge-thickness-thick{stroke-width:3.5px;}#mm3daa279ece .edge-pattern-solid{stroke-dasharray:0;}#mm3daa279ece .edge-thickness-invisible{stroke-width:0;fill:none;}#mm3daa279ece .edge-pattern-dashed{stroke-dasharray:3;}#mm3daa279ece .edge-pattern-dotted{stroke-dasharray:2;}#mm3daa279ece .marker{fill:#6c6357;stroke:#6c6357;}#mm3daa279ece .marker.cross{stroke:#6c6357;}#mm3daa279ece svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm3daa279ece p{margin:0;}#mm3daa279ece .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm3daa279ece .cluster-label text{fill:#0b1018;}#mm3daa279ece .cluster-label span{color:#0b1018;}#mm3daa279ece .cluster-label span p{background-color:transparent;}#mm3daa279ece .label text,#mm3daa279ece span{fill:#211c16;color:#211c16;}#mm3daa279ece .node rect,#mm3daa279ece .node circle,#mm3daa279ece .node ellipse,#mm3daa279ece .node polygon,#mm3daa279ece .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm3daa279ece .rough-node .label text,#mm3daa279ece .node .label text,#mm3daa279ece .image-shape .label,#mm3daa279ece .icon-shape .label{text-anchor:middle;}#mm3daa279ece .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm3daa279ece .rough-node .label,#mm3daa279ece .node .label,#mm3daa279ece .image-shape .label,#mm3daa279ece .icon-shape .label{text-align:center;}#mm3daa279ece .node.clickable{cursor:pointer;}#mm3daa279ece .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm3daa279ece .arrowheadPath{fill:#0b0b0b;}#mm3daa279ece .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm3daa279ece .flowchart-link{stroke:#6c6357;fill:none;}#mm3daa279ece .edgeLabel{background-color:#ffffff;text-align:center;}#mm3daa279ece .edgeLabel p{background-color:#ffffff;}#mm3daa279ece .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm3daa279ece .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm3daa279ece .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm3daa279ece .cluster text{fill:#0b1018;}#mm3daa279ece .cluster span{color:#0b1018;}#mm3daa279ece div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm3daa279ece .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm3daa279ece rect.text{fill:none;stroke-width:0;}#mm3daa279ece .icon-shape,#mm3daa279ece .image-shape{background-color:#ffffff;text-align:center;}#mm3daa279ece .icon-shape p,#mm3daa279ece .image-shape p{background-color:#ffffff;padding:2px;}#mm3daa279ece .icon-shape .label rect,#mm3daa279ece .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm3daa279ece .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm3daa279ece .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm3daa279ece .node .neo-node{stroke:#b5521b;}#mm3daa279ece [data-look="neo"].node rect,#mm3daa279ece [data-look="neo"].cluster rect,#mm3daa279ece [data-look="neo"].node polygon{stroke:url(#mm3daa279ece-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm3daa279ece [data-look="neo"].swimlane.cluster rect{filter:none;}#mm3daa279ece [data-look="neo"].node path{stroke:url(#mm3daa279ece-gradient);stroke-width:1px;}#mm3daa279ece [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm3daa279ece [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm3daa279ece [data-look="neo"].node circle{stroke:url(#mm3daa279ece-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm3daa279ece [data-look="neo"].node circle .state-start{fill:#000000;}#mm3daa279ece [data-look="neo"].icon-shape .icon{fill:url(#mm3daa279ece-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm3daa279ece [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm3daa279ece-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm3daa279ece :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm3daa279ece_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm3daa279ece_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm3daa279ece_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0.0419921875, 0)"><g class="clusters"><g class="cluster" id="mm3daa279ece-Attention" data-look="classic"><rect style="" x="7.9580078125" y="8" width="252.771484375" height="693"/><g class="cluster-label" transform="translate(11.9580078125, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Attention</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Distribution</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Across</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Context</tspan></tspan></text></g></g></g></g><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="node default" id="mm3daa279ece-flowchart-P1-0" data-look="classic" transform="translate(134.34375, 89.5)"><rect class="basic label-container" style="fill:#51cf66 !important" x="-84.546875" y="-46.5" width="169.09375" height="93"/><g class="label" style="color:#000 !important" transform="translate(-54.546875, -31.5)"><rect/><foreignObject width="109.09375" height="63"><div style="color: rgb(0, 0, 0) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#000 !important" class="nodeLabel"><p>Position 0-20%<br />HIGH attention<br />(system prompt)</p></span></div></foreignObject></g></g><g class="node default" id="mm3daa279ece-flowchart-P2-1" data-look="classic" transform="translate(134.34375, 222)"><rect class="basic label-container" style="fill:#ffa500 !important" x="-86.03125" y="-36" width="172.0625" height="72"/><g class="label" style="color:#000 !important" transform="translate(-56.03125, -21)"><rect/><foreignObject width="112.0625" height="42"><div style="color: rgb(0, 0, 0) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#000 !important" class="nodeLabel"><p>Position 20-40%<br />MODERATE</p></span></div></foreignObject></g></g><g class="node default" id="mm3daa279ece-flowchart-P3-2" data-look="classic" transform="translate(134.34375, 354.5)"><rect class="basic label-container" style="fill:#ff6b6b !important" x="-85.453125" y="-46.5" width="170.90625" height="93"/><g class="label" style="color:#fff !important" transform="translate(-55.453125, -31.5)"><rect/><foreignObject width="110.90625" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Position 40-70%<br />LOW attention<br />(lost in middle)</p></span></div></foreignObject></g></g><g class="node default" id="mm3daa279ece-flowchart-P4-3" data-look="classic" transform="translate(134.34375, 487)"><rect class="basic label-container" style="fill:#ffa500 !important" x="-85.4296875" y="-36" width="170.859375" height="72"/><g class="label" style="color:#000 !important" transform="translate(-55.4296875, -21)"><rect/><foreignObject width="110.859375" height="42"><div style="color: rgb(0, 0, 0) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#000 !important" class="nodeLabel"><p>Position 70-90%<br />MODERATE</p></span></div></foreignObject></g></g><g class="node default" id="mm3daa279ece-flowchart-P5-4" data-look="classic" transform="translate(134.34375, 619.5)"><rect class="basic label-container" style="fill:#51cf66 !important" x="-88.84375" y="-46.5" width="177.6875" height="93"/><g class="label" style="color:#000 !important" transform="translate(-58.84375, -31.5)"><rect/><foreignObject width="117.6875" height="63"><div style="color: rgb(0, 0, 0) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#000 !important" class="nodeLabel"><p>Position 90-100%<br />HIGH attention<br />(current query)</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mm3daa279ece-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm3daa279ece-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm3daa279ece-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<h2>Idea 3 · Context Components</h2>
+<p><strong>System prompt</strong>: sets the persona, constraints, and behavioral rules. This goes first and stays constant across turns. Coding agents and assistants ship many thousands of tokens of instructions and tool definitions. Keep it tight: every word in the system prompt is sent again on every API call (prompt caching, Lesson 11.26, makes the repeats cheaper, not free).</p>
+<p><strong>Tool definitions</strong>: each tool adds 50-200 tokens (name, description, parameter schema). 50 tools at 150 tokens each is 7,500 tokens before any conversation happens. Dynamic tool selection -- only including tools relevant to the current query -- can reduce this by 60-80%.</p>
+<p><strong>Retrieved context</strong>: documents from a vector database, search results, file contents. The quality of retrieval directly determines the quality of the response. Bad retrieval is worse than no retrieval -- it fills the window with noise and actively misleads the model.</p>
+<p><strong>Conversation history</strong>: every previous user message and assistant response. Grows linearly with conversation length. A 50-turn conversation at 200 tokens per turn is 10,000 tokens of history. Most of it is irrelevant to the current query.</p>
+<p><strong>Few-shot examples</strong>: input/output pairs that demonstrate the desired behavior. Two to three well-chosen examples often improve output quality more than thousands of tokens of instructions. But they cost space.</p>
+<p><strong>Generation budget</strong>: the tokens reserved for the model's response. If you fill the window to capacity, the model has no room to answer. Reserve at least 2,000-4,000 tokens for generation.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>The budget.</strong> With a window of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span></span></span></span> tokens and a reserve <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span></span></span></span> for the answer, the components must fit:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">system</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">tools</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">retrieved</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">history</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">examples</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9694em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">query</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">W</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>What a token of context costs at inference.</strong> Every token in the window is stored in the KV cache of every layer:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">KV bytes per token</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">head</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">b</span><span class="mpunct">,</span></span></span></span></span></div>
+for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> layers, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">h</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> key-value heads of size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8444em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">d</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">head</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> bytes per number (keys and values: the factor 2). Prefill attention work grows with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span></span></span></span></span></span></span></span> for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> prompt tokens, so doubling the context roughly doubles the per-token cost of reading it.</p>
+<p><strong>Billing.</strong> Input cost per request <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>: whatever you put in the window you pay for again on every call.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Qwen2.5-0.5B, and the lesson&#x27;s coding-assistant budget</div><div class="co-body"><ul>
+<li>KV cache per token: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">24</span><span class="mord text"><span class="mord"> layers</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7778em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mord text"><span class="mord"> heads</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">64</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">2</span><span class="mord text"><span class="mord"> bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">12</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">288</span></span></span></span> bytes, 12 KB. A full 32,768-token context: 384 MiB per sequence.</li>
+<li>The lesson's budget: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">500</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">8</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">6</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">200</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">4</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">22</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">700</span></span></span></span> tokens, 17.7% of 128K.</li>
+<li>Measured below, one realistic tool definition is 131 Qwen tokens, so 50 tools are 6,550 tokens, sent on every request: over 3 million tokens a day at 500 requests.</li>
+<li>Sending only 5 relevant tools saves 5,895 tokens per request, 90% of the tool budget.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A 1M-token window means 1M tokens of context are equally useful."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Accuracy falls as relevant facts get buried among distractors; a short, relevant context often wins.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Tokens are about 1.3 per word."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> For English prose, roughly. Code, JSON, logs and many languages take far more (measured below); count with the model's own tokenizer.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Put the most important document in the middle so the model sees it in context."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Put it first or last; the middle is where models miss things.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>A 0.5B model must find one value among 75 key-value pairs (about 1,400 tokens). Will its accuracy depend on where the pair sits, and if so, will the middle be worst? (Solution P1.)</p></div></aside>
+<h2>Idea 4 · Context Compression Strategies</h2>
+<p><strong>History summarization</strong>: instead of keeping all previous turns verbatim, periodically summarize the conversation. "We discussed X, decided Y, and the user wants Z" in 100 tokens replaces 10 turns that took 2,000 tokens. Run summarization when history exceeds a threshold (e.g., 5,000 tokens).</p>
+<p><strong>Relevance filtering</strong>: score each retrieved document against the current query and drop documents below a threshold. If you retrieved 10 chunks but only 3 are relevant, discard the other 7. Better to have 3 highly relevant chunks than 10 mediocre ones.</p>
+<p><strong>Tool pruning</strong>: classify the user's query intent and only include tools relevant to that intent. A code question does not need calendar tools. A scheduling question does not need file system tools. This can reduce tool definitions from 8,000 tokens to 1,000.</p>
+<p><strong>Recursive summarization</strong>: for very long documents, summarize in stages. First summarize each section, then summarize the summaries. A 50-page document becomes a 500-token digest that captures the key points.</p>
+<h2>Idea 5 · Memory Systems</h2>
+<p>Context engineering spans three time horizons.</p>
+<p><strong>Short-term memory</strong>: the current conversation. Stored in the context window directly. Grows with each turn. Managed by summarization and truncation.</p>
+<p><strong>Long-term memory</strong>: facts and preferences that persist across conversations. "The user prefers TypeScript." "The project uses PostgreSQL." Stored in a database, retrieved on session start. Claude Code stores this in CLAUDE.md files. ChatGPT stores it in its memory feature.</p>
+<p><strong>Episodic memory</strong>: specific past interactions that might be relevant. "Last Tuesday, we debugged a similar issue in the auth module." Stored as embeddings, retrieved when the current conversation matches a past episode.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm1c8515b667" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 929.5px; background-color: transparent;" viewBox="0 0 929.5 407" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm1c8515b667{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm1c8515b667 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm1c8515b667 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm1c8515b667 .error-icon{fill:#f4efe7;}#mm1c8515b667 .error-text{fill:#0b1018;stroke:#0b1018;}#mm1c8515b667 .edge-thickness-normal{stroke-width:1px;}#mm1c8515b667 .edge-thickness-thick{stroke-width:3.5px;}#mm1c8515b667 .edge-pattern-solid{stroke-dasharray:0;}#mm1c8515b667 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm1c8515b667 .edge-pattern-dashed{stroke-dasharray:3;}#mm1c8515b667 .edge-pattern-dotted{stroke-dasharray:2;}#mm1c8515b667 .marker{fill:#6c6357;stroke:#6c6357;}#mm1c8515b667 .marker.cross{stroke:#6c6357;}#mm1c8515b667 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm1c8515b667 p{margin:0;}#mm1c8515b667 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm1c8515b667 .cluster-label text{fill:#0b1018;}#mm1c8515b667 .cluster-label span{color:#0b1018;}#mm1c8515b667 .cluster-label span p{background-color:transparent;}#mm1c8515b667 .label text,#mm1c8515b667 span{fill:#211c16;color:#211c16;}#mm1c8515b667 .node rect,#mm1c8515b667 .node circle,#mm1c8515b667 .node ellipse,#mm1c8515b667 .node polygon,#mm1c8515b667 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm1c8515b667 .rough-node .label text,#mm1c8515b667 .node .label text,#mm1c8515b667 .image-shape .label,#mm1c8515b667 .icon-shape .label{text-anchor:middle;}#mm1c8515b667 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm1c8515b667 .rough-node .label,#mm1c8515b667 .node .label,#mm1c8515b667 .image-shape .label,#mm1c8515b667 .icon-shape .label{text-align:center;}#mm1c8515b667 .node.clickable{cursor:pointer;}#mm1c8515b667 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm1c8515b667 .arrowheadPath{fill:#0b0b0b;}#mm1c8515b667 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm1c8515b667 .flowchart-link{stroke:#6c6357;fill:none;}#mm1c8515b667 .edgeLabel{background-color:#ffffff;text-align:center;}#mm1c8515b667 .edgeLabel p{background-color:#ffffff;}#mm1c8515b667 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm1c8515b667 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm1c8515b667 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm1c8515b667 .cluster text{fill:#0b1018;}#mm1c8515b667 .cluster span{color:#0b1018;}#mm1c8515b667 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm1c8515b667 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm1c8515b667 rect.text{fill:none;stroke-width:0;}#mm1c8515b667 .icon-shape,#mm1c8515b667 .image-shape{background-color:#ffffff;text-align:center;}#mm1c8515b667 .icon-shape p,#mm1c8515b667 .image-shape p{background-color:#ffffff;padding:2px;}#mm1c8515b667 .icon-shape .label rect,#mm1c8515b667 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm1c8515b667 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm1c8515b667 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm1c8515b667 .node .neo-node{stroke:#b5521b;}#mm1c8515b667 [data-look="neo"].node rect,#mm1c8515b667 [data-look="neo"].cluster rect,#mm1c8515b667 [data-look="neo"].node polygon{stroke:url(#mm1c8515b667-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm1c8515b667 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm1c8515b667 [data-look="neo"].node path{stroke:url(#mm1c8515b667-gradient);stroke-width:1px;}#mm1c8515b667 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm1c8515b667 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm1c8515b667 [data-look="neo"].node circle{stroke:url(#mm1c8515b667-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm1c8515b667 [data-look="neo"].node circle .state-start{fill:#000000;}#mm1c8515b667 [data-look="neo"].icon-shape .icon{fill:url(#mm1c8515b667-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm1c8515b667 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm1c8515b667-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm1c8515b667 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm1c8515b667_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm1c8515b667_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm1c8515b667_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M454.651,59L453.001,63.167C451.351,67.333,448.05,75.667,446.987,83.342C445.925,91.018,447.099,98.037,447.687,101.546L448.274,105.055" id="mm1c8515b667-L_Q_STM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_STM_0" data-points="W3sieCI6NDU0LjY1MDk5MDA5OTAwOTksInkiOjU5fSx7IngiOjQ0NC43NSwieSI6ODR9LHsieCI6NDQ4LjkzNDEwMDQxODQxLCJ5IjoxMDl9XQ==" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/><path d="M464.75,59L464.75,63.167C464.75,67.333,464.75,75.667,464.75,83.333C464.75,91,464.75,98,464.75,101.5L464.75,105" id="mm1c8515b667-L_Q_LTM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_LTM_0" data-points="W3sieCI6NDY0Ljc1LCJ5Ijo1OX0seyJ4Ijo0NjQuNzUsInkiOjg0fSx7IngiOjQ2NC43NSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/><path d="M474.849,59L476.499,63.167C478.149,67.333,481.45,75.667,482.513,83.342C483.575,91.018,482.401,98.037,481.813,101.546L481.226,105.055" id="mm1c8515b667-L_Q_EM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q_EM_0" data-points="W3sieCI6NDc0Ljg0OTAwOTkwMDk5MDEsInkiOjU5fSx7IngiOjQ4NC43NSwieSI6ODR9LHsieCI6NDgwLjU2NTg5OTU4MTU5LCJ5IjoxMDl9XQ==" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/><path d="M448.934,298L448.237,302.167C447.539,306.333,446.145,314.667,446.852,322.38C447.559,330.094,450.369,337.187,451.773,340.734L453.178,344.281" id="mm1c8515b667-L_STM_CW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_STM_CW_0" data-points="W3sieCI6NDQ4LjkzNDEwMDQxODQxLCJ5IjoyOTh9LHsieCI6NDQ0Ljc1LCJ5IjozMjN9LHsieCI6NDU0LjY1MDk5MDA5OTAwOTksInkiOjM0OH1d" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/><path d="M464.75,298L464.75,302.167C464.75,306.333,464.75,314.667,464.75,322.333C464.75,330,464.75,337,464.75,340.5L464.75,344" id="mm1c8515b667-L_LTM_CW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LTM_CW_0" data-points="W3sieCI6NDY0Ljc1LCJ5IjoyOTh9LHsieCI6NDY0Ljc1LCJ5IjozMjN9LHsieCI6NDY0Ljc1LCJ5IjozNDh9XQ==" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/><path d="M480.566,298L481.263,302.167C481.961,306.333,483.355,314.667,482.648,322.38C481.941,330.094,479.131,337.187,477.727,340.734L476.322,344.281" id="mm1c8515b667-L_EM_CW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_EM_CW_0" data-points="W3sieCI6NDgwLjU2NTg5OTU4MTU5LCJ5IjoyOTh9LHsieCI6NDg0Ljc1LCJ5IjozMjN9LHsieCI6NDc0Ljg0OTAwOTkwMDk5MDEsInkiOjM0OH1d" data-look="classic" marker-end="url(#mm1c8515b667_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_Q_STM_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q_LTM_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q_EM_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_STM_CW_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_LTM_CW_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_EM_CW_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="root" transform="translate(0, 101)"><g class="clusters"><g class="cluster" id="mm1c8515b667-Memory" data-look="classic"><rect style="" x="8" y="8" width="913.5" height="189"/><g class="cluster-label" transform="translate(394.8515625, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Memory</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Architecture</tspan></tspan></text></g></g></g></g><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="node default" id="mm1c8515b667-flowchart-STM-0" data-look="classic" transform="translate(154.75, 102.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-111.75" y="-46.5" width="223.5" height="93"/><g class="label" style="color:#fff !important" transform="translate(-81.75, -31.5)"><rect/><foreignObject width="163.5" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Short-term Memory<br />(current conversation)<br />Direct in context window</p></span></div></foreignObject></g></g><g class="node default" id="mm1c8515b667-flowchart-LTM-1" data-look="classic" transform="translate(446.5, 102.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#0f3460 !important" x="-130" y="-57" width="260" height="114"/><g class="label" style="color:#fff !important" transform="translate(-100, -42)"><rect/><foreignObject width="200" height="84"><div style="color: rgb(255, 255, 255) !important; display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Long-term Memory<br />(facts, preferences)<br />DB -&gt; retrieved on session start</p></span></div></foreignObject></g></g><g class="node default" id="mm1c8515b667-flowchart-EM-2" data-look="classic" transform="translate(756.5, 102.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#e94560 !important" x="-130" y="-57" width="260" height="114"/><g class="label" style="color:#fff !important" transform="translate(-100, -42)"><rect/><foreignObject width="200" height="84"><div style="color: rgb(255, 255, 255) !important; display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Episodic Memory<br />(past interactions)<br />Embeddings -&gt; retrieved on similarity</p></span></div></foreignObject></g></g></g></g><g class="node default" id="mm1c8515b667-flowchart-Q-3" data-look="classic" transform="translate(464.75, 33.5)"><rect class="basic label-container" style="" x="-77.25" y="-25.5" width="154.5" height="51"/><g class="label" style="" transform="translate(-47.25, -10.5)"><rect/><foreignObject width="94.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Current Query</p></span></div></foreignObject></g></g><g class="node default" id="mm1c8515b667-flowchart-CW-10" data-look="classic" transform="translate(464.75, 373.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#ffa500 !important" x="-84.625" y="-25.5" width="169.25" height="51"/><g class="label" style="color:#fff !important" transform="translate(-54.625, -10.5)"><rect/><foreignObject width="109.25" height="21"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Context Window</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm1c8515b667-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm1c8515b667-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm1c8515b667-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<h2>Idea 6 · Dynamic Context Assembly</h2>
+<p>The key insight: different queries need different context. A static system prompt + static tools + static history is wasteful. The best systems dynamically assemble context per query.</p>
+<ol>
+<li>Classify the query intent</li>
+<li>Select relevant tools (not all tools)</li>
+<li>Retrieve relevant documents (not a fixed set)</li>
+<li>Include relevant history turns (not all history)</li>
+<li>Add few-shot examples that match the task type</li>
+<li>Order everything by importance: critical first, important last, optional in the middle</li>
+</ol>
+<p>This is what separates a good AI application from a great one. The model is the same. The context is the differentiator.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="lost-in-the-middle"></div></figure></p>
+<h2>Step 1 · Token Counter</h2>
+<p>You cannot budget what you cannot measure. Build a simple token counter (approximation using whitespace splitting, since the exact count depends on the tokenizer).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json
+import numpy as np
+from collections import OrderedDict
+
+def count_tokens(text):
+    if not text:
+        return 0
+    return int(len(text.split()) * 1.3)
+
+def count_tokens_json(obj):
+    return count_tokens(json.dumps(obj))
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">How wrong is &quot;words × 1.3&quot;?</div><div class="co-body"><p>The lesson's <code>count_tokens</code> estimate against three real tokenizers (GPT-2, Qwen2.5 and SmolLM2) on prose, code, a tool definition, a log line and Hindi. A second or two.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json
+from transformers import AutoTokenizer
+toks = {&quot;GPT-2 (50K vocab)&quot;: AutoTokenizer.from_pretrained(&quot;openai-community/gpt2&quot;),
+        &quot;Qwen2.5 (151K vocab)&quot;: AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;),
+        &quot;SmolLM2 (49K vocab)&quot;: AutoTokenizer.from_pretrained(&quot;HuggingFaceTB/SmolLM2-135M&quot;)}
+def estimate(text): return int(len(text.split()) * 1.3)          # the lesson's count_tokens
+
+tool = {&quot;name&quot;: &quot;search_orders&quot;, &quot;description&quot;: &quot;Search a customer's orders by status and date range.&quot;,
+        &quot;input_schema&quot;: {&quot;type&quot;: &quot;object&quot;, &quot;properties&quot;: {
+            &quot;customer_id&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;description&quot;: &quot;Customer ID, e.g. C-10442&quot;},
+            &quot;status&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;enum&quot;: [&quot;pending&quot;, &quot;shipped&quot;, &quot;delivered&quot;, &quot;returned&quot;]},
+            &quot;from_date&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;format&quot;: &quot;date&quot;}, &quot;to_date&quot;: {&quot;type&quot;: &quot;string&quot;, &quot;format&quot;: &quot;date&quot;}},
+            &quot;required&quot;: [&quot;customer_id&quot;]}}
+SAMPLES = {
+    &quot;English prose&quot;: &quot;Context engineering decides what goes into the window, in which order, and what gets left out. &quot;
+                     &quot;A small, relevant context usually beats a large, noisy one, because every extra token competes for attention.&quot;,
+    &quot;Python code&quot;: &quot;def budget(parts, limit=128_000, reserve=4_000):\n    used = sum(len(p) for p in parts)\n&quot;
+                   &quot;    if used &gt; limit - reserve:\n        raise ValueError(f'over budget by {used - limit + reserve}')\n    return limit - reserve - used\n&quot;,
+    &quot;one tool definition (JSON)&quot;: json.dumps(tool),
+    &quot;a log line&quot;: &quot;2026-11-24T21:47:03.118Z ERROR [payments-api] req=7f3a9c2e user=C-10442 status=502 latency_ms=3184 upstream=bank-gw&quot;,
+    &quot;Hindi&quot;: &quot;संदर्भ विंडो एक सीमित संसाधन है, इसलिए हर टोकन का सही उपयोग करना ज़रूरी है।&quot;,
+}
+print(f&quot;{'text':28} {'words':&gt;5} {'estimate':&gt;8} &quot; + &quot; &quot;.join(f&quot;{k:&gt;21}&quot; for k in toks))
+for name, text in SAMPLES.items():
+    real = [len(t(text).input_ids) for t in toks.values()]
+    est = estimate(text)
+    print(f&quot;{name:28} {len(text.split()):5} {est:8} &quot; + &quot; &quot;.join(f&quot;{r:13} ({est / r - 1:+5.0%})&quot; for r in real))
+q = toks[&quot;Qwen2.5 (151K vocab)&quot;]
+per_tool = len(q(json.dumps(tool)).input_ids)
+print(f&quot;\n50 tools like this one: {50 * per_tool:,} Qwen tokens of definitions sent with every request&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">text                         words estimate     GPT-2 (50K vocab)  Qwen2.5 (151K vocab)   SmolLM2 (49K vocab)
+English prose                   33       42            41 (  +2%)            41 (  +2%)            41 (  +2%)
+Python code                     32       41            81 ( -49%)            65 ( -37%)            69 ( -41%)
+one tool definition (JSON)      44       57           140 ( -59%)           131 ( -56%)           139 ( -59%)
+a log line                       8       10            53 ( -81%)            64 ( -84%)            71 ( -86%)
+Hindi                           15       19           118 ( -84%)            71 ( -73%)            83 ( -77%)
+
+50 tools like this one: 6,550 Qwen tokens of definitions sent with every request</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>For English prose the rule of thumb works: 42 estimated against 41 real tokens with all three tokenizers. Everywhere else it fails, always in the same direction, by underestimating:</p>
+<ul>
+<li><strong>Python code</strong>: 65 to 81 real tokens against an estimate of 41. Indentation, symbols and identifiers split into many tokens.</li>
+<li><strong>A tool definition in JSON</strong>: 131 to 140 tokens against 57. Quotes, braces and key names cost tokens, so 50 tool definitions like this one are 6,550 tokens on every request, exactly the "tool definitions" line in the lesson's budget.</li>
+<li><strong>A log line</strong>: 53 to 71 tokens against 10. Timestamps, IDs and hashes are almost all digits and fragments.</li>
+<li><strong>Hindi</strong>: 71 to 118 tokens against 19, and the gap depends on the tokenizer's vocabulary (GPT-2's 50K vocabulary, trained mostly on English, needs 118).</li>
+</ul>
+<p>A budget manager built on words × 1.3 would underestimate this kind of content by a factor of 2 to 7. Count with the model's own tokenizer (or the provider's token-counting endpoint).</p></div></aside>
+<h2>Step 2 · Context Budget Manager</h2>
+<p>The core abstraction. A budget manager tracks how many tokens each component uses and enforces limits.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ContextBudget:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.max_tokens = max_tokens
+        self.generation_reserve = generation_reserve
+        self.available = max_tokens - generation_reserve
+        self.allocations = OrderedDict()
+
+    def allocate(self, component, content, max_tokens=None):
+        tokens = count_tokens(content)
+        if max_tokens and tokens &gt; max_tokens:
+            words = content.split()
+            target_words = int(max_tokens / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        used = sum(self.allocations.values())
+        if used + tokens &gt; self.available:
+            allowed = self.available - used
+            if allowed &lt;= 0:
+                return None, 0
+            words = content.split()
+            target_words = int(allowed / 1.3)
+            content = &quot; &quot;.join(words[:target_words])
+            tokens = count_tokens(content)
+
+        self.allocations[component] = tokens
+        return content, tokens
+
+    def remaining(self):
+        used = sum(self.allocations.values())
+        return self.available - used
+
+    def utilization(self):
+        used = sum(self.allocations.values())
+        return used / self.max_tokens
+
+    def report(self):
+        total_used = sum(self.allocations.values())
+        lines = []
+        lines.append(f&quot;Context Budget Report ({self.max_tokens:,} token window)&quot;)
+        lines.append(&quot;-&quot; * 50)
+        for component, tokens in self.allocations.items():
+            pct = tokens / self.max_tokens * 100
+            bar = &quot;#&quot; * int(pct / 2)
+            lines.append(f&quot;  {component:&lt;25} {tokens:&gt;6} tokens ({pct:&gt;5.1f}%) {bar}&quot;)
+        lines.append(&quot;-&quot; * 50)
+        lines.append(f&quot;  {'Used':&lt;25} {total_used:&gt;6} tokens ({total_used/self.max_tokens*100:.1f}%)&quot;)
+        lines.append(f&quot;  {'Generation reserve':&lt;25} {self.generation_reserve:&gt;6} tokens&quot;)
+        lines.append(f&quot;  {'Remaining':&lt;25} {self.remaining():&gt;6} tokens&quot;)
+        return &quot;\n&quot;.join(lines)
+</code></pre></div>
+
+<h2>Step 3 · Lost-in-the-Middle Reordering</h2>
+<p>Implement the reordering strategy: most important items go first and last, least important go in the middle.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def reorder_lost_in_middle(items, scores):
+    paired = sorted(zip(scores, items), reverse=True)
+    sorted_items = [item for _, item in paired]
+
+    if len(sorted_items) &lt;= 2:
+        return sorted_items
+
+    first_half = sorted_items[::2]
+    second_half = sorted_items[1::2]
+    second_half.reverse()
+
+    return first_half + second_half
+
+def score_relevance(query, documents):
+    query_words = set(query.lower().split())
+    scores = []
+    for doc in documents:
+        doc_words = set(doc.lower().split())
+        if not query_words:
+            scores.append(0.0)
+            continue
+        overlap = len(query_words &amp; doc_words) / len(query_words)
+        scores.append(round(overlap, 3))
+    return scores
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Lost in the middle, on a real model</div><div class="co-body"><p>The key-value retrieval task from Liu et al. on Qwen2.5-0.5B-Instruct: a JSON object of 75 random key-value pairs, asked for one key whose pair sits at the start, a quarter, the middle, three quarters or the end of the object. 20 prompts per position, greedy decoding. About 15 minutes on CPU, so the output below was recorded.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, random, time, torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(name, padding_side=&quot;left&quot;)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+rng = random.Random(0)
+hexs = lambda: &quot;&quot;.join(rng.choice(&quot;0123456789abcdef&quot;) for _ in range(8))
+
+N_PAIRS, TRIALS, POSITIONS = 75, 20, [0, 18, 37, 56, 74]       # where the asked-for key sits among 75 pairs
+def make(pos):
+    pairs = [(hexs(), hexs()) for _ in range(N_PAIRS)]
+    key, val = pairs[pos]
+    data = json.dumps(dict(pairs), indent=0)
+    msg = (f&quot;Extract the value for the specified key from the JSON object below.\n\n{data}\n\n&quot;
+           f'Key: &quot;{key}&quot;\nReply with the value only.')
+    return [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: msg}], val
+
+results = {}
+t = time.time()
+for pos in POSITIONS:
+    cases = [make(pos) for _ in range(TRIALS)]
+    texts = [tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m, _ in cases]
+    outs = []
+    for i in range(0, TRIALS, 4):                              # 4 prompts at a time keeps attention memory small
+        enc = tok(texts[i:i + 4], return_tensors=&quot;pt&quot;, padding=True)
+        with torch.no_grad():
+            g = model.generate(**enc, max_new_tokens=10, do_sample=False, pad_token_id=tok.eos_token_id)
+        outs += [tok.decode(x[enc.input_ids.shape[1]:], skip_special_tokens=True).strip().strip('&quot;') for x in g]
+    results[pos] = sum(o == v for o, (_, v) in zip(outs, cases)) / TRIALS
+    ctx = enc.attention_mask.sum(1).float().mean()
+print(f&quot;key-value retrieval, {N_PAIRS} pairs of 8-character hex strings, about {ctx:.0f} prompt tokens, &quot;
+      f&quot;{TRIALS} prompts per position, greedy ({time.time() - t:.0f} s)\n&quot;)
+for pos in POSITIONS:
+    bar = &quot;#&quot; * round(results[pos] * 40)
+    print(f&quot;  key at pair {pos + 1:&gt;2} of {N_PAIRS} ({pos / (N_PAIRS - 1):4.0%} into the context): {results[pos]:5.0%}  {bar}&quot;)
+</code></pre></div>
+<p><strong>Recorded output</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">key-value retrieval, 75 pairs of 8-character hex strings, about 1420 prompt tokens, 20 prompts per position, greedy (888 s)
+
+  key at pair  1 of 75 (  0% into the context):   90%  ####################################
+  key at pair 19 of 75 ( 24% into the context):   50%  ####################
+  key at pair 38 of 75 ( 50% into the context):   55%  ######################
+  key at pair 57 of 75 ( 76% into the context):   80%  ################################
+  key at pair 75 of 75 (100% into the context):   95%  ######################################
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The U-shape, reproduced on a small model.</strong> With the requested pair at the very start, the model returned the right value in 90% of prompts. At the end it was right 95% of the time. A quarter of the way in it fell to 50%, and at the middle 55%; three quarters of the way in it recovered to 80%. The context was only about 1,400 tokens, far inside the model's window, so this is not truncation. The same text is easier to use at the edges than in the middle.</p>
+<p><strong>It matches the original finding.</strong> Liu et al. saw the same curve on GPT-3.5 and other models with 20 retrieved documents: 75.8% with the answer first, 53.8% in the middle, 63.2% last. Frontier models in 2026 are much better on such tests, but long-context benchmarks still show accuracy depending on position and on how many similar distractors surround the fact.</p>
+<p><strong>What to do about it.</strong> Put the most important material (instructions, the best retrieved passages, the current task) at the start or the end of the context, not in the middle. Keep only what is needed, because every extra chunk is another distractor. Test your own prompts with the key fact at several positions, as this run does, instead of trusting the advertised window size.</p>
+<p><strong>About the measurement.</strong> 20 prompts per position gives wide error bars: 50% and 55% are not reliably different, but 50–55% against 90–95% is. Each prompt uses fresh random keys and values, so the model cannot have memorised them.</p></div></aside>
+<h2>Step 4 · Conversation History Compressor</h2>
+<p>Summarize old conversation turns to reclaim token budget.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ConversationManager:
+    def __init__(self, max_history_tokens=5000):
+        self.turns = []
+        self.summaries = []
+        self.max_history_tokens = max_history_tokens
+
+    def add_turn(self, role, content):
+        self.turns.append({&quot;role&quot;: role, &quot;content&quot;: content})
+        self._compress_if_needed()
+
+    def _compress_if_needed(self):
+        total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+        if total &lt;= self.max_history_tokens:
+            return
+
+        while total &gt; self.max_history_tokens and len(self.turns) &gt; 4:
+            old_turns = self.turns[:2]
+            summary = self._summarize_turns(old_turns)
+            self.summaries.append(summary)
+            self.turns = self.turns[2:]
+            total = sum(count_tokens(t[&quot;content&quot;]) for t in self.turns)
+
+    def _summarize_turns(self, turns):
+        parts = []
+        for t in turns:
+            content = t[&quot;content&quot;]
+            if len(content) &gt; 100:
+                content = content[:100] + &quot;...&quot;
+            parts.append(f&quot;{t['role']}: {content}&quot;)
+        return &quot;Previous: &quot; + &quot; | &quot;.join(parts)
+
+    def get_context(self):
+        parts = []
+        if self.summaries:
+            parts.append(&quot;[Conversation Summary]&quot;)
+            for s in self.summaries:
+                parts.append(s)
+        parts.append(&quot;[Recent Conversation]&quot;)
+        for t in self.turns:
+            parts.append(f&quot;{t['role']}: {t['content']}&quot;)
+        return &quot;\n&quot;.join(parts)
+
+    def token_count(self):
+        return count_tokens(self.get_context())
+</code></pre></div>
+
+<h2>Step 5 · Dynamic Tool Selector</h2>
+<p>Only include tools relevant to the current query. Classify intent, then filter.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">TOOL_REGISTRY = {
+    &quot;read_file&quot;: {
+        &quot;description&quot;: &quot;Read contents of a file&quot;,
+        &quot;tokens&quot;: 120,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;write_file&quot;: {
+        &quot;description&quot;: &quot;Write content to a file&quot;,
+        &quot;tokens&quot;: 150,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;files&quot;],
+    },
+    &quot;search_code&quot;: {
+        &quot;description&quot;: &quot;Search for patterns in codebase&quot;,
+        &quot;tokens&quot;: 130,
+        &quot;categories&quot;: [&quot;code&quot;],
+    },
+    &quot;run_command&quot;: {
+        &quot;description&quot;: &quot;Execute a shell command&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;system&quot;],
+    },
+    &quot;create_calendar_event&quot;: {
+        &quot;description&quot;: &quot;Create a new calendar event&quot;,
+        &quot;tokens&quot;: 180,
+        &quot;categories&quot;: [&quot;calendar&quot;],
+    },
+    &quot;list_emails&quot;: {
+        &quot;description&quot;: &quot;List recent emails&quot;,
+        &quot;tokens&quot;: 160,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;send_email&quot;: {
+        &quot;description&quot;: &quot;Send an email message&quot;,
+        &quot;tokens&quot;: 200,
+        &quot;categories&quot;: [&quot;email&quot;],
+    },
+    &quot;web_search&quot;: {
+        &quot;description&quot;: &quot;Search the web for information&quot;,
+        &quot;tokens&quot;: 140,
+        &quot;categories&quot;: [&quot;research&quot;],
+    },
+    &quot;query_database&quot;: {
+        &quot;description&quot;: &quot;Run a SQL query on the database&quot;,
+        &quot;tokens&quot;: 170,
+        &quot;categories&quot;: [&quot;code&quot;, &quot;data&quot;],
+    },
+    &quot;generate_chart&quot;: {
+        &quot;description&quot;: &quot;Generate a chart from data&quot;,
+        &quot;tokens&quot;: 190,
+        &quot;categories&quot;: [&quot;data&quot;, &quot;visualization&quot;],
+    },
+}
+
+def classify_intent(query):
+    query_lower = query.lower()
+
+    intent_keywords = {
+        &quot;code&quot;: [&quot;code&quot;, &quot;function&quot;, &quot;bug&quot;, &quot;error&quot;, &quot;file&quot;, &quot;implement&quot;, &quot;refactor&quot;, &quot;debug&quot;, &quot;test&quot;],
+        &quot;calendar&quot;: [&quot;meeting&quot;, &quot;schedule&quot;, &quot;calendar&quot;, &quot;appointment&quot;, &quot;event&quot;],
+        &quot;email&quot;: [&quot;email&quot;, &quot;mail&quot;, &quot;send&quot;, &quot;inbox&quot;, &quot;message&quot;],
+        &quot;research&quot;: [&quot;search&quot;, &quot;find&quot;, &quot;what is&quot;, &quot;how does&quot;, &quot;explain&quot;, &quot;look up&quot;],
+        &quot;data&quot;: [&quot;data&quot;, &quot;query&quot;, &quot;database&quot;, &quot;chart&quot;, &quot;graph&quot;, &quot;analytics&quot;, &quot;sql&quot;],
+    }
+
+    scores = {}
+    for intent, keywords in intent_keywords.items():
+        score = sum(1 for kw in keywords if kw in query_lower)
+        if score &gt; 0:
+            scores[intent] = score
+
+    if not scores:
+        return [&quot;code&quot;]
+
+    max_score = max(scores.values())
+    return [intent for intent, score in scores.items() if score &gt;= max_score * 0.5]
+
+def select_tools(query, token_budget=2000):
+    intents = classify_intent(query)
+    relevant = {}
+    total_tokens = 0
+
+    for name, tool in TOOL_REGISTRY.items():
+        if any(cat in intents for cat in tool[&quot;categories&quot;]):
+            if total_tokens + tool[&quot;tokens&quot;] &lt;= token_budget:
+                relevant[name] = tool
+                total_tokens += tool[&quot;tokens&quot;]
+
+    return relevant, total_tokens
+</code></pre></div>
+
+<h2>Step 6 · Full Context Assembly Pipeline</h2>
+<p>Wire everything together. Given a query, dynamically assemble the optimal context.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ContextEngine:
+    def __init__(self, max_tokens=128000, generation_reserve=4000):
+        self.budget = ContextBudget(max_tokens, generation_reserve)
+        self.conversation = ConversationManager(max_history_tokens=5000)
+        self.system_prompt = (
+            &quot;You are a helpful AI assistant. You have access to tools for &quot;
+            &quot;code editing, file management, web search, and data analysis. &quot;
+            &quot;Use the appropriate tools for each task. Be concise and accurate.&quot;
+        )
+        self.knowledge_base = [
+            &quot;Python 3.12 introduced type parameter syntax for generic classes using bracket notation.&quot;,
+            &quot;The project uses PostgreSQL 16 with pgvector for embedding storage.&quot;,
+            &quot;Authentication is handled by Supabase Auth with JWT tokens.&quot;,
+            &quot;The frontend is built with Next.js 15 using the App Router.&quot;,
+            &quot;API rate limits are set to 100 requests per minute per user.&quot;,
+            &quot;The deployment pipeline uses GitHub Actions with Docker multi-stage builds.&quot;,
+            &quot;Test coverage must be above 80% for all new modules.&quot;,
+            &quot;The codebase follows the repository pattern for data access.&quot;,
+        ]
+
+    def assemble(self, query):
+        self.budget = ContextBudget(self.budget.max_tokens, self.budget.generation_reserve)
+
+        system_content, _ = self.budget.allocate(&quot;system_prompt&quot;, self.system_prompt, max_tokens=1000)
+
+        tools, tool_tokens = select_tools(query, token_budget=2000)
+        tool_text = json.dumps(list(tools.keys()))
+        tool_content, _ = self.budget.allocate(&quot;tools&quot;, tool_text, max_tokens=2000)
+
+        relevance = score_relevance(query, self.knowledge_base)
+        threshold = 0.1
+        relevant_docs = [
+            doc for doc, score in zip(self.knowledge_base, relevance)
+            if score &gt;= threshold
+        ]
+
+        if relevant_docs:
+            doc_scores = [s for s in relevance if s &gt;= threshold]
+            reordered = reorder_lost_in_middle(relevant_docs, doc_scores)
+            doc_text = &quot;\n&quot;.join(reordered)
+            doc_content, _ = self.budget.allocate(&quot;retrieved_context&quot;, doc_text, max_tokens=3000)
+
+        history_text = self.conversation.get_context()
+        if history_text.strip():
+            history_content, _ = self.budget.allocate(&quot;conversation_history&quot;, history_text, max_tokens=5000)
+
+        query_content, _ = self.budget.allocate(&quot;user_query&quot;, query, max_tokens=500)
+
+        return self.budget
+
+    def chat(self, query):
+        self.conversation.add_turn(&quot;user&quot;, query)
+        budget = self.assemble(query)
+        response = f&quot;[Response to: {query[:50]}...]&quot;
+        self.conversation.add_turn(&quot;assistant&quot;, response)
+        return budget
+
+
+def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Context Engineering Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    engine = ContextEngine(max_tokens=128000, generation_reserve=4000)
+
+    print(&quot;\n--- Query 1: Code task ---&quot;)
+    budget = engine.chat(&quot;Fix the bug in the authentication module where JWT tokens expire too early&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 2: Research task ---&quot;)
+    budget = engine.chat(&quot;What is the best approach for implementing vector search in PostgreSQL?&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Query 3: After conversation history builds up ---&quot;)
+    for i in range(8):
+        engine.conversation.add_turn(&quot;user&quot;, f&quot;Follow-up question number {i+1} about the implementation details of the system&quot;)
+        engine.conversation.add_turn(&quot;assistant&quot;, f&quot;Here is the response to follow-up {i+1} with technical details about the architecture&quot;)
+
+    budget = engine.chat(&quot;Now implement the changes we discussed&quot;)
+    print(budget.report())
+
+    print(&quot;\n--- Tool Selection Examples ---&quot;)
+    test_queries = [
+        &quot;Fix the bug in auth.py&quot;,
+        &quot;Schedule a meeting with the team for Tuesday&quot;,
+        &quot;Show me the database query performance stats&quot;,
+        &quot;Search for best practices on error handling&quot;,
+    ]
+
+    for q in test_queries:
+        tools, tokens = select_tools(q)
+        intents = classify_intent(q)
+        print(f&quot;\n  Query: {q}&quot;)
+        print(f&quot;  Intents: {intents}&quot;)
+        print(f&quot;  Tools: {list(tools.keys())} ({tokens} tokens)&quot;)
+
+    print(&quot;\n--- Lost-in-the-Middle Reordering ---&quot;)
+    docs = [&quot;Doc A (most relevant)&quot;, &quot;Doc B (somewhat relevant)&quot;, &quot;Doc C (least relevant)&quot;,
+            &quot;Doc D (relevant)&quot;, &quot;Doc E (moderately relevant)&quot;]
+    scores = [0.95, 0.60, 0.20, 0.80, 0.50]
+    reordered = reorder_lost_in_middle(docs, scores)
+    print(f&quot;  Original order: {docs}&quot;)
+    print(f&quot;  Scores:         {scores}&quot;)
+    print(f&quot;  Reordered:      {reordered}&quot;)
+    print(f&quot;  (Most relevant at start and end, least relevant in middle)&quot;)
+</code></pre></div>
+
+<h2>Use it: the same idea with real libraries</h2>
+<h3>Harness-Managed Context</h3>
+<p>Coding agents such as Claude Code manage context in layers. The system prompt holds behavioral rules and tool definitions. When a file is opened, its contents are injected as context; when the agent searches, results are added. Long sessions are compacted: older turns are replaced by a summary. A CLAUDE.md file provides project memory that persists across sessions.</p>
+<p>The key engineering decision: Claude Code does not dump your entire codebase into the context. It retrieves relevant files on demand. This is context engineering in practice.</p>
+<h3>Dynamic Context Loading</h3>
+<p>Cursor indexes your entire codebase into embeddings. When you type a query, it retrieves the most relevant files and code blocks using vector similarity. Only those pieces go into the context window. A 500K-line codebase is compressed into the 5-10 most relevant code blocks.</p>
+<p>This is the pattern: embed everything, retrieve on demand, include only what matters.</p>
+<h3>Assistant Long-Term Memory</h3>
+<p>ChatGPT stores user preferences and facts as long-term memory. On each conversation start, relevant memories are retrieved and included in the system prompt. "The user prefers Python" costs 5 tokens but saves hundreds of tokens of repeated instructions across conversations.</p>
+<h3>RAG as Context Engineering</h3>
+<p>Retrieval-Augmented Generation is context engineering formalized. Instead of stuffing knowledge into the model's weights (training) or the system prompt (static context), you retrieve relevant documents at query time and inject them into the context window. The entire RAG pipeline -- chunking, embedding, retrieval, reranking -- exists to solve one problem: putting the right information in the context window.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the full pipeline, set the history budget so small that the compressor drops the turn where the user stated a constraint ("only show results in EUR"). Then ask a follow-up. What does the assembled context lose, and how would you make that constraint survive compression? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Server-side compaction and context editing</strong>: Anthropic's API can summarise older turns for you (compaction, in beta) and clear old tool results or thinking blocks by rule (context editing); agent harnesses do the same client-side.</li>
+<li><strong>Memory as files and stores</strong>: long-term memory lives outside the window (memory tools, CLAUDE.md-style project files, vector or key-value stores) and is loaded on demand.</li>
+<li><strong>Tool search instead of all tools</strong>: agents with hundreds of tools load a few definitions per task through search, the dynamic tool selector of this lesson.</li>
+<li><strong>Context rot</strong>: evaluations keep finding that accuracy falls as input grows, even on simple retrieval, so curated short contexts beat stuffing the 1M-token window.</li>
+</ul>
+<p>Sources: <a href="https://ar5iv.labs.arxiv.org/html/2307.03172">Liu et al. 2023</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/compaction">Claude compaction</a>, <a href="https://platform.claude.com/docs/en/build-with-claude/context-editing">Claude context editing</a>, <a href="https://www.anthropic.com/news/context-management">Anthropic on context management</a>, <a href="https://platform.claude.com/docs/en/about-claude/models/overview">Claude models overview</a>, <a href="https://developers.openai.com/docs/models">OpenAI models</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>The window is a budget: system, tools, retrieval, history, examples, query, and a reserve for the answer.</li>
+<li>Count tokens with the real tokenizer; code and JSON cost far more than prose.</li>
+<li>Put critical material first and the query and best evidence last; the middle is weakest.</li>
+<li>Compress history, prune tools, filter retrieval: relevance beats volume.</li>
+<li>Keep long-term memory outside the window and load it when it matters.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-context-engineering"><span class="t" style="--cs-hue:280">CE</span>Cheat sheet · Agent Memory and Context Engineering</a><a href="#cs-dialogue-systems-v4"><span class="t" style="--cs-hue:170">CS</span>Cheat sheet · Dialogue State Tracking and Chatbots</a><a href="#cs-prompt-engineering"><span class="t" style="--cs-hue:230">PE</span>Cheat sheet · Prompt Engineering: Quick Reference</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/prompt-context-optimizer.md</code> -- a reusable prompt that audits a context assembly strategy and recommends optimizations. Feed it your system prompt, tool count, average history length, and retrieval strategy, and it identifies token waste and suggests improvements.</p>
+<p>It also produces <code>outputs/skill-context-engineering.md</code> -- a decision framework for designing context assembly pipelines based on task type, context window size, and latency budget.</p>
+<p><strong><code>outputs/prompt-context-optimizer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-context-optimizer
+description: Audit a context assembly strategy and recommend optimizations to reduce token waste and improve response quality
+phase: 11
+lesson: 05
+---
+
+You are a context engineering consultant. I will describe how an LLM application assembles its context window. You will audit the strategy and recommend specific optimizations.
+
+## Audit Protocol
+
+### 1. Token Budget Analysis
+
+Calculate the current token allocation:
+
+- System prompt: how many tokens? Is there redundancy?
+- Tool definitions: how many tools, total tokens? Are all tools relevant to every query?
+- Retrieved context: how many chunks, total tokens? What is the retrieval quality?
+- Conversation history: how many turns kept verbatim? Is summarization used?
+- Few-shot examples: how many, total tokens? Are they static or dynamic?
+- Generation reserve: how many tokens? Is it sufficient for the expected output?
+- Total used vs available: what is the utilization percentage?
+
+### 2. Waste Detection
+
+Flag specific sources of token waste:
+
+**Over-allocation**: components using more than 30% of the budget. A system prompt consuming 10,000 tokens is almost certainly too verbose.
+
+**Static context**: tool definitions or few-shot examples that never change per query. If 80% of tools are irrelevant to most queries, you are wasting tool tokens 80% of the time.
+
+**Stale history**: conversation turns from 20 messages ago that are irrelevant to the current query. Verbatim history is the biggest token waste in long conversations.
+
+**Low-relevance retrieval**: retrieved chunks with low similarity scores that dilute the signal. Better to include 3 highly relevant chunks than 10 mediocre ones.
+
+**Duplicate information**: the same fact appearing in the system prompt, retrieved context, and conversation history.
+
+### 3. Ordering Analysis
+
+Check for lost-in-the-middle problems:
+
+- Is the most important information at the start and end of the context?
+- Are retrieved documents ordered by relevance, or by insertion order?
+- Is the user query near the end of the context (where attention is highest)?
+
+### 4. Recommendations
+
+For each waste source, provide a specific fix:
+
+- **System prompt**: reduce to essential instructions, move examples to dynamic few-shot
+- **Tools**: implement intent-based tool selection, only include relevant tools per query
+- **Retrieval**: add reranking, raise similarity threshold, deduplicate chunks
+- **History**: summarize turns older than N, keep only the last K verbatim
+- **Ordering**: reorder by lost-in-the-middle pattern (important first and last)
+- **Generation**: ensure at least 2K tokens reserved, increase for long-form outputs
+
+### 5. Impact Estimate
+
+For each recommendation, estimate:
+
+- Tokens saved per query
+- Expected quality impact (positive, neutral, or negative)
+- Implementation effort (minutes to hours)
+
+## Input Format
+
+Provide:
+- Context window size (e.g., 128K tokens)
+- Current token breakdown by component
+- Number of tools defined
+- Retrieval strategy (vector search, keyword, hybrid)
+- History management (keep all, truncate, summarize)
+- Any observed quality issues
+
+## Output Format
+
+1. **Budget Summary**: current allocation table with waste flags
+2. **Top 3 Waste Sources**: specific problems with estimated token cost
+3. **Recommendations**: ordered by impact/effort ratio
+4. **Projected Savings**: estimated tokens recovered and quality improvement
+</code></pre></div>
+<p><strong><code>outputs/skill-context-engineering.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-context-engineering
+description: Decision framework for designing context assembly pipelines based on task type, window size, and latency budget
+version: 1.0.0
+phase: 11
+lesson: 05
+tags: [context-engineering, context-window, rag, memory, tool-selection, lost-in-the-middle]
+---
+
+# Context Engineering
+
+When building an LLM application, apply this framework to design the context assembly pipeline.
+
+## Core principles
+
+1. **Context is scarce.** A 128K window sounds large but fills fast. Budget every component explicitly.
+2. **Attention is uneven.** Models attend more to the start and end. Put critical information there. The middle is the dead zone.
+3. **Dynamic beats static.** Different queries need different context. Assemble per query, not once at startup.
+4. **Less is more.** A curated 10K context outperforms a dumped 100K context. Signal-to-noise ratio matters more than total information.
+5. **Measure everything.** You cannot optimize what you do not measure. Count tokens per component on every request.
+
+## Context budget guidelines
+
+| Component | Typical Range | Priority | Compression Strategy |
+|-----------|-------------|----------|---------------------|
+| System prompt | 200-1,000 tokens | Fixed, high | Write tight, remove redundancy |
+| Tool definitions | 500-3,000 tokens | Dynamic, medium | Prune by query intent |
+| Retrieved context | 1,000-5,000 tokens | Dynamic, high | Rerank + threshold + deduplicate |
+| Conversation history | 500-5,000 tokens | Dynamic, medium | Summarize old turns |
+| Few-shot examples | 500-2,000 tokens | Dynamic, high | Select by task similarity |
+| User query | 50-500 tokens | Fixed, highest | N/A |
+| Generation reserve | 2,000-8,000 tokens | Fixed | Adjust by expected output length |
+
+## When to use each memory type
+
+**Short-term (conversation history):** The current session. Managed by summarization. Compress turns older than 5-10 exchanges. Keep the last 3-4 turns verbatim.
+
+**Long-term (facts database):** Preferences and project facts that persist across sessions. Retrieve on session start. Examples: &quot;user prefers Python&quot;, &quot;project uses PostgreSQL&quot;, &quot;team follows trunk-based development&quot;. Store in CLAUDE.md, a database, or a structured memory system.
+
+**Episodic (past interactions):** Specific past conversations relevant to the current task. Store as embeddings, retrieve by similarity. &quot;Last week we debugged a similar auth issue&quot; is episodic memory.
+
+## Tool selection strategy
+
+Do not include all tools in every request. This wastes tokens and confuses the model.
+
+1. Classify the query intent (code, email, calendar, research, data)
+2. Map intents to tool categories
+3. Include only matching tools
+4. If intent is ambiguous, include tools from the top 2 categories
+5. Always include a &quot;general&quot; tool (like web search) as fallback
+
+Expected savings: 60-80% of tool definition tokens on queries with clear intent.
+
+## Retrieval best practices
+
+- **Rerank after retrieval.** Vector similarity is a rough filter. A reranker (cross-encoder or LLM-based) improves precision significantly.
+- **Set a relevance threshold.** Do not include chunks below 0.3 cosine similarity. They add noise.
+- **Deduplicate.** If two chunks share 80%+ content, keep only the higher-scored one.
+- **Apply lost-in-the-middle ordering.** Place the most relevant chunks first and last.
+- **Limit total retrieval tokens.** 3-5 highly relevant chunks beat 15 mediocre ones.
+
+## History management
+
+- Keep the last 3-4 turns verbatim (the model needs recent context)
+- Summarize older turns into a digest (&quot;We discussed X, decided Y, and blocked on Z&quot;)
+- Drop system-generated turns that add no information (tool invocations with no user-facing content)
+- Trigger compression when history exceeds 30% of the available budget
+
+## Red flags
+
+- System prompt exceeds 2,000 tokens: probably includes information that should be dynamic
+- All tools included on every request: implement intent-based selection
+- No relevance filtering on retrieval: you are dumping noise into the window
+- History grows unbounded: summarization is not implemented
+- No generation reserve: the model truncates its responses
+- Same information in 3 places (system prompt, retrieved doc, history): deduplicate
+- Context utilization over 60%: you are leaving too little room for the model to &quot;think&quot;
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Add a "token waste detector" to the ContextBudget class. It should flag components using more than 30% of the budget and suggest compression strategies specific to each component type (summarize history, prune tools, re-rank documents).</p>
+</li>
+<li>
+<p>Implement semantic deduplication for retrieved context. If two retrieved documents are more than 80% similar (by word overlap or cosine similarity of their embeddings), keep only the higher-scored one. Measure how much token budget this recovers.</p>
+</li>
+<li>
+<p>Build a "context replay" tool. Given a conversation transcript, replay it through the ContextEngine and visualize how the budget allocation changes turn by turn. Plot token usage per component over time. Identify the turn where context starts getting compressed.</p>
+</li>
+<li>
+<p>Implement a priority-based tool selector. Instead of binary include/exclude, assign each tool a relevance score to the current query. Include tools in descending relevance order until the tool budget is exhausted. Compare task performance with 5, 10, 20, and 50 tools included.</p>
+</li>
+<li>
+<p>Build a multi-strategy context compressor. Implement three compression strategies (truncation, summarization, extraction of key sentences) and benchmark them on a set of 20 documents. Measure the tradeoff between compression ratio and information retention (does the compressed version still contain the answer to the query?).</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1105-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Position mattered</span></summary><div class="qa-a"><p>Yes, and the middle was worst. The value was found 90% of the time at the start and 95% at the end, but only 50% a quarter of the way in, 55% in the middle and 80% three quarters in. The context was about 1,400 tokens, well within the model's window. Position alone changed the result by 40 percentage points.</p></div></details>
+<details class="qa" id="a1105-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Constraints must be pinned, not summarised away</span></summary><div class="qa-a"><p>The compressor summarises or drops old turns by age, not by importance, so "only show results in EUR" can disappear while greetings from the last two turns survive. The next answer then quietly uses dollars: nothing errors, the constraint is just gone.</p>
+<p>Make constraints survive explicitly: extract user preferences and hard constraints into a small pinned block (or a memory store) that is always included, outside the history budget; or summarise with a prompt that must keep every instruction and decision; and test it with conversations where the key fact sits in an early turn.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2307.03172">Liu et al., 2023 -- "Lost in the Middle: How Language Models Use Long Contexts"</a> -- the definitive study on position-dependent attention, showing that models struggle with information in the middle of long contexts</li>
+<li><a href="https://www.anthropic.com/news/contextual-retrieval">Anthropic's Contextual Retrieval blog post</a> -- how Anthropic approaches context-aware chunk retrieval, reducing retrieval failure by 49%</li>
+<li><a href="https://simonwillison.net/2025/Jun/27/context-engineering/">Simon Willison's "Context Engineering"</a> -- the blog post that named the discipline and distinguished it from prompt engineering</li>
+<li><a href="https://python.langchain.com/docs/tutorials/rag/">LangChain documentation on RAG</a> -- practical implementation of retrieval-augmented generation as a context engineering pattern</li>
+<li><a href="https://github.com/gkamradt/LLMTest_NeedleInAHaystack">Greg Kamradt's Needle in a Haystack test</a> -- the benchmark that revealed position-dependent retrieval failures across all major models</li>
+<li><a href="https://arxiv.org/abs/2211.05102">Pope et al., "Efficiently Scaling Transformer Inference" (2022)</a> -- why context length drives memory and latency, and how KV cache, MQA, and GQA change the budget calculation.</li>
+<li><a href="https://arxiv.org/abs/2308.16369">Agrawal et al., "SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills" (2023)</a> -- the two phases of inference that make long prompts expensive in TTFT but cheap in TPOT; the ground truth behind context-packing tradeoffs.</li>
+<li><a href="https://arxiv.org/abs/2305.13245">Ainslie et al., "GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints" (EMNLP 2023)</a> -- the grouped-query attention paper that cut KV memory 8× in production decoders without quality loss.</li>
+</ul></div></aside>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="a1105-q1"><p class="q-text"><span class="q-num">Q1</span>What is the difference between prompt engineering and context engineering?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1105-q1-o0"><span class="opt-key">A</span><span>Context engineering is about database design</span></button><button type="button" class="opt" data-correct="true" id="a1105-q1-o1"><span class="opt-key">B</span><span>A prompt is the user&#x27;s query; context is everything in the model&#x27;s window: system prompt, tools, retrieved docs, history, and the prompt itself</span></button><button type="button" class="opt" data-correct="false" id="a1105-q1-o2"><span class="opt-key">C</span><span>They are the same thing</span></button><button type="button" class="opt" data-correct="false" id="a1105-q1-o3"><span class="opt-key">D</span><span>Prompt engineering is more advanced</span></button></div><p class="q-explain" hidden>Prompt engineering focuses on crafting the user instruction. Context engineering manages the entire input to the model: what goes in, what stays out, in what order, and how to allocate the limited context window.</p></div><div class="q" id="a1105-q2"><p class="q-text"><span class="q-num">Q2</span>Why does context window order matter for LLM performance?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1105-q2-o0"><span class="opt-key">A</span><span>Order only matters for code</span></button><button type="button" class="opt" data-correct="true" id="a1105-q2-o1"><span class="opt-key">B</span><span>LLMs have recency and primacy biases, paying more attention to the beginning and end of the context window</span></button><button type="button" class="opt" data-correct="false" id="a1105-q2-o2"><span class="opt-key">C</span><span>Alphabetical order helps the model search faster</span></button><button type="button" class="opt" data-correct="false" id="a1105-q2-o3"><span class="opt-key">D</span><span>It doesn&#x27;t -- LLMs process all tokens equally</span></button></div><p class="q-explain" hidden>Research shows LLMs attend more to the start and end of the context window (&#x27;lost in the middle&#x27; phenomenon). Placing the most important information at the beginning or end of context improves utilization.</p></div><div class="q" id="a1105-q3"><p class="q-text"><span class="q-num">Q3</span>A coding assistant uses 22,700 tokens of a 128K context window. Why is budget management still important?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1105-q3-o0"><span class="opt-key">A</span><span>Only the prompt matters</span></button><button type="button" class="opt" data-correct="false" id="a1105-q3-o1"><span class="opt-key">B</span><span>Token counting is inaccurate</span></button><button type="button" class="opt" data-correct="false" id="a1105-q3-o2"><span class="opt-key">C</span><span>128K should be enough for any use case</span></button><button type="button" class="opt" data-correct="true" id="a1105-q3-o3"><span class="opt-key">D</span><span>Long conversations, large code files, and retrieved documentation can quickly fill the window; without budget management, critical context gets truncated</span></button></div><p class="q-explain" hidden>22,700 tokens is the baseline. A 50-turn conversation adds 30K+ tokens. Retrieving a large codebase adds 50K+. Tool call results add more. Without active management, the window fills and oldest context is lost.</p></div><div class="q" id="a1105-q4"><p class="q-text"><span class="q-num">Q4</span>What is the sliding window strategy for conversation history?</p><div class="opts"><button type="button" class="opt" data-correct="true" id="a1105-q4-o0"><span class="opt-key">A</span><span>Keeping only the N most recent turns in context and dropping older turns, optionally summarizing them first</span></button><button type="button" class="opt" data-correct="false" id="a1105-q4-o1"><span class="opt-key">B</span><span>Expanding the context window dynamically</span></button><button type="button" class="opt" data-correct="false" id="a1105-q4-o2"><span class="opt-key">C</span><span>Moving the model to a different server</span></button><button type="button" class="opt" data-correct="false" id="a1105-q4-o3"><span class="opt-key">D</span><span>Processing the conversation in fixed-size chunks</span></button></div><p class="q-explain" hidden>Sliding window keeps the K most recent conversation turns in full context. Older turns are either dropped or replaced with a summary. This bounds memory usage while preserving the most relevant recent context.</p></div><div class="q" id="a1105-q5"><p class="q-text"><span class="q-num">Q5</span>How should a context assembler allocate tokens across components?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1105-q5-o0"><span class="opt-key">A</span><span>Maximize retrieval context always</span></button><button type="button" class="opt" data-correct="false" id="a1105-q5-o1"><span class="opt-key">B</span><span>Equal allocation to each component</span></button><button type="button" class="opt" data-correct="false" id="a1105-q5-o2"><span class="opt-key">C</span><span>Minimize system prompt tokens</span></button><button type="button" class="opt" data-correct="true" id="a1105-q5-o3"><span class="opt-key">D</span><span>Dynamically based on query type: a simple question needs less retrieval context; a complex question needs more, with generation headroom always reserved</span></button></div><p class="q-explain" hidden>A simple factual question might need 500 tokens of retrieved context. A complex analysis might need 10,000. A good context assembler adjusts allocation dynamically while always reserving headroom for the model&#x27;s response.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1105" id="done-a1105">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1105" id="undo-a1105" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1104"><span class="pn-dir">Previous</span><span class="pn-t">11.13 · Vector Embeddings and Representations</span></a><a class="pn next" href="#a1106"><span class="pn-dir">Next</span><span class="pn-t">11.15 · RAG: Retrieval-Augmented Generation Fundamentals</span></a></div></footer>

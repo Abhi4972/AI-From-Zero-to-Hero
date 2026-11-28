@@ -1,0 +1,1078 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-19">Phase 19 · Capstone Builds</a></nav><h1>Capstone 13: a Governed MCP Server with a Registry</h1><div class="m-meta"><span class="chip chip-num">Lesson 19.13</span><span class="chip">25 min</span><span class="chip chip-core">Capstone</span><span class="chip chip-done" data-done-chip="a1913" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Implement the stateless MCP request and result envelope.</li>
+<li>Keep Registry metadata separate from live protocol discovery.</li>
+<li>Build deterministic, cache-aware tool discovery.</li>
+<li>Enforce issuer, audience, scope, and approval policy for every tool call.</li>
+<li>Deploy Streamable HTTP without session affinity.</li>
+<li>Prove behavior at the wire, authorization, policy, registry, and audit boundaries.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 11, Phase 13, Phase 14, Phase 17, and Phase 18</li>
+<li><strong>Type</strong>: Capstone. <strong>Time</strong>: about 25 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Production MCP is not one server process. It is a chain of contracts: publishable metadata, live discovery, a stateless request envelope, authorization, policy, audit, and deployment evidence.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Stateless MCP</td>
+<td>"No state anywhere"</td>
+<td>No protocol session; cross-call state is explicit and server-managed</td>
+</tr>
+<tr>
+<td><code>server.json</code></td>
+<td>"The tool manifest"</td>
+<td>Registry metadata for naming, packaging, configuration, and transports</td>
+</tr>
+<tr>
+<td><code>server/discover</code></td>
+<td>"The handshake"</td>
+<td>A normal mandatory RPC for live versions and capabilities, not a session initializer</td>
+</tr>
+<tr>
+<td>Cache scope</td>
+<td>"Can I cache it?"</td>
+<td>Whether a cacheable result is safe for shared or private reuse</td>
+</tr>
+<tr>
+<td>Policy decision</td>
+<td>"The token allows it"</td>
+<td>A separate decision over actor, tool, target, arguments, and context</td>
+</tr>
+<tr>
+<td>Approval record</td>
+<td>"A human clicked yes"</td>
+<td>Evidence bound to one actor and consequential action under an expiry policy</td>
+</tr>
+<tr>
+<td>Explicit handle</td>
+<td>"A session ID"</td>
+<td>Ordinary application data for named server-managed state, not protocol connection state</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Required MCP Prerequisite Path</h2>
+<p>Complete the four linked Phase 13 lessons in order before treating this capstone as production-ready:</p>
+<ol>
+<li><a href="#a1328">[Lesson 19.28](#a1928)</a> defines the tool, schema, content, pagination, completion, routing, and error contracts this server must expose.</li>
+<li><a href="#a1329">[Lesson 19.29](#a1929)</a> defines cancellation races, deadlines, idempotency, backpressure, retry, and reconnect behavior.</li>
+<li><a href="#a1330">[Lesson 19.30](#a1930)</a> defines namespace, provenance, admission pin, Registry status, drift, ledger, and rollback evidence.</li>
+<li><a href="#a1331">[Lesson 19.31](#a1931)</a> defines golden and negative transcripts, strict version eras, SDK differential checks, proxy proof, redaction, health, and release gating.</li>
+</ol>
+<p>The capstone integrates those artifacts. It does not replace them with one happy-path SDK test.</p>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>The <strong>Model Context Protocol (MCP)</strong> is the standard way for AI applications to call outside tools. Running an MCP server in production for a whole organization involves several separate agreements that must stay consistent: a <strong>registry entry</strong> (<code>server.json</code>) that says where the server lives; <strong>live discovery</strong> (<code>server/discover</code>) that says what the running process supports right now; a <strong>stateless request envelope</strong>, so any replica can answer any request and no session needs to stick to one machine (the main change in the 2026-07-28 revision of the protocol); <strong>authorization</strong> that checks every token's issuer, audience and scopes; a <strong>policy</strong> decision on each specific call, with state-changing tools needing an explicit <strong>approval record</strong>; and an <strong>audit log</strong> that records what happened without leaking secrets. This capstone builds and tests each of these boundaries.</p></div></aside>
+<p>An internal platform needs read-only data tools and a small set of state-changing tools. Developers must be able to discover the server, understand how to connect, inspect its live capabilities, and call only the operations they are authorized to use.</p>
+<p>The difficult part is not registering a function. The difficult part is keeping six different truths aligned:</p>
+<ol>
+<li><code>server.json</code> says where the server can be installed or reached.</li>
+<li><code>server/discover</code> says what the live process supports now.</li>
+<li>Every request says which protocol revision and client capabilities it uses.</li>
+<li>Authorization binds a caller to the correct issuer, resource, and scopes.</li>
+<li>Policy decides whether this specific action may run.</li>
+<li>Audit evidence records what crossed the boundary without leaking secrets or sensitive payloads.</li>
+</ol>
+<p>If any one of these drifts, the platform may list a server that cannot be reached, route an incompatible client, accept a token minted for another resource, or expose a destructive action without the expected review.</p>
+<h2>The Two Discovery Layers</h2>
+<p>The Registry and the live MCP server answer different questions.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Contract</th>
+<th>Question it answers</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Publication</td>
+<td><code>server.json</code> and Registry API</td>
+<td>What is this server, where is its package or remote endpoint, and how is it configured?</td>
+</tr>
+<tr>
+<td>Runtime</td>
+<td><code>server/discover</code></td>
+<td>Which protocol versions, capabilities, extensions, and server identity does this process support?</td>
+</tr>
+</tbody>
+</table></div>
+<p>The official Registry uses a versioned <code>server.json</code> schema. A remote entry can name a Streamable HTTP URL:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;$schema&quot;: &quot;https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json&quot;,
+  &quot;name&quot;: &quot;com.example/internal-readonly&quot;,
+  &quot;title&quot;: &quot;Internal Read-Only Tools&quot;,
+  &quot;description&quot;: &quot;Read-only incident and data lookup tools.&quot;,
+  &quot;version&quot;: &quot;1.0.0&quot;,
+  &quot;remotes&quot;: [
+    {
+      &quot;type&quot;: &quot;streamable-http&quot;,
+      &quot;url&quot;: &quot;https://mcp.internal.example.com/readonly&quot;
+    }
+  ]
+}
+</code></pre></div>
+<p>The Registry schema version and the MCP protocol revision are independent. Do not rewrite one date to match the other. Validate each document against its own contract.</p>
+<p>Schema validity does not prove namespace ownership. A publisher verified for <code>example.com</code> uses the reverse-DNS namespace <code>com.example/*</code> or one of its child namespaces. The Registry authentication flow proves that ownership. Keeping the domain labels in their ordinary order names a different namespace.</p>
+<p>The stdlib model's <code>validate_registry_document</code> function is intentionally a partial remote-profile validator. It checks the official required <code>name</code>, <code>description</code>, and <code>version</code> fields; the optional <code>title</code>; the published name and length constraints; concrete-version shape; and each <code>streamable-http</code> or <code>sse</code> remote's HTTP(S) URL shape. It additionally requires a non-empty <code>remotes</code> list because this capstone always live-probes a remote. <code>validate_publisher_namespace</code> separately checks the name against the verified publisher domain, while <code>validate_runtime_alignment</code> compares the publication name and version with live <code>serverInfo</code>. The official schema also supports package-only records and more remote fields. Before publication, validate the entire document with the pinned official JSON Schema or <code>mcp-publisher</code>; do not present this dependency-free subset as full schema validation.</p>
+<p>The server must implement <code>server/discover</code>; a client may call it before other methods. This capstone client does so after resolving the endpoint, and receives the current protocol revision and live capabilities:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;resultType&quot;: &quot;complete&quot;,
+  &quot;supportedVersions&quot;: [&quot;2026-07-28&quot;],
+  &quot;capabilities&quot;: {
+    &quot;tools&quot;: {
+      &quot;listChanged&quot;: false
+    }
+  },
+  &quot;_meta&quot;: {
+    &quot;io.modelcontextprotocol/serverInfo&quot;: {
+      &quot;name&quot;: &quot;com.example/internal-readonly&quot;,
+      &quot;version&quot;: &quot;1.0.0&quot;
+    }
+  },
+  &quot;ttlMs&quot;: 3600000,
+  &quot;cacheScope&quot;: &quot;public&quot;
+}
+</code></pre></div>
+<p>A private catalog may index extra ownership, review, or lifecycle data, but it must not invent that data as MCP wire fields or root <code>server.json</code> fields. Store organizational policy beside the published record. When public custom metadata is necessary, use the Registry's <code>_meta.io.modelcontextprotocol.registry/publisher-provided</code> extension and stay within its 4 KB limit.</p>
+<h2>Stateless MCP Core</h2>
+<p>MCP revision <code>2026-07-28</code> removes protocol sessions and the <code>initialize</code> / <code>notifications/initialized</code> handshake. It also removes <code>Mcp-Session-Id</code>.</p>
+<p>Every request carries protocol context in <code>params._meta</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+  &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+  &quot;io.modelcontextprotocol/clientInfo&quot;: {
+    &quot;name&quot;: &quot;internal-platform-client&quot;,
+    &quot;version&quot;: &quot;1.0.0&quot;
+  }
+}
+</code></pre></div>
+<p>The version and capabilities are request facts, not connection facts. A load balancer may send consecutive requests to different healthy replicas because either replica can validate the request from the message itself.</p>
+<p>Ordinary results include <code>resultType: "complete"</code>. Servers should place their identity in <code>_meta.io.modelcontextprotocol/serverInfo</code> on each result. A missing or non-string protocol version is invalid params <code>-32602</code>. Error <code>-32022</code> is only for a supplied string that is unsupported, with exactly <code>{"supported": ["2026-07-28"], "requested": "..."}</code> as its data.</p>
+<h3>Cacheable discovery</h3>
+<p><code>tools/list</code> must be deterministic for the same effective tool set. The result includes:</p>
+<ul>
+<li><code>ttlMs</code>, a freshness hint for the client;</li>
+<li><code>cacheScope</code>, either <code>public</code> or <code>private</code>;</li>
+<li>a stable tool order so identical lists can reuse prompt caches;</li>
+<li><code>resultType: "complete"</code> and server identity metadata.</li>
+</ul>
+<p>Per-user authorization should normally produce <code>cacheScope: "private"</code>. Do not put user-specific tool visibility behind a shared public cache.</p>
+<h2>Streamable HTTP</h2>
+<p>A network server exposes one MCP endpoint that accepts POST. Each JSON-RPC request or notification gets its own POST.</p>
+<p>For a request, the server returns either one JSON object or an SSE stream scoped to that request. A long-lived <code>subscriptions/listen</code> request carries opted-in change notifications. There is no standalone GET stream, session DELETE, session header, or <code>Last-Event-ID</code> replay in the current transport.</p>
+<p>Each request includes:</p>
+<ul>
+<li><code>MCP-Protocol-Version</code>, matching the body metadata;</li>
+<li><code>Mcp-Method</code>, matching the JSON-RPC method;</li>
+<li><code>Mcp-Name</code> for <code>tools/call</code>, <code>resources/read</code>, and <code>prompts/get</code>;</li>
+<li><code>Accept: application/json, text/event-stream</code>.</li>
+</ul>
+<p>Reject mismatched mirrored headers with the specified <code>-32020</code> error. Validate <code>Origin</code>, bind local development servers to loopback, authenticate remote clients, and treat a closed request-scoped SSE response as cancellation.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmd66438348e" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1350.39px; background-color: transparent;" viewBox="0 0 1350.390625 340" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd66438348e{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd66438348e .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd66438348e .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd66438348e .error-icon{fill:#f4efe7;}#mmd66438348e .error-text{fill:#0b1018;stroke:#0b1018;}#mmd66438348e .edge-thickness-normal{stroke-width:1px;}#mmd66438348e .edge-thickness-thick{stroke-width:3.5px;}#mmd66438348e .edge-pattern-solid{stroke-dasharray:0;}#mmd66438348e .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd66438348e .edge-pattern-dashed{stroke-dasharray:3;}#mmd66438348e .edge-pattern-dotted{stroke-dasharray:2;}#mmd66438348e .marker{fill:#6c6357;stroke:#6c6357;}#mmd66438348e .marker.cross{stroke:#6c6357;}#mmd66438348e svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmd66438348e p{margin:0;}#mmd66438348e .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmd66438348e .cluster-label text{fill:#0b1018;}#mmd66438348e .cluster-label span{color:#0b1018;}#mmd66438348e .cluster-label span p{background-color:transparent;}#mmd66438348e .label text,#mmd66438348e span{fill:#211c16;color:#211c16;}#mmd66438348e .node rect,#mmd66438348e .node circle,#mmd66438348e .node ellipse,#mmd66438348e .node polygon,#mmd66438348e .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmd66438348e .rough-node .label text,#mmd66438348e .node .label text,#mmd66438348e .image-shape .label,#mmd66438348e .icon-shape .label{text-anchor:middle;}#mmd66438348e .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd66438348e .rough-node .label,#mmd66438348e .node .label,#mmd66438348e .image-shape .label,#mmd66438348e .icon-shape .label{text-align:center;}#mmd66438348e .node.clickable{cursor:pointer;}#mmd66438348e .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmd66438348e .arrowheadPath{fill:#0b0b0b;}#mmd66438348e .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmd66438348e .flowchart-link{stroke:#6c6357;fill:none;}#mmd66438348e .edgeLabel{background-color:#ffffff;text-align:center;}#mmd66438348e .edgeLabel p{background-color:#ffffff;}#mmd66438348e .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd66438348e .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd66438348e .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmd66438348e .cluster text{fill:#0b1018;}#mmd66438348e .cluster span{color:#0b1018;}#mmd66438348e div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmd66438348e .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmd66438348e rect.text{fill:none;stroke-width:0;}#mmd66438348e .icon-shape,#mmd66438348e .image-shape{background-color:#ffffff;text-align:center;}#mmd66438348e .icon-shape p,#mmd66438348e .image-shape p{background-color:#ffffff;padding:2px;}#mmd66438348e .icon-shape .label rect,#mmd66438348e .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd66438348e .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd66438348e .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd66438348e .node .neo-node{stroke:#b5521b;}#mmd66438348e [data-look="neo"].node rect,#mmd66438348e [data-look="neo"].cluster rect,#mmd66438348e [data-look="neo"].node polygon{stroke:url(#mmd66438348e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd66438348e [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd66438348e [data-look="neo"].node path{stroke:url(#mmd66438348e-gradient);stroke-width:1px;}#mmd66438348e [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd66438348e [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmd66438348e [data-look="neo"].node circle{stroke:url(#mmd66438348e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd66438348e [data-look="neo"].node circle .state-start{fill:#000000;}#mmd66438348e [data-look="neo"].icon-shape .icon{fill:url(#mmd66438348e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd66438348e [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd66438348e-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd66438348e :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd66438348e_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd66438348e_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd66438348e_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M148.578,134.5L152.745,134.5C156.911,134.5,165.245,134.5,172.911,134.5C180.578,134.5,187.578,134.5,191.078,134.5L194.578,134.5" id="mmd66438348e-L_R_J_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_J_0" data-points="W3sieCI6MTQ4LjU3ODEyNSwieSI6MTM0LjV9LHsieCI6MTczLjU3ODEyNSwieSI6MTM0LjV9LHsieCI6MTk4LjU3ODEyNSwieSI6MTM0LjV9XQ==" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M331.266,134.5L335.432,134.5C339.599,134.5,347.932,134.5,355.599,134.5C363.266,134.5,370.266,134.5,373.766,134.5L377.266,134.5" id="mmd66438348e-L_J_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_J_C_0" data-points="W3sieCI6MzMxLjI2NTYyNSwieSI6MTM0LjV9LHsieCI6MzU2LjI2NTYyNSwieSI6MTM0LjV9LHsieCI6MzgxLjI2NTYyNSwieSI6MTM0LjV9XQ==" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M469.957,109L481.266,96.417C492.576,83.833,515.194,58.667,538.075,46.083C560.956,33.5,584.099,33.5,595.671,33.5L607.242,33.5" id="mmd66438348e-L_C_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_D_0" data-points="W3sieCI6NDY5Ljk1NzEwODYwMTQ4NTIsInkiOjEwOX0seyJ4Ijo1MzcuODEyNSwieSI6MzMuNX0seyJ4Ijo2MTEuMjQyMTg3NSwieSI6MzMuNX1d" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M512.813,134.5L516.979,134.5C521.146,134.5,529.479,134.5,549.161,134.5C568.844,134.5,599.875,134.5,615.391,134.5L630.906,134.5" id="mmd66438348e-L_C_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_L_0" data-points="W3sieCI6NTEyLjgxMjUsInkiOjEzNC41fSx7IngiOjUzNy44MTI1LCJ5IjoxMzQuNX0seyJ4Ijo2MzQuOTA2MjUsInkiOjEzNC41fV0=" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M467.799,160L479.468,174.333C491.137,188.667,514.475,217.333,529.644,231.667C544.813,246,551.813,246,555.313,246L558.813,246" id="mmd66438348e-L_C_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_G_0" data-points="W3sieCI6NDY3Ljc5ODkwNjk1MDY3MjYzLCJ5IjoxNjB9LHsieCI6NTM3LjgxMjUsInkiOjI0Nn0seyJ4Ijo1NjIuODEyNSwieSI6MjQ2fV0=" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M785.044,210L795.505,205.917C805.967,201.833,826.89,193.667,843.669,189.583C860.448,185.5,873.083,185.5,879.401,185.5L885.719,185.5" id="mmd66438348e-L_G_RO_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_RO_0" data-points="W3sieCI6Nzg1LjA0MzkwNDk1ODY3NzcsInkiOjIxMH0seyJ4Ijo4NDcuODEyNSwieSI6MTg1LjV9LHsieCI6ODg5LjcxODc1LCJ5IjoxODUuNX1d" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M803.308,282L810.725,284.417C818.143,286.833,832.978,291.667,843.895,294.083C854.813,296.5,861.813,296.5,865.313,296.5L868.813,296.5" id="mmd66438348e-L_G_RW_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_G_RW_0" data-points="W3sieCI6ODAzLjMwNzU0OTUwNDk1MDUsInkiOjI4Mn0seyJ4Ijo4NDcuODEyNSwieSI6Mjk2LjV9LHsieCI6ODcyLjgxMjUsInkiOjI5Ni41fV0=" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M1109.328,185.5L1116.313,185.5C1123.297,185.5,1137.266,185.5,1151.17,186.14C1165.073,186.78,1178.912,188.061,1185.832,188.701L1192.751,189.341" id="mmd66438348e-L_RO_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RO_A_0" data-points="W3sieCI6MTEwOS4zMjgxMjUsInkiOjE4NS41fSx7IngiOjExNTEuMjM0Mzc1LCJ5IjoxODUuNX0seyJ4IjoxMTk2LjczNDM3NSwieSI6MTg5LjcwOTkxNzU5NDMzMjh9XQ==" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M1126.234,304.852L1130.401,305.127C1134.568,305.401,1142.901,305.951,1150.568,306.225C1158.234,306.5,1165.234,306.5,1168.734,306.5L1172.234,306.5" id="mmd66438348e-L_RW_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RW_H_0" data-points="W3sieCI6MTEyNi4yMzQzNzUsInkiOjMwNC44NTIxMjkzNTc4NDU0fSx7IngiOjExNTEuMjM0Mzc1LCJ5IjozMDYuNX0seyJ4IjoxMTc2LjIzNDM3NSwieSI6MzA2LjV9XQ==" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/><path d="M1076.13,271L1088.647,266.833C1101.165,262.667,1126.2,254.333,1147.03,246.282C1167.861,238.231,1184.488,230.462,1192.801,226.578L1201.114,222.693" id="mmd66438348e-L_RW_A_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RW_A_0" data-points="W3sieCI6MTA3Ni4xMjk5NTA0OTUwNDk2LCJ5IjoyNzF9LHsieCI6MTE1MS4yMzQzNzUsInkiOjI0Nn0seyJ4IjoxMjA0LjczODM5NzI3NzIyNzcsInkiOjIyMX1d" data-look="classic" marker-end="url(#mmd66438348e_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R_J_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_J_C_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_C_D_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_C_L_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_C_G_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_G_RO_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_G_RW_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_RO_A_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_RW_H_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_RW_A_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmd66438348e-flowchart-R-0" data-look="classic" transform="translate(78.2890625, 134.5)"><rect class="basic label-container" style="" x="-70.2890625" y="-25.5" width="140.578125" height="51"/><g class="label" style="" transform="translate(-40.2890625, -10.5)"><rect/><foreignObject width="80.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Registry API</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-J-1" data-look="classic" transform="translate(264.921875, 134.5)"><rect class="basic label-container" style="" x="-66.34375" y="-25.5" width="132.6875" height="51"/><g class="label" style="" transform="translate(-36.34375, -10.5)"><rect/><foreignObject width="72.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>server.json</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-C-3" data-look="classic" transform="translate(447.0390625, 134.5)"><rect class="basic label-container" style="" x="-65.7734375" y="-25.5" width="131.546875" height="51"/><g class="label" style="" transform="translate(-35.7734375, -10.5)"><rect/><foreignObject width="71.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>MCP client</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-D-5" data-look="classic" transform="translate(692.8125, 33.5)"><rect class="basic label-container" style="" x="-81.5703125" y="-25.5" width="163.140625" height="51"/><g class="label" style="" transform="translate(-51.5703125, -10.5)"><rect/><foreignObject width="103.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>server/discover</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-L-7" data-look="classic" transform="translate(692.8125, 134.5)"><rect class="basic label-container" style="" x="-57.90625" y="-25.5" width="115.8125" height="51"/><g class="label" style="" transform="translate(-27.90625, -10.5)"><rect/><foreignObject width="55.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>tools/list</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-G-9" data-look="classic" transform="translate(692.8125, 246)"><rect class="basic label-container" style="" x="-130" y="-36" width="260" height="72"/><g class="label" style="" transform="translate(-100, -21)"><rect/><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Authorization and policy gateway</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-RO-11" data-look="classic" transform="translate(999.5234375, 185.5)"><rect class="basic label-container" style="" x="-109.8046875" y="-25.5" width="219.609375" height="51"/><g class="label" style="" transform="translate(-79.8046875, -10.5)"><rect/><foreignObject width="159.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Read-only MCP replicas</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-RW-13" data-look="classic" transform="translate(999.5234375, 296.5)"><rect class="basic label-container" style="" x="-126.7109375" y="-25.5" width="253.421875" height="51"/><g class="label" style="" transform="translate(-96.7109375, -10.5)"><rect/><foreignObject width="193.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>State-changing MCP replicas</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-A-15" data-look="classic" transform="translate(1259.3125, 195.5)"><rect class="basic label-container" style="" x="-62.578125" y="-25.5" width="125.15625" height="51"/><g class="label" style="" transform="translate(-32.578125, -10.5)"><rect/><foreignObject width="65.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Audit sink</p></span></div></foreignObject></g></g><g class="node default" id="mmd66438348e-flowchart-H-17" data-look="classic" transform="translate(1259.3125, 306.5)"><rect class="basic label-container" style="" x="-83.078125" y="-25.5" width="166.15625" height="51"/><g class="label" style="" transform="translate(-53.078125, -10.5)"><rect/><foreignObject width="106.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Approval record</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd66438348e-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd66438348e-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd66438348e-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cf-mcp-gate"></div></figure></p>
+<h2>Authorization and Policy</h2>
+<p>Transport metadata is not authorization. Validate authorization on every call.</p>
+<p>For remote servers:</p>
+<ol>
+<li>Discover protected-resource metadata.</li>
+<li>Select the authorization server for that resource.</li>
+<li>Prefer Client ID Metadata Documents for client registration. Treat Dynamic Client Registration as compatibility support.</li>
+<li>Send the resource indicator during authorization.</li>
+<li>Validate a returned <code>iss</code> value against the authorization server recorded for the flow.</li>
+<li>Key client credentials by issuer. Never reuse registration data across issuers.</li>
+<li>Validate token issuer, audience or resource, expiry, and scopes at the MCP server.</li>
+<li>Apply a second policy decision to the concrete tool and arguments.</li>
+</ol>
+<p>Tool annotations such as <code>readOnlyHint</code> and <code>destructiveHint</code> help clients present risk. They are not trusted authorization controls.</p>
+<h3>Approval is a record, not a magic scope</h3>
+<p>A state-changing call needs an approval record bound to the actor, tool, normalized arguments or digest, target environment, expiry, and one-time or repeat-use policy. A chat message alone is not proof of approval.</p>
+<p>The Python model hashes canonical JSON with sorted keys, then binds that digest with the token subject, tool name, server URL, and expiry. Replaying the record after changing even one argument fails before the handler runs. Approval is separate evidence, not a scope added to the access token.</p>
+<p>Keep high-risk tools on a separately reviewable surface when that materially reduces blast radius. Separation is useful only if credentials, policy, deployment identity, and audit controls are also separate.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Why an approval must be bound to the arguments</div><div class="co-body"><p>A user approves "create a Jira ticket titled <em>new bug</em> in PROJ". The approval is stored.</p>
+<ol>
+<li><strong>Unbound approval</strong> (just "u42 may call <code>jira.create</code>"): the agent can later call <code>jira.create</code> with any title in any project, including one an injected instruction asked for, and the approval still matches.</li>
+<li><strong>Bound approval:</strong> the record stores a hash of the exact normalized arguments, plus the user, the tool, the server and an expiry.</li>
+<li>A later call with title <em>"new bug"</em> in PROJ matches the hash and runs once. A call with title <em>"urgent: rotate all keys"</em> produces a different hash and is refused before the handler runs.</li>
+<li>The approval is evidence about one action, not a broader permission, which is why it is kept separate from the token's scopes.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> The registry entry and live discovery answer different questions and must be validated separately.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> <code>readOnlyHint</code> and <code>destructiveHint</code> annotations are security controls.
+  They help clients present risk; the server must still authorize every call.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A token minted for one MCP server must be rejected by another (audience check).</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A chat message saying "yes, go ahead" is enough approval for a state-changing tool.
+  Approval should be a record bound to actor, tool, arguments, target and expiry.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: an approval is bound to the SHA-256 of the canonical JSON of the arguments. Does reordering the keys of the same arguments invalidate it? Does changing one character of the title?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Binding an approval to its arguments</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import hashlib, json, time
+def digest(args):
+    return hashlib.sha256(json.dumps(args, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;)).encode()).hexdigest()
+
+approval = {&quot;actor&quot;: &quot;u42&quot;, &quot;tool&quot;: &quot;jira.create&quot;, &quot;server&quot;: &quot;https://mcp.internal.example.com/destructive&quot;,
+            &quot;args_digest&quot;: digest({&quot;project&quot;: &quot;PROJ&quot;, &quot;title&quot;: &quot;new bug&quot;}), &quot;expires&quot;: time.time() + 300}
+
+def check(actor, tool, server, args, now=None):
+    now = now or time.time()
+    if (actor, tool, server) != (approval[&quot;actor&quot;], approval[&quot;tool&quot;], approval[&quot;server&quot;]): return &quot;refused: wrong actor, tool or server&quot;
+    if now &gt; approval[&quot;expires&quot;]: return &quot;refused: approval expired&quot;
+    if digest(args) != approval[&quot;args_digest&quot;]: return &quot;refused: arguments differ from what was approved&quot;
+    return &quot;allowed&quot;
+
+S = approval[&quot;server&quot;]
+print(&quot;same args             :&quot;, check(&quot;u42&quot;, &quot;jira.create&quot;, S, {&quot;project&quot;: &quot;PROJ&quot;, &quot;title&quot;: &quot;new bug&quot;}))
+print(&quot;same args, other order:&quot;, check(&quot;u42&quot;, &quot;jira.create&quot;, S, {&quot;title&quot;: &quot;new bug&quot;, &quot;project&quot;: &quot;PROJ&quot;}))
+print(&quot;title changed         :&quot;, check(&quot;u42&quot;, &quot;jira.create&quot;, S, {&quot;project&quot;: &quot;PROJ&quot;, &quot;title&quot;: &quot;new bug!&quot;}))
+print(&quot;other user            :&quot;, check(&quot;u7&quot;, &quot;jira.create&quot;, S, {&quot;project&quot;: &quot;PROJ&quot;, &quot;title&quot;: &quot;new bug&quot;}))
+print(&quot;ten minutes later     :&quot;, check(&quot;u42&quot;, &quot;jira.create&quot;, S, {&quot;project&quot;: &quot;PROJ&quot;, &quot;title&quot;: &quot;new bug&quot;}, time.time() + 600))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">same args             : allowed
+same args, other order: allowed
+title changed         : refused: arguments differ from what was approved
+other user            : refused: wrong actor, tool or server
+ten minutes later     : refused: approval expired</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Reordering keys changes nothing, because the JSON is canonicalized (sorted keys, fixed separators) before hashing; changing a single character, the user, or the time past expiry each refuses the call before any handler runs. Canonicalization is the subtle part: without it, the same approved action could fail on harmless differences, and teams then loosen the check until it protects nothing.</p></div></aside>
+<h2>Build · 1. Model publication metadata</h2>
+<p>Create and schema-validate <code>server.json</code>. Include a stable name inside the namespace authenticated for the publisher, plus version, description, official <code>repository</code> or <code>packages</code> metadata when applicable, and a remote or stdio transport. Keep secrets as declared environment-variable inputs, never literal values.</p>
+<h2>Build · 2. Implement live discovery</h2>
+<p>Implement <code>server/discover</code> before any feature RPC. Advertise supported protocol versions, capabilities, extensions, and server identity. Add a version rejection case using <code>-32022</code>.</p>
+<h2>Build · 3. Implement the stateless envelope</h2>
+<p>Require protocol version and client capabilities in every request. Return <code>resultType</code> and server identity in every result. Remove initialization state, connection-scoped capability caches, and session identifiers.</p>
+<h2>Build · 4. Build the tool surface</h2>
+<p>Start with two read-only tools and one state-changing tool. Give each a bounded JSON Schema, precise description, deterministic result shape, and honest annotations. Add output schemas when clients rely on structured results.</p>
+<h2>Build · 5. Add cache-aware listing</h2>
+<p>Return tools in stable order with <code>ttlMs</code> and <code>cacheScope</code>. Exercise cache expiry and list-change notification behavior separately.</p>
+<h2>Build · 6. Add authorization and policy</h2>
+<p>Validate issuer, audience, expiry, and scope. Run a policy decision for every tool call. Bind approvals to exact high-risk actions. Deny missing or stale approvals before executing a handler.</p>
+<h2>Build · 7. Separate registry and runtime validation</h2>
+<p>Validate the static <code>server.json</code> record, then probe the remote endpoint with <code>server/discover</code>. Report drift when the published remote, identity, version, or required capabilities disagree with the live process.</p>
+<h2>Build · 8. Add audit evidence</h2>
+<p>Record actor, issuer, resource, tool, policy decision, request identifier, trace context, latency, and outcome. Redact or digest sensitive arguments and results before persistence. Keep the audit sink outside model-visible context.</p>
+<h2>Build · 9. Exercise horizontal scaling</h2>
+<p>Place two stateless replicas behind a load balancer. Send at least 100 concurrent requests. Demonstrate that correctness does not depend on affinity. If a tool needs cross-call state, mint an explicit opaque handle and store it in a shared durable system.</p>
+<h2>Build · 10. Cross the real wire</h2>
+<p>Run conformance checks against the actual server binary. Capture request headers and JSON bodies, not only SDK objects. Exercise wrong version, header mismatch, missing scope, wrong audience, malformed arguments, handler failure, cancellation, and cache expiry.</p>
+<h2>Required Evidence Pack</h2>
+<p>A submission is incomplete until it contains all five evidence classes:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Evidence</th>
+<th>Minimum proof</th>
+<th>Source lesson</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Wire</td>
+<td>Redacted raw headers and JSON-RPC bodies for golden and negative cases, including metadata type failure, header mismatch, unsupported version, missing or unknown <code>resultType</code>, notification no-response, and response ID matching</td>
+<td><a href="#a1331">[Lesson 19.31](#a1931)</a></td>
+</tr>
+<tr>
+<td>Proxy</td>
+<td>The same stable case run directly and through the deployed intermediary, with ingress, origin, and egress status and body digests; prove protocol errors are not collapsed into generic 500 responses and streaming is not buffered</td>
+<td><a href="#a1329">Lessons 29</a> and <a href="#a1331">31</a></td>
+</tr>
+<tr>
+<td>Admission</td>
+<td>Verified publisher namespace, immutable Registry record digest, artifact or remote provenance, live <code>server/discover</code> identity and capability observation, descriptor pin, current Registry status, and admission-ledger event</td>
+<td><a href="#a1330">[Lesson 19.30](#a1930)</a></td>
+</tr>
+<tr>
+<td>Retry</td>
+<td>A cancellation-versus-completion race, explicit timeout, safe read retry, mutation idempotency key, reconnect refetch, and proof that request cancellation cannot silently become durable task cancellation</td>
+<td><a href="#a1329">[Lesson 19.29](#a1929)</a></td>
+</tr>
+<tr>
+<td>Rollback</td>
+<td>Exact previous version, admission and artifact digests, descriptor pin, active Registry status, current health window, route restoration result, and redacted decision evidence</td>
+<td><a href="#a1330">Lessons 30</a> and <a href="#a1331">31</a></td>
+</tr>
+</tbody>
+</table></div>
+<p>Store a digest of the redacted pack with the release. If any class is missing, hold the release. Do not infer proxy behavior from an in-process dispatcher, admission from Registry presence, retry safety from a new JSON-RPC id, or rollback readiness from “the previous deployment.”</p>
+<h2>Local Reference Models</h2>
+<p>The Python model demonstrates registry metadata, reverse-DNS publisher namespace validation, publication-to-runtime identity checks, live discovery, deterministic tool listing, per-request metadata, trusted-issuer, audience, expiry, and scope checks, action-bound approvals, a documented partial Registry validator, policy, and audit without opening a network socket:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/19-capstone-projects/13-mcp-server-with-registry
+python3 code/main.py
+npx tsx code/main.ts
+python3 -m unittest discover -s code/tests -v
+</code></pre></div>
+<p>The TypeScript project exposes the stateless JSON-RPC shape over stdio without an MCP SDK. Its <code>tools/call</code> path enforces the same bounded input schemas advertised by <code>tools/list</code>; invalid arguments for a known tool return a complete result with <code>isError: true</code> without invoking the executor:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/19-capstone-projects/13-mcp-server-with-registry/code/ts
+npm install
+npm run typecheck
+npm test
+npm run demo
+</code></pre></div>
+<p>These models prove local contract logic. They do not prove HTTP headers, OAuth exchange, Registry publication, OPA integration, load balancing, or collector receipt.</p>
+<p>Here is <code>code/main.py</code>, in 10 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 10 · <code>request_meta</code>, <code>error</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Stateless MCP server, registry metadata, policy, and audit simulation.
+
+This stdlib-only model keeps two discovery layers separate:
+
+* ``server.json`` describes installation and remote transport metadata to a
+  registry.
+* ``server/discover`` reports live protocol versions and capabilities.
+
+It does not open a network listener, validate a real OAuth token, call OPA, or
+publish to a registry. Run with ``python3 code/main.py`` from the lesson root.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
+from typing import Callable
+
+
+PROTOCOL_VERSION = &quot;2026-07-28&quot;
+REGISTRY_SCHEMA = &quot;https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json&quot;
+PUBLISHER_DOMAIN = &quot;example.com&quot;
+SERVER_NAME_RE = re.compile(r&quot;^[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+$&quot;)
+DOMAIN_LABEL_RE = re.compile(r&quot;^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$&quot;)
+REMOTE_URL_RE = re.compile(r&quot;^https?://\S+$&quot;)
+VERSION_RANGE_RE = re.compile(r&quot;(?:^[~^&lt;&gt;=]|[*]|(?:^|\.)x(?:$|\.))&quot;, re.IGNORECASE)
+
+
+def request_meta() -&gt; dict:
+    return {
+        &quot;io.modelcontextprotocol/protocolVersion&quot;: PROTOCOL_VERSION,
+        &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+        &quot;io.modelcontextprotocol/clientInfo&quot;: {
+            &quot;name&quot;: &quot;registry-capstone-client&quot;,
+            &quot;version&quot;: &quot;1.0.0&quot;,
+        },
+    }
+
+
+def error(code: int, message: str, data: dict | None = None) -&gt; dict:
+    detail = {&quot;code&quot;: code, &quot;message&quot;: message}
+    if data is not None:
+        detail[&quot;data&quot;] = data
+    return {&quot;error&quot;: detail}
+</code></pre></div>
+
+<p><strong>Part 2 of 10 · <code>validate_meta</code>, <code>ToolSchema</code>, <code>MCPServer</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def validate_meta(meta: object) -&gt; dict | None:
+    if not isinstance(meta, dict):
+        return error(-32602, &quot;params._meta must be an object&quot;)
+    requested = meta.get(&quot;io.modelcontextprotocol/protocolVersion&quot;)
+    if not isinstance(requested, str):
+        return error(-32602, &quot;protocolVersion must be a string&quot;)
+    if requested != PROTOCOL_VERSION:
+        return error(
+            -32022,
+            &quot;Unsupported protocol version&quot;,
+            {&quot;supported&quot;: [PROTOCOL_VERSION], &quot;requested&quot;: requested},
+        )
+    if not isinstance(meta.get(&quot;io.modelcontextprotocol/clientCapabilities&quot;), dict):
+        return error(-32602, &quot;clientCapabilities must be an object&quot;)
+    return None
+
+
+@dataclass(frozen=True)
+class ToolSchema:
+    name: str
+    required_scope: str
+    destructive: bool
+    description: str
+    input_schema: dict
+
+
+Handler = Callable[[dict], dict]
+
+
+@dataclass
+class MCPServer:
+    name: str
+    title: str
+    description: str
+    version: str
+    url: str
+    trusted_issuer: str
+    tools: dict[str, ToolSchema] = field(default_factory=dict)
+    handlers: dict[str, Handler] = field(default_factory=dict)
+
+    @property
+    def server_info(self) -&gt; dict:
+        return {&quot;name&quot;: self.name, &quot;version&quot;: self.version}
+
+    def register(self, schema: ToolSchema, handler: Handler) -&gt; None:
+        if schema.name in self.tools:
+            raise ValueError(f&quot;duplicate tool: {schema.name}&quot;)
+        self.tools[schema.name] = schema
+        self.handlers[schema.name] = handler
+
+    def result(self, **fields: object) -&gt; dict:
+        return {
+            &quot;resultType&quot;: &quot;complete&quot;,
+            **fields,
+            &quot;_meta&quot;: {&quot;io.modelcontextprotocol/serverInfo&quot;: self.server_info},
+        }
+
+    def discover(self, meta: dict) -&gt; dict:
+        invalid = validate_meta(meta)
+        if invalid:
+            return invalid
+        return self.result(
+            supportedVersions=[PROTOCOL_VERSION],
+            capabilities={&quot;tools&quot;: {&quot;listChanged&quot;: False}},
+            ttlMs=3_600_000,
+            cacheScope=&quot;public&quot;,
+        )
+
+    def tools_list(self, meta: dict) -&gt; dict:
+        invalid = validate_meta(meta)
+        if invalid:
+            return invalid
+        tools = [
+            {
+                &quot;name&quot;: tool.name,
+                &quot;description&quot;: tool.description,
+                &quot;inputSchema&quot;: tool.input_schema,
+                &quot;annotations&quot;: {
+                    &quot;readOnlyHint&quot;: not tool.destructive,
+                    &quot;destructiveHint&quot;: tool.destructive,
+                },
+            }
+            for tool in sorted(self.tools.values(), key=lambda item: item.name)
+        ]
+        return self.result(tools=tools, ttlMs=60_000, cacheScope=&quot;private&quot;)
+
+    def registry_document(self) -&gt; dict:
+        return {
+            &quot;$schema&quot;: REGISTRY_SCHEMA,
+            &quot;name&quot;: self.name,
+            &quot;title&quot;: self.title,
+            &quot;description&quot;: self.description,
+            &quot;version&quot;: self.version,
+            &quot;remotes&quot;: [{&quot;type&quot;: &quot;streamable-http&quot;, &quot;url&quot;: self.url}],
+        }
+</code></pre></div>
+
+<p><strong>Part 3 of 10 · <code>Token</code>, <code>arguments_digest</code>, <code>ApprovalRecord</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass(frozen=True)
+class Token:
+    user: str
+    issuer: str
+    audience: str
+    scopes: frozenset[str]
+    expires_at: float
+
+    def has_scope(self, scope: str) -&gt; bool:
+        return scope in self.scopes
+
+    def is_expired(self, now: float) -&gt; bool:
+        return now &gt;= self.expires_at
+
+
+def arguments_digest(args: dict) -&gt; str:
+    normalized = json.dumps(
+        args,
+        ensure_ascii=False,
+        separators=(&quot;,&quot;, &quot;:&quot;),
+        sort_keys=True,
+    )
+    return hashlib.sha256(normalized.encode(&quot;utf-8&quot;)).hexdigest()
+
+
+@dataclass(frozen=True)
+class ApprovalRecord:
+    actor: str
+    tool: str
+    arguments_digest: str
+    target: str
+    expires_at: float
+
+    @classmethod
+    def for_action(
+        cls,
+        actor: str,
+        tool: str,
+        args: dict,
+        target: str,
+        expires_at: float,
+    ) -&gt; ApprovalRecord:
+        return cls(actor, tool, arguments_digest(args), target, expires_at)
+
+    def authorize(
+        self,
+        actor: str,
+        tool: str,
+        args: dict,
+        target: str,
+        now: float,
+    ) -&gt; tuple[bool, str]:
+        if self.actor != actor:
+            return False, &quot;approval actor does not match token subject&quot;
+        if self.tool != tool:
+            return False, &quot;approval tool does not match requested tool&quot;
+        if self.target != target:
+            return False, &quot;approval target does not match this server&quot;
+        if self.arguments_digest != arguments_digest(args):
+            return False, &quot;approval arguments do not match requested action&quot;
+        if now &gt;= self.expires_at:
+            return False, &quot;approval has expired&quot;
+        return True, &quot;ok&quot;
+</code></pre></div>
+
+<p><strong>Part 4 of 10 · <code>policy_decide</code>, <code>redact</code>, <code>AuditEntry</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def policy_decide(
+    server: MCPServer,
+    tool: str,
+    token: Token,
+    args: dict,
+    now: float,
+    approval: ApprovalRecord | None = None,
+) -&gt; tuple[bool, str]:
+    if token.issuer != server.trusted_issuer:
+        return False, &quot;token issuer is not trusted by this server&quot;
+    if token.audience != server.url:
+        return False, &quot;token audience does not match this server&quot;
+    if token.is_expired(now):
+        return False, &quot;token has expired&quot;
+    schema = server.tools.get(tool)
+    if schema is None:
+        return False, f&quot;no such tool: {tool}&quot;
+    if not token.has_scope(schema.required_scope):
+        return False, f&quot;missing scope: {schema.required_scope}&quot;
+    if len(json.dumps(args)) &gt; 8192:
+        return False, &quot;payload too large&quot;
+    if schema.destructive:
+        if approval is None:
+            return False, &quot;destructive tool requires an action-bound approval&quot;
+        approved, reason = approval.authorize(
+            token.user,
+            tool,
+            args,
+            server.url,
+            now,
+        )
+        if not approved:
+            return False, reason
+    return True, &quot;ok&quot;
+
+
+def redact(payload: dict) -&gt; dict:
+    text = json.dumps(payload)
+    text = re.sub(r&quot;[\w.+-]+@[\w-]+\.[\w.-]+&quot;, &quot;[email]&quot;, text)
+    text = re.sub(r&quot;\b\d{3}-\d{2}-\d{4}\b&quot;, &quot;[ssn]&quot;, text)
+    return json.loads(text)
+
+
+@dataclass(frozen=True)
+class AuditEntry:
+    ts: float
+    user: str
+    issuer: str
+    tool: str
+    outcome: str
+    args_redacted: dict
+    response_redacted: dict
+</code></pre></div>
+
+<p><strong>Part 5 of 10 · <code>dispatch</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def dispatch(
+    server: MCPServer,
+    token: Token,
+    tool: str,
+    args: dict,
+    meta: dict,
+    audit: list[AuditEntry],
+    approval: ApprovalRecord | None = None,
+) -&gt; dict:
+    invalid = validate_meta(meta)
+    if invalid:
+        return invalid
+    now = time.time()
+    allowed, reason = policy_decide(server, tool, token, args, now, approval)
+    if not allowed:
+        audit.append(
+            AuditEntry(now, token.user, token.issuer, tool, f&quot;denied:{reason}&quot;, redact(args), {})
+        )
+        return error(-32000, reason)
+    try:
+        response = server.handlers[tool](args)
+    except Exception as exc:
+        audit.append(
+            AuditEntry(now, token.user, token.issuer, tool, &quot;handler_error&quot;, redact(args), {})
+        )
+        return server.result(
+            content=[{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: str(exc)}],
+            isError=True,
+        )
+    audit.append(
+        AuditEntry(
+            now,
+            token.user,
+            token.issuer,
+            tool,
+            &quot;allowed&quot;,
+            redact(args),
+            redact(response),
+        )
+    )
+    return server.result(
+        content=[{&quot;type&quot;: &quot;text&quot;, &quot;text&quot;: json.dumps(response)}],
+        structuredContent=response,
+        isError=False,
+    )
+</code></pre></div>
+
+<p><strong>Part 6 of 10 · <code>validate_registry_document</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def validate_registry_document(document: object) -&gt; list[str]:
+    &quot;&quot;&quot;Validate the official fields used by this lesson's remote-only profile.
+
+    This dependency-free subset is not a replacement for validation against
+    the complete pinned Registry JSON Schema before publication.
+    &quot;&quot;&quot;
+    if not isinstance(document, dict):
+        return [&quot;server.json must be an object&quot;]
+    issues: list[str] = []
+
+    for key in (&quot;name&quot;, &quot;description&quot;, &quot;version&quot;):
+        if key not in document:
+            issues.append(f&quot;missing {key}&quot;)
+
+    schema_uri = document.get(&quot;$schema&quot;)
+    if &quot;$schema&quot; in document and schema_uri != REGISTRY_SCHEMA:
+        issues.append(&quot;unsupported registry schema&quot;)
+
+    name = document.get(&quot;name&quot;)
+    if &quot;name&quot; in document and (
+        not isinstance(name, str)
+        or not 3 &lt;= len(name) &lt;= 200
+        or SERVER_NAME_RE.fullmatch(name) is None
+    ):
+        issues.append(&quot;name must match namespace/server and be 3-200 characters&quot;)
+
+    description = document.get(&quot;description&quot;)
+    if &quot;description&quot; in document and (
+        not isinstance(description, str) or not 1 &lt;= len(description) &lt;= 100
+    ):
+        issues.append(&quot;description must be a 1-100 character string&quot;)
+
+    title = document.get(&quot;title&quot;)
+    if &quot;title&quot; in document and (
+        not isinstance(title, str) or not 1 &lt;= len(title) &lt;= 100
+    ):
+        issues.append(&quot;title must be a 1-100 character string&quot;)
+
+    version = document.get(&quot;version&quot;)
+    if &quot;version&quot; in document and (
+        not isinstance(version, str)
+        or not 1 &lt;= len(version) &lt;= 255
+        or VERSION_RANGE_RE.search(version) is not None
+        or version.casefold() == &quot;latest&quot;
+    ):
+        issues.append(&quot;version must be one concrete 1-255 character version&quot;)
+
+    remotes = document.get(&quot;remotes&quot;)
+    if not isinstance(remotes, list) or not remotes:
+        issues.append(&quot;remote profile requires a non-empty remotes list&quot;)
+    else:
+        for index, remote in enumerate(remotes):
+            if not isinstance(remote, dict):
+                issues.append(f&quot;remotes[{index}] must be an object&quot;)
+                continue
+            if remote.get(&quot;type&quot;) not in {&quot;streamable-http&quot;, &quot;sse&quot;}:
+                issues.append(f&quot;remotes[{index}].type must be streamable-http or sse&quot;)
+            remote_url = remote.get(&quot;url&quot;)
+            if not isinstance(remote_url, str) or REMOTE_URL_RE.fullmatch(remote_url) is None:
+                issues.append(f&quot;remotes[{index}].url must be an http(s) URL template&quot;)
+    return issues
+</code></pre></div>
+
+<p><strong>Part 7 of 10 · <code>reverse_dns_namespace</code>, <code>validate_publisher_namespace</code>, <code>validate_runtime_alignment</code>, <code>Registry</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def reverse_dns_namespace(domain: str) -&gt; str:
+    normalized = domain.casefold().rstrip(&quot;.&quot;)
+    labels = normalized.split(&quot;.&quot;)
+    if len(labels) &lt; 2 or any(DOMAIN_LABEL_RE.fullmatch(label) is None for label in labels):
+        raise ValueError(&quot;publisher domain must be a valid multi-label DNS name&quot;)
+    return &quot;.&quot;.join(reversed(labels))
+
+
+def validate_publisher_namespace(document: object, verified_domain: str) -&gt; list[str]:
+    &quot;&quot;&quot;Check domain ownership outside the server.json shape contract.&quot;&quot;&quot;
+    if not isinstance(document, dict) or not isinstance(document.get(&quot;name&quot;), str):
+        return []
+    namespace = document[&quot;name&quot;].partition(&quot;/&quot;)[0]
+    expected = reverse_dns_namespace(verified_domain)
+    if namespace != expected and not namespace.startswith(f&quot;{expected}.&quot;):
+        return [
+            f&quot;name namespace must be {expected} or its child for verified domain {verified_domain}&quot;
+        ]
+    return []
+
+
+def validate_runtime_alignment(document: dict, discovery: object) -&gt; list[str]:
+    &quot;&quot;&quot;Compare publication identity with the live server/discover identity.&quot;&quot;&quot;
+    if not isinstance(discovery, dict):
+        return [&quot;server/discover result must be an object&quot;]
+    meta = discovery.get(&quot;_meta&quot;)
+    server_info = (
+        meta.get(&quot;io.modelcontextprotocol/serverInfo&quot;) if isinstance(meta, dict) else None
+    )
+    if not isinstance(server_info, dict):
+        return [&quot;server/discover must include serverInfo for registry drift checks&quot;]
+
+    issues: list[str] = []
+    if server_info.get(&quot;name&quot;) != document.get(&quot;name&quot;):
+        issues.append(&quot;runtime serverInfo.name does not match server.json name&quot;)
+    if server_info.get(&quot;version&quot;) != document.get(&quot;version&quot;):
+        issues.append(&quot;runtime serverInfo.version does not match server.json version&quot;)
+    return issues
+
+
+@dataclass
+class Registry:
+    publisher_domain: str = PUBLISHER_DOMAIN
+    entries: dict[str, dict] = field(default_factory=dict)
+    runtime_discovery: dict[str, dict] = field(default_factory=dict)
+
+    def register(self, server: MCPServer) -&gt; None:
+        document = server.registry_document()
+        issues = validate_registry_document(document)
+        issues.extend(validate_publisher_namespace(document, self.publisher_domain))
+        if issues:
+            raise ValueError(&quot;; &quot;.join(issues))
+        discovery = server.discover(request_meta())
+        if &quot;error&quot; in discovery:
+            raise ValueError(&quot;runtime discovery failed&quot;)
+        alignment_issues = validate_runtime_alignment(document, discovery)
+        if alignment_issues:
+            raise ValueError(&quot;; &quot;.join(alignment_issues))
+        self.entries[server.name] = deepcopy(document)
+        self.runtime_discovery[server.name] = deepcopy(discovery)
+
+    def search(self, query: str) -&gt; list[str]:
+        needle = query.casefold()
+        return sorted(
+            name
+            for name, entry in self.entries.items()
+            if needle in name.casefold()
+            or needle in entry[&quot;title&quot;].casefold()
+            or needle in entry[&quot;description&quot;].casefold()
+        )
+</code></pre></div>
+
+<p><strong>Part 8 of 10 · <code>build_readonly_server</code>, <code>build_destructive_server</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def build_readonly_server() -&gt; MCPServer:
+    server = MCPServer(
+        name=&quot;com.example/internal-readonly&quot;,
+        title=&quot;Internal Read-Only Tools&quot;,
+        description=&quot;Read-only incident and data lookup tools.&quot;,
+        version=&quot;1.0.0&quot;,
+        url=&quot;https://mcp.internal.example.com/readonly&quot;,
+        trusted_issuer=&quot;https://auth.internal.example.com&quot;,
+    )
+    server.register(
+        ToolSchema(
+            &quot;postgres.readonly&quot;,
+            &quot;postgres:query:readonly&quot;,
+            False,
+            &quot;Run an approved read-only query.&quot;,
+            {
+                &quot;type&quot;: &quot;object&quot;,
+                &quot;properties&quot;: {&quot;sql&quot;: {&quot;type&quot;: &quot;string&quot;}},
+                &quot;required&quot;: [&quot;sql&quot;],
+                &quot;additionalProperties&quot;: False,
+            },
+        ),
+        lambda args: {&quot;rows&quot;: [[1]], &quot;sql&quot;: args[&quot;sql&quot;]},
+    )
+    server.register(
+        ToolSchema(
+            &quot;s3.list&quot;,
+            &quot;s3:list&quot;,
+            False,
+            &quot;List objects in one approved bucket.&quot;,
+            {
+                &quot;type&quot;: &quot;object&quot;,
+                &quot;properties&quot;: {&quot;bucket&quot;: {&quot;type&quot;: &quot;string&quot;}},
+                &quot;required&quot;: [&quot;bucket&quot;],
+                &quot;additionalProperties&quot;: False,
+            },
+        ),
+        lambda args: {&quot;bucket&quot;: args[&quot;bucket&quot;], &quot;objects&quot;: [&quot;a/b.txt&quot;]},
+    )
+    return server
+
+
+def build_destructive_server() -&gt; MCPServer:
+    server = MCPServer(
+        name=&quot;com.example/internal-destructive&quot;,
+        title=&quot;Internal Destructive Tools&quot;,
+        description=&quot;State-changing tools behind explicit approval.&quot;,
+        version=&quot;1.0.0&quot;,
+        url=&quot;https://mcp.internal.example.com/destructive&quot;,
+        trusted_issuer=&quot;https://auth.internal.example.com&quot;,
+    )
+    server.register(
+        ToolSchema(
+            &quot;jira.create&quot;,
+            &quot;jira:write&quot;,
+            True,
+            &quot;Create one Jira issue after explicit approval.&quot;,
+            {
+                &quot;type&quot;: &quot;object&quot;,
+                &quot;properties&quot;: {&quot;title&quot;: {&quot;type&quot;: &quot;string&quot;}},
+                &quot;required&quot;: [&quot;title&quot;],
+                &quot;additionalProperties&quot;: False,
+            },
+        ),
+        lambda args: {&quot;id&quot;: &quot;PROJ-99&quot;, &quot;title&quot;: args[&quot;title&quot;], &quot;created&quot;: True},
+    )
+    return server
+</code></pre></div>
+
+<p><strong>Part 9 of 10 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    readonly = build_readonly_server()
+    destructive = build_destructive_server()
+    registry = Registry()
+    registry.register(readonly)
+    registry.register(destructive)
+    audit: list[AuditEntry] = []
+
+    readonly_token = Token(
+        &quot;u42&quot;,
+        readonly.trusted_issuer,
+        readonly.url,
+        frozenset({&quot;postgres:query:readonly&quot;, &quot;s3:list&quot;}),
+        time.time() + 3_600,
+    )
+    approved_token = Token(
+        &quot;u42&quot;,
+        destructive.trusted_issuer,
+        destructive.url,
+        frozenset({&quot;jira:write&quot;}),
+        time.time() + 3_600,
+    )
+    approved_args = {&quot;title&quot;: &quot;new bug&quot;}
+    approval = ApprovalRecord.for_action(
+        approved_token.user,
+        &quot;jira.create&quot;,
+        approved_args,
+        destructive.url,
+        time.time() + 900,
+    )
+
+    print(&quot;=== registry metadata and runtime discovery ===&quot;)
+    print(json.dumps(registry.entries[readonly.name], indent=2))
+    print(json.dumps(registry.runtime_discovery[readonly.name], indent=2))
+    print(&quot;tools:&quot;, json.dumps(readonly.tools_list(request_meta()), indent=2))
+
+    print(&quot;\n=== policy-gated calls ===&quot;)
+    print(
+        dispatch(
+            readonly,
+            readonly_token,
+            &quot;postgres.readonly&quot;,
+            {&quot;sql&quot;: &quot;SELECT 1&quot;},
+            request_meta(),
+            audit,
+        )
+    )
+    print(
+        dispatch(
+            destructive,
+            approved_token,
+            &quot;jira.create&quot;,
+            approved_args,
+            request_meta(),
+            audit,
+            approval,
+        )
+    )
+
+    print(&quot;\n=== audit log ===&quot;)
+    for entry in audit:
+        print(json.dumps(asdict(entry), sort_keys=True))
+</code></pre></div>
+
+<p><strong>Part 10 of 10 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+
+<h2>Wire Example</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-http">POST /mcp HTTP/1.1
+Host: mcp.internal.example.com
+Content-Type: application/json
+Accept: application/json, text/event-stream
+MCP-Protocol-Version: 2026-07-28
+Mcp-Method: tools/call
+Mcp-Name: postgres.readonly
+Authorization: Bearer REDACTED
+
+{
+  &quot;jsonrpc&quot;: &quot;2.0&quot;,
+  &quot;id&quot;: 42,
+  &quot;method&quot;: &quot;tools/call&quot;,
+  &quot;params&quot;: {
+    &quot;name&quot;: &quot;postgres.readonly&quot;,
+    &quot;arguments&quot;: {&quot;sql&quot;: &quot;SELECT 1&quot;},
+    &quot;_meta&quot;: {
+      &quot;io.modelcontextprotocol/protocolVersion&quot;: &quot;2026-07-28&quot;,
+      &quot;io.modelcontextprotocol/clientCapabilities&quot;: {},
+      &quot;io.modelcontextprotocol/clientInfo&quot;: {
+        &quot;name&quot;: &quot;internal-platform-client&quot;,
+        &quot;version&quot;: &quot;1.0.0&quot;
+      }
+    }
+  }
+}
+</code></pre></div>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The reference model prints the registry document and the live discovery result side by side (different schemas, versions and caching rules), a stable tool list with read-only and destructive hints, then two policy-gated calls: a read-only query, and a <code>jira.create</code> that runs because it carries a matching approval record. The audit log records issuer, user, tool, outcome and redacted arguments for each call, enough to reconstruct what happened without storing raw secrets.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team deploys their MCP server behind a load balancer with three replicas. Some tool calls fail with "unknown session" after a few minutes. Their server keeps per-session state in process memory. What is wrong for the 2026-07-28 model, and what is the fix? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Registry metadata and live discovery are separate contracts; validate both.</li>
+<li>Every request is self-contained, so any replica can serve it.</li>
+<li>Authorize every call: issuer, audience, expiry, scopes.</li>
+<li>State-changing calls need approval records bound to the exact arguments.</li>
+<li>Audit what crossed the boundary, with sensitive data redacted.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-mcp-server-build"><span class="t" style="--cs-hue:172">BM</span>Cheat sheet · MCP Server Build Checklist</a></div>
+<h2>Ship it</h2>
+<p>Ship a repository containing:</p>
+<ul>
+<li>a schema-valid <code>server.json</code>;</li>
+<li>read-only and state-changing server surfaces;</li>
+<li><code>server/discover</code>, deterministic <code>tools/list</code>, and policy-gated <code>tools/call</code>;</li>
+<li>a Streamable HTTP deployment with two interchangeable replicas;</li>
+<li>authorization and approval integration;</li>
+<li>a Registry publisher or private Registry API adapter;</li>
+<li>policy definitions and action-bound approval records;</li>
+<li>redacted audit output and trace propagation;</li>
+<li>wire and proxy failure evidence;</li>
+<li>admission, retry, health, and rollback evidence with a digest of the redacted pack.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th style="text-align: right;">Weight</th>
+<th>Criterion</th>
+<th>Evidence</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">25</td>
+<td>Protocol correctness</td>
+<td>Stateless request metadata, discovery, results, headers, and negative cases</td>
+</tr>
+<tr>
+<td style="text-align: right;">20</td>
+<td>Authorization</td>
+<td>Issuer, audience, expiry, scope, and action-bound approval cases</td>
+</tr>
+<tr>
+<td style="text-align: right;">15</td>
+<td>Registry integrity</td>
+<td>Valid <code>server.json</code>, publication record, live discovery probe, and drift report</td>
+</tr>
+<tr>
+<td style="text-align: right;">15</td>
+<td>Policy and safety</td>
+<td>Allow, deny, malformed, stale approval, and sensitive-data cases</td>
+</tr>
+<tr>
+<td style="text-align: right;">15</td>
+<td>Scale and reliability</td>
+<td>Two replicas, no affinity dependency, cancellation, timeout, and recovery</td>
+</tr>
+<tr>
+<td style="text-align: right;">10</td>
+<td>Auditability</td>
+<td>Redacted receiver-side audit and trace evidence</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong><code>outputs/skill-mcp-server.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: mcp-server-platform
+description: Design a stateless MCP 2026-07-28 server with registry metadata, live discovery, authorization, policy, audit, and scale evidence.
+version: 2.0.0
+phase: 19
+lesson: 13
+tags: [capstone, mcp, stateless, streamable-http, oauth, registry, governance]
+---
+
+Given an internal platform need, design a stateless MCP server and governance boundary targeting protocol revision `2026-07-28`.
+
+Build plan:
+
+1. A schema-valid `server.json` whose reverse-DNS name matches the publisher's authenticated namespace.
+2. Mandatory `server/discover` for live versions, capabilities, extensions, and server identity.
+3. Version and client capabilities in every request `_meta`; `resultType` and server identity in every result.
+4. Deterministic `tools/list` with `ttlMs` and `cacheScope`.
+5. POST-only Streamable HTTP with required version, method, and name headers; no protocol sessions, GET stream, session DELETE, or replay header.
+6. Authorization that validates issuer, audience, expiry, and scopes on every call.
+7. Policy over actor, tool, target, and normalized arguments. Bind high-risk approvals to the exact action and expiry, then prove that changing one argument rejects replay.
+8. Redacted audit and trace evidence outside model-visible context.
+9. A registry adapter that validates `server.json`, probes `server/discover`, and reports metadata/runtime drift.
+10. Two interchangeable replicas and a concurrent load probe with no session affinity.
+
+Assessment rubric:
+
+| Weight | Criterion | Measurement |
+|:-:|---|---|
+| 25 | Protocol correctness | Stateless envelopes, discovery, results, headers, and negative cases |
+| 20 | Authorization | Issuer, audience, expiry, scope, and exact-action approval cases |
+| 15 | Registry integrity | Valid `server.json`, live probe, and drift report |
+| 15 | Policy and safety | Allow, deny, malformed, stale approval, and sensitive-data cases |
+| 15 | Scale | Two replicas with no affinity dependency plus cancellation and recovery |
+| 10 | Auditability | Redacted receiver-side audit and trace evidence |
+
+Hard rejects:
+
+- A current MCP design that uses `initialize`, `notifications/initialized`, or `Mcp-Session-Id`.
+- Treating `server.json` as live capability discovery or inventing `.well-known/mcp-capabilities` as an MCP requirement.
+- Publishing a server name outside the namespace authenticated for that publisher.
+- Accepting a token without issuer and audience or resource validation.
+- Treating tool annotations or a chat approval as authorization.
+- Audit records that persist secrets or raw sensitive data.
+
+Refusal rules:
+
+- Refuse to claim production readiness from the local simulations alone.
+- Refuse to expose a state-changing tool without policy and action-bound approval evidence.
+- Refuse to publish metadata that points to an endpoint whose live discovery cannot be verified.
+
+Output: a build plan and evidence matrix covering publication metadata, live discovery, stateless transport, tool schemas, authorization, policy, approval, audit, and scale. End with the highest-risk boundary and the exact failure test that proves it fails closed.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Change the published remote URL while leaving the live server unchanged. Make the registry validation report the exact drift.</li>
+<li>Send <code>tools/list</code> twice with identical inputs and prove byte-stable tool order. Then expire <code>ttlMs</code> and refresh.</li>
+<li>Send a valid body with a different <code>MCP-Protocol-Version</code> header. Return <code>-32020</code> and do not invoke policy or the tool.</li>
+<li>Mint a token for the read-only server and present it to the state-changing server. Prove audience validation fails before the handler runs.</li>
+<li>Bind an approval to one normalized argument digest. Change one field and prove the approval cannot be replayed.</li>
+<li>Route consecutive calls to alternating replicas. Replace hidden process memory with an explicit shared handle wherever the workflow needs persistence.</li>
+<li>Break a request-scoped SSE connection and retry with a new JSON-RPC request ID. Verify that no <code>Last-Event-ID</code> recovery path is used.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1913-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P4 · Audience validation</span></summary><div class="qa-a"><p>Mint a token whose audience is the read-only server's URL and send it to the state-changing server. The server must compare the token's audience (or resource) with its own canonical URL and reject the call before policy or the handler runs, returning an authorization error and an audit entry with outcome "denied".</p></div></details>
+<details class="qa" id="a1913-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P5 · Replaying a changed approval</span></summary><div class="qa-a"><p>Approve <code>{"project": "PROJ", "title": "new bug"}</code>, then call with <code>"title": "new bug!"</code>. The canonical-JSON digest differs, so the policy check refuses before the handler runs, as the visual shows. Also test the opposite: the same arguments with keys in a different order must still pass.</p></div></details>
+<details class="qa" id="a1913-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · State in the wrong place</span></summary><div class="qa-a"><p>In-memory sessions tie a client to one replica, so when the load balancer routes a request elsewhere, the state is missing. Under the stateless model every request carries what the server needs (protocol version, capabilities); anything that must persist across calls lives in an explicit shared store referenced by a handle in the request, so any replica can serve any call.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/changelog">MCP 2026-07-28 key changes</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http">Streamable HTTP</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/server/discover">Server discovery</a></li>
+<li><a href="https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization">MCP authorization</a></li>
+<li><a href="https://github.com/modelcontextprotocol/registry/blob/main/docs/reference/server-json/official-registry-requirements.md">Official Registry server.json requirements</a></li>
+<li><a href="https://registry.modelcontextprotocol.io/openapi.yaml">Official Registry OpenAPI contract</a></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1913" id="done-a1913">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1913" id="undo-a1913" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1912"><span class="pn-dir">Previous</span><span class="pn-t">19.12 · Capstone 12: a Video Understanding Pipeline for Scenes, QA and Search</span></a><a class="pn next" href="#a1914"><span class="pn-dir">Next</span><span class="pn-t">19.14 · Capstone 14: an Inference Server with Speculative Decoding</span></a></div></footer>

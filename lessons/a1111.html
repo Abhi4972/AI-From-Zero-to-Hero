@@ -1,0 +1,1409 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-11">Phase 11 · LLM Engineering and Applications</a></nav><h1>LLM Cost Optimization: Caching and Rate Limiting</h1><div class="m-meta"><span class="chip chip-num">Lesson 11.20</span><span class="chip">45 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1111" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Implement semantic caching that serves repeated or similar queries from cache instead of making a new API call</li>
+<li>Calculate per-request costs across providers and implement token-aware rate limiting and budget alerts</li>
+<li>Build a cost optimization layer with prompt compression, model routing (expensive vs cheap), and response caching</li>
+<li>Design a tiered caching strategy using exact match, semantic similarity, and prefix caching for different query types</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 11.18 (Function Calling)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 45 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Most AI startups do not die from bad models. They die from bad unit economics. A single GPT-4o call costs fractions of a cent. Ten thousand users making ten calls per day costs $250 in input tokens alone -- before you charge a single dollar. The companies that survive are the ones that treat every API call as a financial transaction, not a function call.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Prompt caching</td>
+<td>"Cache the system prompt"</td>
+<td>Provider-level caching where repeated prompt prefixes are billed at a small fraction of the input price (5-10% on current Anthropic and OpenAI models) -- automatic for OpenAI, explicit markers for Anthropic</td>
+</tr>
+<tr>
+<td>Semantic caching</td>
+<td>"Smart caching"</td>
+<td>Embedding the query, computing similarity to past queries, and returning the cached response if similarity exceeds a threshold -- catches paraphrases that exact matching misses</td>
+</tr>
+<tr>
+<td>Exact caching</td>
+<td>"Hash caching"</td>
+<td>Hashing the full prompt (model + messages + temperature) and returning the cached response for identical inputs -- only works for temperature=0 deterministic calls</td>
+</tr>
+<tr>
+<td>Token bucket</td>
+<td>"Rate limiter"</td>
+<td>An algorithm where each user has a bucket of N tokens that refills at rate R per second -- allows bursts up to N while enforcing an average rate of R</td>
+</tr>
+<tr>
+<td>Model routing</td>
+<td>"Cheapskate routing"</td>
+<td>Using a classifier to send simple queries to cheap models (Haiku-class) and complex queries to expensive ones (Opus- or Astra-class) -- often halves model costs at similar quality</td>
+</tr>
+<tr>
+<td>Cost tracking</td>
+<td>"Metering"</td>
+<td>Logging every API call with model, tokens, latency, cost, and user ID so you know exactly where money goes and which features are expensive</td>
+</tr>
+<tr>
+<td>Circuit breaker</td>
+<td>"Kill switch"</td>
+<td>Automatically degrading service (cheaper models, cached-only) or stopping requests entirely when spending approaches the budget limit</td>
+</tr>
+<tr>
+<td>Batch API</td>
+<td>"Bulk discount"</td>
+<td>OpenAI's asynchronous processing at 50% discount -- submit up to 50,000 requests, get results within 24 hours</td>
+</tr>
+<tr>
+<td>Prompt compression</td>
+<td>"Token diet"</td>
+<td>Rewriting system prompts and context to use fewer tokens while preserving meaning -- shorter prompts cost less and often perform better</td>
+</tr>
+<tr>
+<td>Cache hit rate</td>
+<td>"Cache efficiency"</td>
+<td>The percentage of requests served from cache instead of calling the LLM -- 40-60% is typical for production chatbots, saves proportionally on cost</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Every call to a hosted model is billed by the token, input and output, and the same text is often paid for again and again: the same system prompt on every request, the same question asked in different words by different users. Cost engineering removes the repeats and sends each request to the cheapest model that can handle it: provider prompt caching for repeated prefixes, your own exact and semantic caches for repeated questions, routing between cheap and expensive models, batch pricing for work that can wait, and rate limits and budgets so a bug cannot spend a month's money in an hour. This lesson builds each piece, recomputes the lesson's cost math with November 2026 prices, and measures the risk inside semantic caching: how often a similarity threshold serves the answer to a different question. No model is trained.</p></div></aside>
+<p>You build a RAG chatbot. It works beautifully. Users love it.</p>
+<p>Then the invoice arrives.</p>
+<p>In November 2026, OpenAI's GPT-6.2 Sol costs $2 per million input tokens and $10 per million output; Claude Sonnet 5.5 costs the same, Claude Opus 5.5 $4 / $20, GPT-6.2 Astra $8 / $40, and the small models a few cents to a few tens of cents (Claude Haiku 5.5 from $0.10 / $0.50). The math below uses $2 / $10. Prices change often; always check the provider's current pricing page.</p>
+<p>Here is the math that kills startups:</p>
+<ul>
+<li>10,000 daily active users</li>
+<li>10 queries per user per day</li>
+<li>1,000 input tokens per query (system prompt + context + user message)</li>
+<li>500 output tokens per response</li>
+</ul>
+<p><strong>Daily input cost:</strong> 10,000 x 10 x 1,000 / 1,000,000 x $2.00 = <strong>$200/day</strong>
+<strong>Daily output cost:</strong> 10,000 x 10 x 500 / 1,000,000 x $10.00 = <strong>$500/day</strong>
+<strong>Monthly total (30 days):</strong> <strong>$21,000/month</strong></p>
+<p>That is just the LLM. Add embeddings, vector database hosting, infrastructure. You are looking at $30,000/month for a chatbot.</p>
+<p>The brutal part: in many support-style applications a large share of queries are near-duplicates. Users ask the same questions in slightly different words. Your system prompt -- identical across every request -- gets billed every single time. Context documents retrieved by RAG repeat across users who ask about the same topic.</p>
+<p>You are paying full price for redundant computation.</p>
+<h2>Idea 1 · The Cost Anatomy of an LLM Call</h2>
+<p>Every API call has five cost components.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmff5ad675fc" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1054.55px; background-color: transparent;" viewBox="0 0 1054.546875 332" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmff5ad675fc{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmff5ad675fc .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmff5ad675fc .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmff5ad675fc .error-icon{fill:#f4efe7;}#mmff5ad675fc .error-text{fill:#0b1018;stroke:#0b1018;}#mmff5ad675fc .edge-thickness-normal{stroke-width:1px;}#mmff5ad675fc .edge-thickness-thick{stroke-width:3.5px;}#mmff5ad675fc .edge-pattern-solid{stroke-dasharray:0;}#mmff5ad675fc .edge-thickness-invisible{stroke-width:0;fill:none;}#mmff5ad675fc .edge-pattern-dashed{stroke-dasharray:3;}#mmff5ad675fc .edge-pattern-dotted{stroke-dasharray:2;}#mmff5ad675fc .marker{fill:#6c6357;stroke:#6c6357;}#mmff5ad675fc .marker.cross{stroke:#6c6357;}#mmff5ad675fc svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmff5ad675fc p{margin:0;}#mmff5ad675fc .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmff5ad675fc .cluster-label text{fill:#0b1018;}#mmff5ad675fc .cluster-label span{color:#0b1018;}#mmff5ad675fc .cluster-label span p{background-color:transparent;}#mmff5ad675fc .label text,#mmff5ad675fc span{fill:#211c16;color:#211c16;}#mmff5ad675fc .node rect,#mmff5ad675fc .node circle,#mmff5ad675fc .node ellipse,#mmff5ad675fc .node polygon,#mmff5ad675fc .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmff5ad675fc .rough-node .label text,#mmff5ad675fc .node .label text,#mmff5ad675fc .image-shape .label,#mmff5ad675fc .icon-shape .label{text-anchor:middle;}#mmff5ad675fc .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmff5ad675fc .rough-node .label,#mmff5ad675fc .node .label,#mmff5ad675fc .image-shape .label,#mmff5ad675fc .icon-shape .label{text-align:center;}#mmff5ad675fc .node.clickable{cursor:pointer;}#mmff5ad675fc .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmff5ad675fc .arrowheadPath{fill:#0b0b0b;}#mmff5ad675fc .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmff5ad675fc .flowchart-link{stroke:#6c6357;fill:none;}#mmff5ad675fc .edgeLabel{background-color:#ffffff;text-align:center;}#mmff5ad675fc .edgeLabel p{background-color:#ffffff;}#mmff5ad675fc .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmff5ad675fc .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmff5ad675fc .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmff5ad675fc .cluster text{fill:#0b1018;}#mmff5ad675fc .cluster span{color:#0b1018;}#mmff5ad675fc div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmff5ad675fc .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmff5ad675fc rect.text{fill:none;stroke-width:0;}#mmff5ad675fc .icon-shape,#mmff5ad675fc .image-shape{background-color:#ffffff;text-align:center;}#mmff5ad675fc .icon-shape p,#mmff5ad675fc .image-shape p{background-color:#ffffff;padding:2px;}#mmff5ad675fc .icon-shape .label rect,#mmff5ad675fc .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmff5ad675fc .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmff5ad675fc .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmff5ad675fc .node .neo-node{stroke:#b5521b;}#mmff5ad675fc [data-look="neo"].node rect,#mmff5ad675fc [data-look="neo"].cluster rect,#mmff5ad675fc [data-look="neo"].node polygon{stroke:url(#mmff5ad675fc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmff5ad675fc [data-look="neo"].swimlane.cluster rect{filter:none;}#mmff5ad675fc [data-look="neo"].node path{stroke:url(#mmff5ad675fc-gradient);stroke-width:1px;}#mmff5ad675fc [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmff5ad675fc [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmff5ad675fc [data-look="neo"].node circle{stroke:url(#mmff5ad675fc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmff5ad675fc [data-look="neo"].node circle .state-start{fill:#000000;}#mmff5ad675fc [data-look="neo"].icon-shape .icon{fill:url(#mmff5ad675fc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmff5ad675fc [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmff5ad675fc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmff5ad675fc :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmff5ad675fc_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmff5ad675fc_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmff5ad675fc_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M95.25,140.5L107.489,124.417C119.729,108.333,144.208,76.167,160.207,60.083C176.206,44,183.724,44,187.483,44L191.242,44" id="mmff5ad675fc-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6OTUuMjQ5NjE1Nzc4Njg4NTIsInkiOjE0MC41fSx7IngiOjE2OC42ODc1LCJ5Ijo0NH0seyJ4IjoxOTUuMjQyMTg3NSwieSI6NDR9XQ==" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M143.688,166L147.854,166C152.021,166,160.354,166,168.021,166C175.688,166,182.688,166,186.188,166L189.688,166" id="mmff5ad675fc-L_A_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_C_0" data-points="W3sieCI6MTQzLjY4NzUsInkiOjE2Nn0seyJ4IjoxNjguNjg3NSwieSI6MTY2fSx7IngiOjE5My42ODc1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M95.25,191.5L107.489,207.583C119.729,223.667,144.208,255.833,161.642,271.917C179.076,288,189.464,288,194.658,288L199.852,288" id="mmff5ad675fc-L_A_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_D_0" data-points="W3sieCI6OTUuMjQ5NjE1Nzc4Njg4NTIsInkiOjE5MS41fSx7IngiOjE2OC42ODc1LCJ5IjoyODh9LHsieCI6MjAzLjg1MTU2MjUsInkiOjI4OH1d" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M370.398,44L374.824,44C379.25,44,388.102,44,405.008,57.838C421.914,71.677,446.876,99.353,459.356,113.191L471.837,127.03" id="mmff5ad675fc-L_B_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_E_0" data-points="W3sieCI6MzcwLjM5ODQzNzUsInkiOjQ0fSx7IngiOjM5Ni45NTMxMjUsInkiOjQ0fSx7IngiOjQ3NC41MTYxMzcyOTUwODIsInkiOjEzMH1d" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M371.953,166L376.12,166C380.286,166,388.62,166,396.286,166C403.953,166,410.953,166,414.453,166L417.953,166" id="mmff5ad675fc-L_C_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_E_0" data-points="W3sieCI6MzcxLjk1MzEyNSwieSI6MTY2fSx7IngiOjM5Ni45NTMxMjUsInkiOjE2Nn0seyJ4Ijo0MjEuOTUzMTI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M361.789,288L367.65,288C373.51,288,385.232,288,403.573,274.162C421.914,260.323,446.876,232.647,459.356,218.809L471.837,204.97" id="mmff5ad675fc-L_D_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_E_0" data-points="W3sieCI6MzYxLjc4OTA2MjUsInkiOjI4OH0seyJ4IjozOTYuOTUzMTI1LCJ5IjoyODh9LHsieCI6NDc0LjUxNjEzNzI5NTA4MiwieSI6MjAyfV0=" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M592.016,166L596.182,166C600.349,166,608.682,166,616.349,166C624.016,166,631.016,166,634.516,166L638.016,166" id="mmff5ad675fc-L_E_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_F_0" data-points="W3sieCI6NTkyLjAxNTYyNSwieSI6MTY2fSx7IngiOjYxNy4wMTU2MjUsInkiOjE2Nn0seyJ4Ijo2NDIuMDE1NjI1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/><path d="M820.688,166L824.854,166C829.021,166,837.354,166,845.021,166C852.688,166,859.688,166,863.188,166L866.688,166" id="mmff5ad675fc-L_F_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_G_0" data-points="W3sieCI6ODIwLjY4NzUsInkiOjE2Nn0seyJ4Ijo4NDUuNjg3NSwieSI6MTY2fSx7IngiOjg3MC42ODc1LCJ5IjoxNjZ9XQ==" data-look="classic" marker-end="url(#mmff5ad675fc_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_A_C_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_A_D_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_B_E_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_C_E_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_D_E_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_E_F_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_F_G_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmff5ad675fc-flowchart-A-0" data-look="classic" transform="translate(75.84375, 166)"><rect class="basic label-container" style="" x="-67.84375" y="-25.5" width="135.6875" height="51"/><g class="label" style="" transform="translate(-37.84375, -10.5)"><rect/><foreignObject width="75.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>User Query</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-B-1" data-look="classic" transform="translate(282.8203125, 44)"><rect class="basic label-container" style="" x="-87.578125" y="-36" width="175.15625" height="72"/><g class="label" style="" transform="translate(-57.578125, -21)"><rect/><foreignObject width="115.15625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>System Prompt<br />500-2000 tokens</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-C-3" data-look="classic" transform="translate(282.8203125, 166)"><rect class="basic label-container" style="" x="-89.1328125" y="-36" width="178.265625" height="72"/><g class="label" style="" transform="translate(-59.1328125, -21)"><rect/><foreignObject width="118.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Retrieved Context<br />500-4000 tokens</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-D-5" data-look="classic" transform="translate(282.8203125, 288)"><rect class="basic label-container" style="" x="-78.96875" y="-36" width="157.9375" height="72"/><g class="label" style="" transform="translate(-48.96875, -21)"><rect/><foreignObject width="97.9375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>User Message<br />50-500 tokens</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-E-7" data-look="classic" transform="translate(506.984375, 166)"><rect class="basic label-container" style="" x="-85.03125" y="-36" width="170.0625" height="72"/><g class="label" style="" transform="translate(-55.03125, -21)"><rect/><foreignObject width="110.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Input Cost<br />$2.50/1M tokens</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-F-13" data-look="classic" transform="translate(731.3515625, 166)"><rect class="basic label-container" style="" x="-89.3359375" y="-25.5" width="178.671875" height="51"/><g class="label" style="" transform="translate(-59.3359375, -10.5)"><rect/><foreignObject width="118.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Model Processing</p></span></div></foreignObject></g></g><g class="node default" id="mmff5ad675fc-flowchart-G-15" data-look="classic" transform="translate(958.6171875, 166)"><rect class="basic label-container" style="" x="-87.9296875" y="-36" width="175.859375" height="72"/><g class="label" style="" transform="translate(-57.9296875, -21)"><rect/><foreignObject width="115.859375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Output Cost<br />$10.00/1M tokens</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmff5ad675fc-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmff5ad675fc-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmff5ad675fc-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>System prompts are the silent killer. At $2 per million input tokens, a 1,500-token system prompt sent with every request costs $0.003 per request, $3,000 per million requests, just for that prefix. At 100K requests per day, that is $300/day -- $9,000/month -- for text that never changes.</p>
+<h2>Idea 2 · Provider Caching: Built-in Discounts</h2>
+<p>All three major providers offer provider-side prompt caching in 2026, but the mechanics differ. See Phase 11 · 15 for the deep dive.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Provider</th>
+<th>Mechanism</th>
+<th>Price of a cache hit (Nov 2026)</th>
+<th>Cache writes</th>
+<th>Cache Duration</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Anthropic</td>
+<td>Explicit <code>cache_control</code> markers</td>
+<td>5% of the input price on Opus 5.5 and Sonnet 5.5, 10% on Haiku 5.5</td>
+<td>1.25x input price (5-minute cache) or 2x (1-hour cache)</td>
+<td>5 min default, refreshed on each hit; 1 h option</td>
+</tr>
+<tr>
+<td>OpenAI</td>
+<td>Automatic prefix matching</td>
+<td>5% of the input price on GPT-6.2 Sol and Astra ($0.10 vs $2.00 per million on Sol)</td>
+<td>no surcharge</td>
+<td>best effort, minutes to hours</td>
+</tr>
+<tr>
+<td>Google Gemini</td>
+<td>Implicit caching plus an explicit CachedContent API</td>
+<td>discounted cached tokens (see pricing page)</td>
+<td>explicit caches pay storage per hour</td>
+<td>user-configurable TTL for explicit caches</td>
+</tr>
+</tbody>
+</table></div>
+<p>Minimum cacheable prefix lengths differ by model; check the docs before relying on caching for short prompts.</p>
+<p><strong>Anthropic's approach</strong> is explicit. You mark the end of the reusable prefix with <code>cache_control: {"type": "ephemeral"}</code>. The first request pays a 25% write premium. Subsequent requests with the same prefix pay 5% of the input price on Sonnet 5.5. A 2,000-token system prompt that costs $0.004 normally costs $0.0002 on cache hits. Over 100K requests a day, that saves about $380/day.</p>
+<p><strong>OpenAI's approach</strong> is automatic. Any prompt prefix that matches a recent request is billed at the cached-input price, 5% of the normal input price on GPT-6.2 Sol. No markers needed; you get less control over what stays cached, with zero implementation effort.</p>
+<h2>Idea 3 · Semantic Caching: Your Custom Layer</h2>
+<p>Provider caching only works for identical prefixes. Semantic caching handles the harder case: different queries with the same meaning.</p>
+<p>"What is the return policy?" and "How do I return an item?" are different strings but identical intent. A semantic cache embeds both queries, computes cosine similarity, and returns the cached response if similarity exceeds a threshold (typically 0.92-0.95).</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm7ae4dcc5b4" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 465.344px; background-color: transparent;" viewBox="0 0 465.34375 721.859375" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm7ae4dcc5b4{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm7ae4dcc5b4 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm7ae4dcc5b4 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm7ae4dcc5b4 .error-icon{fill:#f4efe7;}#mm7ae4dcc5b4 .error-text{fill:#0b1018;stroke:#0b1018;}#mm7ae4dcc5b4 .edge-thickness-normal{stroke-width:1px;}#mm7ae4dcc5b4 .edge-thickness-thick{stroke-width:3.5px;}#mm7ae4dcc5b4 .edge-pattern-solid{stroke-dasharray:0;}#mm7ae4dcc5b4 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm7ae4dcc5b4 .edge-pattern-dashed{stroke-dasharray:3;}#mm7ae4dcc5b4 .edge-pattern-dotted{stroke-dasharray:2;}#mm7ae4dcc5b4 .marker{fill:#6c6357;stroke:#6c6357;}#mm7ae4dcc5b4 .marker.cross{stroke:#6c6357;}#mm7ae4dcc5b4 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm7ae4dcc5b4 p{margin:0;}#mm7ae4dcc5b4 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm7ae4dcc5b4 .cluster-label text{fill:#0b1018;}#mm7ae4dcc5b4 .cluster-label span{color:#0b1018;}#mm7ae4dcc5b4 .cluster-label span p{background-color:transparent;}#mm7ae4dcc5b4 .label text,#mm7ae4dcc5b4 span{fill:#211c16;color:#211c16;}#mm7ae4dcc5b4 .node rect,#mm7ae4dcc5b4 .node circle,#mm7ae4dcc5b4 .node ellipse,#mm7ae4dcc5b4 .node polygon,#mm7ae4dcc5b4 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm7ae4dcc5b4 .rough-node .label text,#mm7ae4dcc5b4 .node .label text,#mm7ae4dcc5b4 .image-shape .label,#mm7ae4dcc5b4 .icon-shape .label{text-anchor:middle;}#mm7ae4dcc5b4 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm7ae4dcc5b4 .rough-node .label,#mm7ae4dcc5b4 .node .label,#mm7ae4dcc5b4 .image-shape .label,#mm7ae4dcc5b4 .icon-shape .label{text-align:center;}#mm7ae4dcc5b4 .node.clickable{cursor:pointer;}#mm7ae4dcc5b4 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm7ae4dcc5b4 .arrowheadPath{fill:#0b0b0b;}#mm7ae4dcc5b4 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm7ae4dcc5b4 .flowchart-link{stroke:#6c6357;fill:none;}#mm7ae4dcc5b4 .edgeLabel{background-color:#ffffff;text-align:center;}#mm7ae4dcc5b4 .edgeLabel p{background-color:#ffffff;}#mm7ae4dcc5b4 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm7ae4dcc5b4 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm7ae4dcc5b4 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm7ae4dcc5b4 .cluster text{fill:#0b1018;}#mm7ae4dcc5b4 .cluster span{color:#0b1018;}#mm7ae4dcc5b4 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm7ae4dcc5b4 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm7ae4dcc5b4 rect.text{fill:none;stroke-width:0;}#mm7ae4dcc5b4 .icon-shape,#mm7ae4dcc5b4 .image-shape{background-color:#ffffff;text-align:center;}#mm7ae4dcc5b4 .icon-shape p,#mm7ae4dcc5b4 .image-shape p{background-color:#ffffff;padding:2px;}#mm7ae4dcc5b4 .icon-shape .label rect,#mm7ae4dcc5b4 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm7ae4dcc5b4 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm7ae4dcc5b4 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm7ae4dcc5b4 .node .neo-node{stroke:#b5521b;}#mm7ae4dcc5b4 [data-look="neo"].node rect,#mm7ae4dcc5b4 [data-look="neo"].cluster rect,#mm7ae4dcc5b4 [data-look="neo"].node polygon{stroke:url(#mm7ae4dcc5b4-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7ae4dcc5b4 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm7ae4dcc5b4 [data-look="neo"].node path{stroke:url(#mm7ae4dcc5b4-gradient);stroke-width:1px;}#mm7ae4dcc5b4 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7ae4dcc5b4 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm7ae4dcc5b4 [data-look="neo"].node circle{stroke:url(#mm7ae4dcc5b4-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7ae4dcc5b4 [data-look="neo"].node circle .state-start{fill:#000000;}#mm7ae4dcc5b4 [data-look="neo"].icon-shape .icon{fill:url(#mm7ae4dcc5b4-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7ae4dcc5b4 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm7ae4dcc5b4-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm7ae4dcc5b4 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm7ae4dcc5b4_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm7ae4dcc5b4_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M218.648,59L218.648,63.167C218.648,67.333,218.648,75.667,218.648,83.333C218.648,91,218.648,98,218.648,101.5L218.648,105" id="mm7ae4dcc5b4-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6MjE4LjY0ODQzNzUsInkiOjU5fSx7IngiOjIxOC42NDg0Mzc1LCJ5Ijo4NH0seyJ4IjoyMTguNjQ4NDM3NSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M218.648,160L218.648,164.167C218.648,168.333,218.648,176.667,218.648,184.333C218.648,192,218.648,199,218.648,202.5L218.648,206" id="mm7ae4dcc5b4-L_B_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_C_0" data-points="W3sieCI6MjE4LjY0ODQzNzUsInkiOjE2MH0seyJ4IjoyMTguNjQ4NDM3NSwieSI6MTg1fSx7IngiOjIxOC42NDg0Mzc1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M260.004,327.504L273.918,340.313C287.831,353.122,315.658,378.741,329.571,401.717C343.484,424.693,343.484,445.026,343.484,463.609C343.484,482.193,343.484,499.026,343.484,512.693C343.484,526.359,343.484,536.859,343.484,542.109L343.484,547.359" id="mm7ae4dcc5b4-L_C_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_D_0" data-points="W3sieCI6MjYwLjAwNDE1NTIxMTM4ODEsInkiOjMyNy41MDM2NTcyODg2MTE5fSx7IngiOjM0My40ODQzNzUsInkiOjQwNC4zNTkzNzV9LHsieCI6MzQzLjQ4NDM3NSwieSI6NDY1LjM1OTM3NX0seyJ4IjozNDMuNDg0Mzc1LCJ5Ijo1MTUuODU5Mzc1fSx7IngiOjM0My40ODQzNzUsInkiOjU1MS4zNTkzNzV9XQ==" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M177.293,327.504L163.379,340.313C149.466,353.122,121.639,378.741,107.726,396.8C93.813,414.859,93.813,425.359,93.813,430.609L93.813,435.859" id="mm7ae4dcc5b4-L_C_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_E_0" data-points="W3sieCI6MTc3LjI5MjcxOTc4ODYxMTkyLCJ5IjozMjcuNTAzNjU3Mjg4NjExOX0seyJ4Ijo5My44MTI1LCJ5Ijo0MDQuMzU5Mzc1fSx7IngiOjkzLjgxMjUsInkiOjQzOS44NTkzNzV9XQ==" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M93.813,490.859L93.813,495.026C93.813,499.193,93.813,507.526,93.813,515.193C93.813,522.859,93.813,529.859,93.813,533.359L93.813,536.859" id="mm7ae4dcc5b4-L_E_F_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_E_F_0" data-points="W3sieCI6OTMuODEyNSwieSI6NDkwLjg1OTM3NX0seyJ4Ijo5My44MTI1LCJ5Ijo1MTUuODU5Mzc1fSx7IngiOjkzLjgxMjUsInkiOjU0MC44NTkzNzV9XQ==" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M93.813,612.859L93.813,617.026C93.813,621.193,93.813,629.526,103.494,637.609C113.176,645.693,132.54,653.526,142.222,657.443L151.904,661.359" id="mm7ae4dcc5b4-L_F_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_F_G_0" data-points="W3sieCI6OTMuODEyNSwieSI6NjEyLjg1OTM3NX0seyJ4Ijo5My44MTI1LCJ5Ijo2MzcuODU5Mzc1fSx7IngiOjE1NS42MTI0NjkwNTk0MDU5NSwieSI6NjYyLjg1OTM3NX1d" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/><path d="M343.484,602.359L343.484,608.276C343.484,614.193,343.484,626.026,333.802,635.859C324.12,645.693,304.756,653.526,295.074,657.443L285.392,661.359" id="mm7ae4dcc5b4-L_D_G_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_G_0" data-points="W3sieCI6MzQzLjQ4NDM3NSwieSI6NjAyLjM1OTM3NX0seyJ4IjozNDMuNDg0Mzc1LCJ5Ijo2MzcuODU5Mzc1fSx7IngiOjI4MS42ODQ0MDU5NDA1OTQwNSwieSI6NjYyLjg1OTM3NX1d" data-look="classic" marker-end="url(#mm7ae4dcc5b4_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_B_C_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel" transform="translate(343.484375, 465.359375)"><g class="label" data-id="L_C_D_0" transform="translate(0, -8.500000953674316)"><g><rect class="background" style="" x="-30.296875" y="-1.9999990463256836" width="60.59375" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">sim</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> 0.95</tspan></tspan></text></g></g></g><g class="edgeLabel" transform="translate(93.8125, 404.359375)"><g class="label" data-id="L_C_E_0" transform="translate(0, -8.500000953674316)"><g><rect class="background" style="" x="-36.8984375" y="-1.9999990463256836" width="73.796875" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">sim</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> &lt;</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> 0.95</tspan></tspan></text></g></g></g><g class="edgeLabel"><g class="label" data-id="L_E_F_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_F_G_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_D_G_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm7ae4dcc5b4-flowchart-A-0" data-look="classic" transform="translate(218.6484375, 33.5)"><rect class="basic label-container" style="" x="-67.84375" y="-25.5" width="135.6875" height="51"/><g class="label" style="" transform="translate(-37.84375, -10.5)"><rect/><foreignObject width="75.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>User Query</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-B-1" data-look="classic" transform="translate(218.6484375, 134.5)"><rect class="basic label-container" style="" x="-75.21875" y="-25.5" width="150.4375" height="51"/><g class="label" style="" transform="translate(-45.21875, -10.5)"><rect/><foreignObject width="90.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Embed Query</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-C-3" data-look="classic" transform="translate(218.6484375, 289.4296875)"><polygon points="79.4296875,0 158.859375,-79.4296875 79.4296875,-158.859375 0,-79.4296875" class="label-container" transform="translate(-78.9296875, 79.4296875)"/><g class="label" style="" transform="translate(-43.4296875, -21)"><rect/><foreignObject width="86.859375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Similar query<br />in cache?</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-D-5" data-look="classic" transform="translate(343.484375, 576.859375)"><rect class="basic label-container" style="" x="-113.859375" y="-25.5" width="227.71875" height="51"/><g class="label" style="" transform="translate(-83.859375, -10.5)"><rect/><foreignObject width="167.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Return Cached Response</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-E-7" data-look="classic" transform="translate(93.8125, 465.359375)"><rect class="basic label-container" style="" x="-71.796875" y="-25.5" width="143.59375" height="51"/><g class="label" style="" transform="translate(-41.796875, -10.5)"><rect/><foreignObject width="83.59375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Call LLM API</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-F-9" data-look="classic" transform="translate(93.8125, 576.859375)"><rect class="basic label-container" style="" x="-85.8125" y="-36" width="171.625" height="72"/><g class="label" style="" transform="translate(-55.8125, -21)"><rect/><foreignObject width="111.625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Cache Response<br />with Embedding</p></span></div></foreignObject></g></g><g class="node default" id="mm7ae4dcc5b4-flowchart-G-11" data-look="classic" transform="translate(218.6484375, 688.359375)"><rect class="basic label-container" style="" x="-86.3359375" y="-25.5" width="172.671875" height="51"/><g class="label" style="" transform="translate(-56.3359375, -10.5)"><rect/><foreignObject width="112.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Return Response</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm7ae4dcc5b4-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm7ae4dcc5b4-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm7ae4dcc5b4-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>The embedding costs are negligible. OpenAI's text-embedding-3-small costs $0.02 per million tokens. Checking the cache costs almost nothing compared to a full LLM call.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Cost of one request</strong> with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> input tokens, of which <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> hit the provider cache, and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> output tokens:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">c</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">ρ</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">in</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8778em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:-0.1389em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">out</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span></span></span></span></span></div>
+with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">ρ</span></span></span></span> the cache-read multiplier (0.05 on Sonnet 5.5 and GPT-6.2 Sol).</p>
+<p><strong>With a semantic cache</strong> that answers a fraction <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> of requests at near-zero cost (one embedding):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≈</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">h</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">LLM</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0715em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">embed</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>The price of a wrong hit.</strong> With threshold <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span></span></span></span>, a hit happens when <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0019em;vertical-align:-0.25em;"></span><span class="mop">cos</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7519em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">′</span></span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≥</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span></span></span></span>. If a fraction <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span><span class="mclose">)</span></span></span></span> of non-duplicate pairs clear the threshold, users receive answers to questions they did not ask. Raising <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">θ</span></span></span></span> lowers <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.10764em;">f</span></span></span></span> and lowers <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span></span></span></span> together; the run below measures both on real paraphrase data.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">The lesson&#x27;s chatbot at November 2026 prices</div><div class="co-body"><ul>
+<li>100,000 requests a day × 1,000 input tokens × $2 per million = $200; × 500 output tokens × $10 per million = $500. $700 a day, $21,000 a month.</li>
+<li>Cache a 600-token shared prefix with Anthropic or OpenAI at 5%: input becomes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">400</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8974em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">600</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8141em;"></span><span class="mord">1</span><span class="mord"><span class="mord">0</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">−</span><span class="mord mtight">6</span></span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.00086</span></span></span></span> per request instead of 0.002: input $86 a day, saving $114.</li>
+<li>Semantic cache with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">h</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.3</span></span></span></span>: 30,000 fewer model calls, about $210 a day saved at the uncached price ($0.007 a call), for 100,000 embeddings at $0.02 per million tokens (about 20 tokens each): $0.04.</li>
+<li>Route 60% of the remaining traffic to a $0.10 / $0.50 model: those requests cost a twentieth as much.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Prompt caching caches answers."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It caches the processed prompt prefix; every request still generates a fresh answer. Semantic caching is what reuses answers.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A 0.95 cosine threshold guarantees the same question."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It makes wrong matches rarer, not impossible; the run below counts them.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Caching only saves money."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Hits also cut latency: a cache read skips prefill, a semantic hit skips the model entirely.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>On 2,000 human-labelled Quora question pairs, what share of real duplicates does a 0.95 threshold catch, and what share of non-duplicates does it wrongly match? Is there a threshold that catches most duplicates with almost no wrong matches? (Solution P1.)</p></div></aside>
+<h2>Idea 4 · Exact Caching: Hash and Match</h2>
+<p>For deterministic calls (temperature=0, same model, same prompt), exact caching is simpler and faster. Hash the full prompt, check the cache, return if found.</p>
+<p>This works perfectly for:
+- System prompt + fixed context + identical user queries
+- Function calling with identical tool definitions
+- Batch processing where the same document gets processed multiple times</p>
+<h2>Idea 5 · Rate Limiting: Protecting Your Budget</h2>
+<p>Rate limiting is not just about fairness. It is about survival.</p>
+<p><strong>Token bucket algorithm:</strong> each user gets a bucket of N tokens that refills at rate R per second. A request consumes tokens from the bucket. If the bucket is empty, the request is rejected. This allows bursts (use the full bucket at once) while enforcing an average rate.</p>
+<p><strong>Per-user quotas:</strong> set daily/monthly token limits per user tier.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Tier</th>
+<th>Daily Token Limit</th>
+<th>Max Requests/min</th>
+<th>Model Access</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Free</td>
+<td>50,000</td>
+<td>10</td>
+<td>small models only</td>
+</tr>
+<tr>
+<td>Pro</td>
+<td>500,000</td>
+<td>60</td>
+<td>mid-size models (Sonnet-, Sol-class)</td>
+</tr>
+<tr>
+<td>Enterprise</td>
+<td>5,000,000</td>
+<td>300</td>
+<td>All models</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Idea 6 · Model Routing: Right Model for the Right Job</h2>
+<p>Not every query needs a frontier model.</p>
+<p>"What time does the store close?" does not require a $10/M-output model. Claude Haiku 5.5 at $0.50/M output handles it. A simple classifier routes cheap queries to cheap models and complex queries to expensive models.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmb42f5410cc" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 751.641px; background-color: transparent;" viewBox="0 0 751.640625 312" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmb42f5410cc{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmb42f5410cc .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmb42f5410cc .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmb42f5410cc .error-icon{fill:#f4efe7;}#mmb42f5410cc .error-text{fill:#0b1018;stroke:#0b1018;}#mmb42f5410cc .edge-thickness-normal{stroke-width:1px;}#mmb42f5410cc .edge-thickness-thick{stroke-width:3.5px;}#mmb42f5410cc .edge-pattern-solid{stroke-dasharray:0;}#mmb42f5410cc .edge-thickness-invisible{stroke-width:0;fill:none;}#mmb42f5410cc .edge-pattern-dashed{stroke-dasharray:3;}#mmb42f5410cc .edge-pattern-dotted{stroke-dasharray:2;}#mmb42f5410cc .marker{fill:#6c6357;stroke:#6c6357;}#mmb42f5410cc .marker.cross{stroke:#6c6357;}#mmb42f5410cc svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmb42f5410cc p{margin:0;}#mmb42f5410cc .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmb42f5410cc .cluster-label text{fill:#0b1018;}#mmb42f5410cc .cluster-label span{color:#0b1018;}#mmb42f5410cc .cluster-label span p{background-color:transparent;}#mmb42f5410cc .label text,#mmb42f5410cc span{fill:#211c16;color:#211c16;}#mmb42f5410cc .node rect,#mmb42f5410cc .node circle,#mmb42f5410cc .node ellipse,#mmb42f5410cc .node polygon,#mmb42f5410cc .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmb42f5410cc .rough-node .label text,#mmb42f5410cc .node .label text,#mmb42f5410cc .image-shape .label,#mmb42f5410cc .icon-shape .label{text-anchor:middle;}#mmb42f5410cc .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmb42f5410cc .rough-node .label,#mmb42f5410cc .node .label,#mmb42f5410cc .image-shape .label,#mmb42f5410cc .icon-shape .label{text-align:center;}#mmb42f5410cc .node.clickable{cursor:pointer;}#mmb42f5410cc .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmb42f5410cc .arrowheadPath{fill:#0b0b0b;}#mmb42f5410cc .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmb42f5410cc .flowchart-link{stroke:#6c6357;fill:none;}#mmb42f5410cc .edgeLabel{background-color:#ffffff;text-align:center;}#mmb42f5410cc .edgeLabel p{background-color:#ffffff;}#mmb42f5410cc .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmb42f5410cc .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmb42f5410cc .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmb42f5410cc .cluster text{fill:#0b1018;}#mmb42f5410cc .cluster span{color:#0b1018;}#mmb42f5410cc div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmb42f5410cc .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmb42f5410cc rect.text{fill:none;stroke-width:0;}#mmb42f5410cc .icon-shape,#mmb42f5410cc .image-shape{background-color:#ffffff;text-align:center;}#mmb42f5410cc .icon-shape p,#mmb42f5410cc .image-shape p{background-color:#ffffff;padding:2px;}#mmb42f5410cc .icon-shape .label rect,#mmb42f5410cc .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmb42f5410cc .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmb42f5410cc .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmb42f5410cc .node .neo-node{stroke:#b5521b;}#mmb42f5410cc [data-look="neo"].node rect,#mmb42f5410cc [data-look="neo"].cluster rect,#mmb42f5410cc [data-look="neo"].node polygon{stroke:url(#mmb42f5410cc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb42f5410cc [data-look="neo"].swimlane.cluster rect{filter:none;}#mmb42f5410cc [data-look="neo"].node path{stroke:url(#mmb42f5410cc-gradient);stroke-width:1px;}#mmb42f5410cc [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb42f5410cc [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmb42f5410cc [data-look="neo"].node circle{stroke:url(#mmb42f5410cc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb42f5410cc [data-look="neo"].node circle .state-start{fill:#000000;}#mmb42f5410cc [data-look="neo"].icon-shape .icon{fill:url(#mmb42f5410cc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb42f5410cc [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmb42f5410cc-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmb42f5410cc :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmb42f5410cc_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmb42f5410cc_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmb42f5410cc_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M356.383,59L356.383,63.167C356.383,67.333,356.383,75.667,356.383,83.333C356.383,91,356.383,98,356.383,101.5L356.383,105" id="mmb42f5410cc-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6MzU2LjM4MjgxMjUsInkiOjU5fSx7IngiOjM1Ni4zODI4MTI1LCJ5Ijo4NH0seyJ4IjozNTYuMzgyODEyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmb42f5410cc_flowchart-v2-pointEnd)"/><path d="M256.359,158.621L230.526,164.851C204.693,171.081,153.026,183.54,127.193,195.104C101.359,206.667,101.359,217.333,101.359,222.667L101.359,228" id="mmb42f5410cc-L_B_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_C_0" data-points="W3sieCI6MjU2LjM1OTM3NSwieSI6MTU4LjYyMTA4MjYyMTA4MjYyfSx7IngiOjEwMS4zNTkzNzUsInkiOjE5Nn0seyJ4IjoxMDEuMzU5Mzc1LCJ5IjoyMzJ9XQ==" data-look="classic" marker-end="url(#mmb42f5410cc_flowchart-v2-pointEnd)"/><path d="M356.383,160L356.383,166C356.383,172,356.383,184,356.383,195.333C356.383,206.667,356.383,217.333,356.383,222.667L356.383,228" id="mmb42f5410cc-L_B_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_D_0" data-points="W3sieCI6MzU2LjM4MjgxMjUsInkiOjE2MH0seyJ4IjozNTYuMzgyODEyNSwieSI6MTk2fSx7IngiOjM1Ni4zODI4MTI1LCJ5IjoyMzJ9XQ==" data-look="classic" marker-end="url(#mmb42f5410cc_flowchart-v2-pointEnd)"/><path d="M456.406,156.913L485.479,163.427C514.552,169.942,572.698,182.971,601.771,194.819C630.844,206.667,630.844,217.333,630.844,222.667L630.844,228" id="mmb42f5410cc-L_B_E_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_E_0" data-points="W3sieCI6NDU2LjQwNjI1LCJ5IjoxNTYuOTEyODEyMDQ2MzQwODN9LHsieCI6NjMwLjg0Mzc1LCJ5IjoxOTZ9LHsieCI6NjMwLjg0Mzc1LCJ5IjoyMzJ9XQ==" data-look="classic" marker-end="url(#mmb42f5410cc_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel" transform="translate(101.359375, 196)"><g class="label" data-id="L_B_C_0" transform="translate(0, -8.500000953674316)"><g><rect class="background" style="" x="-68.15625" y="-1.9999990463256836" width="136.3125" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Simple:</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> lookup,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> FAQ</tspan></tspan></text></g></g></g><g class="edgeLabel" transform="translate(356.3828125, 196)"><g class="label" data-id="L_B_D_0" transform="translate(-0.06201171875, -8.500000953674316)"><g><rect class="background" style="" x="-94.09375" y="-1.9999990463256836" width="188.3115234375" height="21"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Medium:</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> analysis,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> summary</tspan></tspan></text></g></g></g><g class="edgeLabel" transform="translate(630.84375, 196)"><g class="label" data-id="L_B_E_0" transform="translate(0, -9.000000953674316)"><g><rect class="background" style="" x="-88.46875" y="-1.9999990463256836" width="176.9375" height="22"/><text y="-10.1" text-anchor="middle" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Complex:</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> reasoning,</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> code</tspan></tspan></text></g></g></g></g><g class="nodes"><g class="node default" id="mmb42f5410cc-flowchart-A-0" data-look="classic" transform="translate(356.3828125, 33.5)"><rect class="basic label-container" style="" x="-67.84375" y="-25.5" width="135.6875" height="51"/><g class="label" style="" transform="translate(-37.84375, -10.5)"><rect/><foreignObject width="75.6875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>User Query</p></span></div></foreignObject></g></g><g class="node default" id="mmb42f5410cc-flowchart-B-1" data-look="classic" transform="translate(356.3828125, 134.5)"><rect class="basic label-container" style="" x="-100.0234375" y="-25.5" width="200.046875" height="51"/><g class="label" style="" transform="translate(-70.0234375, -10.5)"><rect/><foreignObject width="140.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Complexity Classifier</p></span></div></foreignObject></g></g><g class="node default" id="mmb42f5410cc-flowchart-C-3" data-look="classic" transform="translate(101.359375, 268)"><rect class="basic label-container" style="" x="-93.359375" y="-36" width="186.71875" height="72"/><g class="label" style="" transform="translate(-63.359375, -21)"><rect/><foreignObject width="126.71875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Haiku 5.5 class<br />$0.10/$0.50 per 1M</p></span></div></foreignObject></g></g><g class="node default" id="mmb42f5410cc-flowchart-D-5" data-look="classic" transform="translate(356.3828125, 268)"><rect class="basic label-container" style="" x="-111.6640625" y="-36" width="223.328125" height="72"/><g class="label" style="" transform="translate(-81.6640625, -21)"><rect/><foreignObject width="163.328125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Sonnet 5.5 / GPT-6.2 Sol<br />$2/$10 per 1M</p></span></div></foreignObject></g></g><g class="node default" id="mmb42f5410cc-flowchart-E-7" data-look="classic" transform="translate(630.84375, 268)"><rect class="basic label-container" style="" x="-112.796875" y="-36" width="225.59375" height="72"/><g class="label" style="" transform="translate(-82.796875, -21)"><rect/><foreignObject width="165.59375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Opus 5.5 / GPT-6.2 Astra<br />$4/$20 to $8/$40</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmb42f5410cc-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmb42f5410cc-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmb42f5410cc-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>A well-tuned router saves a large share of model costs: the RouteLLM study (Ong et al. 2024) reported cutting costs by more than half while keeping 95% of GPT-4's quality on its benchmarks. Measure quality on your own traffic before trusting the savings.</p>
+<h2>Idea 7 · Cost Tracking: Know Where the Money Goes</h2>
+<p>You cannot optimize what you do not measure. Log every API call with:</p>
+<ul>
+<li>Timestamp</li>
+<li>Model name</li>
+<li>Input tokens</li>
+<li>Output tokens</li>
+<li>Latency (ms)</li>
+<li>Computed cost ($)</li>
+<li>User ID</li>
+<li>Cache hit/miss</li>
+<li>Request category</li>
+</ul>
+<p>This data reveals which features are expensive, which users are heavy consumers, and where caching has the most impact.</p>
+<h2>Idea 8 · Batching: Bulk Discounts</h2>
+<p>OpenAI's and Anthropic's Batch APIs process requests asynchronously at a 50% discount. You submit a batch of up to tens of thousands of requests, and results come back within 24 hours (usually much sooner).</p>
+<p>Use batching for:
+- Nightly document processing
+- Bulk classification
+- Evaluation runs
+- Data enrichment pipelines</p>
+<p>Not for: real-time user-facing queries (latency matters).</p>
+<h2>Idea 9 · Budget Alerts and Circuit Breakers</h2>
+<p>A circuit breaker stops spending when you hit a limit. Without one, a bug or abuse can burn through your monthly budget in hours.</p>
+<p>Set three thresholds:
+1. <strong>Warning</strong> (70% of budget): send an alert
+2. <strong>Throttle</strong> (85% of budget): switch to cheaper models only
+3. <strong>Stop</strong> (95% of budget): reject new requests, return cached responses only</p>
+<h2>Idea 10 · The Optimization Stack</h2>
+<p>Apply these techniques in order. Each layer compounds on the previous ones.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Technique</th>
+<th>Typical Savings</th>
+<th>Implementation Effort</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Provider prompt caching</td>
+<td>30-50%</td>
+<td>Low (add cache markers)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Exact caching</td>
+<td>10-20%</td>
+<td>Low (hash + dict)</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Semantic caching</td>
+<td>15-30%</td>
+<td>Medium (embeddings + similarity)</td>
+</tr>
+<tr>
+<td>4</td>
+<td>Model routing</td>
+<td>40-70%</td>
+<td>Medium (classifier)</td>
+</tr>
+<tr>
+<td>5</td>
+<td>Rate limiting</td>
+<td>Budget protection</td>
+<td>Low (token bucket)</td>
+</tr>
+<tr>
+<td>6</td>
+<td>Prompt compression</td>
+<td>10-30%</td>
+<td>Medium (rewrite prompts)</td>
+</tr>
+<tr>
+<td>7</td>
+<td>Batching</td>
+<td>50% on eligible</td>
+<td>Low (batch API)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The savings in the table are typical ranges, not guarantees, and they do not simply add up: a semantic-cache hit also removes the routing and prompt-caching savings for that request. Measure each layer on your own traffic.</p>
+<h2>Idea 11 · Real Savings: Before and After</h2>
+<p>Here is an illustrative breakdown for a RAG chatbot serving 10,000 DAU (assumed hit and routing rates, older prices; a pattern, not a measured deployment).</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Metric</th>
+<th>Before Optimization</th>
+<th>After Optimization</th>
+<th>Savings</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Monthly LLM cost</td>
+<td>$22,500</td>
+<td>$5,200</td>
+<td>77%</td>
+</tr>
+<tr>
+<td>Avg cost per query</td>
+<td>$0.0075</td>
+<td>$0.0017</td>
+<td>77%</td>
+</tr>
+<tr>
+<td>Cache hit rate</td>
+<td>0%</td>
+<td>52%</td>
+<td>--</td>
+</tr>
+<tr>
+<td>Queries routed to mini</td>
+<td>0%</td>
+<td>65%</td>
+<td>--</td>
+</tr>
+<tr>
+<td>P95 latency</td>
+<td>2,800ms</td>
+<td>900ms (cache hits: 50ms)</td>
+<td>68%</td>
+</tr>
+<tr>
+<td>Monthly embedding cost</td>
+<td>$0</td>
+<td>$180</td>
+<td>(new cost)</td>
+</tr>
+<tr>
+<td>Total monthly cost</td>
+<td>$22,500</td>
+<td>$5,380</td>
+<td>76%</td>
+</tr>
+</tbody>
+</table></div>
+<p>The embedding cost for semantic caching ($180/month) pays for itself within the first hour of cache hits.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="semantic-cache"></div></figure></p>
+<h2>Step 1 · Cost Calculator</h2>
+<p>Build a token cost calculator that knows current pricing for major models.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import hashlib
+import time
+import json
+import math
+from dataclasses import dataclass, field
+
+
+MODEL_PRICING = {
+    &quot;gpt-4o&quot;: {&quot;input&quot;: 2.50, &quot;output&quot;: 10.00, &quot;cached_input&quot;: 1.25},
+    &quot;gpt-4o-mini&quot;: {&quot;input&quot;: 0.15, &quot;output&quot;: 0.60, &quot;cached_input&quot;: 0.075},
+    &quot;gpt-4.1&quot;: {&quot;input&quot;: 2.00, &quot;output&quot;: 8.00, &quot;cached_input&quot;: 0.50},
+    &quot;gpt-4.1-mini&quot;: {&quot;input&quot;: 0.40, &quot;output&quot;: 1.60, &quot;cached_input&quot;: 0.10},
+    &quot;gpt-4.1-nano&quot;: {&quot;input&quot;: 0.10, &quot;output&quot;: 0.40, &quot;cached_input&quot;: 0.025},
+    &quot;o3&quot;: {&quot;input&quot;: 2.00, &quot;output&quot;: 8.00, &quot;cached_input&quot;: 0.50},
+    &quot;o3-mini&quot;: {&quot;input&quot;: 1.10, &quot;output&quot;: 4.40, &quot;cached_input&quot;: 0.55},
+    &quot;o4-mini&quot;: {&quot;input&quot;: 1.10, &quot;output&quot;: 4.40, &quot;cached_input&quot;: 0.275},
+    &quot;claude-opus-4&quot;: {&quot;input&quot;: 15.00, &quot;output&quot;: 75.00, &quot;cached_input&quot;: 1.50},
+    &quot;claude-sonnet-4&quot;: {&quot;input&quot;: 3.00, &quot;output&quot;: 15.00, &quot;cached_input&quot;: 0.30},
+    &quot;claude-haiku-3.5&quot;: {&quot;input&quot;: 0.80, &quot;output&quot;: 4.00, &quot;cached_input&quot;: 0.08},
+    &quot;gemini-2.5-pro&quot;: {&quot;input&quot;: 1.25, &quot;output&quot;: 10.00, &quot;cached_input&quot;: 0.3125},
+    &quot;gemini-2.5-flash&quot;: {&quot;input&quot;: 0.15, &quot;output&quot;: 0.60, &quot;cached_input&quot;: 0.0375},
+}
+
+
+def calculate_cost(model, input_tokens, output_tokens, cached_input_tokens=0):
+    if model not in MODEL_PRICING:
+        return {&quot;error&quot;: f&quot;Unknown model: {model}&quot;}
+    pricing = MODEL_PRICING[model]
+    non_cached = input_tokens - cached_input_tokens
+    input_cost = (non_cached / 1_000_000) * pricing[&quot;input&quot;]
+    cached_cost = (cached_input_tokens / 1_000_000) * pricing[&quot;cached_input&quot;]
+    output_cost = (output_tokens / 1_000_000) * pricing[&quot;output&quot;]
+    total = input_cost + cached_cost + output_cost
+    return {
+        &quot;model&quot;: model,
+        &quot;input_tokens&quot;: input_tokens,
+        &quot;output_tokens&quot;: output_tokens,
+        &quot;cached_input_tokens&quot;: cached_input_tokens,
+        &quot;input_cost&quot;: round(input_cost, 6),
+        &quot;cached_input_cost&quot;: round(cached_cost, 6),
+        &quot;output_cost&quot;: round(output_cost, 6),
+        &quot;total_cost&quot;: round(total, 6),
+    }
+</code></pre></div>
+
+<h2>Step 2 · Exact Cache</h2>
+<p>Hash the full prompt and return cached responses for identical requests.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class ExactCache:
+    def __init__(self, max_size=1000, ttl_seconds=3600):
+        self.cache = {}
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.hits = 0
+        self.misses = 0
+
+    def _hash(self, model, messages, temperature):
+        key_data = json.dumps({&quot;model&quot;: model, &quot;messages&quot;: messages, &quot;temperature&quot;: temperature}, sort_keys=True)
+        return hashlib.sha256(key_data.encode()).hexdigest()
+
+    def get(self, model, messages, temperature=0.0):
+        if temperature &gt; 0:
+            self.misses += 1
+            return None
+        key = self._hash(model, messages, temperature)
+        if key in self.cache:
+            entry = self.cache[key]
+            if time.time() - entry[&quot;timestamp&quot;] &lt; self.ttl:
+                self.hits += 1
+                entry[&quot;access_count&quot;] += 1
+                return entry[&quot;response&quot;]
+            del self.cache[key]
+        self.misses += 1
+        return None
+
+    def put(self, model, messages, temperature, response):
+        if temperature &gt; 0:
+            return
+        if len(self.cache) &gt;= self.max_size:
+            oldest_key = min(self.cache, key=lambda k: self.cache[k][&quot;timestamp&quot;])
+            del self.cache[oldest_key]
+        key = self._hash(model, messages, temperature)
+        self.cache[key] = {
+            &quot;response&quot;: response,
+            &quot;timestamp&quot;: time.time(),
+            &quot;access_count&quot;: 1,
+        }
+
+    def stats(self):
+        total = self.hits + self.misses
+        return {
+            &quot;hits&quot;: self.hits,
+            &quot;misses&quot;: self.misses,
+            &quot;hit_rate&quot;: round(self.hits / total, 4) if total &gt; 0 else 0,
+            &quot;cache_size&quot;: len(self.cache),
+        }
+</code></pre></div>
+
+<h2>Step 3 · Semantic Cache</h2>
+<p>Embed queries and return cached responses when similarity exceeds a threshold.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simple_embed(text):
+    words = text.lower().split()
+    vocab = {}
+    for w in words:
+        vocab[w] = vocab.get(w, 0) + 1
+    norm = math.sqrt(sum(v * v for v in vocab.values()))
+    if norm == 0:
+        return {}
+    return {k: v / norm for k, v in vocab.items()}
+
+
+def cosine_similarity(a, b):
+    if not a or not b:
+        return 0.0
+    all_keys = set(a) | set(b)
+    dot = sum(a.get(k, 0) * b.get(k, 0) for k in all_keys)
+    return dot
+
+
+class SemanticCache:
+    def __init__(self, similarity_threshold=0.85, max_size=500, ttl_seconds=3600):
+        self.entries = []
+        self.threshold = similarity_threshold
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, query):
+        query_embedding = simple_embed(query)
+        now = time.time()
+        best_match = None
+        best_sim = 0.0
+        for entry in self.entries:
+            if now - entry[&quot;timestamp&quot;] &gt; self.ttl:
+                continue
+            sim = cosine_similarity(query_embedding, entry[&quot;embedding&quot;])
+            if sim &gt; best_sim:
+                best_sim = sim
+                best_match = entry
+        if best_match and best_sim &gt;= self.threshold:
+            self.hits += 1
+            best_match[&quot;access_count&quot;] += 1
+            return {&quot;response&quot;: best_match[&quot;response&quot;], &quot;similarity&quot;: round(best_sim, 4), &quot;original_query&quot;: best_match[&quot;query&quot;]}
+        self.misses += 1
+        return None
+
+    def put(self, query, response):
+        if len(self.entries) &gt;= self.max_size:
+            self.entries.sort(key=lambda e: e[&quot;timestamp&quot;])
+            self.entries.pop(0)
+        self.entries.append({
+            &quot;query&quot;: query,
+            &quot;embedding&quot;: simple_embed(query),
+            &quot;response&quot;: response,
+            &quot;timestamp&quot;: time.time(),
+            &quot;access_count&quot;: 1,
+        })
+
+    def stats(self):
+        total = self.hits + self.misses
+        return {
+            &quot;hits&quot;: self.hits,
+            &quot;misses&quot;: self.misses,
+            &quot;hit_rate&quot;: round(self.hits / total, 4) if total &gt; 0 else 0,
+            &quot;cache_size&quot;: len(self.entries),
+        }
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The threshold trade-off, on real paraphrases</div><div class="co-body"><p>bge-small-en-v1.5 embeds a few customer-support queries to show how close "same topic" and "same question" sit, then 2,000 random pairs from the Quora Question Pairs validation set, which people labelled as duplicate or not. For each threshold: the share of duplicates a semantic cache would serve, the share of non-duplicates it would wrongly match, and the precision of its hits. About a minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import random, time, numpy as np
+from datasets import load_dataset
+from sentence_transformers import SentenceTransformer
+
+enc = SentenceTransformer(&quot;BAAI/bge-small-en-v1.5&quot;, device=&quot;cpu&quot;)
+cos = lambda a, b: float(enc.encode(a, normalize_embeddings=True) @ enc.encode(b, normalize_embeddings=True))
+
+print(&quot;A. Same intent or not? Cosine similarity of query pairs (bge-small-en-v1.5)&quot;)
+base = &quot;What is the return policy?&quot;
+for other in [&quot;How do I return an item?&quot;, &quot;What's your policy on returns?&quot;,
+              &quot;What is the refund policy for digital items?&quot;, &quot;How do I return a gift card balance?&quot;,
+              &quot;What is the shipping policy?&quot;]:
+    print(f&quot;  {cos(base, other):.3f}  {base!r} vs {other!r}&quot;)
+
+# B. Quora Question Pairs: human labels say whether two questions mean the same thing
+rows = load_dataset(&quot;nyu-mll/glue&quot;, &quot;qqp&quot;, split=&quot;validation&quot;)
+idx = random.Random(0).sample(range(len(rows)), 2000)
+q1 = [rows[i][&quot;question1&quot;] for i in idx]; q2 = [rows[i][&quot;question2&quot;] for i in idx]
+dup = np.array([rows[i][&quot;label&quot;] for i in idx]) == 1
+t = time.time()
+E1 = enc.encode(q1, batch_size=64, normalize_embeddings=True); E2 = enc.encode(q2, batch_size=64, normalize_embeddings=True)
+sim = (E1 * E2).sum(1)
+print(f&quot;\nB. 2,000 Quora question pairs ({dup.sum()} labelled duplicates), embedded in {time.time() - t:.0f} s&quot;)
+print(f&quot;  exact-string cache would hit {sum(a.strip().lower() == b.strip().lower() for a, b in zip(q1, q2))} of them&quot;)
+print(f&quot;  {'threshold':&gt;9} {'duplicates served':&gt;18} {'non-duplicates matched':&gt;23} {'precision of hits':&gt;18}&quot;)
+for th in (0.80, 0.85, 0.90, 0.92, 0.95, 0.97):
+    hit = sim &gt;= th
+    tp, fp = (hit &amp; dup).sum(), (hit &amp; ~dup).sum()
+    print(f&quot;  {th:9.2f} {tp / dup.sum():17.1%} {fp / (~dup).sum():22.1%} {tp / max(tp + fp, 1):17.1%}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A. Same intent or not? Cosine similarity of query pairs (bge-small-en-v1.5)
+  0.848  &#x27;What is the return policy?&#x27; vs &#x27;How do I return an item?&#x27;
+  0.929  &#x27;What is the return policy?&#x27; vs &quot;What&#x27;s your policy on returns?&quot;
+  0.825  &#x27;What is the return policy?&#x27; vs &#x27;What is the refund policy for digital items?&#x27;
+  0.774  &#x27;What is the return policy?&#x27; vs &#x27;How do I return a gift card balance?&#x27;
+  0.788  &#x27;What is the return policy?&#x27; vs &#x27;What is the shipping policy?&#x27;
+
+B. 2,000 Quora question pairs (770 labelled duplicates), embedded in 66 s
+  exact-string cache would hit 0 of them
+  threshold  duplicates served  non-duplicates matched  precision of hits
+       0.80             96.0%                  36.0%             62.5%
+       0.85             80.4%                  21.5%             70.0%
+       0.90             57.9%                   9.8%             78.7%
+       0.92             44.7%                   6.7%             80.8%
+       0.95             27.1%                   2.7%             86.4%
+       0.97             17.7%                   0.6%             95.1%</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>"Same topic" and "same question" sit close together.</strong> "What's your policy on returns?" is a true paraphrase and scores 0.929. "What is the shipping policy?" is a different question, yet it scores 0.788, higher than "How do I return a gift card balance?" (0.774), which is about returns. "What is the refund policy for digital items?" scores 0.825, close to the real rephrasing "How do I return an item?" (0.848). A threshold that serves the second would also serve the first, and give an answer about physical returns to someone asking about digital refunds.</p>
+<p><strong>An exact-string cache would hit nothing.</strong> None of the 770 human-labelled duplicate pairs are character-for-character identical. Real users rephrase, which is the case for a semantic cache.</p>
+<p><strong>Every threshold is a trade.</strong> At 0.80 the cache serves 96% of duplicates, but it also matches 36% of non-duplicates, and only 62.5% of its hits are right. At 0.97 almost every hit is right (95.1%), but it serves only 17.7% of duplicates. Moving the threshold moves errors between "missed savings" and "wrong answers"; it never removes both.</p>
+<p><strong>Production is harder than this table.</strong> Here 38.5% of pairs are duplicates (770 of 2,000). In real traffic, most incoming queries are not duplicates of a given cached one, so the same false-match rate produces many more wrong hits per correct one. Choose the threshold on your own traffic. Start strict (0.95 or above). Scope the cache, for example by product or user segment, and log hits so a person can review a sample.</p></div></aside>
+<h2>Step 4 · Rate Limiter</h2>
+<p>Token bucket rate limiter with per-user quotas.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class TokenBucketRateLimiter:
+    def __init__(self):
+        self.buckets = {}
+        self.tiers = {
+            &quot;free&quot;: {&quot;capacity&quot;: 50_000, &quot;refill_rate&quot;: 500, &quot;max_requests_per_min&quot;: 10},
+            &quot;pro&quot;: {&quot;capacity&quot;: 500_000, &quot;refill_rate&quot;: 5_000, &quot;max_requests_per_min&quot;: 60},
+            &quot;enterprise&quot;: {&quot;capacity&quot;: 5_000_000, &quot;refill_rate&quot;: 50_000, &quot;max_requests_per_min&quot;: 300},
+        }
+
+    def _get_bucket(self, user_id, tier=&quot;free&quot;):
+        if user_id not in self.buckets:
+            tier_config = self.tiers.get(tier, self.tiers[&quot;free&quot;])
+            self.buckets[user_id] = {
+                &quot;tokens&quot;: tier_config[&quot;capacity&quot;],
+                &quot;capacity&quot;: tier_config[&quot;capacity&quot;],
+                &quot;refill_rate&quot;: tier_config[&quot;refill_rate&quot;],
+                &quot;last_refill&quot;: time.time(),
+                &quot;request_timestamps&quot;: [],
+                &quot;max_rpm&quot;: tier_config[&quot;max_requests_per_min&quot;],
+                &quot;tier&quot;: tier,
+                &quot;total_tokens_used&quot;: 0,
+            }
+        return self.buckets[user_id]
+
+    def _refill(self, bucket):
+        now = time.time()
+        elapsed = now - bucket[&quot;last_refill&quot;]
+        refill = int(elapsed * bucket[&quot;refill_rate&quot;])
+        if refill &gt; 0:
+            bucket[&quot;tokens&quot;] = min(bucket[&quot;capacity&quot;], bucket[&quot;tokens&quot;] + refill)
+            bucket[&quot;last_refill&quot;] = now
+
+    def check(self, user_id, tokens_needed, tier=&quot;free&quot;):
+        bucket = self._get_bucket(user_id, tier)
+        self._refill(bucket)
+        now = time.time()
+        bucket[&quot;request_timestamps&quot;] = [t for t in bucket[&quot;request_timestamps&quot;] if now - t &lt; 60]
+        if len(bucket[&quot;request_timestamps&quot;]) &gt;= bucket[&quot;max_rpm&quot;]:
+            return {&quot;allowed&quot;: False, &quot;reason&quot;: &quot;rate_limit&quot;, &quot;retry_after_seconds&quot;: 60 - (now - bucket[&quot;request_timestamps&quot;][0])}
+        if bucket[&quot;tokens&quot;] &lt; tokens_needed:
+            deficit = tokens_needed - bucket[&quot;tokens&quot;]
+            wait = deficit / bucket[&quot;refill_rate&quot;]
+            return {&quot;allowed&quot;: False, &quot;reason&quot;: &quot;token_limit&quot;, &quot;tokens_available&quot;: bucket[&quot;tokens&quot;], &quot;retry_after_seconds&quot;: round(wait, 1)}
+        return {&quot;allowed&quot;: True, &quot;tokens_available&quot;: bucket[&quot;tokens&quot;]}
+
+    def consume(self, user_id, tokens_used, tier=&quot;free&quot;):
+        bucket = self._get_bucket(user_id, tier)
+        bucket[&quot;tokens&quot;] -= tokens_used
+        bucket[&quot;request_timestamps&quot;].append(time.time())
+        bucket[&quot;total_tokens_used&quot;] += tokens_used
+
+    def get_usage(self, user_id):
+        if user_id not in self.buckets:
+            return {&quot;error&quot;: &quot;User not found&quot;}
+        b = self.buckets[user_id]
+        return {
+            &quot;user_id&quot;: user_id,
+            &quot;tier&quot;: b[&quot;tier&quot;],
+            &quot;tokens_remaining&quot;: b[&quot;tokens&quot;],
+            &quot;capacity&quot;: b[&quot;capacity&quot;],
+            &quot;total_tokens_used&quot;: b[&quot;total_tokens_used&quot;],
+            &quot;utilization&quot;: round(b[&quot;total_tokens_used&quot;] / b[&quot;capacity&quot;], 4) if b[&quot;capacity&quot;] else 0,
+        }
+</code></pre></div>
+
+<h2>Step 5 · Cost Tracker</h2>
+<p>Log every call and compute running totals.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class CostTracker:
+    def __init__(self, monthly_budget=1000.0):
+        self.logs = []
+        self.monthly_budget = monthly_budget
+        self.alerts = []
+
+    def log_call(self, model, input_tokens, output_tokens, cached_input_tokens=0, latency_ms=0, user_id=&quot;anonymous&quot;, cache_status=&quot;miss&quot;):
+        cost = calculate_cost(model, input_tokens, output_tokens, cached_input_tokens)
+        entry = {
+            &quot;timestamp&quot;: time.time(),
+            &quot;model&quot;: model,
+            &quot;input_tokens&quot;: input_tokens,
+            &quot;output_tokens&quot;: output_tokens,
+            &quot;cached_input_tokens&quot;: cached_input_tokens,
+            &quot;latency_ms&quot;: latency_ms,
+            &quot;cost&quot;: cost[&quot;total_cost&quot;],
+            &quot;user_id&quot;: user_id,
+            &quot;cache_status&quot;: cache_status,
+        }
+        self.logs.append(entry)
+        self._check_budget()
+        return entry
+
+    def _check_budget(self):
+        total = self.total_cost()
+        pct = total / self.monthly_budget if self.monthly_budget &gt; 0 else 0
+        if pct &gt;= 0.95 and not any(a[&quot;level&quot;] == &quot;stop&quot; for a in self.alerts):
+            self.alerts.append({&quot;level&quot;: &quot;stop&quot;, &quot;message&quot;: f&quot;Budget 95% consumed: ${total:.2f}/${self.monthly_budget:.2f}&quot;, &quot;timestamp&quot;: time.time()})
+        elif pct &gt;= 0.85 and not any(a[&quot;level&quot;] == &quot;throttle&quot; for a in self.alerts):
+            self.alerts.append({&quot;level&quot;: &quot;throttle&quot;, &quot;message&quot;: f&quot;Budget 85% consumed: ${total:.2f}/${self.monthly_budget:.2f}&quot;, &quot;timestamp&quot;: time.time()})
+        elif pct &gt;= 0.70 and not any(a[&quot;level&quot;] == &quot;warning&quot; for a in self.alerts):
+            self.alerts.append({&quot;level&quot;: &quot;warning&quot;, &quot;message&quot;: f&quot;Budget 70% consumed: ${total:.2f}/${self.monthly_budget:.2f}&quot;, &quot;timestamp&quot;: time.time()})
+
+    def total_cost(self):
+        return round(sum(e[&quot;cost&quot;] for e in self.logs), 6)
+
+    def cost_by_model(self):
+        by_model = {}
+        for e in self.logs:
+            m = e[&quot;model&quot;]
+            if m not in by_model:
+                by_model[m] = {&quot;calls&quot;: 0, &quot;cost&quot;: 0, &quot;input_tokens&quot;: 0, &quot;output_tokens&quot;: 0}
+            by_model[m][&quot;calls&quot;] += 1
+            by_model[m][&quot;cost&quot;] = round(by_model[m][&quot;cost&quot;] + e[&quot;cost&quot;], 6)
+            by_model[m][&quot;input_tokens&quot;] += e[&quot;input_tokens&quot;]
+            by_model[m][&quot;output_tokens&quot;] += e[&quot;output_tokens&quot;]
+        return by_model
+
+    def cache_savings(self):
+        cache_hits = [e for e in self.logs if e[&quot;cache_status&quot;] == &quot;hit&quot;]
+        if not cache_hits:
+            return {&quot;saved&quot;: 0, &quot;cache_hits&quot;: 0}
+        saved = 0
+        for e in cache_hits:
+            full_cost = calculate_cost(e[&quot;model&quot;], e[&quot;input_tokens&quot;], e[&quot;output_tokens&quot;])
+            saved += full_cost[&quot;total_cost&quot;]
+        return {&quot;saved&quot;: round(saved, 4), &quot;cache_hits&quot;: len(cache_hits)}
+
+    def summary(self):
+        if not self.logs:
+            return {&quot;total_calls&quot;: 0, &quot;total_cost&quot;: 0}
+        total_latency = sum(e[&quot;latency_ms&quot;] for e in self.logs)
+        cache_hits = sum(1 for e in self.logs if e[&quot;cache_status&quot;] == &quot;hit&quot;)
+        return {
+            &quot;total_calls&quot;: len(self.logs),
+            &quot;total_cost&quot;: self.total_cost(),
+            &quot;avg_cost_per_call&quot;: round(self.total_cost() / len(self.logs), 6),
+            &quot;avg_latency_ms&quot;: round(total_latency / len(self.logs), 1),
+            &quot;cache_hit_rate&quot;: round(cache_hits / len(self.logs), 4),
+            &quot;cost_by_model&quot;: self.cost_by_model(),
+            &quot;cache_savings&quot;: self.cache_savings(),
+            &quot;budget_remaining&quot;: round(self.monthly_budget - self.total_cost(), 2),
+            &quot;budget_utilization&quot;: round(self.total_cost() / self.monthly_budget, 4) if self.monthly_budget &gt; 0 else 0,
+            &quot;alerts&quot;: self.alerts,
+        }
+</code></pre></div>
+
+<h2>Step 6 · Model Router</h2>
+<p>Route queries to the cheapest model that can handle them.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">SIMPLE_KEYWORDS = [&quot;what time&quot;, &quot;hours&quot;, &quot;address&quot;, &quot;phone&quot;, &quot;price&quot;, &quot;return policy&quot;, &quot;hello&quot;, &quot;hi&quot;, &quot;thanks&quot;, &quot;yes&quot;, &quot;no&quot;]
+COMPLEX_KEYWORDS = [&quot;analyze&quot;, &quot;compare&quot;, &quot;explain why&quot;, &quot;write code&quot;, &quot;debug&quot;, &quot;architect&quot;, &quot;design&quot;, &quot;trade-off&quot;, &quot;evaluate&quot;]
+
+
+def classify_complexity(query):
+    q = query.lower()
+    if len(q.split()) &lt;= 5 or any(kw in q for kw in SIMPLE_KEYWORDS):
+        return &quot;simple&quot;
+    if any(kw in q for kw in COMPLEX_KEYWORDS):
+        return &quot;complex&quot;
+    return &quot;medium&quot;
+
+
+def route_model(query, tier=&quot;pro&quot;):
+    complexity = classify_complexity(query)
+    routing_table = {
+        &quot;simple&quot;: {&quot;free&quot;: &quot;gpt-4.1-nano&quot;, &quot;pro&quot;: &quot;gpt-4o-mini&quot;, &quot;enterprise&quot;: &quot;gpt-4o-mini&quot;},
+        &quot;medium&quot;: {&quot;free&quot;: &quot;gpt-4o-mini&quot;, &quot;pro&quot;: &quot;claude-sonnet-4&quot;, &quot;enterprise&quot;: &quot;claude-sonnet-4&quot;},
+        &quot;complex&quot;: {&quot;free&quot;: &quot;gpt-4o-mini&quot;, &quot;pro&quot;: &quot;gpt-4o&quot;, &quot;enterprise&quot;: &quot;claude-opus-4&quot;},
+    }
+    model = routing_table[complexity].get(tier, &quot;gpt-4o-mini&quot;)
+    return {&quot;query&quot;: query, &quot;complexity&quot;: complexity, &quot;model&quot;: model, &quot;tier&quot;: tier}
+</code></pre></div>
+
+<h2>Step 7 · Run the Demo</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simulate_llm_call(model, query):
+    input_tokens = len(query.split()) * 4 + 500
+    output_tokens = 150 + (len(query.split()) * 2)
+    latency = 200 + (output_tokens * 2)
+    return {
+        &quot;model&quot;: model,
+        &quot;response&quot;: f&quot;[Simulated {model} response to: {query[:50]}...]&quot;,
+        &quot;input_tokens&quot;: input_tokens,
+        &quot;output_tokens&quot;: output_tokens,
+        &quot;latency_ms&quot;: latency,
+    }
+
+
+def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Caching, Rate Limiting &amp; Cost Optimization Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Model Pricing ---&quot;)
+    for model, pricing in list(MODEL_PRICING.items())[:6]:
+        cost_1k = calculate_cost(model, 1000, 500)
+        print(f&quot;  {model}: ${cost_1k['total_cost']:.6f} per 1K in + 500 out&quot;)
+
+    print(&quot;\n--- Cost Comparison: 100K Requests ---&quot;)
+    for model in [&quot;gpt-4o&quot;, &quot;gpt-4o-mini&quot;, &quot;claude-sonnet-4&quot;, &quot;claude-haiku-3.5&quot;]:
+        cost = calculate_cost(model, 1000 * 100_000, 500 * 100_000)
+        print(f&quot;  {model}: ${cost['total_cost']:.2f}&quot;)
+
+    print(&quot;\n--- Anthropic Cache Savings ---&quot;)
+    no_cache = calculate_cost(&quot;claude-sonnet-4&quot;, 2000, 500, 0)
+    with_cache = calculate_cost(&quot;claude-sonnet-4&quot;, 2000, 500, 1500)
+    saving = no_cache[&quot;total_cost&quot;] - with_cache[&quot;total_cost&quot;]
+    print(f&quot;  Without cache: ${no_cache['total_cost']:.6f}&quot;)
+    print(f&quot;  With 1500 cached tokens: ${with_cache['total_cost']:.6f}&quot;)
+    print(f&quot;  Savings per call: ${saving:.6f} ({saving/no_cache['total_cost']*100:.1f}%)&quot;)
+
+    exact_cache = ExactCache(max_size=100, ttl_seconds=300)
+    semantic_cache = SemanticCache(similarity_threshold=0.75, max_size=100)
+    rate_limiter = TokenBucketRateLimiter()
+    tracker = CostTracker(monthly_budget=100.0)
+
+    print(&quot;\n--- Exact Cache ---&quot;)
+    messages_1 = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the return policy?&quot;}]
+    result = exact_cache.get(&quot;gpt-4o-mini&quot;, messages_1, 0.0)
+    print(f&quot;  First lookup: {'HIT' if result else 'MISS'}&quot;)
+    exact_cache.put(&quot;gpt-4o-mini&quot;, messages_1, 0.0, &quot;You can return items within 30 days.&quot;)
+    result = exact_cache.get(&quot;gpt-4o-mini&quot;, messages_1, 0.0)
+    print(f&quot;  Second lookup: {'HIT' if result else 'MISS'} -&gt; {result}&quot;)
+    result = exact_cache.get(&quot;gpt-4o-mini&quot;, messages_1, 0.7)
+    print(f&quot;  With temp=0.7: {'HIT' if result else 'MISS (non-deterministic, skip cache)'}&quot;)
+    print(f&quot;  Stats: {exact_cache.stats()}&quot;)
+
+    print(&quot;\n--- Semantic Cache ---&quot;)
+    test_queries = [
+        (&quot;What is the return policy?&quot;, &quot;Items can be returned within 30 days with receipt.&quot;),
+        (&quot;How do I return an item?&quot;, None),
+        (&quot;What are your store hours?&quot;, &quot;We are open 9am-9pm Monday through Saturday.&quot;),
+        (&quot;When does the store open?&quot;, None),
+        (&quot;Tell me about quantum computing&quot;, &quot;Quantum computers use qubits...&quot;),
+        (&quot;Explain quantum mechanics&quot;, None),
+    ]
+    for query, response in test_queries:
+        cached = semantic_cache.get(query)
+        if cached:
+            print(f&quot;  '{query[:40]}' -&gt; CACHE HIT (sim={cached['similarity']}, original='{cached['original_query'][:40]}')&quot;)
+        elif response:
+            semantic_cache.put(query, response)
+            print(f&quot;  '{query[:40]}' -&gt; MISS (stored)&quot;)
+        else:
+            print(f&quot;  '{query[:40]}' -&gt; MISS (no match)&quot;)
+    print(f&quot;  Stats: {semantic_cache.stats()}&quot;)
+
+    print(&quot;\n--- Rate Limiting ---&quot;)
+    for i in range(12):
+        check = rate_limiter.check(&quot;user_1&quot;, 1000, &quot;free&quot;)
+        if check[&quot;allowed&quot;]:
+            rate_limiter.consume(&quot;user_1&quot;, 1000, &quot;free&quot;)
+        status = &quot;OK&quot; if check[&quot;allowed&quot;] else f&quot;BLOCKED ({check['reason']})&quot;
+        if i &lt; 5 or not check[&quot;allowed&quot;]:
+            print(f&quot;  Request {i+1}: {status}&quot;)
+    print(f&quot;  Usage: {rate_limiter.get_usage('user_1')}&quot;)
+
+    print(&quot;\n--- Model Routing ---&quot;)
+    routing_queries = [
+        &quot;What time do you close?&quot;,
+        &quot;Summarize this quarterly earnings report&quot;,
+        &quot;Analyze the trade-offs between microservices and monoliths&quot;,
+        &quot;Hello&quot;,
+        &quot;Write code for a binary search tree with deletion&quot;,
+    ]
+    for q in routing_queries:
+        route = route_model(q, &quot;pro&quot;)
+        print(f&quot;  '{q[:50]}' -&gt; {route['model']} ({route['complexity']})&quot;)
+
+    print(&quot;\n--- Full Pipeline: Before vs After Optimization ---&quot;)
+    queries = [
+        &quot;What is the return policy?&quot;,
+        &quot;How do I return something?&quot;,
+        &quot;What are your hours?&quot;,
+        &quot;When do you open?&quot;,
+        &quot;Explain the difference between TCP and UDP&quot;,
+        &quot;Compare TCP vs UDP protocols&quot;,
+        &quot;Hello&quot;,
+        &quot;What is your phone number?&quot;,
+        &quot;Write a Python function to sort a list&quot;,
+        &quot;Analyze the pros and cons of serverless architecture&quot;,
+    ]
+
+    print(&quot;\n  [Before: no caching, single model (gpt-4o)]&quot;)
+    tracker_before = CostTracker(monthly_budget=1000.0)
+    for q in queries:
+        result = simulate_llm_call(&quot;gpt-4o&quot;, q)
+        tracker_before.log_call(&quot;gpt-4o&quot;, result[&quot;input_tokens&quot;], result[&quot;output_tokens&quot;], latency_ms=result[&quot;latency_ms&quot;], cache_status=&quot;miss&quot;)
+    before = tracker_before.summary()
+    print(f&quot;  Total cost: ${before['total_cost']:.6f}&quot;)
+    print(f&quot;  Avg cost/call: ${before['avg_cost_per_call']:.6f}&quot;)
+    print(f&quot;  Avg latency: {before['avg_latency_ms']}ms&quot;)
+
+    print(&quot;\n  [After: caching + routing + rate limiting]&quot;)
+    exact_c = ExactCache()
+    semantic_c = SemanticCache(similarity_threshold=0.75)
+    tracker_after = CostTracker(monthly_budget=1000.0)
+
+    for q in queries:
+        messages = [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: q}]
+        cached = exact_c.get(&quot;gpt-4o&quot;, messages, 0.0)
+        if cached:
+            tracker_after.log_call(&quot;gpt-4o-mini&quot;, 0, 0, latency_ms=5, cache_status=&quot;hit&quot;)
+            continue
+        sem_cached = semantic_c.get(q)
+        if sem_cached:
+            tracker_after.log_call(&quot;gpt-4o-mini&quot;, 0, 0, latency_ms=15, cache_status=&quot;hit&quot;)
+            continue
+        route = route_model(q)
+        result = simulate_llm_call(route[&quot;model&quot;], q)
+        tracker_after.log_call(route[&quot;model&quot;], result[&quot;input_tokens&quot;], result[&quot;output_tokens&quot;], latency_ms=result[&quot;latency_ms&quot;], cache_status=&quot;miss&quot;)
+        exact_c.put(route[&quot;model&quot;], messages, 0.0, result[&quot;response&quot;])
+        semantic_c.put(q, result[&quot;response&quot;])
+
+    after = tracker_after.summary()
+    print(f&quot;  Total cost: ${after['total_cost']:.6f}&quot;)
+    print(f&quot;  Avg cost/call: ${after['avg_cost_per_call']:.6f}&quot;)
+    print(f&quot;  Avg latency: {after['avg_latency_ms']}ms&quot;)
+    print(f&quot;  Cache hit rate: {after['cache_hit_rate']:.0%}&quot;)
+
+    if before[&quot;total_cost&quot;] &gt; 0:
+        savings_pct = (1 - after[&quot;total_cost&quot;] / before[&quot;total_cost&quot;]) * 100
+        print(f&quot;\n  SAVINGS: {savings_pct:.1f}% cost reduction&quot;)
+        print(f&quot;  Latency improvement: {(1 - after['avg_latency_ms'] / before['avg_latency_ms']) * 100:.1f}% faster&quot;)
+
+    print(&quot;\n--- Budget Alerts Demo ---&quot;)
+    alert_tracker = CostTracker(monthly_budget=0.01)
+    for i in range(5):
+        alert_tracker.log_call(&quot;gpt-4o&quot;, 5000, 2000, latency_ms=500)
+    print(f&quot;  Total spent: ${alert_tracker.total_cost():.6f} / ${alert_tracker.monthly_budget}&quot;)
+    for alert in alert_tracker.alerts:
+        print(f&quot;  ALERT [{alert['level'].upper()}]: {alert['message']}&quot;)
+
+    print(&quot;\n--- Cost Breakdown by Model ---&quot;)
+    multi_tracker = CostTracker(monthly_budget=500.0)
+    for _ in range(50):
+        multi_tracker.log_call(&quot;gpt-4o-mini&quot;, 800, 200, latency_ms=150)
+    for _ in range(30):
+        multi_tracker.log_call(&quot;claude-sonnet-4&quot;, 1500, 500, latency_ms=400)
+    for _ in range(10):
+        multi_tracker.log_call(&quot;gpt-4o&quot;, 2000, 800, latency_ms=600)
+    for _ in range(10):
+        multi_tracker.log_call(&quot;claude-opus-4&quot;, 3000, 1000, latency_ms=1200)
+    breakdown = multi_tracker.cost_by_model()
+    for model, data in sorted(breakdown.items(), key=lambda x: x[1][&quot;cost&quot;], reverse=True):
+        print(f&quot;  {model}: {data['calls']} calls, ${data['cost']:.6f}, {data['input_tokens']:,} in / {data['output_tokens']:,} out&quot;)
+    print(f&quot;  Total: ${multi_tracker.total_cost():.6f}&quot;)
+
+    print(&quot;\n&quot; + &quot;=&quot; * 60)
+    print(&quot;  Demo complete.&quot;)
+    print(&quot;=&quot; * 60)
+
+
+if __name__ == &quot;__main__&quot;:
+    run_demo()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">============================================================
+  Caching, Rate Limiting &amp; Cost Optimization Demo
+============================================================
+
+--- Model Pricing ---
+  gpt-4o: $0.007500 per 1K in + 500 out
+  gpt-4o-mini: $0.000450 per 1K in + 500 out
+  gpt-4.1: $0.006000 per 1K in + 500 out
+  gpt-4.1-mini: $0.001200 per 1K in + 500 out
+  gpt-4.1-nano: $0.000300 per 1K in + 500 out
+  o3: $0.006000 per 1K in + 500 out
+
+--- Cost Comparison: 100K Requests ---
+  gpt-4o: $750.00
+  gpt-4o-mini: $45.00
+  claude-sonnet-4: $1050.00
+  claude-haiku-3.5: $280.00
+
+--- Anthropic Cache Savings ---
+  Without cache: $0.013500
+  With 1500 cached tokens: $0.009450
+  Savings per call: $0.004050 (30.0%)
+
+--- Exact Cache ---
+  First lookup: MISS
+  Second lookup: HIT -&gt; You can return items within 30 days.
+  With temp=0.7: MISS (non-deterministic, skip cache)
+  Stats: {&#x27;hits&#x27;: 1, &#x27;misses&#x27;: 2, &#x27;hit_rate&#x27;: 0.3333, &#x27;cache_size&#x27;: 1}
+
+--- Semantic Cache ---
+  &#x27;What is the return policy?&#x27; -&gt; MISS (stored)
+  &#x27;How do I return an item?&#x27; -&gt; MISS (no match)
+  &#x27;What are your store hours?&#x27; -&gt; MISS (stored)
+  &#x27;When does the store open?&#x27; -&gt; MISS (no match)
+  &#x27;Tell me about quantum computing&#x27; -&gt; MISS (stored)
+  &#x27;Explain quantum mechanics&#x27; -&gt; MISS (no match)
+…
+(51 more lines)</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<h3>Anthropic Prompt Caching</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># import anthropic
+#
+# client = anthropic.Anthropic()
+#
+# response = client.messages.create(
+#     model=&quot;claude-sonnet-5&quot;,
+#     max_tokens=1024,
+#     system=[
+#         {
+#             &quot;type&quot;: &quot;text&quot;,
+#             &quot;text&quot;: &quot;You are a helpful customer support agent for Acme Corp...&quot;,
+#             &quot;cache_control&quot;: {&quot;type&quot;: &quot;ephemeral&quot;},
+#         }
+#     ],
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the return policy?&quot;}],
+# )
+#
+# print(f&quot;Input tokens: {response.usage.input_tokens}&quot;)
+# print(f&quot;Cache creation tokens: {response.usage.cache_creation_input_tokens}&quot;)
+# print(f&quot;Cache read tokens: {response.usage.cache_read_input_tokens}&quot;)
+</code></pre></div>
+
+<p>The first call writes to the cache (25% premium). Every subsequent call with the same system prompt prefix reads from the cache (90% discount). The cache lasts 5 minutes and resets the timer on every hit.</p>
+<h3>OpenAI Automatic Caching</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># from openai import OpenAI
+#
+# client = OpenAI()
+#
+# response = client.chat.completions.create(
+#     model=&quot;gpt-4o&quot;,
+#     messages=[
+#         {&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: &quot;You are a helpful customer support agent...&quot;},
+#         {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the return policy?&quot;},
+#     ],
+# )
+#
+# print(f&quot;Prompt tokens: {response.usage.prompt_tokens}&quot;)
+# print(f&quot;Cached tokens: {response.usage.prompt_tokens_details.cached_tokens}&quot;)
+# print(f&quot;Completion tokens: {response.usage.completion_tokens}&quot;)
+</code></pre></div>
+
+<p>OpenAI caches automatically. Any prompt prefix of 1,024+ tokens that matches a recent request gets a 50% discount. No code changes needed -- just check <code>prompt_tokens_details.cached_tokens</code> in the response to verify it is working.</p>
+<h3>OpenAI Batch API</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># import json
+# from openai import OpenAI
+#
+# client = OpenAI()
+#
+# requests = []
+# for i, query in enumerate(queries):
+#     requests.append({
+#         &quot;custom_id&quot;: f&quot;request-{i}&quot;,
+#         &quot;method&quot;: &quot;POST&quot;,
+#         &quot;url&quot;: &quot;/v1/chat/completions&quot;,
+#         &quot;body&quot;: {
+#             &quot;model&quot;: &quot;gpt-4o-mini&quot;,
+#             &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: query}],
+#         },
+#     })
+#
+# with open(&quot;batch_input.jsonl&quot;, &quot;w&quot;) as f:
+#     for r in requests:
+#         f.write(json.dumps(r) + &quot;\n&quot;)
+#
+# batch_file = client.files.create(file=open(&quot;batch_input.jsonl&quot;, &quot;rb&quot;), purpose=&quot;batch&quot;)
+# batch = client.batches.create(input_file_id=batch_file.id, endpoint=&quot;/v1/chat/completions&quot;, completion_window=&quot;24h&quot;)
+# print(f&quot;Batch ID: {batch.id}, Status: {batch.status}&quot;)
+</code></pre></div>
+
+<p>Batch API gives a flat 50% discount on all tokens. Results arrive within 24 hours. Perfect for non-real-time workloads: evaluations, data labeling, bulk summarization.</p>
+<h3>Production Semantic Cache with Redis</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># import redis
+# import numpy as np
+# from openai import OpenAI
+#
+# r = redis.Redis()
+# client = OpenAI()
+#
+# def get_embedding(text):
+#     response = client.embeddings.create(model=&quot;text-embedding-3-small&quot;, input=text)
+#     return response.data[0].embedding
+#
+# def semantic_cache_lookup(query, threshold=0.95):
+#     query_emb = np.array(get_embedding(query))
+#     keys = r.keys(&quot;cache:emb:*&quot;)
+#     best_sim, best_key = 0, None
+#     for key in keys:
+#         stored_emb = np.frombuffer(r.get(key), dtype=np.float32)
+#         sim = np.dot(query_emb, stored_emb) / (np.linalg.norm(query_emb) * np.linalg.norm(stored_emb))
+#         if sim &gt; best_sim:
+#             best_sim, best_key = sim, key
+#     if best_sim &gt;= threshold and best_key:
+#         response_key = best_key.decode().replace(&quot;cache:emb:&quot;, &quot;cache:resp:&quot;)
+#         return r.get(response_key).decode()
+#     return None
+</code></pre></div>
+
+<p>In production, replace the linear scan with a vector index (Redis Vector Search, Pinecone, or pgvector). Linear scan works for &lt;1,000 entries. Beyond that, use ANN (approximate nearest neighbor) for <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span> lookup.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Put the user's name and today's date at the top of the system prompt ("You are helping Priya on 25 November..."), then the 2,000-token static instructions. What happens to the provider cache hit rate, and how do you fix it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Cache reads at 5-10% of input price</strong>: Anthropic and OpenAI bill cached prefixes at a twentieth to a tenth of the normal input price, which makes prompt layout (static first, dynamic last) a cost decision.</li>
+<li><strong>Batch and background tiers</strong>: 50% off for asynchronous batches, and OpenAI's background requests at 30-40% off for longer completion windows.</li>
+<li><strong>Gateways</strong>: LiteLLM, Portkey, Cloudflare and Kong AI gateways put routing, caching, rate limits and budgets in one proxy layer.</li>
+<li><strong>Routers</strong>: learned routers (RouteLLM-style) and providers' own "auto" model choice pick a model per request.</li>
+</ul>
+<p>Sources: <a href="https://platform.claude.com/docs/en/about-claude/pricing">Claude pricing</a>, <a href="https://developers.openai.com/api/docs/pricing">OpenAI pricing</a>, <a href="https://platform.claude.com/docs/en/about-claude/models/overview">Claude models overview</a>, <a href="https://arxiv.org/abs/2406.18665">RouteLLM, Ong et al. 2024</a>, <a href="https://gluebenchmark.com/tasks">Quora Question Pairs via GLUE</a>, <a href="https://github.com/zilliztech/GPTCache">GPTCache</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Cost = input tokens × input price + output tokens × output price, per call.</li>
+<li>Put static content first so provider caches hit; cached reads cost 5-10%.</li>
+<li>Semantic caches reuse answers; the threshold trades savings for wrong answers.</li>
+<li>Route easy requests to small models; batch what can wait.</li>
+<li>Track cost per user and feature; rate-limit and stop at a budget.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-llm-cost-caching"><span class="t" style="--cs-hue:40">LC</span>Cheat sheet · Batch APIs, Caching and LLM Cost Control</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/prompt-cost-optimizer.md</code> -- a reusable prompt that analyzes your LLM application and recommends specific cost optimizations with projected savings.</p>
+<p>It also produces <code>outputs/skill-cost-patterns.md</code> -- a decision framework for choosing the right caching strategy, rate limiting configuration, and model routing rules for your use case.</p>
+<p><strong><code>outputs/prompt-cost-optimizer.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-cost-optimizer
+description: Analyze an LLM application and recommend specific cost optimizations with projected savings
+phase: 11
+lesson: 11
+---
+
+You are an LLM cost optimization consultant. I will describe my application's usage patterns and current costs. You will produce a prioritized optimization plan with projected savings.
+
+## Analysis Protocol
+
+### 1. Gather Usage Profile
+
+Before recommending anything, extract these numbers from the description:
+
+- Monthly API spend (current)
+- Primary model(s) used
+- Average input tokens per request (including system prompt)
+- Average output tokens per request
+- Daily active users
+- Requests per user per day
+- System prompt length (tokens)
+- Temperature setting
+- Cache hit potential (% of queries that are duplicates or near-duplicates)
+
+If any number is missing, estimate it from industry benchmarks and flag the assumption.
+
+### 2. Calculate Baseline
+
+Compute the current per-request cost breakdown:
+
+```
+System prompt cost = (system_prompt_tokens / 1M) * input_price
+Context cost = (context_tokens / 1M) * input_price
+User message cost = (user_tokens / 1M) * input_price
+Output cost = (output_tokens / 1M) * output_price
+Total per request = sum of above
+Monthly cost = total_per_request * daily_requests * 30
+```
+
+### 3. Recommend Optimizations (in priority order)
+
+For each optimization, provide:
+
+- **What:** specific technique
+- **How:** implementation steps (2-3 sentences)
+- **Savings:** dollar amount and percentage
+- **Effort:** low / medium / high
+- **Risk:** what could go wrong
+
+Priority order (highest ROI first):
+
+1. **Provider prompt caching** -- if system prompt &gt; 1,024 tokens
+2. **Model routing** -- if &gt;40% of queries are simple lookups
+3. **Exact caching** -- if temperature=0 and queries repeat
+4. **Semantic caching** -- if users ask paraphrased versions of the same questions
+5. **Batch API** -- if any workloads are non-real-time
+6. **Prompt compression** -- if system prompt &gt; 1,000 tokens
+7. **Output length limits** -- if average output is &gt; 500 tokens and could be shorter
+
+### 4. Project Total Savings
+
+Produce a before/after table:
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Monthly cost | $X | $Y | -Z% |
+| Cost per request | $X | $Y | -Z% |
+| Avg latency | Xms | Yms | -Z% |
+| Cache hit rate | 0% | X% | -- |
+
+### 5. Implementation Roadmap
+
+Order the optimizations into 3 phases:
+
+- **Phase 1 (Week 1):** Zero-code or minimal changes. Provider caching, batch API.
+- **Phase 2 (Week 2-3):** Moderate effort. Exact caching, model routing, rate limiting.
+- **Phase 3 (Month 2):** Significant effort. Semantic caching, prompt compression, cost monitoring dashboard.
+
+## Input Format
+
+**Application description:**
+```
+{description}
+```
+
+**Current monthly spend:** ${amount}
+
+**Usage numbers (if known):**
+```
+{usage_stats}
+```
+
+## Output
+
+A prioritized optimization plan with dollar savings, implementation effort, and a 3-phase roadmap.
+</code></pre></div>
+<p><strong><code>outputs/skill-cost-patterns.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-cost-patterns
+description: Decision framework for LLM cost optimization -- caching strategies, rate limiting, model routing, and budget controls
+version: 1.0.0
+phase: 11
+lesson: 11
+tags: [caching, cost-optimization, rate-limiting, model-routing, budget, llm-ops]
+---
+
+# LLM Cost Optimization Patterns
+
+When building an LLM application that needs to control costs, apply this decision framework.
+
+## When to optimize
+
+**Optimize immediately when:**
+- Monthly LLM spend exceeds $500 or 10% of infrastructure budget
+- Cost per query is above $0.01 for a consumer product
+- Your system prompt is over 1,000 tokens and sent with every request
+- More than 30% of queries are duplicates or near-duplicates
+- You are scaling from 100 to 10,000+ daily users
+
+**Do not optimize yet when:**
+- You have fewer than 100 DAU and are still validating product-market fit
+- Monthly spend is under $100 and growing slowly
+- You are still iterating on prompt design (caching locks you into a prompt)
+
+## Caching strategy selection
+
+### Exact caching
+
+**Use when:** temperature=0, identical prompts repeat, deterministic outputs needed.
+
+```python
+key = sha256(json.dumps({&quot;model&quot;: m, &quot;messages&quot;: msgs, &quot;temp&quot;: 0}))
+```
+
+- Implementation: 30 minutes
+- Hit rate: 10-25% for most apps, 40-60% for FAQ bots
+- Latency: &lt;1ms (dict lookup)
+- Risk: stale responses if underlying data changes
+
+**Skip when:** temperature &gt; 0, every query is unique, real-time data needed.
+
+### Semantic caching
+
+**Use when:** users ask the same question in different words, FAQ-heavy products, customer support.
+
+- Implementation: 2-4 hours (embedding + similarity + storage)
+- Hit rate: 15-35% on top of exact cache
+- Latency: 10-50ms (embedding + ANN search)
+- Risk: false positives (returning wrong cached answer for a similar but different question)
+
+**Threshold guidelines:**
+- 0.98+: very conservative, almost no false positives, lower hit rate
+- 0.95: good balance for factual Q&amp;A
+- 0.90: aggressive, higher hit rate but risk of wrong answers
+- 0.85: only for low-stakes applications (suggestions, autocomplete)
+
+**Skip when:** every query has unique context (code generation), responses must reflect latest data, query space is unbounded.
+
+### Provider prompt caching
+
+**Use when:** system prompt &gt; 1,024 tokens (OpenAI) or model-specific minimum, same prefix sent repeatedly.
+
+| Provider | Action | Savings |
+|----------|--------|---------|
+| Anthropic | Add `cache_control: {&quot;type&quot;: &quot;ephemeral&quot;}` to system message | 90% on cached prefix (after 25% write premium) |
+| OpenAI | Nothing (automatic) | 50% on cached prefix |
+| Google | Use Context Caching API with explicit TTL | ~75% on cached context |
+
+**Skip when:** system prompt changes per request, prompt is under minimum length.
+
+## Model routing rules
+
+### Keyword-based (simple, fast)
+
+```
+simple:  &lt;= 5 words OR matches FAQ keywords -&gt; gpt-4o-mini ($0.15/$0.60)
+medium:  general queries, summaries        -&gt; claude-sonnet ($3/$15)
+complex: &quot;analyze&quot;, &quot;compare&quot;, &quot;debug&quot;     -&gt; gpt-4o ($2.50/$10)
+```
+
+- Implementation: 1 hour
+- Accuracy: 70-80%
+- Savings: 40-60% of model costs
+
+### Embedding-based (more accurate)
+
+Embed 50-100 labeled queries per category. Classify new queries by nearest neighbor.
+
+- Implementation: 4-8 hours
+- Accuracy: 85-92%
+- Savings: 50-70% of model costs
+- Additional cost: ~$0.02/1M tokens for classification embeddings (negligible)
+
+### ML-based (production grade)
+
+Train a small classifier (logistic regression or small BERT) on historical query/model pairs.
+
+- Implementation: 1-2 weeks
+- Accuracy: 90-95%
+- Savings: 60-75% of model costs
+- Requires: labeled training data from production traffic
+
+## Rate limiting configuration
+
+### Token bucket parameters by tier
+
+| Tier | Bucket Size | Refill Rate | Max RPM | Daily Cap |
+|------|-------------|-------------|---------|-----------|
+| Free | 50K tokens | 500/sec | 10 | 50K |
+| Pro | 500K tokens | 5K/sec | 60 | 500K |
+| Enterprise | 5M tokens | 50K/sec | 300 | 5M |
+
+### Implementation checklist
+
+1. Store buckets in Redis (not in-memory) for multi-instance apps
+2. Use atomic operations (MULTI/EXEC) to prevent race conditions
+3. Return `Retry-After` header with rejection responses
+4. Track rejected requests as a metric (&gt;5% rejection = tier limits too tight)
+5. Implement graceful degradation: reject expensive model requests first, keep cheap model access
+
+## Budget controls
+
+### Three-threshold circuit breaker
+
+| Threshold | Action | Reversible |
+|-----------|--------|------------|
+| 70% of monthly budget | Log warning, alert team via Slack/PagerDuty | Yes (auto) |
+| 85% of monthly budget | Route all traffic to cheapest model | Yes (auto, next billing cycle) |
+| 95% of monthly budget | Serve cached responses only, reject new LLM calls | Yes (manual reset or next cycle) |
+
+### Per-user cost tracking
+
+Track cumulative cost per user. Flag users exceeding 10x the median. Common causes:
+- Legitimate power user (upgrade their tier)
+- Prompt injection loop (bot sending automated requests)
+- Inefficient integration (client retrying on every error)
+
+## Cost tracking fields
+
+Log every API call with these fields:
+
+```json
+{
+  &quot;timestamp&quot;: &quot;2026-04-02T10:30:00Z&quot;,
+  &quot;model&quot;: &quot;gpt-4o&quot;,
+  &quot;input_tokens&quot;: 1523,
+  &quot;output_tokens&quot;: 487,
+  &quot;cached_input_tokens&quot;: 1024,
+  &quot;latency_ms&quot;: 1847,
+  &quot;cost_usd&quot;: 0.006142,
+  &quot;user_id&quot;: &quot;user_abc123&quot;,
+  &quot;cache_status&quot;: &quot;partial_hit&quot;,
+  &quot;request_category&quot;: &quot;customer_support&quot;,
+  &quot;complexity_class&quot;: &quot;medium&quot;,
+  &quot;routed_from&quot;: &quot;gpt-4o&quot;
+}
+```
+
+### Key metrics to dashboard
+
+- **Cost per query** (P50, P95, P99) -- by model, by feature, by user tier
+- **Cache hit rate** -- exact vs semantic, trend over time
+- **Model distribution** -- % of traffic per model, cost per model
+- **Budget burn rate** -- current spend vs projected monthly at current rate
+- **Rejection rate** -- % of requests rate-limited, by tier
+
+## Common mistakes
+
+| Mistake | Why it hurts | Fix |
+|---------|-------------|-----|
+| Caching with temperature &gt; 0 | Non-deterministic outputs, stale cache gives wrong variety | Only cache temp=0 calls, or accept that cached responses lose randomness |
+| Semantic cache threshold too low | Returns wrong answers for superficially similar queries | Start at 0.95, lower only after measuring false positive rate |
+| No cache invalidation | Responses go stale when underlying data changes | Set TTL (1 hour for dynamic data, 24 hours for static), invalidate on data updates |
+| Routing all traffic to cheapest model | Quality drops, users notice | Route by complexity, measure quality per tier, set minimum quality thresholds |
+| No per-user limits | One abusive user burns entire budget | Always implement per-user quotas, even if generous |
+| Ignoring output tokens | Output costs 2-5x more than input per token | Set max_tokens appropriately, use stop sequences, compress outputs |
+| Caching before prompt is stable | Cache fills with responses from old prompts | Only enable caching after prompt is finalized, flush cache on prompt changes |
+
+## Pricing reference (as of April 2026)
+
+| Model | Input ($/1M) | Output ($/1M) | Cached Input ($/1M) | Best For |
+|-------|-------------|--------------|--------------------|---------| 
+| gpt-4.1-nano | $0.10 | $0.40 | $0.025 | High-volume simple tasks |
+| gpt-4o-mini | $0.15 | $0.60 | $0.075 | Simple routing, classification |
+| gemini-2.5-flash | $0.15 | $0.60 | $0.0375 | Budget multimodal |
+| claude-haiku-3.5 | $0.80 | $4.00 | $0.08 | Fast mid-tier tasks |
+| o4-mini | $1.10 | $4.40 | $0.275 | Reasoning on a budget |
+| gemini-2.5-pro | $1.25 | $10.00 | $0.3125 | Long context, multimodal |
+| gpt-4o | $2.50 | $10.00 | $1.25 | General purpose, function calling |
+| claude-sonnet-4 | $3.00 | $15.00 | $0.30 | Balanced quality/cost |
+| claude-opus-4 | $15.00 | $75.00 | $1.50 | Maximum quality, complex reasoning |
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p><strong>Implement LRU eviction for the semantic cache.</strong> Replace the oldest-first eviction with least-recently-used. Track the last access time for each entry and evict the entry with the oldest access time when the cache is full. Compare hit rates between the two strategies over 100 queries.</p>
+</li>
+<li>
+<p><strong>Build a cost projection tool.</strong> Given a log of API calls (the CostTracker logs), project the monthly cost based on the trailing 7-day average. Account for weekday/weekend patterns. Trigger an alert if the projected monthly cost exceeds the budget by more than 20%.</p>
+</li>
+<li>
+<p><strong>Implement tiered semantic caching.</strong> Use two similarity thresholds: 0.98 for high-confidence hits (return immediately) and 0.90 for medium-confidence hits (return with a disclaimer: "Based on a similar previous question..."). Track which tier each hit came from and measure user satisfaction differences.</p>
+</li>
+<li>
+<p><strong>Build a model routing classifier.</strong> Replace the keyword-based classifier with an embedding-based one. Embed 50 labeled queries (simple/medium/complex), then classify new queries by finding the nearest labeled example. Measure classification accuracy against a test set of 20 queries.</p>
+</li>
+<li>
+<p><strong>Implement a circuit breaker with degradation levels.</strong> At 70% budget, log a warning. At 85%, automatically switch all routing to the cheapest model (gpt-4o-mini). At 95%, serve only cached responses and reject new queries. Test by simulating 1,000 requests against a $1.00 budget and verify each threshold triggers correctly.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1111-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · No threshold is both generous and safe</span></summary><div class="qa-a"><p>At 0.95 the cache catches 27.1% of real duplicates and wrongly matches 2.7% of non-duplicates, and 86.4% of its hits are correct. No threshold does both jobs. Catching most duplicates (80% at 0.85) means matching one in five non-duplicates. Getting near-zero wrong matches (0.6% at 0.97) means catching fewer than one duplicate in five. Embedding similarity measures closeness of topic and wording, not "the same answer applies".</p></div></details>
+<details class="qa" id="a1111-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A changing prefix defeats prefix caching</span></summary><div class="qa-a"><p>Prompt caching reuses work only for an identical prefix, token for token from the first one. Put the name and date first, and every user and every day gets a different first line. The 2,000 static tokens after it are then never part of a shared prefix, so the hit rate falls to about zero across users, and also across days for the same user. On Anthropic you also pay the 1.25x cache-write price on every request, which is more than not caching. The fix is the layout rule from Lesson 11.26: static instructions, tool definitions and examples first, with the cache breakpoint after them; the name, the date and the conversation after the breakpoint. Then check the cached-token fields in the usage data. Lesson 11.26's run shows the same effect on a real model: a timestamp at the top leaves only a few shared tokens.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching">Anthropic Prompt Caching Guide</a> -- the official docs for Anthropic's explicit cache_control markers, pricing, and cache lifetime behavior</li>
+<li><a href="https://platform.openai.com/docs/guides/prompt-caching">OpenAI Prompt Caching</a> -- OpenAI's automatic caching, how to verify cache hits via usage fields, and minimum prefix lengths</li>
+<li><a href="https://platform.openai.com/docs/guides/batch">OpenAI Batch API</a> -- 50% discount for asynchronous processing, JSONL format, 24-hour completion window, and 50K request limits</li>
+<li><a href="https://github.com/zilliztech/GPTCache">GPTCache</a> -- open-source semantic caching library supporting multiple embedding backends, vector stores, and eviction policies</li>
+<li><a href="https://docs.withmartian.com">Martian Model Router</a> -- production model routing that automatically selects the cheapest model capable of handling each query</li>
+<li><a href="https://www.notdiamond.ai">Not Diamond</a> -- ML-based model router that learns from your traffic patterns to optimize cost/quality tradeoffs across providers</li>
+<li><a href="https://www.helicone.ai">Helicone</a> -- LLM observability platform with cost tracking, caching, rate limiting, and budget alerts as a proxy layer</li>
+<li><a href="https://research.google/pubs/the-tail-at-scale/">Dean &amp; Barroso, "The Tail at Scale" (CACM 2013)</a> -- latency, throughput, TTFT/TPOT percentiles, and hedged requests; the cost model behind "pick the cheapest model that still meets P95."</li>
+<li><a href="https://arxiv.org/abs/2309.06180">Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023)</a> -- the vLLM paper; why paged KV-cache + continuous batching beat naive servers 24× on throughput, the infra layer under "caching and cost."</li>
+<li><a href="https://arxiv.org/abs/2307.08691">Dao et al., "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning" (ICLR 2024)</a> -- kernel-level cost reduction orthogonal to prompt caching; read alongside speculative decoding and GQA for the full cost-curve picture.</li>
+</ul></div></aside>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="a1111-q1"><p class="q-text"><span class="q-num">Q1</span>Why do AI startups often fail from cost issues rather than model quality?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1111-q1-o0"><span class="opt-key">A</span><span>Models are always good enough</span></button><button type="button" class="opt" data-correct="true" id="a1111-q1-o1"><span class="opt-key">B</span><span>Per-call costs compound rapidly: 10K users making 10 calls/day costs $250/day in tokens before charging a single dollar</span></button><button type="button" class="opt" data-correct="false" id="a1111-q1-o2"><span class="opt-key">C</span><span>API providers offer unlimited free tiers</span></button><button type="button" class="opt" data-correct="false" id="a1111-q1-o3"><span class="opt-key">D</span><span>Cost optimization is easy</span></button></div><p class="q-explain" hidden>LLM API costs scale linearly with usage. A feature that costs $0.003 per call seems cheap until it&#x27;s called 100K times/day ($300/day, $9K/month). Without cost optimization, many AI products are unprofitable at scale.</p></div><div class="q" id="a1111-q2"><p class="q-text"><span class="q-num">Q2</span>What is semantic caching for LLM applications?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1111-q2-o0"><span class="opt-key">A</span><span>Pre-generating all possible responses</span></button><button type="button" class="opt" data-correct="false" id="a1111-q2-o1"><span class="opt-key">B</span><span>Caching embeddings only</span></button><button type="button" class="opt" data-correct="true" id="a1111-q2-o2"><span class="opt-key">C</span><span>Storing responses for previous queries and serving cached responses when a new query is semantically similar (not just exactly matching)</span></button><button type="button" class="opt" data-correct="false" id="a1111-q2-o3"><span class="opt-key">D</span><span>Caching model weights</span></button></div><p class="q-explain" hidden>Exact-match caching only helps with identical queries. Semantic caching embeds queries and serves cached responses when cosine similarity exceeds a threshold. &#x27;What&#x27;s the weather in NYC?&#x27; matches &#x27;NYC weather today?&#x27;.</p></div><div class="q" id="a1111-q3"><p class="q-text"><span class="q-num">Q3</span>What is model routing as a cost optimization strategy?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1111-q3-o0"><span class="opt-key">A</span><span>Caching responses from multiple models</span></button><button type="button" class="opt" data-correct="true" id="a1111-q3-o1"><span class="opt-key">B</span><span>Sending simple queries to cheap/fast models and complex queries to expensive/powerful models based on query classification</span></button><button type="button" class="opt" data-correct="false" id="a1111-q3-o2"><span class="opt-key">C</span><span>Load balancing across servers</span></button><button type="button" class="opt" data-correct="false" id="a1111-q3-o3"><span class="opt-key">D</span><span>Routing between different API providers</span></button></div><p class="q-explain" hidden>Not every query needs GPT-4. A classifier routes simple questions (FAQ, greetings) to a cheap model (GPT-3.5, Haiku) and complex questions (reasoning, analysis) to an expensive model. This can cut costs 50-80%.</p></div><div class="q" id="a1111-q4"><p class="q-text"><span class="q-num">Q4</span>What is prompt compression and how does it reduce costs?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1111-q4-o0"><span class="opt-key">A</span><span>Using shorter variable names</span></button><button type="button" class="opt" data-correct="true" id="a1111-q4-o1"><span class="opt-key">B</span><span>Removing redundant tokens, summarizing long contexts, and eliminating boilerplate to reduce input token count while preserving essential information</span></button><button type="button" class="opt" data-correct="false" id="a1111-q4-o2"><span class="opt-key">C</span><span>Making prompts shorter by removing words</span></button><button type="button" class="opt" data-correct="false" id="a1111-q4-o3"><span class="opt-key">D</span><span>Compressing prompts with gzip</span></button></div><p class="q-explain" hidden>Input tokens dominate cost in RAG applications (large retrieved contexts). Prompt compression removes filler words, summarizes verbose passages, and trims low-relevance chunks to reduce token count without losing key information.</p></div><div class="q" id="a1111-q5"><p class="q-text"><span class="q-num">Q5</span>What is prefix caching and which provider feature enables it?</p><div class="opts"><button type="button" class="opt" data-correct="true" id="a1111-q5-o0"><span class="opt-key">A</span><span>Reusing KV-cache computation for shared prompt prefixes (system prompt + tool definitions), reducing latency and cost for repeated patterns</span></button><button type="button" class="opt" data-correct="false" id="a1111-q5-o1"><span class="opt-key">B</span><span>Browser caching of API responses</span></button><button type="button" class="opt" data-correct="false" id="a1111-q5-o2"><span class="opt-key">C</span><span>Caching DNS lookups</span></button><button type="button" class="opt" data-correct="false" id="a1111-q5-o3"><span class="opt-key">D</span><span>Caching the first word of each response</span></button></div><p class="q-explain" hidden>If your system prompt + tool definitions are 5000 tokens and identical across requests, prefix caching computes the KV-cache once and reuses it. Anthropic&#x27;s prompt caching and OpenAI&#x27;s cached tokens both support this.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1111" id="done-a1111">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1111" id="undo-a1111" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1110"><span class="pn-dir">Previous</span><span class="pn-t">11.19 · Testing and Evaluating LLM Applications</span></a><a class="pn next" href="#l0102"><span class="pn-dir">Next</span><span class="pn-t">11.21 · Latency: prefill, decode and time to first token</span></a></div></footer>

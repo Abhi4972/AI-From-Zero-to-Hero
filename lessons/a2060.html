@@ -1,0 +1,918 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-20">Phase 20 · Hands-On AI Projects</a></nav><h1>Recovering Streamed Answers after a Drop</h1><div class="m-meta"><span class="chip chip-num">Lesson 20.60</span><span class="chip">480 min</span><span class="chip chip-core">Project</span><span class="chip chip-done" data-done-chip="a2060" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Decode chunked bytes into complete events</li>
+<li>Render text and citations by stable identity</li>
+<li>Handle reconnect and cancellation</li>
+<li>Export and replay an interrupted-answer trace</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: nothing beyond the earlier phases.</li>
+<li><strong>Type</strong>: Project, level 3 (). <strong>Time</strong>: about 8 hours over 4 steps.</li>
+<li><strong>Code in</strong>: TypeScript, Go.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Reconnect a streamed answer without duplicating text or hiding an incomplete result.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Chat answers arrive as a stream, token by token. Connections drop. A careless client either starts the answer again (and the user sees text twice), or shows the partial text as if it were complete. Two lower-level traps make it worse: a network chunk can end in the middle of a multi-byte character such as "é", or in the middle of an event.</p>
+<p>This project builds stream recovery for server-sent events (SSE). It decodes bytes incrementally so characters and events survive any chunk boundary, applies events by stable id so a repeated event changes nothing, reconnects with the id of the last accepted event, keeps a cancelled answer as a draft, and exports a trace that can rebuild the answer exactly.</p></div></aside>
+<p>Build a browser answer view and local event stream for developers integrating assistant output. Handle split UTF-8 bytes, event IDs, reconnection, cancellation and partial citations. Preserve the difference between an interrupted draft and a completed answer, with a downloadable event trace to reproduce rendering failures.</p>
+<p>Standard libraries only. Four stages, approximately eight hours. TypeScript, Go implementations are exercised by the grader.</p>
+<p><strong>What you will build:</strong> Reusable browser component, SSE fixture server and replayable event trace</p>
+<h2>Step 1 · Decode chunked bytes into complete events</h2>
+<p><em>Step 1 of 4 · about 2 hours · TypeScript</em></p>
+<blockquote>
+<p>Let UTF-8 and SSE framing survive arbitrary transport boundaries.</p>
+</blockquote>
+<p><strong>What you build.</strong> Build an incremental UTF-8 decoder and line parser. Handle LF, CRLF and CR, even when the separator or multibyte character spans chunks. A blank line dispatches data; EOF by itself does not. Comments are ignored. Multiple data fields join with a newline.</p>
+<p><strong>Worked example.</strong> Split the two bytes of é across pushes. No replacement character should appear. <code>id: 1</code>, <code>data: Caf</code> and a blank line dispatch one event. An event without a new id inherits the previous id; an empty id resets it.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-streaming-answer-recovery-1"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>new SSEDecoder().push(bytes:Uint8Array,final=false):Event[]</code>, where Event is <code>{id,event,data}</code>. Default event type is message. Ignore id values containing NUL. Final flush rejects truncated UTF-8 and discards un-dispatched data. This subset ignores retry fields.</p>
+<p>Reject malformed input before producing a partial artifact. The tests include held-out records separate from the demonstration fixture.</p>
+<details class="qa" id="a2060-qa1"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage.test.ts</code> (49 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { test } from &quot;node:test&quot;;
+import assert from &quot;node:assert/strict&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import path from &quot;node:path&quot;;
+const m = await import(
+  pathToFileURL(path.join(process.env.PROJECT_WORKSPACE!, &quot;main.ts&quot;)).href
+);
+
+const enc = new TextEncoder();
+test(&quot;dispatch blank line&quot;, () =&gt;
+  assert.deepEqual(
+    new m.SSEDecoder().push(enc.encode(&quot;id: 1\ndata: hello\n\n&quot;)),
+    [{ id: &quot;1&quot;, event: &quot;message&quot;, data: &quot;hello&quot; }],
+  ));
+test(&quot;split Unicode&quot;, () =&gt; {
+  const d = new m.SSEDecoder(),
+    b = enc.encode(&quot;data: café\n\n&quot;);
+  let out = [];
+  for (const x of b) out.push(...d.push(Uint8Array.of(x)));
+  assert.equal(out[0].data, &quot;café&quot;);
+});
+test(&quot;CRLF and multiline&quot;, () =&gt; {
+  const d = new m.SSEDecoder();
+  assert.equal(d.push(enc.encode(&quot;data: a\r&quot;)).length, 0);
+  assert.equal(d.push(enc.encode(&quot;\ndata: b\r\n\r\n&quot;))[0].data, &quot;a\nb&quot;);
+});
+test(&quot;EOF is not dispatch&quot;, () =&gt;
+  assert.equal(
+    new m.SSEDecoder().push(enc.encode(&quot;data: unfinished&quot;), true).length,
+    0,
+  ));
+test(&quot;persistent ID and reset&quot;, () =&gt; {
+  const r = new m.SSEDecoder().push(
+    enc.encode(&quot;id: 7\ndata: a\n\ndata: b\n\nid:\ndata: c\n\n&quot;),
+  );
+  assert.deepEqual(
+    r.map((x) =&gt; x.id),
+    [&quot;7&quot;, &quot;7&quot;, &quot;&quot;],
+  );
+});
+test(&quot;invalid truncated bytes&quot;, () =&gt;
+  assert.throws(() =&gt; new m.SSEDecoder().push(Uint8Array.of(0xc3), true)));
+test(&quot;comments and NUL ID&quot;, () =&gt; {
+  const r = new m.SSEDecoder().push(
+    enc.encode(&quot;: comment\nid: a\0b\ndata:\n\n&quot;),
+  );
+  assert.equal(r[0].id, &quot;&quot;);
+  assert.equal(r[0].data, &quot;&quot;);
+});
+</code></pre></div></div></details>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A character split across chunks</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import codecs
+data = &quot;data: Café\n\n&quot;.encode()                     # é is two bytes in UTF-8
+chunks = [data[:10], data[10:]]                       # the split falls inside é
+print(&quot;naive:&quot;, [c.decode(errors=&quot;replace&quot;) for c in chunks])
+dec, text = codecs.getincrementaldecoder(&quot;utf-8&quot;)(), &quot;&quot;
+for c in chunks: text += dec.decode(c)
+print(&quot;incremental:&quot;, repr(text))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">naive: [&#x27;data: Caf&#xFFFD;&#x27;, &#x27;&#xFFFD;\n\n&#x27;]
+incremental: &#x27;data: Café\n\n&#x27;</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>"é" is two bytes in UTF-8, and the chunk boundary falls between them. Decoding each chunk separately produces replacement characters (the &#xFFFD; symbols) where the halves should be. An incremental decoder holds the incomplete byte until the next chunk arrives and produces "Café". The same holds one level up: an event is dispatched only when its blank line arrives, never on a partial line.</p></div></aside>
+<h2>Step 2 · Render text and citations by stable identity</h2>
+<p><em>Step 2 of 4 · about 2 hours · TypeScript</em></p>
+<blockquote>
+<p>Make duplicate delivery harmless while preserving incomplete state.</p>
+</blockquote>
+<p><strong>What you build.</strong> The answer protocol adds contiguous positive integer IDs and JSON payloads to SSE. Text appends content, citation adds a labelled HTTP(S) URL and complete marks the answer done. Equal duplicate IDs are ignored; conflicting duplicate payloads, gaps and events after completion fail.</p>
+<p><strong>Worked example.</strong> Event 1 appends Caf. Replaying event 1 changes nothing. Event 2 appends é and more text. A citation does not imply completion. The answer remains draft until a complete event arrives.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-streaming-answer-recovery-2"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>initial():Answer</code>; <code>apply(state,event):Answer</code>. Answer contains text, citations, status, lastID and accepted events. <code>interrupt(state)</code> preserves text and marks interrupted. <code>cancel(state)</code> marks a noncompleted answer cancelled; cancelled answers ignore subsequent events.</p>
+<details class="qa" id="a2060-qa2"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage.test.ts</code> (48 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { test } from &quot;node:test&quot;;
+import assert from &quot;node:assert/strict&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import path from &quot;node:path&quot;;
+const m = await import(
+  pathToFileURL(path.join(process.env.PROJECT_WORKSPACE!, &quot;main.ts&quot;)).href
+);
+
+const event = (id, type, value = {}) =&gt; ({
+  id: String(id),
+  event: &quot;message&quot;,
+  data: JSON.stringify({ type, ...value }),
+});
+test(&quot;append and complete&quot;, () =&gt; {
+  let s = m.apply(m.initial(), event(1, &quot;text&quot;, { text: &quot;heldout&quot; }));
+  s = m.apply(s, event(2, &quot;complete&quot;));
+  assert.equal(s.text, &quot;heldout&quot;);
+  assert.equal(s.status, &quot;completed&quot;);
+});
+test(&quot;duplicate ignored&quot;, () =&gt; {
+  const e = event(1, &quot;text&quot;, { text: &quot;x&quot; }),
+    s = m.apply(m.initial(), e);
+  assert.deepEqual(m.apply(s, e), s);
+});
+test(&quot;conflicting ID rejected&quot;, () =&gt; {
+  const s = m.apply(m.initial(), event(1, &quot;text&quot;, { text: &quot;x&quot; }));
+  assert.throws(() =&gt; m.apply(s, event(1, &quot;text&quot;, { text: &quot;y&quot; })));
+});
+test(&quot;gap rejected&quot;, () =&gt;
+  assert.throws(() =&gt; m.apply(m.initial(), event(2, &quot;complete&quot;))));
+test(&quot;unsafe citation rejected&quot;, () =&gt;
+  assert.throws(() =&gt;
+    m.apply(
+      m.initial(),
+      event(1, &quot;citation&quot;, { label: &quot;bad&quot;, url: &quot;javascript:alert(1)&quot; }),
+    ),
+  ));
+test(&quot;interrupted text retained&quot;, () =&gt; {
+  const s = m.interrupt(
+    m.apply(m.initial(), event(1, &quot;text&quot;, { text: &quot;draft&quot; })),
+  );
+  assert.equal(s.text, &quot;draft&quot;);
+  assert.equal(s.status, &quot;interrupted&quot;);
+});
+test(&quot;cancel terminal&quot;, () =&gt; {
+  const s = m.cancel(m.initial());
+  assert.deepEqual(m.apply(s, event(1, &quot;text&quot;, { text: &quot;late&quot; })), s);
+});
+</code></pre></div></div></details>
+<h2>Step 3 · Handle reconnect and cancellation</h2>
+<p><em>Step 3 of 4 · about 2 hours · typescript+go</em></p>
+<blockquote>
+<p>Resume after the last accepted event, not the last partial byte.</p>
+</blockquote>
+<p><strong>What you build.</strong> Go serves an authored SSE stream in three-byte writes and deliberately closes the first request halfway through é. TypeScript connect sends Last-Event-ID on the next request, creates a fresh decoder, preserves accepted answer state and handles AbortSignal cancellation.</p>
+<p><strong>Worked example.</strong> First connection accepts event 1 then ends with a truncated UTF-8 error: text Caf, status interrupted, lastID 1. Reconnect sends Last-Event-ID:1. Go emits complete event 2 onward, producing Café once, one citation and completed state.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-streaming-answer-recovery-3"></div></figure></p>
+<p><strong>Implement the contract.</strong> TypeScript <code>connect(url,state,onState,signal?):Promise&lt;Answer&gt;</code> bounds each connection to one MiB and marks failures interrupted. Cancel and release the response reader after malformed data, cancellation or application completion so failed streams cannot remain open. Go <code>Encode(StreamEvent)([]byte,error)</code>, <code>After(events,last)([]StreamEvent,error)</code>, <code>Handler(events)http.Handler</code>. No automatic reconnect loop is hidden; the caller chooses each connection.</p>
+<details class="qa" id="a2060-qa3"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage.test.ts</code> (131 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { test } from &quot;node:test&quot;;
+import assert from &quot;node:assert/strict&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import path from &quot;node:path&quot;;
+const m = await import(
+  pathToFileURL(path.join(process.env.PROJECT_WORKSPACE!, &quot;main.ts&quot;)).href
+);
+
+import { createServer } from &quot;node:http&quot;;
+async function withServer(handler, fn) {
+  const server = createServer(handler);
+  await new Promise((resolve) =&gt; server.listen(0, &quot;127.0.0.1&quot;, resolve));
+  try {
+    return await fn(`http://127.0.0.1:${server.address().port}`);
+  } finally {
+    await new Promise((resolve) =&gt; server.close(resolve));
+  }
+}
+const one = 'id: 1\ndata: {&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;A&quot;}\n\n';
+test(&quot;real wire completion&quot;, () =&gt;
+  withServer(
+    (q, r) =&gt; {
+      r.setHeader(&quot;Content-Type&quot;, &quot;text/event-stream&quot;);
+      r.end(one + 'id: 2\ndata: {&quot;type&quot;:&quot;complete&quot;}\n\n');
+    },
+    async (u) =&gt; {
+      assert.equal(
+        (await m.connect(u, m.initial(), () =&gt; {})).status,
+        &quot;completed&quot;,
+      );
+    },
+  ));
+test(&quot;real wire interruption&quot;, () =&gt;
+  withServer(
+    (q, r) =&gt; {
+      r.setHeader(&quot;Content-Type&quot;, &quot;text/event-stream&quot;);
+      r.end(one);
+    },
+    async (u) =&gt; {
+      const s = await m.connect(u, m.initial(), () =&gt; {});
+      assert.equal(s.status, &quot;interrupted&quot;);
+      assert.equal(s.text, &quot;A&quot;);
+    },
+  ));
+test(&quot;resume header&quot;, () =&gt;
+  withServer(
+    (q, r) =&gt; {
+      assert.equal(q.headers[&quot;last-event-id&quot;], &quot;1&quot;);
+      r.setHeader(&quot;Content-Type&quot;, &quot;text/event-stream&quot;);
+      r.end('id: 2\ndata: {&quot;type&quot;:&quot;complete&quot;}\n\n');
+    },
+    async (u) =&gt; {
+      const s = m.apply(m.initial(), {
+        id: &quot;1&quot;,
+        event: &quot;message&quot;,
+        data: '{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;A&quot;}',
+      });
+      assert.equal((await m.connect(u, s, () =&gt; {})).status, &quot;completed&quot;);
+    },
+  ));
+test(&quot;HTTP failure&quot;, () =&gt;
+  withServer(
+    (q, r) =&gt; {
+      r.statusCode = 503;
+      r.end();
+    },
+    async (u) =&gt;
+      assert.equal(
+        (await m.connect(u, m.initial(), () =&gt; {})).status,
+        &quot;interrupted&quot;,
+      ),
+  ));
+test(&quot;aborted&quot;, () =&gt;
+  withServer(
+    (q, r) =&gt; r.end(),
+    async (u) =&gt; {
+      const c = new AbortController();
+      c.abort();
+      assert.equal(
+        (await m.connect(u, m.initial(), () =&gt; {}, c.signal)).status,
+        &quot;cancelled&quot;,
+      );
+    },
+  ));
+
+test(&quot;malformed stream is cancelled&quot;, async (t) =&gt; {
+  let cancelled = false;
+  t.mock.method(
+    globalThis,
+    &quot;fetch&quot;,
+    async () =&gt;
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(new TextEncoder().encode(&quot;id: 1\ndata: not-json\n\n&quot;));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { &quot;content-type&quot;: &quot;text/event-stream&quot; } },
+      ),
+  );
+  const s = await m.connect(&quot;http://fixture.invalid&quot;, m.initial(), () =&gt; {});
+  assert.equal(s.status, &quot;interrupted&quot;);
+  assert.equal(cancelled, true);
+});
+test(&quot;completion closes an otherwise open stream&quot;, async (t) =&gt; {
+  let cancelled = false;
+  t.mock.method(
+    globalThis,
+    &quot;fetch&quot;,
+    async () =&gt;
+      new Response(
+        new ReadableStream({
+          start(c) {
+            c.enqueue(
+              new TextEncoder().encode('id: 1\ndata: {&quot;type&quot;:&quot;complete&quot;}\n\n'),
+            );
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { headers: { &quot;content-type&quot;: &quot;text/event-stream&quot; } },
+      ),
+  );
+  const s = await m.connect(&quot;http://fixture.invalid&quot;, m.initial(), () =&gt; {});
+  assert.equal(s.status, &quot;completed&quot;);
+  assert.equal(cancelled, true);
+});
+</code></pre></div></div></details>
+<details class="qa" id="a2060-qa4"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage_test.go</code> (47 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;io&quot;
+    &quot;net/http&quot;
+    &quot;net/http/httptest&quot;
+    &quot;strings&quot;
+    &quot;testing&quot;
+)
+
+func TestEncode(t *testing.T) {
+    b, e := Encode(StreamEvent{1, `{&quot;type&quot;:&quot;complete&quot;}`})
+    if e != nil || !strings.HasSuffix(string(b), &quot;\n\n&quot;) {
+        t.Fatal(string(b), e)
+    }
+}
+func TestBadPayload(t *testing.T) {
+    if _, e := Encode(StreamEvent{1, &quot;{&quot;}); e == nil {
+        t.Fatal(&quot;invalid JSON&quot;)
+    }
+}
+func TestAfter(t *testing.T) {
+    x, e := After(FixtureEvents(), &quot;2&quot;)
+    if e != nil || len(x) != 2 || x[0].ID != 3 {
+        t.Fatal(x, e)
+    }
+}
+func TestBadResume(t *testing.T) {
+    if _, e := After(FixtureEvents(), &quot;99&quot;); e == nil {
+        t.Fatal(&quot;unavailable resume&quot;)
+    }
+}
+func TestHTTPResume(t *testing.T) {
+    s := httptest.NewServer(Handler(FixtureEvents()))
+    defer s.Close()
+    req, _ := http.NewRequest(&quot;GET&quot;, s.URL, nil)
+    req.Header.Set(&quot;Last-Event-ID&quot;, &quot;2&quot;)
+    r, e := s.Client().Do(req)
+    if e != nil {
+        t.Fatal(e)
+    }
+    defer r.Body.Close()
+    b, _ := io.ReadAll(r.Body)
+    if strings.Contains(string(b), &quot;id: 1&quot;) || !strings.Contains(string(b), &quot;id: 3&quot;) {
+        t.Fatal(string(b))
+    }
+}
+</code></pre></div></div></details>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Reconnecting sends the id of the last accepted event, so the server resumes after it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> After a reconnect, the client should clear the text and replay from the start.
+  Events are applied by id; already-accepted events are ignored, so nothing is duplicated.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A cancelled answer keeps its draft text and does not reconnect.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> A citation's URL can be inserted into the page as HTML.
+  URLs are validated (no <code>javascript:</code>) and text is set with <code>textContent</code>.</li>
+</ul></div></aside>
+<h2>Step 4 · Export and replay an interrupted-answer trace</h2>
+<p><em>Step 4 of 4 · about 2 hours · TypeScript</em></p>
+<blockquote>
+<p>Ship the browser component with a replayable accepted-event artifact.</p>
+</blockquote>
+<p><strong>What you build.</strong> Serialize accepted events and terminal state as a version-1 trace. Replay rebuilds the answer by running apply on each event and checks that completion agrees with the event ledger. The reusable mount component provides resume, cancellation, citations and a trace download.</p>
+<p><strong>Worked example.</strong> Download immediately after the first interruption. Replay yields text Caf and status interrupted. Download after resuming and replay yields the completed Unicode answer with one citation. A trace claiming completed without a complete event fails.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="pj-streaming-answer-recovery-4"></div></figure></p>
+<p><strong>Implement the contract.</strong> <code>trace(state):string</code>; <code>replay(text):Answer</code>; <code>mount(host:HTMLElement,url:string):()=&gt;void</code>. The returned disposer aborts work and clears the host. build-browser.ts strips native TypeScript into an importable browser module; no framework runtime is required.</p>
+<details class="qa" id="a2060-qa5"><summary><span class="qa-lvl qa-tests">Checks</span><span class="qa-q">The checks this stage must pass: <code>stage.test.ts</code> (35 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { test } from &quot;node:test&quot;;
+import assert from &quot;node:assert/strict&quot;;
+import { pathToFileURL } from &quot;node:url&quot;;
+import path from &quot;node:path&quot;;
+const m = await import(
+  pathToFileURL(path.join(process.env.PROJECT_WORKSPACE!, &quot;main.ts&quot;)).href
+);
+
+const event = (id, type, value = {}) =&gt; ({
+  id: String(id),
+  event: &quot;message&quot;,
+  data: JSON.stringify({ type, ...value }),
+});
+test(&quot;interrupted replay&quot;, () =&gt; {
+  const s = m.interrupt(m.apply(m.initial(), event(1, &quot;text&quot;, { text: &quot;雪&quot; })));
+  assert.deepEqual(m.replay(m.trace(s)), s);
+});
+test(&quot;completed replay&quot;, () =&gt; {
+  const s = m.apply(m.initial(), event(1, &quot;complete&quot;));
+  assert.deepEqual(m.replay(m.trace(s)), s);
+});
+test(&quot;fake completion fails&quot;, () =&gt;
+  assert.throws(() =&gt;
+    m.replay('{&quot;schemaVersion&quot;:1,&quot;status&quot;:&quot;completed&quot;,&quot;events&quot;:[]}'),
+  ));
+test(&quot;unknown schema fails&quot;, () =&gt;
+  assert.throws(() =&gt;
+    m.replay('{&quot;schemaVersion&quot;:2,&quot;status&quot;:&quot;draft&quot;,&quot;events&quot;:[]}'),
+  ));
+test(&quot;cancel replay&quot;, () =&gt;
+  assert.equal(m.replay(m.trace(m.cancel(m.initial()))).status, &quot;cancelled&quot;));
+test(&quot;trace contains only accepted events&quot;, () =&gt; {
+  const s = m.apply(m.initial(), event(1, &quot;text&quot;, { text: &quot;Caf&quot; }));
+  assert.equal(JSON.parse(m.trace(s)).events.length, 1);
+});
+</code></pre></div></div></details>
+<h2>Run the finished project</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The test server sends "Café supports interrupted answers." in three-byte writes and drops the first connection halfway through "é". What will the client show after the first connection, and what after reconnecting?</p></div></aside>
+<p>The finished reference runs with one command, from its <code>solution/</code> folder:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">python3 demo.py
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{&quot;connection&quot;:1,&quot;status&quot;:&quot;interrupted&quot;,&quot;text&quot;:&quot;Caf&quot;,&quot;lastID&quot;:&quot;1&quot;}
+{
+  &quot;connection&quot;: 2,
+  &quot;text&quot;: &quot;Café supports interrupted answers. &quot;,
+  &quot;citations&quot;: [
+    {
+      &quot;label&quot;: &quot;SSE specification&quot;,
+      &quot;url&quot;: &quot;https://html.spec.whatwg.org/multipage/server-sent-events.html&quot;
+    }
+  ],
+  &quot;status&quot;: &quot;completed&quot;,
+  &quot;lastID&quot;: &quot;4&quot;,
+  &quot;events&quot;: [
+    {
+      &quot;id&quot;: &quot;1&quot;,
+      &quot;event&quot;: &quot;message&quot;,
+      &quot;data&quot;: &quot;{\&quot;type\&quot;:\&quot;text\&quot;,\&quot;text\&quot;:\&quot;Caf\&quot;}&quot;
+    },
+    {
+      &quot;id&quot;: &quot;2&quot;,
+      &quot;event&quot;: &quot;message&quot;,
+      &quot;data&quot;: &quot;{\&quot;type\&quot;:\&quot;text\&quot;,\&quot;text\&quot;:\&quot;é supports interrupted answers. \&quot;}&quot;
+    },
+    {
+      &quot;id&quot;: &quot;3&quot;,
+      &quot;event&quot;: &quot;message&quot;,
+      &quot;data&quot;: &quot;{\&quot;type\&quot;:\&quot;citation\&quot;,\&quot;label\&quot;:\&quot;SSE specification\&quot;,\&quot;url\&quot;:\&quot;https://html.spec.whatwg.org/multipage/server-sent-events.html\&quot;}&quot;
+    },
+    {
+      &quot;id&quot;: &quot;4&quot;,
+      &quot;event&quot;: &quot;message&quot;,
+      &quot;data&quot;: &quot;{\&quot;type\&quot;:\&quot;complete\&quot;}&quot;
+    }
+  ]
+}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Connection 1 ends <code>interrupted</code> with text "Caf" and <code>lastID: 1</code>: the half-received "é" was not shown, because only complete events count. Connection 2 resumes after event 1 and completes: the text is "Café supports interrupted answers. " (event 2 carries "é supports…"), with one citation (the SSE specification) and status <code>completed</code> at event 4. The event list is the trace: replaying those four events rebuilds the same answer.</p></div></aside>
+<h2>Read the finished code</h2>
+<p>The complete reference, file by file. Open a file to read it; the stages above say which part each function belongs to.</p>
+<details class="qa" id="a2060-qa6"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/build-browser.ts</code> (14 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { readFile, writeFile, mkdir } from &quot;node:fs/promises&quot;;
+import { stripTypeScriptTypes } from &quot;node:module&quot;;
+import path from &quot;node:path&quot;;
+const out = process.argv[2] ?? &quot;/tmp/aiefs-stream-browser&quot;;
+await mkdir(out, { recursive: true });
+await writeFile(
+  path.join(out, &quot;answer.js&quot;),
+  stripTypeScriptTypes(await readFile(&quot;main.ts&quot;, &quot;utf8&quot;)),
+);
+await writeFile(
+  path.join(out, &quot;index.html&quot;),
+  '&lt;!doctype html&gt;&lt;html lang=&quot;en&quot;&gt;&lt;meta charset=&quot;utf-8&quot;&gt;&lt;meta name=&quot;viewport&quot; content=&quot;width=device-width,initial-scale=1&quot;&gt;&lt;title&gt;Streaming answer recovery&lt;/title&gt;&lt;style&gt;body{font:18px system-ui;max-width:800px;margin:50px auto;padding:20px;background:#f5f7fb;color:#123}button{padding:12px;margin-right:8px}input{width:90%;padding:12px}@media(prefers-color-scheme:dark){body{background:#14232e;color:#edf5ff}a{color:#9dcfff}}&lt;/style&gt;&lt;h1&gt;Streaming answer recovery&lt;/h1&gt;&lt;label&gt;SSE URL &lt;input id=&quot;url&quot; value=&quot;/events?interrupt=1&quot;&gt;&lt;/label&gt;&lt;button id=&quot;load&quot;&gt;Load component&lt;/button&gt;&lt;main id=&quot;answer&quot;&gt;&lt;/main&gt;&lt;script type=&quot;module&quot;&gt;import {mount} from &quot;./answer.js&quot;;let dispose;document.querySelector(&quot;#load&quot;).onclick=()=&gt;{dispose?.();dispose=mount(document.querySelector(&quot;#answer&quot;),document.querySelector(&quot;#url&quot;).value)};document.querySelector(&quot;#load&quot;).click();&lt;/script&gt;&lt;/html&gt;',
+);
+console.log(out);
+</code></pre></div></div></details>
+<details class="qa" id="a2060-qa7"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/cli.ts</code> (19 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">import { writeFile } from &quot;node:fs/promises&quot;;
+import { initial, connect, trace, replay } from &quot;./main.ts&quot;;
+const url = process.argv[2];
+if (!url) throw Error(&quot;usage: node cli.ts SSE_URL [TRACE_PATH]&quot;);
+let state = await connect(url, initial(), () =&gt; {});
+console.log(
+  JSON.stringify({
+    connection: 1,
+    status: state.status,
+    text: state.text,
+    lastID: state.lastID,
+  }),
+);
+state = await connect(url, state, () =&gt; {});
+const artifact = trace(state);
+await writeFile(process.argv[3] ?? &quot;/tmp/aiefs-answer-trace.json&quot;, artifact);
+const restored = replay(artifact);
+console.log(JSON.stringify({ connection: 2, ...restored }, null, 2));
+if (restored.status !== &quot;completed&quot;) process.exitCode = 1;
+</code></pre></div></div></details>
+<details class="qa" id="a2060-qa8"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/demo.py</code> (12 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import subprocess,tempfile
+from pathlib import Path
+with tempfile.TemporaryDirectory() as tmp:
+    binary=str(Path(tmp)/'sse-fixture')
+    subprocess.run(['go','build','-o',binary,'.'],check=True)
+    server=subprocess.Popen([binary,'--seconds','10'],stdout=subprocess.PIPE,text=True)
+    try:
+        url=server.stdout.readline().strip()
+        if not url: raise RuntimeError('fixture did not start')
+        subprocess.run(['node','--experimental-strip-types','cli.ts',url],check=True)
+    finally:
+        server.terminate();server.wait(timeout=5)
+</code></pre></div></div></details>
+<details class="qa" id="a2060-qa9"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/main.go</code> (126 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-go">package main
+
+import (
+    &quot;encoding/json&quot;
+    &quot;errors&quot;
+    &quot;flag&quot;
+    &quot;fmt&quot;
+    &quot;net&quot;
+    &quot;net/http&quot;
+    &quot;os&quot;
+    &quot;strconv&quot;
+    &quot;strings&quot;
+    &quot;time&quot;
+)
+
+type StreamEvent struct {
+    ID   int    `json:&quot;id&quot;`
+    Data string `json:&quot;data&quot;`
+}
+
+func Encode(e StreamEvent) ([]byte, error) {
+    if e.ID &lt; 1 || !json.Valid([]byte(e.Data)) {
+        return nil, errors.New(&quot;positive ID and JSON payload required&quot;)
+    }
+    return []byte(fmt.Sprintf(&quot;id: %d\ndata: %s\n\n&quot;, e.ID, strings.ReplaceAll(e.Data, &quot;\n&quot;, &quot;\ndata: &quot;))), nil
+}
+func After(events []StreamEvent, last string) ([]StreamEvent, error) {
+    id := 0
+    var err error
+    if last != &quot;&quot; {
+        id, err = strconv.Atoi(last)
+        if err != nil || id &lt; 0 {
+            return nil, errors.New(&quot;invalid Last-Event-ID&quot;)
+        }
+    }
+    out := []StreamEvent{}
+    for i, e := range events {
+        if e.ID != i+1 {
+            return nil, errors.New(&quot;fixture IDs must be contiguous&quot;)
+        }
+        if e.ID &gt; id {
+            out = append(out, e)
+        }
+    }
+    if id &gt; len(events) {
+        return nil, errors.New(&quot;resume beyond stream&quot;)
+    }
+    return out, nil
+}
+func FixtureEvents() []StreamEvent {
+    return []StreamEvent{{1, `{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;Caf&quot;}`}, {2, `{&quot;type&quot;:&quot;text&quot;,&quot;text&quot;:&quot;é supports interrupted answers. &quot;}`}, {3, `{&quot;type&quot;:&quot;citation&quot;,&quot;label&quot;:&quot;SSE specification&quot;,&quot;url&quot;:&quot;https://html.spec.whatwg.org/multipage/server-sent-events.html&quot;}`}, {4, `{&quot;type&quot;:&quot;complete&quot;}`}}
+}
+func Handler(events []StreamEvent) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.Method != &quot;GET&quot; {
+            http.Error(w, &quot;GET only&quot;, 405)
+            return
+        }
+        selected, err := After(events, r.Header.Get(&quot;Last-Event-ID&quot;))
+        if err != nil {
+            http.Error(w, err.Error(), 400)
+            return
+        }
+        w.Header().Set(&quot;Content-Type&quot;, &quot;text/event-stream; charset=utf-8&quot;)
+        w.Header().Set(&quot;Cache-Control&quot;, &quot;no-cache&quot;)
+        for _, e := range selected {
+            b, err := Encode(e)
+            if err != nil {
+                http.Error(w, &quot;invalid fixture&quot;, 500)
+                return
+            }
+            if r.URL.Query().Get(&quot;interrupt&quot;) == &quot;1&quot; &amp;&amp; r.Header.Get(&quot;Last-Event-ID&quot;) == &quot;&quot; &amp;&amp; e.ID == 2 {
+                n := strings.Index(string(b), &quot;é&quot;)
+                if n &gt;= 0 {
+                    w.Write(b[:n+1])
+                    if f, ok := w.(http.Flusher); ok {
+                        f.Flush()
+                    }
+                    return
+                }
+            }
+            for len(b) &gt; 0 {
+                n := 3
+                if len(b) &lt; n {
+                    n = len(b)
+                }
+                if _, err := w.Write(b[:n]); err != nil {
+                    return
+                }
+                if f, ok := w.(http.Flusher); ok {
+                    f.Flush()
+                }
+                b = b[n:]
+            }
+        }
+    })
+}
+func main() {
+    addr := flag.String(&quot;listen&quot;, &quot;127.0.0.1:0&quot;, &quot;loopback address&quot;)
+    seconds := flag.Int(&quot;seconds&quot;, 20, &quot;finite server lifetime&quot;)
+    web := flag.String(&quot;web&quot;, &quot;&quot;, &quot;optional generated browser directory&quot;)
+    flag.Parse()
+    if *seconds &lt; 1 || *seconds &gt; 600 {
+        fmt.Fprintln(os.Stderr, &quot;seconds must be 1..600&quot;)
+        os.Exit(1)
+    }
+    ln, e := net.Listen(&quot;tcp&quot;, *addr)
+    if e != nil {
+        fmt.Fprintln(os.Stderr, e)
+        os.Exit(1)
+    }
+    var handler http.Handler = Handler(FixtureEvents())
+    if *web != &quot;&quot; {
+        mux := http.NewServeMux()
+        mux.Handle(&quot;/events&quot;, handler)
+        mux.Handle(&quot;/&quot;, http.FileServer(http.Dir(*web)))
+        handler = mux
+    }
+    server := &amp;http.Server{Handler: handler, ReadHeaderTimeout: 2 * time.Second, WriteTimeout: 5 * time.Second}
+    fmt.Println(&quot;http://&quot; + ln.Addr().String() + &quot;/?interrupt=1&quot;)
+    time.AfterFunc(time.Duration(*seconds)*time.Second, func() { server.Close() })
+    if e = server.Serve(ln); e != nil &amp;&amp; e != http.ErrServerClosed {
+        fmt.Fprintln(os.Stderr, e)
+        os.Exit(1)
+    }
+}
+</code></pre></div></div></details>
+<details class="qa" id="a2060-qa10"><summary><span class="qa-lvl qa-code">Code</span><span class="qa-q"><code>solution/main.ts</code> (269 lines)</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-typescript">export type Event = { id: string; event: string; data: string };
+export class SSEDecoder {
+  decoder = new TextDecoder(&quot;utf-8&quot;, { fatal: true });
+  buffer = &quot;&quot;;
+  lastID = &quot;&quot;;
+  kind = &quot;&quot;;
+  data: string[] = [];
+  closed = false;
+  push(bytes: Uint8Array, final = false): Event[] {
+    if (this.closed) throw Error(&quot;decoder already closed&quot;);
+    this.buffer += this.decoder.decode(bytes, { stream: !final });
+    const events: Event[] = [];
+    while (true) {
+      const i = this.buffer.search(/[\r\n]/);
+      if (i &lt; 0) break;
+      if (this.buffer[i] === &quot;\r&quot; &amp;&amp; i === this.buffer.length - 1 &amp;&amp; !final)
+        break;
+      const line = this.buffer.slice(0, i),
+        skip = this.buffer[i] === &quot;\r&quot; &amp;&amp; this.buffer[i + 1] === &quot;\n&quot; ? 2 : 1;
+      this.buffer = this.buffer.slice(i + skip);
+      if (line === &quot;&quot;) {
+        if (this.data.length)
+          events.push({
+            id: this.lastID,
+            event: this.kind || &quot;message&quot;,
+            data: this.data.join(&quot;\n&quot;),
+          });
+        this.data = [];
+        this.kind = &quot;&quot;;
+        continue;
+      }
+      if (line.startsWith(&quot;:&quot;)) continue;
+      const colon = line.indexOf(&quot;:&quot;);
+      const field = colon &lt; 0 ? line : line.slice(0, colon);
+      let value = colon &lt; 0 ? &quot;&quot; : line.slice(colon + 1);
+      if (value.startsWith(&quot; &quot;)) value = value.slice(1);
+      if (field === &quot;data&quot;) this.data.push(value);
+      else if (field === &quot;event&quot;) this.kind = value;
+      else if (field === &quot;id&quot; &amp;&amp; !value.includes(&quot;\0&quot;)) this.lastID = value;
+    }
+    if (final) {
+      this.closed = true;
+      this.buffer = &quot;&quot;;
+      this.data = [];
+    }
+    return events;
+  }
+}
+export type Answer = {
+  text: string;
+  citations: Array&lt;{ label: string; url: string }&gt;;
+  status: &quot;draft&quot; | &quot;interrupted&quot; | &quot;completed&quot; | &quot;cancelled&quot;;
+  lastID: string;
+  events: Event[];
+};
+export function initial(): Answer {
+  return { text: &quot;&quot;, citations: [], status: &quot;draft&quot;, lastID: &quot;&quot;, events: [] };
+}
+export function apply(state: Answer, event: Event): Answer {
+  if (state.status === &quot;cancelled&quot;) return state;
+  if (
+    !event ||
+    typeof event.id !== &quot;string&quot; ||
+    typeof event.event !== &quot;string&quot; ||
+    typeof event.data !== &quot;string&quot;
+  )
+    throw Error(&quot;invalid event shape&quot;);
+  const previous = state.events.find((e) =&gt; e.id === event.id);
+  if (previous) {
+    if (previous.data !== event.data || previous.event !== event.event)
+      throw Error(&quot;conflicting event identity&quot;);
+    return state;
+  }
+  if (state.status === &quot;completed&quot;) throw Error(&quot;event after completion&quot;);
+  if (
+    !/^[1-9][0-9]*$/.test(event.id) ||
+    !Number.isSafeInteger(Number(event.id)) ||
+    Number(event.id) !== Number(state.lastID || 0) + 1
+  )
+    throw Error(&quot;noncontiguous answer event ID&quot;);
+  const value = JSON.parse(event.data);
+  let text = state.text,
+    citations = [...state.citations],
+    status: Answer[&quot;status&quot;] = &quot;draft&quot;;
+  if (value.type === &quot;text&quot;) {
+    if (typeof value.text !== &quot;string&quot;) throw Error(&quot;text payload required&quot;);
+    text += value.text;
+  } else if (value.type === &quot;citation&quot;) {
+    if (
+      typeof value.label !== &quot;string&quot; ||
+      !value.label.trim() ||
+      typeof value.url !== &quot;string&quot;
+    )
+      throw Error(&quot;citation required&quot;);
+    const u = new URL(value.url);
+    if (![&quot;http:&quot;, &quot;https:&quot;].includes(u.protocol))
+      throw Error(&quot;unsafe citation URL&quot;);
+    citations.push({ label: value.label, url: value.url });
+  } else if (value.type === &quot;complete&quot;) {
+    status = &quot;completed&quot;;
+  } else throw Error(&quot;unknown answer event type&quot;);
+  return {
+    text,
+    citations,
+    status,
+    lastID: event.id,
+    events: [...state.events, { ...event }],
+  };
+}
+export function interrupt(state: Answer): Answer {
+  return state.status === &quot;completed&quot; || state.status === &quot;cancelled&quot;
+    ? state
+    : { ...state, status: &quot;interrupted&quot; };
+}
+export function cancel(state: Answer): Answer {
+  return state.status === &quot;completed&quot;
+    ? state
+    : { ...state, status: &quot;cancelled&quot; };
+}
+export async function connect(
+  url: string,
+  state: Answer,
+  onState: (s: Answer) =&gt; void,
+  signal?: AbortSignal,
+): Promise&lt;Answer&gt; {
+  if (state.status === &quot;completed&quot; || state.status === &quot;cancelled&quot;)
+    return state;
+  const decoder = new SSEDecoder();
+  let current = state;
+  let reader: ReadableStreamDefaultReader&lt;Uint8Array&gt; | null = null;
+  let response: Response | null = null;
+  try {
+    response = await fetch(url, {
+      headers: state.lastID ? { &quot;Last-Event-ID&quot;: state.lastID } : {},
+      signal,
+    });
+    if (
+      !response.ok ||
+      !response.headers.get(&quot;content-type&quot;)?.startsWith(&quot;text/event-stream&quot;) ||
+      !response.body
+    )
+      throw Error(&quot;invalid SSE response&quot;);
+    reader = response.body.getReader();
+    let bytes = 0;
+    while (true) {
+      const chunk = await reader.read();
+      bytes += chunk.value?.byteLength ?? 0;
+      if (bytes &gt; 1_048_576) {
+        await reader.cancel();
+        throw Error(&quot;stream exceeds one MiB&quot;);
+      }
+      for (const event of decoder.push(
+        chunk.value ?? new Uint8Array(),
+        chunk.done,
+      )) {
+        current = apply(current, event);
+        onState(current);
+        if (current.status === &quot;completed&quot;) break;
+      }
+      if (chunk.done || current.status === &quot;completed&quot;) break;
+    }
+    if (current.status !== &quot;completed&quot;) current = interrupt(current);
+  } catch (error) {
+    current = signal?.aborted ? cancel(current) : interrupt(current);
+  } finally {
+    if (reader) {
+      try {
+        await reader.cancel();
+      } catch {}
+      reader.releaseLock();
+    } else if (response?.body) {
+      try {
+        await response.body.cancel();
+      } catch {}
+    }
+  }
+  onState(current);
+  return current;
+}
+export function trace(state: Answer): string {
+  return JSON.stringify(
+    { schemaVersion: 1, status: state.status, events: state.events },
+    null,
+    2,
+  );
+}
+export function replay(text: string): Answer {
+  if (new TextEncoder().encode(text).length &gt; 1_048_576)
+    throw Error(&quot;trace too large&quot;);
+  const value = JSON.parse(text);
+  if (
+    value.schemaVersion !== 1 ||
+    !Array.isArray(value.events) ||
+    ![&quot;draft&quot;, &quot;interrupted&quot;, &quot;completed&quot;, &quot;cancelled&quot;].includes(value.status)
+  )
+    throw Error(&quot;invalid trace&quot;);
+  let state = initial();
+  for (const e of value.events) state = apply(state, e);
+  if (value.status === &quot;completed&quot; &amp;&amp; state.status !== &quot;completed&quot;)
+    throw Error(&quot;missing completion event&quot;);
+  if (state.status === &quot;completed&quot; &amp;&amp; value.status !== &quot;completed&quot;)
+    throw Error(&quot;completion status mismatch&quot;);
+  if (value.status === &quot;cancelled&quot;) state = cancel(state);
+  if (value.status === &quot;interrupted&quot;) state = interrupt(state);
+  return state;
+}
+export function mount(host: HTMLElement, url: string) {
+  let state = initial(),
+    controller: AbortController | null = null;
+  const title = document.createElement(&quot;h2&quot;),
+    status = document.createElement(&quot;p&quot;),
+    text = document.createElement(&quot;pre&quot;),
+    citations = document.createElement(&quot;ul&quot;),
+    resume = document.createElement(&quot;button&quot;),
+    stop = document.createElement(&quot;button&quot;),
+    download = document.createElement(&quot;button&quot;);
+  title.textContent = &quot;Recoverable answer&quot;;
+  resume.textContent = &quot;Connect / resume&quot;;
+  stop.textContent = &quot;Cancel answer&quot;;
+  download.textContent = &quot;Download event trace&quot;;
+  text.style.whiteSpace = &quot;pre-wrap&quot;;
+  host.replaceChildren(title, status, text, citations, resume, stop, download);
+  const draw = (s: Answer) =&gt; {
+    state = s;
+    status.textContent =
+      &quot;Status: &quot; + s.status + &quot; | last event: &quot; + (s.lastID || &quot;none&quot;);
+    text.textContent = s.text;
+    citations.replaceChildren();
+    for (const c of s.citations) {
+      const li = document.createElement(&quot;li&quot;),
+        a = document.createElement(&quot;a&quot;);
+      a.textContent = c.label;
+      a.href = c.url;
+      a.rel = &quot;noopener noreferrer&quot;;
+      li.append(a);
+      citations.append(li);
+    }
+    resume.disabled =
+      !!controller || s.status === &quot;completed&quot; || s.status === &quot;cancelled&quot;;
+    stop.disabled = s.status === &quot;completed&quot; || s.status === &quot;cancelled&quot;;
+  };
+  resume.onclick = async () =&gt; {
+    controller = new AbortController();
+    draw(state);
+    state = await connect(url, state, draw, controller.signal);
+    controller = null;
+    draw(state);
+  };
+  stop.onclick = () =&gt; {
+    controller?.abort();
+    state = cancel(state);
+    draw(state);
+  };
+  download.onclick = () =&gt; {
+    const a = document.createElement(&quot;a&quot;),
+      u = URL.createObjectURL(
+        new Blob([trace(state)], { type: &quot;application/json&quot; }),
+      );
+    a.href = u;
+    a.download = &quot;answer-trace.json&quot;;
+    a.click();
+    setTimeout(() =&gt; URL.revokeObjectURL(u), 1000);
+  };
+  draw(state);
+  return () =&gt; {
+    controller?.abort();
+    host.replaceChildren();
+  };
+}
+</code></pre></div></div></details>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A chat client appends every <code>data:</code> line it receives. After a reconnect the server resends event 2, and users see "é supports interrupted answers." twice. What should the client have tracked? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this project</div><div class="co-body"><ul>
+<li>Decode bytes incrementally; dispatch events only when complete.</li>
+<li>Apply events by stable, contiguous ids; duplicates are harmless.</li>
+<li>Reconnect from the last accepted id; never restart silently.</li>
+<li>Keep cancelled and interrupted answers visibly incomplete.</li>
+<li>Export accepted events so the answer can be replayed.</li>
+</ul></div></aside>
+<h2>Build it on your machine</h2>
+<p>Each step above is meant to be built, not only read. The source repository ships a starter and the checks for every step, and its test runner grades your own folder step by step:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">git clone https://github.com/rohitg00/ai-engineering-from-scratch
+cd ai-engineering-from-scratch
+python3 scripts/project_test.py streaming-answer-recovery --init my-streaming-answer-recovery
+python3 scripts/project_test.py streaming-answer-recovery --stage 1 --path my-streaming-answer-recovery
+</code></pre></div>
+<p>Write the step, run its checks, then move to the next step. The checks for each step are also shown above, under that step, so you can see what is expected before you start.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Try a trailing data line without a blank line. Explain why prematurely dispatching it can display incomplete JSON. <a href="https://html.spec.whatwg.org/multipage/server-sent-events.html">WHATWG server-sent events</a>. <em>(step 1)</em></li>
+<li>Inject a javascript: citation and reject it before rendering. Citation text is content and is rendered with textContent. <em>(step 2)</em></li>
+<li>Abort between two events. A cancelled answer must keep its draft text and must not reconnect when the user clicks resume. <em>(step 3)</em></li>
+<li>Store transport-level byte traces separately if you need to reproduce decoder failures. This exported trace records accepted application events and status, not discarded partial bytes. <em>(step 4)</em></li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a2060-qa11"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol>
+<li>A trailing data line</li>
+</ol></span></summary><div class="qa-a"><p>An event is complete only at its blank line. Dispatching the last <code>data:</code> line early could hand half a JSON object to the parser and display garbage, or fail outright.</p></div></details>
+<details class="qa" id="a2060-qa12"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="2">
+<li>A javascript: citation</li>
+</ol></span></summary><div class="qa-a"><p>Validate the URL scheme (only http and https) before creating the link, and reject the citation otherwise. Its label is inserted with <code>textContent</code>, so it cannot inject markup.</p></div></details>
+<details class="qa" id="a2060-qa13"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="3">
+<li>Abort between events</li>
+</ol></span></summary><div class="qa-a"><p>Set the status to cancelled, keep the text received so far, and do not reconnect when the user presses resume; resuming a cancelled answer would contradict their action.</p></div></details>
+<details class="qa" id="a2060-qa14"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q"><ol start="4">
+<li>Byte-level traces</li>
+</ol></span></summary><div class="qa-a"><p>Keep them as a separate debugging artifact. The exported trace records accepted application events, which is what is needed to rebuild the answer, not the raw bytes that were discarded.</p></div></details>
+<details class="qa" id="a2060-qa15"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Duplicate text</span></summary><div class="qa-a"><p>The id of the last accepted event. With it, the resent event 2 is recognised as already applied and ignored, and the reconnect request asks the server to start after it.</p></div></details>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-production-llm-app"><span class="t" style="--cs-hue:15">SP</span>Cheat sheet · Production LLM Apps: Shipping Checklist</a></div></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a2060" id="done-a2060">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a2060" id="undo-a2060" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a2059"><span class="pn-dir">Previous</span><span class="pn-t">20.59 · Scanning the Skill Supply Chain</span></a><a class="pn next" href="#a2061"><span class="pn-dir">Next</span><span class="pn-t">20.61 · A Support Agent Built with Google ADK</span></a></div></footer>

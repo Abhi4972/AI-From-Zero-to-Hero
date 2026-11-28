@@ -1,0 +1,352 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · LLM Inference, Infrastructure and LLMOps</a></nav><h1>Cache-Aware Routing and KV Offloading in a Production Serving Stack</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.18</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1718" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Diagram the vLLM production-stack layers: router, engines, KV offload, observability.</li>
+<li>Explain the KV Offloading Connector API (v0.9.0+) and how the 0.11.0 asynchronous path hides offload latency.</li>
+<li>Quantify when LMCache CPU-DRAM helps (KV &gt; HBM) vs adds overhead (KV small enough to fit HBM).</li>
+<li>Pick between native vLLM CPU offload and LMCache connector given deployment constraints.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 17.4 (Serving Engine Internals), Lesson 17.6 (SGLang/RadixAttention)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy KV-spill simulator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A production serving stack wires router, engines, and observability into one Kubernetes deployment — and treats KV cache as a resource that can leave the GPU. KV offloading extracts KV cache out of GPU memory and reuses it across queries and engines (CPU DRAM, then disk/Ceph). vLLM's production-stack is the reference deployment; LMCache is the offloading layer. The vLLM 0.11.0 KV Offloading Connector (January 2026) makes this asynchronous and pluggable via the Connector API (v0.9.0+). The offload path is usually hidden from the request path, though cache misses and promotions can add end-to-end latency. LMCache is valuable even without shared prefixes — when a GPU runs out of KV slots, preempted requests can be restored from CPU instead of recomputing prefill. Published benchmarks on 16x H100 (80GB HBM) across 4 a3-highgpu-4g: when KV cache exceeds HBM, both native CPU offload and LMCache substantially improve throughput; at low KV footprint, all configs match baseline with small overhead.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Production-stack</td>
+<td>"the reference deployment"</td>
+<td>vLLM's Kubernetes Helm chart + operator</td>
+</tr>
+<tr>
+<td>Connector API</td>
+<td>"KV backend interface"</td>
+<td>vLLM 0.9.0+ pluggable KV store interface</td>
+</tr>
+<tr>
+<td>Native CPU offload</td>
+<td>"engine-local spill"</td>
+<td>Store KV in host RAM of same engine</td>
+</tr>
+<tr>
+<td>LMCache</td>
+<td>"cluster KV cache"</td>
+<td>Cross-engine KV cache server on CPU DRAM + disk</td>
+</tr>
+<tr>
+<td>0.11.0 async</td>
+<td>"non-blocking offload"</td>
+<td>Offload hidden behind engine stream</td>
+</tr>
+<tr>
+<td>Preemption</td>
+<td>"evict to make room"</td>
+<td>KV cache shuffle when HBM full</td>
+</tr>
+<tr>
+<td>Prefix reuse</td>
+<td>"same system prompt"</td>
+<td>Multiple queries share beginning; cache hit</td>
+</tr>
+<tr>
+<td>Ceph tier</td>
+<td>"disk tier"</td>
+<td>Durable storage below DRAM in the cache hierarchy</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A GPU's own memory (HBM) is fast but small. When many users hold long conversations, their KV caches fill it, and the server <strong>preempts</strong> some requests: it throws away their cache and later reads their prompt again from scratch. Ordinary computer memory (CPU DRAM) is slower but much larger and cheaper. <strong>KV offloading</strong> moves cache blocks that do not fit into DRAM, so they can be copied back instead of recomputed. vLLM can do this per engine (<strong>native CPU offload</strong>). <strong>LMCache</strong> goes further: a shared cache server that several engines can read, so a prompt prefix computed on one engine can be reused by another. The <strong>vLLM production stack</strong> bundles the router, the engines, LMCache and monitoring for Kubernetes. Offloading costs a few per cent when memory is not under pressure.</p></div></aside>
+<p>Your vLLM serving shows GPUs at 100% HBM with preemption events whenever concurrency climbs. Requests get evicted, requeued, and you re-prefill the same 2K-token prompt four times in a minute. GPU compute is spent on redundant prefills; goodput is well below raw throughput.</p>
+<p>Adding more GPUs costs linearly. Adding more HBM is not possible. But CPU DRAM is cheap — one socket has 512 GB+ at latency orders of magnitude worse than HBM but fine for "temporarily warm" KV cache.</p>
+<p>LMCache extracts KV cache to CPU DRAM so preempted requests recover fast, and repeated prefixes across engines share cache without each engine re-prefilling.</p>
+<h2>Idea 1 · vLLM production-stack</h2>
+<p><code>github.com/vllm-project/production-stack</code> is the reference Kubernetes deployment:</p>
+<ul>
+<li><strong>Router</strong> — cache-aware (Phase 17 · 11). Consumes KV events.</li>
+<li><strong>Engines</strong> — vLLM workers. One per GPU or per TP/PP group.</li>
+<li><strong>KV cache offload</strong> — LMCache deployment or native connector.</li>
+<li><strong>Observability</strong> — Prometheus scrape, Grafana dashboards, OTel traces.</li>
+<li><strong>Control plane</strong> — service discovery, config, rolling updates.</li>
+</ul>
+<p>Shipped as Helm chart + operator.</p>
+<figure class="diagram mmfig" data-mmd="a1718" data-h="935562d403"><div class="dg-scroll"><svg class="dg mm" id="mm935562d403" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 527.242px; background-color: transparent;" viewBox="0 0 527.2421875 555" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm935562d403{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm935562d403 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm935562d403 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm935562d403 .error-icon{fill:#f4efe7;}#mm935562d403 .error-text{fill:#0b1018;stroke:#0b1018;}#mm935562d403 .edge-thickness-normal{stroke-width:1px;}#mm935562d403 .edge-thickness-thick{stroke-width:3.5px;}#mm935562d403 .edge-pattern-solid{stroke-dasharray:0;}#mm935562d403 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm935562d403 .edge-pattern-dashed{stroke-dasharray:3;}#mm935562d403 .edge-pattern-dotted{stroke-dasharray:2;}#mm935562d403 .marker{fill:#6c6357;stroke:#6c6357;}#mm935562d403 .marker.cross{stroke:#6c6357;}#mm935562d403 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm935562d403 p{margin:0;}#mm935562d403 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm935562d403 .cluster-label text{fill:#0b1018;}#mm935562d403 .cluster-label span{color:#0b1018;}#mm935562d403 .cluster-label span p{background-color:transparent;}#mm935562d403 .label text,#mm935562d403 span{fill:#211c16;color:#211c16;}#mm935562d403 .node rect,#mm935562d403 .node circle,#mm935562d403 .node ellipse,#mm935562d403 .node polygon,#mm935562d403 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm935562d403 .rough-node .label text,#mm935562d403 .node .label text,#mm935562d403 .image-shape .label,#mm935562d403 .icon-shape .label{text-anchor:middle;}#mm935562d403 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm935562d403 .rough-node .label,#mm935562d403 .node .label,#mm935562d403 .image-shape .label,#mm935562d403 .icon-shape .label{text-align:center;}#mm935562d403 .node.clickable{cursor:pointer;}#mm935562d403 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm935562d403 .arrowheadPath{fill:#0b0b0b;}#mm935562d403 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm935562d403 .flowchart-link{stroke:#6c6357;fill:none;}#mm935562d403 .edgeLabel{background-color:#ffffff;text-align:center;}#mm935562d403 .edgeLabel p{background-color:#ffffff;}#mm935562d403 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm935562d403 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm935562d403 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm935562d403 .cluster text{fill:#0b1018;}#mm935562d403 .cluster span{color:#0b1018;}#mm935562d403 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm935562d403 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm935562d403 rect.text{fill:none;stroke-width:0;}#mm935562d403 .icon-shape,#mm935562d403 .image-shape{background-color:#ffffff;text-align:center;}#mm935562d403 .icon-shape p,#mm935562d403 .image-shape p{background-color:#ffffff;padding:2px;}#mm935562d403 .icon-shape .label rect,#mm935562d403 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm935562d403 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm935562d403 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm935562d403 .node .neo-node{stroke:#b5521b;}#mm935562d403 [data-look="neo"].node rect,#mm935562d403 [data-look="neo"].cluster rect,#mm935562d403 [data-look="neo"].node polygon{stroke:url(#mm935562d403-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm935562d403 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm935562d403 [data-look="neo"].node path{stroke:url(#mm935562d403-gradient);stroke-width:1px;}#mm935562d403 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm935562d403 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm935562d403 [data-look="neo"].node circle{stroke:url(#mm935562d403-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm935562d403 [data-look="neo"].node circle .state-start{fill:#000000;}#mm935562d403 [data-look="neo"].icon-shape .icon{fill:url(#mm935562d403-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm935562d403 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm935562d403-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm935562d403 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm935562d403_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm935562d403_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm935562d403_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M383.879,59L383.879,63.167C383.879,67.333,383.879,75.667,383.879,83.333C383.879,91,383.879,98,383.879,101.5L383.879,105" id="mm935562d403-L_H_P_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_P_0" data-points="W3sieCI6MzgzLjg3ODkwNjI1LCJ5Ijo1OX0seyJ4IjozODMuODc4OTA2MjUsInkiOjg0fSx7IngiOjM4My44Nzg5MDYyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/><path d="M383.879,160L383.879,164.167C383.879,168.333,383.879,176.667,383.879,184.333C383.879,192,383.879,199,383.879,202.5L383.879,206" id="mm935562d403-L_P_OFF_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_OFF_0" data-points="W3sieCI6MzgzLjg3ODkwNjI1LCJ5IjoxNjB9LHsieCI6MzgzLjg3ODkwNjI1LCJ5IjoxODV9LHsieCI6MzgzLjg3ODkwNjI1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/><path d="M383.879,282L383.879,286.167C383.879,290.333,383.879,298.667,383.955,309.417C384.03,320.167,384.182,333.334,384.257,339.917L384.333,346.5" id="mm935562d403-L_OFF_BACK_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_OFF_BACK_0" data-points="W3sieCI6MzgzLjg3ODkwNjI1LCJ5IjoyODJ9LHsieCI6MzgzLjg3ODkwNjI1LCJ5IjozMDd9LHsieCI6Mzg0LjM3ODkwNjI1LCJ5IjozNTAuNX1d" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/><path d="M351.512,386.5L335.147,395.333C318.783,404.167,286.053,421.833,261.693,436.204C237.332,450.574,221.339,461.649,213.343,467.186L205.347,472.723" id="mm935562d403-L_BACK_RS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_BACK_RS_0" data-points="W3sieCI6MzUxLjUxMTk5MTkxNDMzNTcsInkiOjM4Ni41fSx7IngiOjI1My4zMjQyMTg3NSwieSI6NDM5LjV9LHsieCI6MjAyLjA1ODI5MzI2OTIzMDc3LCJ5Ijo0NzV9XQ==" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/><path d="M396.283,386.5L402.096,395.333C407.91,404.167,419.537,421.833,425.351,437.667C431.164,453.5,431.164,467.5,431.164,474.5L431.164,481.5" id="mm935562d403-L_BACK_RC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_BACK_RC_0" data-points="W3sieCI6Mzk2LjI4Mjg2MTY2OTU4MDQsInkiOjM4Ni41fSx7IngiOjQzMS4xNjQwNjI1LCJ5Ijo0MzkuNX0seyJ4Ijo0MzEuMTY0MDYyNSwieSI6NDg1LjV9XQ==" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/><path d="M90.719,404L90.719,409.917C90.719,415.833,90.719,427.667,95.204,438.987C99.69,450.307,108.661,461.115,113.147,466.519L117.632,471.922" id="mm935562d403-L_OTHER_RS_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_OTHER_RS_0" data-points="W3sieCI6OTAuNzE4NzUsInkiOjQwNH0seyJ4Ijo5MC43MTg3NSwieSI6NDM5LjV9LHsieCI6MTIwLjE4NzAwODMwNDE5NTgsInkiOjQ3NX1d" data-look="classic" marker-end="url(#mm935562d403_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_H_P_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_P_OFF_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_OFF_BACK_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(274.9813, 427.8099)"><g class="label" data-id="L_BACK_RS_0" transform="translate(-42.828125, -10.5)"><foreignObject width="85.65625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>blocks found</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(431.1640625, 439.5)"><g class="label" data-id="L_BACK_RC_0" transform="translate(-31.7421875, -10.5)"><foreignObject width="63.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>not found</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(90.71875, 439.5)"><g class="label" data-id="L_OTHER_RS_0" transform="translate(-55.875, -10.5)"><foreignObject width="111.75" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>LMCache lookup</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm935562d403-flowchart-H-0" data-look="classic" transform="translate(383.87890625, 33.5)"><rect class="basic label-container" style="" x="-75.0703125" y="-25.5" width="150.140625" height="51"/><g class="label" style="" transform="translate(-45.0703125, -10.5)"><rect/><foreignObject width="90.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>GPU HBM full</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-P-1" data-look="classic" transform="translate(383.87890625, 134.5)"><rect class="basic label-container" style="" x="-94.921875" y="-25.5" width="189.84375" height="51"/><g class="label" style="" transform="translate(-64.921875, -10.5)"><rect/><foreignObject width="129.84375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Request preempted</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-OFF-3" data-look="classic" transform="translate(383.87890625, 246)"><rect class="basic label-container" style="" x="-113.8671875" y="-36" width="227.734375" height="72"/><g class="label" style="" transform="translate(-83.8671875, -21)"><rect/><foreignObject width="167.734375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Its KV blocks offloaded<br />to CPU DRAM / LMCache</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-BACK-5" data-look="classic" transform="translate(383.87890625, 368)"><polygon points="9,0 138.578125,0 147.578125,-18 138.578125,-36 9,-36 0,-18" class="label-container" transform="translate(-73.7890625,18)"/><g class="label" style="" transform="translate(-57.2890625, -10.5)"><rect/><foreignObject width="114.578125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Request resumes</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-RS-7" data-look="classic" transform="translate(150.0703125, 511)"><rect class="basic label-container" style="" x="-123.03125" y="-36" width="246.0625" height="72"/><g class="label" style="" transform="translate(-93.03125, -21)"><rect/><foreignObject width="186.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Restore over PCIe<br />~30× faster than recompute</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-RC-9" data-look="classic" transform="translate(431.1640625, 511)"><rect class="basic label-container" style="" x="-88.078125" y="-25.5" width="176.15625" height="51"/><g class="label" style="" transform="translate(-58.078125, -10.5)"><rect/><foreignObject width="116.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Recompute prefill</p></span></div></foreignObject></g></g><g class="node default" id="mm935562d403-flowchart-OTHER-10" data-look="classic" transform="translate(90.71875, 368)"><rect class="basic label-container" style="" x="-82.71875" y="-36" width="165.4375" height="72"/><g class="label" style="" transform="translate(-52.71875, -21)"><rect/><foreignObject width="105.4375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Another engine,<br />same prefix</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm935562d403-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm935562d403-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm935562d403-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<h2>Idea 2 · The KV Offloading Connector API (v0.9.0+)</h2>
+<p>vLLM 0.9.0 introduced a Connector API for pluggable KV cache backends. Your engine offloads blocks to the connector; connector stores them (RAM, disk, object storage, LMCache). Request needs a block, connector loads it back.</p>
+<p>vLLM 0.11.0 (January 2026) adds an asynchronous offload path — offload can happen in the background so the engine does not block on it in the common case. End-to-end latency and throughput still depend on workload shape, KV cache hit rate, and system pressure; vLLM's own notes call out that custom-kernel offload can degrade throughput at low hit rates and that async scheduling has known interaction issues with speculative decoding.</p>
+<h2>Idea 3 · Native CPU offload vs LMCache</h2>
+<p><strong>Native vLLM CPU offload</strong>: engine-local. Stores KV blocks in host RAM. Fast to implement, zero network hop. Does not cross engines.</p>
+<p><strong>LMCache connector</strong>: cluster-scale. Stores blocks in a shared LMCache server (CPU DRAM + Ceph/S3 tier). Blocks are accessible to any engine. 16x H100 benchmarks published.</p>
+<p>Pick native when a single engine has HBM pressure. Pick LMCache when multiple engines share prefixes (RAG with common system prompts, multi-tenant with shared templates).</p>
+<h2>Idea 4 · Benchmark behavior</h2>
+<p>The 16x H100 (80 GB HBM) spread across 4 a3-highgpu-4g test:</p>
+<ul>
+<li>Low KV footprint (short prompts, low concurrency): all configs match baseline, LMCache adds ~3-5% overhead.</li>
+<li>Moderate footprint: LMCache starts to help on prefix reuse across engines.</li>
+<li>KV exceeds HBM: native CPU offload and LMCache both improve throughput substantially; LMCache larger gain because cross-engine sharing.</li>
+</ul>
+<h2>Idea 5 · When LMCache is decisive</h2>
+<ul>
+<li>Multi-tenant serving where system prompts are shared across tenants.</li>
+<li>RAG where document chunks repeat across queries.</li>
+<li>Fine-tuned variants (LoRA) on the same base where base-model KV reuse cuts redundant work.</li>
+<li>Preemption-heavy workloads: restore from CPU cheaper than re-prefill.</li>
+</ul>
+<h2>Idea 6 · When NOT to enable</h2>
+<ul>
+<li>Small HBM pressure — you pay overhead without benefit.</li>
+<li>Short contexts (&lt;1K tokens) — transfer time &gt; re-prefill.</li>
+<li>Single-tenant single-prompt workload — no reuse to capture.</li>
+</ul>
+<h2>Idea 7 · Integration with disaggregated serving</h2>
+<p>Phase 17 · 17 disaggregated serving + LMCache compounds: KV transfers from prefill pool to decode pool land in LMCache if not used; subsequent queries pull from LMCache. Phase 17 · 11 cache-aware router can route to the engine whose local OR LMCache-shared cache matches.</p>
+<h2>Idea 8 · Numbers you should remember</h2>
+<ul>
+<li>vLLM 0.9.0: Connector API shipped.</li>
+<li>vLLM 0.11.0 (Jan 2026): asynchronous offload path; end-to-end latency impact depends on workload, KV hit rate, and system pressure (not an absolute guarantee).</li>
+<li>16x H100 benchmark: LMCache helps when KV footprint exceeds HBM.</li>
+<li>Small HBM pressure: 3-5% overhead without benefit.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="zero-sharding"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Restore or recompute?</strong> Restoring <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> tokens of KV from DRAM takes about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">PCIe</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>, where <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> is KV bytes per token; recomputing takes the prefill time <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prefill</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span>. Offloading helps when</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.2074em;vertical-align:-0.836em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3714em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:-0.0502em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">PCIe</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.0361em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">prefill</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mclose">)</span></span></span></span></span></div></p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A preempted 2,000-token request</div><div class="co-body"><p>Llama 3.3 70B in FP8: about 0.16 MB of KV per token. Prefill of 2,000 tokens takes about 400 ms on an H100 under load.</p>
+<ol>
+<li>KV for 2,000 tokens: about 330 MB.</li>
+<li>Copy back over PCIe Gen5 at an effective 25 GB/s: about 13 ms.</li>
+<li>Recompute: about 400 ms. Restoring is about 30 times faster.</li>
+<li>A 300-token request: 50 MB, about 2 ms to restore, against about 40 ms to recompute; still faster, but if the server is rarely short of memory, the bookkeeping overhead (a few per cent per request) outweighs the rare saving.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Native CPU offload helps one engine; LMCache lets several engines share cached prefixes.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Offloading is free, so turn it on everywhere.
+  With little memory pressure it adds about 3–5% overhead for no benefit.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Preemption-heavy workloads gain most: restoring beats re-reading the prompt.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Offloading helps short contexts most.
+  Under 1K tokens, recomputing is cheap and the transfer saves little.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: as prompt length grows, does restoring from DRAM get more or less attractive compared with recomputing?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Restore against recompute</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">KV_BYTES = 80 * 8 * 128 * 2          # per token, FP8
+PCIE = 25e9                          # bytes/s, effective
+PREFILL_TOK_S = 5000                 # tokens/s of prefill on a loaded GPU
+for n in (256, 1024, 2048, 8192, 32768):
+    restore = n * KV_BYTES / PCIE * 1000
+    recompute = n / PREFILL_TOK_S * 1000
+    print(f&quot;{n:6d} tokens: restore {restore:7.1f} ms   recompute {recompute:8.1f} ms   ratio {recompute / restore:5.1f}x&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">   256 tokens: restore     1.7 ms   recompute     51.2 ms   ratio  30.5x
+  1024 tokens: restore     6.7 ms   recompute    204.8 ms   ratio  30.5x
+  2048 tokens: restore    13.4 ms   recompute    409.6 ms   ratio  30.5x
+  8192 tokens: restore    53.7 ms   recompute   1638.4 ms   ratio  30.5x
+ 32768 tokens: restore   214.7 ms   recompute   6553.6 ms   ratio  30.5x</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Both grow with length, so in this simple model the ratio stays near 30× at every size: restoring is always faster once a block has been offloaded. In practice prefill gets slower per token at long lengths (attention grows with the square of the prompt), which makes restoring even more attractive for long contexts, while for short ones the fixed per-request overhead decides.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates a preemption-heavy workload with and without LMCache. Reports re-prefills avoided, throughput gain, and the break-even HBM utilization.</p>
+<p>Here is <code>code/main.py</code>, in 3 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 3 · <code>Request</code>, <code>make_workload</code>, <code>simulate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;vLLM production stack + LMCache simulator — stdlib Python.
+
+Compares three configs on a preemption-heavy workload:
+  NATIVE_ONLY   : vLLM with no offload, requests re-prefill on preemption
+  CPU_OFFLOAD   : native CPU offload, engine-local
+  LMCACHE       : cluster LMCache shared across 4 engines
+
+Reports re-prefill count avoided, throughput gain, and break-even HBM utilization.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import random
+
+
+PREFILL_TOK_PER_MS = 40.0
+DECODE_TOK_PER_MS = 0.15
+CPU_OFFLOAD_TIME_MS_PER_BLOCK = 1.5
+LMCACHE_TIME_MS_PER_BLOCK = 3.0
+KV_BLOCK_TOKENS = 16
+
+
+@dataclass
+class Request:
+    prompt_tokens: int
+    output_tokens: int
+    prefix_id: str  # for reuse across engines
+
+
+def make_workload(n: int = 200, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    prefixes = [f&quot;tpl_{i}&quot; for i in range(6)]  # small set = high reuse
+    reqs = []
+    for _ in range(n):
+        prompt = rng.choice([2000, 4000, 8000])
+        reqs.append(Request(prompt, rng.randint(150, 400), rng.choice(prefixes)))
+    return reqs
+
+
+def simulate(config: str, reqs: list[Request]) -&gt; dict:
+    &quot;&quot;&quot;Model a small cluster under HBM pressure.&quot;&quot;&quot;
+    engines_state: list[set[str]] = [set() for _ in range(4)]
+    shared_cache: set[str] = set()
+    hbm_capacity_blocks_per_engine = 900
+    total_time_ms = 0.0
+    re_prefills_avoided = 0
+    prefill_work = 0
+    rng = random.Random(11)
+
+    for r in reqs:
+        eng = rng.randrange(len(engines_state))
+        blocks = (r.prompt_tokens + KV_BLOCK_TOKENS - 1) // KV_BLOCK_TOKENS
+        cached_local = r.prefix_id in engines_state[eng]
+        cached_lmcache = r.prefix_id in shared_cache
+
+        if config == &quot;NATIVE_ONLY&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                engines_state[eng].add(r.prefix_id)
+                if len(engines_state[eng]) &gt; 4:
+                    engines_state[eng].pop()
+        elif config == &quot;CPU_OFFLOAD&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                engines_state[eng].add(r.prefix_id)
+                prefill_ms += blocks * CPU_OFFLOAD_TIME_MS_PER_BLOCK * 0.1
+        elif config == &quot;LMCACHE&quot;:
+            if cached_local:
+                prefill_ms = 0
+                re_prefills_avoided += 1
+            elif cached_lmcache:
+                prefill_ms = blocks * LMCACHE_TIME_MS_PER_BLOCK
+                engines_state[eng].add(r.prefix_id)
+                re_prefills_avoided += 1
+            else:
+                prefill_ms = r.prompt_tokens / PREFILL_TOK_PER_MS
+                shared_cache.add(r.prefix_id)
+                engines_state[eng].add(r.prefix_id)
+
+        decode_ms = r.output_tokens / DECODE_TOK_PER_MS
+        total_time_ms += prefill_ms + decode_ms
+        prefill_work += prefill_ms
+
+    return {
+        &quot;config&quot;: config,
+        &quot;total_ms&quot;: total_time_ms,
+        &quot;prefill_ms&quot;: prefill_work,
+        &quot;re_prefills_avoided&quot;: re_prefills_avoided,
+    }
+</code></pre></div>
+
+<p><strong>Part 2 of 3 · <code>report</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def report(row: dict, baseline: float) -&gt; None:
+    speedup = baseline / row[&quot;total_ms&quot;] if row[&quot;total_ms&quot;] else 1
+    print(f&quot;{row['config']:14}  total={row['total_ms']:8.0f} ms  &quot;
+          f&quot;prefill={row['prefill_ms']:7.0f} ms  &quot;
+          f&quot;avoided_re_prefill={row['re_prefills_avoided']:4}  &quot;
+          f&quot;speedup={speedup:4.2f}x&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 80)
+    print(&quot;vLLM PRODUCTION STACK + LMCACHE: preemption-heavy, 4 engines, shared prefixes&quot;)
+    print(&quot;=&quot; * 80)
+    base = make_workload()
+    baseline = simulate(&quot;NATIVE_ONLY&quot;, [Request(r.prompt_tokens, r.output_tokens, r.prefix_id) for r in base])[&quot;total_ms&quot;]
+    for cfg in (&quot;NATIVE_ONLY&quot;, &quot;CPU_OFFLOAD&quot;, &quot;LMCACHE&quot;):
+        report(simulate(cfg, [Request(r.prompt_tokens, r.output_tokens, r.prefix_id) for r in base]), baseline)
+    print(&quot;\nRead: when prefixes repeat across engines, LMCache avoids redundant prefills&quot;)
+    print(&quot;even when each engine individually evicted the cache.&quot;)
+</code></pre></div>
+
+<p><strong>Part 3 of 3 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">================================================================================
+vLLM PRODUCTION STACK + LMCACHE: preemption-heavy, 4 engines, shared prefixes
+================================================================================
+NATIVE_ONLY     total=  375733 ms  prefill=   9700 ms  avoided_re_prefill= 115  speedup=1.00x
+CPU_OFFLOAD     total=  369402 ms  prefill=   3369 ms  avoided_re_prefill= 176  speedup=1.02x
+LMCACHE         total=  380833 ms  prefill=  14800 ms  avoided_re_prefill= 194  speedup=0.99x
+
+Read: when prefixes repeat across engines, LMCache avoids redundant prefills
+even when each engine individually evicted the cache.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Read the numbers, not the caption. In this run LMCache avoids the most re-prefills (194) but its total time is the slowest (0.98×), and its prefill time is the highest; CPU offload gives a small gain (1.01×). The toy charges LMCache a network hop on every lookup, and with these settings that cost outweighs the reuse. The lesson's claim holds only when cross-engine reuse is large and memory pressure is high, which is why the benchmark section says "starts to help" at moderate load and shows large gains only once KV exceeds HBM.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team enables LMCache on a single-tenant service with 600-token prompts and a GPU memory use of 55%. Throughput drops 4%. What did they misjudge? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Preemption under memory pressure forces expensive re-prefills.</li>
+<li>Offload KV blocks to CPU DRAM; restoring is far faster than recomputing.</li>
+<li>Native offload is per engine; LMCache shares across engines.</li>
+<li>Enable it for memory pressure, shared prefixes and long contexts; skip it otherwise.</li>
+<li>The vLLM production stack packages router, engines, LMCache and monitoring.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-async-disaggregated-inference"><span class="t" style="--cs-hue:170">AD</span>Cheat sheet · Disaggregated, Async and Hogwild Inference</a><a href="#cs-serving-engines-compared"><span class="t" style="--cs-hue:262">SN</span>Cheat sheet · Comparing LLM Serving Engines</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-vllm-stack-decider.md</code>. Given workload shape and vLLM deployment, decides native vs LMCache vs neither.</p>
+<p><strong><code>outputs/skill-vllm-stack-decider.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: vllm-stack-decider
+description: Decide vLLM deployment layout — production-stack Helm chart, KV offload (native CPU or LMCache), router/observability integration — given workload and fleet size.
+version: 1.0.0
+phase: 17
+lesson: 18
+tags: [vllm, production-stack, lmcache, kv-offload, connector-api]
+---
+
+Given workload (prompt shape, concurrency, prefix reuse pattern), fleet (engines, GPU type), and operational context (Kubernetes-native, multi-tenant, budget), produce a vLLM stack plan.
+
+Produce:
+
+1. Stack. Use vLLM production-stack Helm chart (recommended for new deployments) or roll your own. State which operators/CRDs apply.
+2. KV offload. Choose:
+   - None (short prompts, low concurrency — overhead exceeds benefit).
+   - Native vLLM CPU offload (single-engine HBM pressure, simple).
+   - LMCache connector (multi-engine prefix reuse, preemption-heavy, or multi-tenant shared prompts).
+3. HBM utilization monitoring. Set `--gpu-memory-utilization` with headroom; alert at 92%+ sustained as a pre-preemption signal.
+4. Router integration. Cache-aware router (Phase 17 · 11). Confirm KV-event channel configured.
+5. Observability. Prometheus scrape per engine, OTel GenAI attributes (Phase 17 · 13), Grafana dashboard template from production-stack.
+6. Expected impact. Quantify expected throughput gain vs current — reference the 16x H100 benchmark shape (LMCache helps when KV footprint exceeds HBM).
+
+Hard rejects:
+- Deploying LMCache without shared prefixes or preemption. Refuse — overhead, no benefit.
+- Running vLLM without HBM-pressure monitoring. Refuse — first preemption will be a surprise.
+- Hand-rolling production-stack when the Helm chart covers the use case. Refuse — reinvent cost.
+
+Refusal rules:
+- If the fleet has &lt;2 engines, refuse LMCache — cross-engine reuse is the point; single-engine use native.
+- If the workload has prompts &lt; 1K tokens and &lt; 100 concurrency, refuse offload of any kind — HBM headroom suffices.
+- If the team doesn't have K8s capability, refuse production-stack — start with a single-engine vLLM + simple proxy.
+
+Output: a one-page plan naming stack, KV offload choice, HBM monitoring, router integration, observability, expected impact. End with the single gate: HBM utilization P99 over last 24h.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. At what HBM utilization does LMCache start paying?</li>
+<li>A tenant shares a 6K-token system prompt across 200 queries/hour. Compute expected LMCache savings per tenant.</li>
+<li>The LMCache server is a single point of failure. Design the HA strategy (replicas, fallback to native).</li>
+<li>LMCache stores to Ceph on spinning disk. For a 4K-token KV at 70B FP8 (500 MB), what's the read time vs re-prefill?</li>
+<li>Argue whether the vLLM 0.11.0 asynchronous path is "free" — where does the overhead hide?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1718-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Reading the simulation</span></summary><div class="qa-a"><p>CPU offload cuts prefill from 7.75 s to 3.4 s and total time slightly; LMCache avoids more re-prefills but adds lookup cost, ending 2% slower. The break-even comes when prefixes are shared across engines and memory pressure forces frequent preemption: then each avoided re-prefill saves far more than a lookup costs.</p></div></details>
+<details class="qa" id="a1718-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · No pressure, no reuse</span></summary><div class="qa-a"><p>With GPU memory at 55%, there is little preemption, so nothing needs restoring; with one tenant and short prompts, there is little cross-engine reuse. LMCache's per-request bookkeeping and network hop are pure overhead: the 3–5% the benchmark describes. Turn it off, or keep it only for the long-context tier.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://blog.vllm.ai/2026/01/08/kv-offloading-connector.html">vLLM Blog — KV Offloading Connector (Jan 2026)</a></li>
+<li><a href="https://github.com/vllm-project/production-stack">vLLM Production Stack GitHub</a> — Helm chart + operator.</li>
+<li><a href="https://arxiv.org/html/2510.09665v2">LMCache for Enterprise-Scale LLM Inference (arXiv:2510.09665)</a></li>
+<li><a href="https://github.com/LMCache/LMCache">LMCache GitHub</a> — Connector implementation.</li>
+<li><a href="https://github.com/vllm-project/vllm/releases">vLLM 0.11.0 release notes</a> — asynchronous path details.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1718" id="done-a1718">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1718" id="undo-a1718" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1717"><span class="pn-dir">Previous</span><span class="pn-t">17.17 · Prefill/Decode Disaggregation with NVIDIA Dynamo and llm-d</span></a><a class="pn next" href="#a1719"><span class="pn-dir">Next</span><span class="pn-t">17.19 · LiteLLM, Portkey, Kong and Bifrost: AI Gateways</span></a></div></footer>

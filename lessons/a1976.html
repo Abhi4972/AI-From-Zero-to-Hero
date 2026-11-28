@@ -1,0 +1,595 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-19">Phase 19 · Capstone Builds</a></nav><h1>Collective Operations: All-Reduce from Scratch</h1><div class="m-meta"><span class="chip chip-num">Lesson 19.76</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1976" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Implement ring allreduce in two passes (reduce-scatter then allgather) and prove the per-rank communication volume is 2(N-1)/N bytes per element.</li>
+<li>Build broadcast, allgather, and reduce_scatter on top of point-to-point sends over <code>multiprocessing.Queue</code>.</li>
+<li>Verify every primitive against a <code>torch.distributed</code> gloo reference for the same input.</li>
+<li>Defend the choice of ring versus tree on cluster shape, latency floor, and bandwidth ceiling.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons 19.42 to 19.49</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>The four collective operations that hold distributed training together are allreduce, broadcast, allgather, and reduce_scatter. Every other primitive a training framework offers is a wrapper around these. Build them once over a <code>multiprocessing.Queue</code> mesh, verify them against a reference implementation, and the rest of the track becomes plumbing.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Allreduce</td>
+<td>"Sum across ranks"</td>
+<td>After the call every rank holds the same reduced tensor</td>
+</tr>
+<tr>
+<td>Ring</td>
+<td>"The fast topology"</td>
+<td>N-1 chunks of size T/N flow around the cycle twice</td>
+</tr>
+<tr>
+<td>Tree</td>
+<td>"The log topology"</td>
+<td>Reduction follows a binary tree; depth is log2(N) hops</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>"Concatenate shards"</td>
+<td>Every rank ends with every other rank's shard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>"Split the sum"</td>
+<td>Each rank ends with the sum of one chunk only</td>
+</tr>
+<tr>
+<td>Bucket</td>
+<td>"Fuse small tensors"</td>
+<td>Coalesce N small allreduces into one large one</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Distributed training rests on four <strong>collective operations</strong>, each run by every process (<strong>rank</strong>) together. <strong>All-reduce</strong>: every rank ends with the sum of everyone's tensors (used to average gradients). <strong>Broadcast</strong>: one rank's tensor is copied to all. <strong>All-gather</strong>: every rank ends with all ranks' pieces concatenated. <strong>Reduce-scatter</strong>: the sum is computed, but each rank keeps only its own slice. This lesson builds all four on top of plain process queues and checks them against PyTorch's <strong>gloo</strong> backend. The central algorithm is the <strong>ring all-reduce</strong>: ranks pass chunks around a ring, first adding (reduce-scatter), then copying (all-gather), so each rank sends about twice the data size whatever the number of ranks.</p></div></aside>
+<p>A naive allreduce over N ranks sends N times the tensor to a root and broadcasts N times back. Bandwidth scales as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mclose">)</span></span></span></span> per rank, the root becomes a bottleneck, and the wall-clock floor is the slowest link times N. Ring allreduce flattens that into <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span> chunks of size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span>, so per-rank bytes drop to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span>, which approaches <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span> as N grows and never exceeds it, whatever the cluster size. Tree allreduce wins on small N and high-latency links because depth is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop"><span class="mop">lo<span style="margin-right:0.01389em;">g</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.207em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">2</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mclose">)</span></span></span></span> hops instead of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span></span>. Pick the wrong topology for the cluster shape and the slowest GPU dictates step time.</p>
+<p>Every distributed training framework you will read this track depends on these four primitives. PyTorch DDP synchronises gradients with one allreduce per parameter bucket. ZeRO shards optimiser state by reduce_scatter and broadcasts updated parameters by allgather. FSDP turns the full forward into allgather plus reduce_scatter. Pipeline parallel needs broadcast for activations across stage groups. If you cannot implement the four collectives, you cannot reason about why training stalls, why the gradient mismatch shows up at rank 3, or why the pipeline bubble doubles when you swap topologies.</p>
+<h2>The idea</h2>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm26ded37aa7" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1157.69px; background-color: transparent;" viewBox="0 0 1157.6875 120.00801086425781" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm26ded37aa7{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm26ded37aa7 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm26ded37aa7 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm26ded37aa7 .error-icon{fill:#f4efe7;}#mm26ded37aa7 .error-text{fill:#0b1018;stroke:#0b1018;}#mm26ded37aa7 .edge-thickness-normal{stroke-width:1px;}#mm26ded37aa7 .edge-thickness-thick{stroke-width:3.5px;}#mm26ded37aa7 .edge-pattern-solid{stroke-dasharray:0;}#mm26ded37aa7 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm26ded37aa7 .edge-pattern-dashed{stroke-dasharray:3;}#mm26ded37aa7 .edge-pattern-dotted{stroke-dasharray:2;}#mm26ded37aa7 .marker{fill:#6c6357;stroke:#6c6357;}#mm26ded37aa7 .marker.cross{stroke:#6c6357;}#mm26ded37aa7 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm26ded37aa7 p{margin:0;}#mm26ded37aa7 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm26ded37aa7 .cluster-label text{fill:#0b1018;}#mm26ded37aa7 .cluster-label span{color:#0b1018;}#mm26ded37aa7 .cluster-label span p{background-color:transparent;}#mm26ded37aa7 .label text,#mm26ded37aa7 span{fill:#211c16;color:#211c16;}#mm26ded37aa7 .node rect,#mm26ded37aa7 .node circle,#mm26ded37aa7 .node ellipse,#mm26ded37aa7 .node polygon,#mm26ded37aa7 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm26ded37aa7 .rough-node .label text,#mm26ded37aa7 .node .label text,#mm26ded37aa7 .image-shape .label,#mm26ded37aa7 .icon-shape .label{text-anchor:middle;}#mm26ded37aa7 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm26ded37aa7 .rough-node .label,#mm26ded37aa7 .node .label,#mm26ded37aa7 .image-shape .label,#mm26ded37aa7 .icon-shape .label{text-align:center;}#mm26ded37aa7 .node.clickable{cursor:pointer;}#mm26ded37aa7 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm26ded37aa7 .arrowheadPath{fill:#0b0b0b;}#mm26ded37aa7 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm26ded37aa7 .flowchart-link{stroke:#6c6357;fill:none;}#mm26ded37aa7 .edgeLabel{background-color:#ffffff;text-align:center;}#mm26ded37aa7 .edgeLabel p{background-color:#ffffff;}#mm26ded37aa7 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm26ded37aa7 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm26ded37aa7 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm26ded37aa7 .cluster text{fill:#0b1018;}#mm26ded37aa7 .cluster span{color:#0b1018;}#mm26ded37aa7 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm26ded37aa7 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm26ded37aa7 rect.text{fill:none;stroke-width:0;}#mm26ded37aa7 .icon-shape,#mm26ded37aa7 .image-shape{background-color:#ffffff;text-align:center;}#mm26ded37aa7 .icon-shape p,#mm26ded37aa7 .image-shape p{background-color:#ffffff;padding:2px;}#mm26ded37aa7 .icon-shape .label rect,#mm26ded37aa7 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm26ded37aa7 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm26ded37aa7 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm26ded37aa7 .node .neo-node{stroke:#b5521b;}#mm26ded37aa7 [data-look="neo"].node rect,#mm26ded37aa7 [data-look="neo"].cluster rect,#mm26ded37aa7 [data-look="neo"].node polygon{stroke:url(#mm26ded37aa7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm26ded37aa7 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm26ded37aa7 [data-look="neo"].node path{stroke:url(#mm26ded37aa7-gradient);stroke-width:1px;}#mm26ded37aa7 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm26ded37aa7 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm26ded37aa7 [data-look="neo"].node circle{stroke:url(#mm26ded37aa7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm26ded37aa7 [data-look="neo"].node circle .state-start{fill:#000000;}#mm26ded37aa7 [data-look="neo"].icon-shape .icon{fill:url(#mm26ded37aa7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm26ded37aa7 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm26ded37aa7-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm26ded37aa7 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm26ded37aa7_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm26ded37aa7_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm26ded37aa7_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M109.859,53.946L114.026,52.039C118.193,50.132,126.526,46.318,134.193,44.411C141.859,42.504,148.859,42.504,152.359,42.504L155.859,42.504" id="mm26ded37aa7-L_R0_Q01_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R0_Q01_0" data-points="W3sieCI6MTA5Ljg1OTM3NSwieSI6NTMuOTQ2MTI2NzMxMjE1NTE0fSx7IngiOjEzNC44NTkzNzUsInkiOjQyLjUwMzk2NzI4NTE1NjI1fSx7IngiOjE1OS44NTkzNzUsInkiOjQyLjUwMzk2NzI4NTE1NjI1fV0=" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M255.5,42.504L259.667,42.504C263.833,42.504,272.167,42.504,279.833,42.504C287.5,42.504,294.5,42.504,298,42.504L301.5,42.504" id="mm26ded37aa7-L_Q01_R1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q01_R1_0" data-points="W3sieCI6MjU1LjUsInkiOjQyLjUwMzk2NzI4NTE1NjI1fSx7IngiOjI4MC41LCJ5Ijo0Mi41MDM5NjcyODUxNTYyNX0seyJ4IjozMDUuNSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9XQ==" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M404.219,42.504L408.385,42.504C412.552,42.504,420.885,42.504,428.552,42.504C436.219,42.504,443.219,42.504,446.719,42.504L450.219,42.504" id="mm26ded37aa7-L_R1_Q12_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R1_Q12_0" data-points="W3sieCI6NDA0LjIxODc1LCJ5Ijo0Mi41MDM5NjcyODUxNTYyNX0seyJ4Ijo0MjkuMjE4NzUsInkiOjQyLjUwMzk2NzI4NTE1NjI1fSx7IngiOjQ1NC4yMTg3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9XQ==" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M549.563,42.504L553.729,42.504C557.896,42.504,566.229,42.504,573.896,42.504C581.563,42.504,588.563,42.504,592.063,42.504L595.563,42.504" id="mm26ded37aa7-L_Q12_R2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q12_R2_0" data-points="W3sieCI6NTQ5LjU2MjUsInkiOjQyLjUwMzk2NzI4NTE1NjI1fSx7IngiOjU3NC41NjI1LCJ5Ijo0Mi41MDM5NjcyODUxNTYyNX0seyJ4Ijo1OTkuNTYyNSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9XQ==" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M701.125,42.504L705.292,42.504C709.458,42.504,717.792,42.504,725.458,42.504C733.125,42.504,740.125,42.504,743.625,42.504L747.125,42.504" id="mm26ded37aa7-L_R2_Q23_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R2_Q23_0" data-points="W3sieCI6NzAxLjEyNSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6NzI2LjEyNSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6NzUxLjEyNSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9XQ==" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M849.422,42.504L853.589,42.504C857.755,42.504,866.089,42.504,873.755,42.504C881.422,42.504,888.422,42.504,891.922,42.504L895.422,42.504" id="mm26ded37aa7-L_Q23_R3_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q23_R3_0" data-points="W3sieCI6ODQ5LjQyMTg3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6ODc0LjQyMTg3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6ODk5LjQyMTg3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9XQ==" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M1001.094,42.504L1005.26,42.504C1009.427,42.504,1017.76,42.504,1025.49,44.17C1033.219,45.837,1040.345,49.17,1043.908,50.836L1047.471,52.503" id="mm26ded37aa7-L_R3_Q30_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R3_Q30_0" data-points="W3sieCI6MTAwMS4wOTM3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6MTAyNi4wOTM3NSwieSI6NDIuNTAzOTY3Mjg1MTU2MjV9LHsieCI6MTA1MS4wOTM3NSwieSI6NTQuMTk3NTg5NTQxMzMzOTU0fV0=" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/><path d="M1051.094,100.314L1046.927,102.263C1042.76,104.212,1034.427,108.11,1017.621,110.059C1000.815,112.008,975.536,112.008,950.258,112.008C924.979,112.008,899.701,112.008,874.703,112.008C849.706,112.008,824.99,112.008,800.273,112.008C775.557,112.008,750.841,112.008,725.853,112.008C700.865,112.008,675.604,112.008,650.344,112.008C625.083,112.008,599.823,112.008,575.081,112.008C550.339,112.008,526.115,112.008,501.891,112.008C477.667,112.008,453.443,112.008,428.938,112.008C404.432,112.008,379.646,112.008,354.859,112.008C330.073,112.008,305.286,112.008,280.757,112.008C256.227,112.008,231.953,112.008,207.68,112.008C183.406,112.008,159.133,112.008,143.436,110.378C127.738,108.749,120.617,105.49,117.057,103.86L113.497,102.23" id="mm26ded37aa7-L_Q30_R0_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Q30_R0_0" data-points="W3sieCI6MTA1MS4wOTM3NSwieSI6MTAwLjMxNDMxMjMxNDEzNDh9LHsieCI6MTAyNi4wOTM3NSwieSI6MTEyLjAwNzkzNDU3MDMxMjV9LHsieCI6OTUwLjI1NzgxMjUsInkiOjExMi4wMDc5MzQ1NzAzMTI1fSx7IngiOjg3NC40MjE4NzUsInkiOjExMi4wMDc5MzQ1NzAzMTI1fSx7IngiOjgwMC4yNzM0Mzc1LCJ5IjoxMTIuMDA3OTM0NTcwMzEyNX0seyJ4Ijo3MjYuMTI1LCJ5IjoxMTIuMDA3OTM0NTcwMzEyNX0seyJ4Ijo2NTAuMzQzNzUsInkiOjExMi4wMDc5MzQ1NzAzMTI1fSx7IngiOjU3NC41NjI1LCJ5IjoxMTIuMDA3OTM0NTcwMzEyNX0seyJ4Ijo1MDEuODkwNjI1LCJ5IjoxMTIuMDA3OTM0NTcwMzEyNX0seyJ4Ijo0MjkuMjE4NzUsInkiOjExMi4wMDc5MzQ1NzAzMTI1fSx7IngiOjM1NC44NTkzNzUsInkiOjExMi4wMDc5MzQ1NzAzMTI1fSx7IngiOjI4MC41LCJ5IjoxMTIuMDA3OTM0NTcwMzEyNX0seyJ4IjoyMDcuNjc5Njg3NSwieSI6MTEyLjAwNzkzNDU3MDMxMjV9LHsieCI6MTM0Ljg1OTM3NSwieSI6MTEyLjAwNzkzNDU3MDMxMjV9LHsieCI6MTA5Ljg1OTM3NSwieSI6MTAwLjU2NTc3NTEyNDI1MzI0fV0=" data-look="classic" marker-end="url(#mm26ded37aa7_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R0_Q01_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q01_R1_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_R1_Q12_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q12_R2_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_R2_Q23_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q23_R3_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_R3_Q30_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_Q30_R0_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm26ded37aa7-flowchart-R0-0" data-look="classic" transform="translate(58.9296875, 77.25595092773438)"><rect class="basic label-container" style="" x="-50.9296875" y="-25.5" width="101.859375" height="51"/><g class="label" style="" transform="translate(-20.9296875, -10.5)"><rect/><foreignObject width="41.859375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>rank 0</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-Q01-1" data-look="classic" transform="translate(207.6796875, 42.50396728515625)"><path d="M0,10.836697117767862 a47.8203125,10.836697117767862 0,0,0 95.640625,0 a47.8203125,10.836697117767862 0,0,0 -95.640625,0 l0,46.83669711776786 a47.8203125,10.836697117767862 0,0,0 95.640625,0 l0,-46.83669711776786" class="basic label-container outer-path" style="" transform="translate(-47.8203125, -34.25504567665179)"/><g class="label" style="" transform="translate(-40.3203125, -0.5)"><rect/><foreignObject width="80.640625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>queue 0 to 1</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-R1-3" data-look="classic" transform="translate(354.859375, 42.50396728515625)"><rect class="basic label-container" style="" x="-49.359375" y="-25.5" width="98.71875" height="51"/><g class="label" style="" transform="translate(-19.359375, -10.5)"><rect/><foreignObject width="38.71875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>rank 1</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-Q12-5" data-look="classic" transform="translate(501.890625, 42.50396728515625)"><path d="M0,10.817614522762728 a47.671875,10.817614522762728 0,0,0 95.34375,0 a47.671875,10.817614522762728 0,0,0 -95.34375,0 l0,46.817614522762725 a47.671875,10.817614522762728 0,0,0 95.34375,0 l0,-46.817614522762725" class="basic label-container outer-path" style="" transform="translate(-47.671875, -34.226421784144094)"/><g class="label" style="" transform="translate(-40.171875, -0.5)"><rect/><foreignObject width="80.34375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>queue 1 to 2</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-R2-7" data-look="classic" transform="translate(650.34375, 42.50396728515625)"><rect class="basic label-container" style="" x="-50.78125" y="-25.5" width="101.5625" height="51"/><g class="label" style="" transform="translate(-20.78125, -10.5)"><rect/><foreignObject width="41.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>rank 2</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-Q23-9" data-look="classic" transform="translate(800.2734375, 42.50396728515625)"><path d="M0,11.00517808410888 a49.1484375,11.00517808410888 0,0,0 98.296875,0 a49.1484375,11.00517808410888 0,0,0 -98.296875,0 l0,47.00517808410888 a49.1484375,11.00517808410888 0,0,0 98.296875,0 l0,-47.00517808410888" class="basic label-container outer-path" style="" transform="translate(-49.1484375, -34.507767126163316)"/><g class="label" style="" transform="translate(-41.6484375, -0.5)"><rect/><foreignObject width="83.296875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>queue 2 to 3</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-R3-11" data-look="classic" transform="translate(950.2578125, 42.50396728515625)"><rect class="basic label-container" style="" x="-50.8359375" y="-25.5" width="101.671875" height="51"/><g class="label" style="" transform="translate(-20.8359375, -10.5)"><rect/><foreignObject width="41.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>rank 3</p></span></div></foreignObject></g></g><g class="node default" id="mm26ded37aa7-flowchart-Q30-13" data-look="classic" transform="translate(1100.390625, 77.25595092773438)"><path d="M0,11.02375960866527 a49.296875,11.02375960866527 0,0,0 98.59375,0 a49.296875,11.02375960866527 0,0,0 -98.59375,0 l0,47.02375960866527 a49.296875,11.02375960866527 0,0,0 98.59375,0 l0,-47.02375960866527" class="basic label-container outer-path" style="" transform="translate(-49.296875, -34.53563941299791)"/><g class="label" style="" transform="translate(-41.796875, -0.5)"><rect/><foreignObject width="83.59375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>queue 3 to 0</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm26ded37aa7-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm26ded37aa7-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm26ded37aa7-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<h2>Idea 1 · Ring allreduce in two passes</h2>
+<p>Split the tensor into N equal chunks indexed 0..N-1. Each rank owns chunk index equal to its rank. Pass 1, reduce-scatter, runs N-1 steps. At step s, rank r sends chunk (r - s) mod N to rank (r + 1) mod N and receives chunk (r - s - 1) mod N from rank (r - 1) mod N, accumulating the received chunk into its local copy. After N-1 steps, rank r owns the full sum for chunk r. Pass 2, allgather, runs another N-1 steps and rotates the finished chunks around the ring until every rank holds the full sum for every chunk.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>Per-rank bytes</th>
+<th>Steps</th>
+<th>When to use</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring allreduce</td>
+<td>2T(N-1)/N</td>
+<td>2(N-1)</td>
+<td>Large T, fat-pipe homogeneous cluster</td>
+</tr>
+<tr>
+<td>Tree allreduce</td>
+<td>T log2(N)</td>
+<td>2 log2(N)</td>
+<td>Small T or high-latency links</td>
+</tr>
+<tr>
+<td>Broadcast</td>
+<td>T</td>
+<td>log2(N) tree</td>
+<td>Parameter init, scalar config</td>
+</tr>
+<tr>
+<td>Allgather</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>Sharded forward, ZeRO unshard</td>
+</tr>
+<tr>
+<td>Reduce_scatter</td>
+<td>T(N-1)/N</td>
+<td>N-1</td>
+<td>ZeRO gradient sharding</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Idea 2 · Queue mesh as a stand-in for NCCL</h2>
+<p>NCCL runs over PCIe and NVLink with hardware-offloaded reductions. On CPU you do not have that. A <code>multiprocessing.Queue</code> per ring edge gives you ordered point-to-point delivery with a single producer and single consumer. The reduction happens in user space, so you pay Python overhead, but the wire pattern is identical to NCCL ring allreduce. Reason about correctness on the queue version and the cluster behaviour follows.</p>
+<h2>Idea 3 · Verify against gloo</h2>
+<p>Every primitive lands with a unit test that compares its output against <code>torch.distributed</code> initialised with the gloo backend on the same tensor across the same world size. If your ring allreduce diverges from gloo by more than float32 epsilon, the test fails. Verification against a reference implementation is non-negotiable; without it the primitive looks correct until step 10000 of a real training run.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="ci-ring-allreduce"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-title">Bytes sent per rank in a ring all-reduce</div><div class="co-body"><p>With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> ranks and a tensor of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span> bytes split into <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> chunks:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">bytes per rank</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.0463em;vertical-align:-0.686em;"></span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.3603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> steps of reduce-scatter and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> steps of all-gather, each sending one chunk of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> bytes. As <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span> grows, this approaches <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">2</span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span></span></span></span>, independent of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span></span></span></span>.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A ring of four</div><div class="co-body"><p>Four ranks hold the numbers 1, 2, 3, 4 in each of four chunk positions (chunk c on rank r holds r + 1).</p>
+<ol>
+<li>Reduce-scatter, three steps: each rank sends one chunk to the next and adds what it receives. After three steps, each rank holds the full sum, 1 + 2 + 3 + 4 = 10, for exactly one chunk.</li>
+<li>All-gather, three steps: ranks pass their finished chunks around the ring, copying instead of adding. After three steps every rank has 10 in all four chunks.</li>
+<li>Each rank sent 6 chunks of size T/4: 1.5 T in total, matching 2 × 3 × T / 4.</li>
+<li>A naive "send everything to rank 0, then broadcast" would make rank 0 receive 3T and send 3T: a bottleneck that grows with N.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> All-reduce leaves every rank with the same summed tensor.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Reduce-scatter leaves every rank with the full sum.
+  Each rank keeps only its own slice of the sum.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A ring all-reduce is reduce-scatter followed by all-gather.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Ring all-reduce traffic per rank grows linearly with the number of ranks.
+  It approaches 2T and stays there.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: a 256-byte tensor and 4 ranks. How many bytes does each rank send in a ring all-reduce? With 64 ranks?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A ring all-reduce simulated in one process</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def ring_allreduce(data):                      # data[r][c]: rank r's value for chunk c
+    n = len(data); sent = [0] * n
+    for step in range(n - 1):                  # reduce-scatter
+        msgs = [(r, (r - step) % n, data[r][(r - step) % n]) for r in range(n)]
+        for r, c, v in msgs: data[(r + 1) % n][c] += v; sent[r] += 1
+    for step in range(n - 1):                  # all-gather
+        msgs = [(r, (r + 1 - step) % n, data[r][(r + 1 - step) % n]) for r in range(n)]
+        for r, c, v in msgs: data[(r + 1) % n][c] = v; sent[r] += 1
+    return data, sent
+
+data, sent = ring_allreduce([[r + 1] * 4 for r in range(4)])
+print(&quot;result on every rank:&quot;, data)
+print(&quot;chunks sent per rank:&quot;, sent)
+for n in (4, 64):
+    print(f&quot;N={n:2d}: bytes per rank for T=256 -&gt; {2 * (n - 1) * 256 / n:.0f}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">result on every rank: [[10, 10, 10, 10], [10, 10, 10, 10], [10, 10, 10, 10], [10, 10, 10, 10]]
+chunks sent per rank: [6, 6, 6, 6]
+N= 4: bytes per rank for T=256 -&gt; 384
+N=64: bytes per rank for T=256 -&gt; 504</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Every rank ends with [10, 10, 10, 10] after sending 6 chunks, as in the worked example. For a 256-byte tensor each rank sends 384 bytes with 4 ranks and 504 with 64: the cost per rank barely grows, which is why the ring is the standard algorithm for large gradient all-reduces.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements:</p>
+<ul>
+<li><code>Mesh</code> class that wires N <code>multiprocessing.Queue</code> instances into a ring and exposes <code>send(dst, tensor)</code> and <code>recv(src)</code> per rank.</li>
+<li><code>ring_allreduce(mesh, rank, world_size, tensor)</code> running the two-pass algorithm.</li>
+<li><code>broadcast(mesh, rank, world_size, tensor, src)</code> over a logarithmic tree.</li>
+<li><code>allgather(mesh, rank, world_size, tensor)</code> using N-1 rotations.</li>
+<li><code>reduce_scatter(mesh, rank, world_size, tensor)</code> as the first half of allreduce.</li>
+<li><code>_gloo_reference(op, world_size, tensor)</code> that runs the same input through <code>torch.distributed</code> with gloo for byte-equal comparison.</li>
+</ul>
+<p>Run it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">python3 code/main.py
+</code></pre></div>
+<p>Output: per-primitive verification table comparing queue-mesh and gloo outputs, followed by a per-rank byte counter that proves the 2T(N-1)/N scaling.</p>
+<h2>Production patterns in the wild</h2>
+<p>Three patterns harden the primitives enough to ship.</p>
+<p><strong>Bucket gradients before allreduce.</strong> A 1B-parameter model has tens of thousands of gradient tensors. One allreduce per tensor pays the latency floor N times. DDP buckets gradients into ~25 MB chunks and issues one allreduce per bucket; the small tensors ride on the back of the big ones. Without bucketing the latency overhead dominates the step.</p>
+<p><strong>Overlap communication with computation.</strong> Backward computes gradients layer by layer in reverse order. The moment the last layer's gradient is ready, kick off its allreduce while the next layer keeps computing. PyTorch DDP wires this with bucket-ready hooks. The overlap halves visible communication time when the network has slack.</p>
+<p><strong>Pick ring or tree by message size, not religion.</strong> NCCL ships a topology detector that picks ring for messages above ~1 MB and tree below. The crossover is bandwidth-versus-latency: above 1 MB, the bandwidth term 2T(N-1)/N dominates and ring wins; below 1 MB, the log2(N) hop count wins. Hard-coding one topology costs throughput on the wrong message size.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>Production patterns:</p>
+<ul>
+<li><strong>PyTorch DDP.</strong> Calls <code>dist.all_reduce</code> on bucketed gradients after backward. The bucket size is tunable; default 25 MB is reasonable for 100Gbit Ethernet.</li>
+<li><strong>DeepSpeed ZeRO.</strong> Issues reduce_scatter to shard gradients and allgather to reconstruct full parameters before forward. The lesson's primitives are exactly the calls ZeRO makes.</li>
+<li><strong>FSDP.</strong> Forward begins with allgather to unshard the layer, computes, then reduces with reduce_scatter and discards the unshard. Same primitives, different schedule.</li>
+</ul>
+<p>Here is <code>code/main.py</code>, in 8 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 8 · <code>_loopback_iface</code>, <code>Mesh</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Collective communication primitives over multiprocessing.Queue, verified against gloo.
+
+Implements ring allreduce, tree broadcast, allgather, reduce_scatter on a queue
+mesh that wires N ranks into a ring. Every primitive is checked byte-for-byte
+against torch.distributed initialised with the gloo backend on the same tensor
+and the same world size. The per-rank byte counter proves the 2T(N-1)/N
+scaling of ring allreduce.
+
+Run: python3 code/main.py
+
+The mesh workers use the 'fork' multiprocessing context so child processes
+inherit Queue file descriptors without pickling. The gloo reference workers
+use 'spawn' because torch.distributed needs a clean process. Both contexts
+ship in stdlib multiprocessing.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import tempfile
+from dataclasses import dataclass
+
+import torch
+import torch.distributed as dist
+
+
+PRIMITIVES = (&quot;allreduce&quot;, &quot;broadcast&quot;, &quot;allgather&quot;, &quot;reduce_scatter&quot;)
+RECV_TIMEOUT_S = 30.0
+
+
+def _loopback_iface() -&gt; str:
+    &quot;&quot;&quot;Return the loopback interface name; macOS uses lo0, Linux uses lo.&quot;&quot;&quot;
+    import sys as _sys
+    return &quot;lo0&quot; if _sys.platform == &quot;darwin&quot; else &quot;lo&quot;
+
+
+@dataclass
+class Mesh:
+    &quot;&quot;&quot;A point-to-point mesh wired as a fully-connected graph of queues.
+
+    Each rank holds out_queues[dst] and in_queues[src]. The ring algorithms
+    only use neighbour edges; the full mesh keeps the API general so future
+    lessons can experiment with tree topologies without rewiring.
+    &quot;&quot;&quot;
+
+    rank: int
+    world_size: int
+    out_queues: list
+    in_queues: list
+    byte_counter: object = None
+
+    def send(self, dst: int, tensor: torch.Tensor) -&gt; None:
+        if dst == self.rank:
+            raise ValueError(&quot;rank cannot send to itself&quot;)
+        payload = tensor.detach().clone().contiguous()
+        nbytes = payload.numel() * payload.element_size()
+        if self.byte_counter is not None:
+            with self.byte_counter.get_lock():
+                self.byte_counter.value += nbytes
+        self.out_queues[dst].put(payload)
+
+    def recv(self, src: int) -&gt; torch.Tensor:
+        if src == self.rank:
+            raise ValueError(&quot;rank cannot recv from itself&quot;)
+        return self.in_queues[src].get(timeout=RECV_TIMEOUT_S)
+</code></pre></div>
+
+<p><strong>Part 2 of 8 · <code>build_queue_grid</code>, <code>mesh_from_grid</code>, <code>ring_allreduce</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def build_queue_grid(ctx, world_size: int):
+    &quot;&quot;&quot;Allocate a (world_size, world_size) grid of queues using the given context.&quot;&quot;&quot;
+    grid = [[None] * world_size for _ in range(world_size)]
+    for src in range(world_size):
+        for dst in range(world_size):
+            if src != dst:
+                grid[src][dst] = ctx.Queue()
+    return grid
+
+
+def mesh_from_grid(rank: int, world_size: int, grid, byte_counter) -&gt; Mesh:
+    out_qs = [grid[rank][d] for d in range(world_size)]
+    in_qs = [grid[s][rank] for s in range(world_size)]
+    return Mesh(rank=rank, world_size=world_size,
+                out_queues=out_qs, in_queues=in_qs,
+                byte_counter=byte_counter)
+
+
+def ring_allreduce(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Ring allreduce in two passes (reduce-scatter then allgather).
+
+    Splits the tensor into world_size equal chunks (padding with zeros so the
+    chunk count divides evenly). After the call every rank holds the same
+    summed tensor at the original shape.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    n = tensor.numel()
+    pad = (-n) % w
+    flat = torch.zeros(n + pad, dtype=tensor.dtype)
+    flat[:n] = tensor.flatten()
+    chunks = [c.clone() for c in flat.chunk(w)]
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = chunks[recv_idx] + incoming
+    for step in range(w - 1):
+        send_idx = (r - step + 1) % w
+        recv_idx = (r - step) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = incoming
+    return torch.cat(chunks)[:n].reshape(tensor.shape)
+</code></pre></div>
+
+<p><strong>Part 3 of 8 · <code>broadcast</code>, <code>allgather</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def broadcast(mesh: Mesh, tensor: torch.Tensor, src: int) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Tree broadcast in ceil(log2(world_size)) hops.
+
+    At round r, the set of ranks that hold the value doubles. Source rank
+    seeds the value; non-source ranks ignore their input and receive from
+    a peer that already holds it.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    has_value = {src}
+    out = tensor.clone() if r == src else torch.zeros_like(tensor)
+    round_idx = 0
+    while len(has_value) &lt; w:
+        new_holders = set()
+        for h in sorted(has_value):
+            partner = h + (1 &lt;&lt; round_idx)
+            if partner &lt; w and partner not in has_value:
+                if r == h:
+                    mesh.send(partner, out)
+                elif r == partner:
+                    out = mesh.recv(h)
+                new_holders.add(partner)
+        has_value |= new_holders
+        round_idx += 1
+    return out
+
+
+def allgather(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Allgather via N-1 ring rotations.
+
+    Each rank inputs one shard of length T and outputs all shards concatenated
+    in rank order with total length T * world_size.
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    if w == 1:
+        return tensor.clone()
+    shards = [torch.zeros_like(tensor) for _ in range(w)]
+    shards[r] = tensor.clone()
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, shards[send_idx])
+        shards[recv_idx] = mesh.recv(prev_rank)
+    return torch.cat(shards)
+</code></pre></div>
+
+<p><strong>Part 4 of 8 · <code>reduce_scatter</code>, <code>_gloo_worker</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def reduce_scatter(mesh: Mesh, tensor: torch.Tensor) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Reduce-scatter as the first half of ring allreduce.
+
+    Input is a tensor of length world_size * T. Output is the rank's chunk of
+    length T holding the sum across all ranks for that index range. The
+    underlying ring algorithm parks the full sum at index (r + 1) % W; we
+    return that chunk and label it as rank r's output to match
+    torch.distributed's contract that rank r owns chunks[r].
+    &quot;&quot;&quot;
+    w = mesh.world_size
+    r = mesh.rank
+    n = tensor.numel()
+    if n % w != 0:
+        raise ValueError(f&quot;reduce_scatter needs numel divisible by world_size, got {n} / {w}&quot;)
+    if w == 1:
+        return tensor.clone()
+    rotated = list(tensor.chunk(w))
+    rotated = [rotated[(i - 1) % w].clone() for i in range(w)]
+    chunks = rotated
+    next_rank = (r + 1) % w
+    prev_rank = (r - 1) % w
+    for step in range(w - 1):
+        send_idx = (r - step) % w
+        recv_idx = (r - step - 1) % w
+        mesh.send(next_rank, chunks[send_idx])
+        incoming = mesh.recv(prev_rank)
+        chunks[recv_idx] = chunks[recv_idx] + incoming
+    return chunks[(r + 1) % w]
+
+
+def _gloo_worker(rank: int, world_size: int, op: str, tensor_bytes: bytes,
+                 shape, dtype_str: str, init_file: str,
+                 iface: str, out_queue) -&gt; None:
+    os.environ[&quot;GLOO_SOCKET_IFNAME&quot;] = iface
+    dist.init_process_group(
+        backend=&quot;gloo&quot;,
+        init_method=f&quot;file://{init_file}&quot;,
+        rank=rank,
+        world_size=world_size,
+    )
+    dtype = getattr(torch, dtype_str)
+    tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=dtype).reshape(shape).clone()
+    if op == &quot;allreduce&quot;:
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        out = tensor
+    elif op == &quot;broadcast&quot;:
+        dist.broadcast(tensor, src=0)
+        out = tensor
+    elif op == &quot;allgather&quot;:
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+        out = torch.cat(gathered)
+    elif op == &quot;reduce_scatter&quot;:
+        chunks = [c.contiguous() for c in tensor.chunk(world_size)]
+        recv = torch.zeros_like(chunks[0])
+        dist.reduce_scatter(recv, chunks, op=dist.ReduceOp.SUM)
+        out = recv
+    else:
+        raise ValueError(f&quot;unknown op {op}&quot;)
+    out_queue.put((rank, out.clone()))
+    out_queue.close()
+    out_queue.join_thread()
+    os._exit(0)
+</code></pre></div>
+
+<p><strong>Part 5 of 8 · <code>gloo_reference</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def gloo_reference(op: str, world_size: int,
+                   per_rank_tensors: list) -&gt; list:
+    &quot;&quot;&quot;Run the same operation through torch.distributed gloo for verification.
+
+    Uses file-based init (file:// URI) because TCP init through libuv has
+    known issues on macOS with concurrent process group creation.
+    &quot;&quot;&quot;
+    ctx = mp.get_context(&quot;spawn&quot;)
+    out_queue = ctx.Queue()
+    init_dir = tempfile.mkdtemp(prefix=&quot;aie_gloo_&quot;)
+    init_file = os.path.join(init_dir, &quot;rendezvous&quot;)
+    iface = _loopback_iface()
+    procs = []
+    try:
+        for r in range(world_size):
+            t = per_rank_tensors[r].contiguous()
+            p = ctx.Process(
+                target=_gloo_worker,
+                args=(r, world_size, op, bytes(t.numpy().tobytes()),
+                      tuple(t.shape), str(t.dtype).split(&quot;.&quot;)[-1],
+                      init_file, iface, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, tensor = out_queue.get(timeout=60)
+            results[rank] = tensor
+        return [results[r] for r in range(world_size)]
+    finally:
+        for p in procs:
+            p.join(timeout=5)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+        try:
+            os.remove(init_file)
+        except FileNotFoundError:
+            pass
+        try:
+            os.rmdir(init_dir)
+        except OSError:
+            pass
+</code></pre></div>
+
+<p><strong>Part 6 of 8 · <code>_mesh_worker</code>, <code>run_mesh</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def _mesh_worker(rank: int, world_size: int, op: str,
+                 grid, byte_counter, tensor_bytes: bytes,
+                 shape, dtype_str: str, src: int, out_queue) -&gt; None:
+    mesh = mesh_from_grid(rank, world_size, grid, byte_counter)
+    dtype = getattr(torch, dtype_str)
+    tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=dtype).reshape(shape).clone()
+    if op == &quot;allreduce&quot;:
+        result = ring_allreduce(mesh, tensor)
+    elif op == &quot;broadcast&quot;:
+        result = broadcast(mesh, tensor, src=src)
+    elif op == &quot;allgather&quot;:
+        result = allgather(mesh, tensor)
+    elif op == &quot;reduce_scatter&quot;:
+        result = reduce_scatter(mesh, tensor)
+    else:
+        raise ValueError(f&quot;unknown op {op}&quot;)
+    out_queue.put((rank, result))
+
+
+def run_mesh(op: str, world_size: int,
+             per_rank_tensors: list,
+             src: int = 0) -&gt; tuple:
+    &quot;&quot;&quot;Run the chosen primitive on the queue mesh and return per-rank outputs plus byte total.&quot;&quot;&quot;
+    ctx = mp.get_context(&quot;fork&quot;)
+    grid = build_queue_grid(ctx, world_size)
+    byte_counter = ctx.Value(&quot;q&quot;, 0)
+    out_queue = ctx.Queue()
+    procs = []
+    try:
+        for r in range(world_size):
+            t = per_rank_tensors[r].contiguous()
+            p = ctx.Process(
+                target=_mesh_worker,
+                args=(r, world_size, op, grid, byte_counter,
+                      bytes(t.numpy().tobytes()), tuple(t.shape),
+                      str(t.dtype).split(&quot;.&quot;)[-1], src, out_queue),
+            )
+            p.start()
+            procs.append(p)
+        results = {}
+        for _ in range(world_size):
+            rank, tensor = out_queue.get(timeout=60)
+            results[rank] = tensor
+        return [results[r] for r in range(world_size)], byte_counter.value
+    finally:
+        for p in procs:
+            p.join(timeout=30)
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=2)
+</code></pre></div>
+
+<p><strong>Part 7 of 8 · <code>verify_against_gloo</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def verify_against_gloo(op: str, world_size: int,
+                        per_rank_tensors: list) -&gt; tuple:
+    &quot;&quot;&quot;Compare mesh implementation against gloo reference, return (match, max_abs_diff).&quot;&quot;&quot;
+    mesh_out, _ = run_mesh(op, world_size, per_rank_tensors)
+    gloo_out = gloo_reference(op, world_size, per_rank_tensors)
+    max_diff = 0.0
+    for m, g in zip(mesh_out, gloo_out):
+        diff = (m - g).abs().max().item()
+        if diff &gt; max_diff:
+            max_diff = diff
+    return max_diff &lt; 1e-5, max_diff
+
+
+def main() -&gt; int:
+    world_size = 4
+    n = 64
+    torch.manual_seed(7)
+    per_rank = [torch.randn(n, dtype=torch.float32) for _ in range(world_size)]
+    print(f&quot;world_size={world_size}, tensor_len={n}, dtype=float32&quot;)
+    print(f&quot;{'op':&lt;16} {'gloo_match':&lt;12} {'max_abs_diff':&lt;14}&quot;)
+    for op in PRIMITIVES:
+        if op == &quot;broadcast&quot;:
+            inputs = [per_rank[0].clone() if r == 0 else torch.zeros(n) for r in range(world_size)]
+        elif op == &quot;reduce_scatter&quot;:
+            inputs = [torch.randn(n * world_size, dtype=torch.float32) for _ in range(world_size)]
+        else:
+            inputs = per_rank
+        match, diff = verify_against_gloo(op, world_size, inputs)
+        print(f&quot;{op:&lt;16} {str(match):&lt;12} {diff:&lt;14.3e}&quot;)
+    expected_per_rank_bytes = 2 * (world_size - 1) * (n // world_size) * 4
+    _, total_bytes = run_mesh(&quot;allreduce&quot;, world_size, per_rank)
+    per_rank_bytes = total_bytes / world_size
+    print(f&quot;\nallreduce per-rank bytes: measured={per_rank_bytes:.0f} &quot;
+          f&quot;expected={expected_per_rank_bytes} &quot;
+          f&quot;formula=2T(N-1)/N with T={n*4} bytes&quot;)
+    return 0
+</code></pre></div>
+
+<p><strong>Part 8 of 8 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">world_size=4, tensor_len=64, dtype=float32
+op               gloo_match   max_abs_diff  
+allreduce        True         4.768e-07     
+broadcast        True         0.000e+00     
+allgather        True         0.000e+00     
+reduce_scatter   True         4.768e-07     
+
+allreduce per-rank bytes: measured=384 expected=384 formula=2T(N-1)/N with T=256 bytes</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>All four operations built on queues match gloo: broadcast and all-gather exactly, all-reduce and reduce-scatter to about 5e-7, which is floating-point rounding from summing in a different order. The measured all-reduce traffic is 384 bytes per rank, exactly 2T(N − 1)/N for T = 256 bytes and N = 4. (This demo passes tensors between processes; on this site's build machine that required switching PyTorch to file-system sharing, which does not change the results.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team writes its own all-reduce in which rank 0 receives every tensor, sums them, and broadcasts the result. It works with 4 GPUs but becomes the bottleneck at 64. Why? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Four collectives: all-reduce, broadcast, all-gather, reduce-scatter.</li>
+<li>Ring all-reduce = reduce-scatter + all-gather.</li>
+<li>Each rank sends about 2T bytes whatever the number of ranks.</li>
+<li>Verify hand-built collectives against a reference backend.</li>
+<li>Small float differences come from summation order.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-distributed-training"><span class="t" style="--cs-hue:280">DF</span>Cheat sheet · Distributed Training: DDP, FSDP, ZeRO and Pipeline Parallelism</a></div>
+<h2>Ship it</h2>
+<p>Use the queue-mesh primitives in lessons 77-81. <a href="#a1977">Lesson 19.77</a> wires allreduce into DDP. <a href="#a1978">Lesson 19.78</a> wires reduce_scatter into ZeRO. <a href="#a1979">Lesson 19.79</a> moves pipeline activations with point-to-point send and recv, not a collective. <a href="#a1981">Lesson 19.81</a> composes all four into the end-to-end demo.</p>
+<h2>Exercises</h2>
+<ol>
+<li>Add a tree allreduce variant and switch between ring and tree by message size. Measure the crossover.</li>
+<li>Add a <code>recv_timeout_ms</code> so a stalled rank surfaces a deadline error instead of hanging forever.</li>
+<li>Replace <code>multiprocessing.Queue</code> with TCP sockets for the four primitives. Same tests, real wire.</li>
+<li>Add a bandwidth instrumentation hook so the per-rank byte counter logs to JSONL.</li>
+<li>Compare wall-clock time of ring versus tree on 4 ranks for tensors of size 1KB, 1MB, 16MB. Defend the crossover empirically.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1976-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · A receive timeout</span></summary><div class="qa-a"><p>Wrap every queue <code>get</code> in a deadline (<code>get(timeout=…)</code>) and raise an error naming the rank and step that stalled, instead of waiting forever. A distributed job that hangs silently is much harder to debug than one that fails with "rank 2 waited 30 s for rank 1 at reduce-scatter step 2".</p></div></details>
+<details class="qa" id="a1976-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A central bottleneck</span></summary><div class="qa-a"><p>Rank 0 must receive N − 1 full tensors and send N − 1 full tensors every step, so its traffic grows linearly with N while the others sit idle. A ring spreads the work evenly: every rank sends about 2T regardless of N.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://pytorch.org/docs/stable/distributed.html#collective-functions">PyTorch Distributed: NCCL collectives</a></li>
+<li><a href="https://arxiv.org/abs/1802.05799">Horovod ring allreduce paper</a></li>
+<li><a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html">NCCL topology and algorithm selection</a></li>
+<li><a href="https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf">Patarasuk and Yuan, Bandwidth optimal allreduce algorithms</a></li>
+<li>Phase 10 <a href="#a1905">Lesson 19.5</a> - distributed training overview</li>
+<li>Phase 19 <a href="#a1977">Lesson 19.77</a> - DDP wired on top of these primitives</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1976" id="done-a1976">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1976" id="undo-a1976" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1975"><span class="pn-dir">Previous</span><span class="pn-t">19.75 · An End-to-End Eval Runner</span></a><a class="pn next" href="#a1977"><span class="pn-dir">Next</span><span class="pn-t">19.77 · DDP Data Parallelism from Scratch</span></a></div></footer>

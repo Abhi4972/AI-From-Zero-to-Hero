@@ -1,0 +1,719 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-16">Phase 16 · Multi-Agent Systems and Swarms</a></nav><h1>Blackboard Architectures and Shared Memory for Agents</h1><div class="m-meta"><span class="chip chip-num">Lesson 16.18</span><span class="chip">75 min</span><span class="chip chip-core">Learn + Build</span><span class="chip chip-done" data-done-chip="a1613" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 16.9 (Primitive Model), Lesson 16.14 (Parallel Swarm Networks)</li>
+<li><strong>Type</strong>: Learn + Build. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python (stdlib, <code>threading</code>), TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Two approaches coexist in 2026 multi-agent systems: the <strong>message pool</strong> (everyone sees everyone's messages, as in AutoGen's GroupChat; MetaGPT adds role-based subscription on top) and the <strong>blackboard with subscription</strong> (agents subscribe to relevant events, close to Context-Aware MCP's shared context store). Both are the only stateful part of a multi-agent system — which means both are where the interesting bugs live. The reference failure mode is <strong>memory poisoning</strong>: one agent hallucinates a "fact," other agents treat it as verified, and accuracy decays gradually in a way that is much harder to debug than an immediate crash. This lesson builds both structures from stdlib, injects a poisoning attack, and shows the three mitigations that actually work in production.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message pool</td>
+<td>"Shared chat history"</td>
+<td>Append-only log that every agent reads. Full transparency, poor scaling.</td>
+</tr>
+<tr>
+<td>Blackboard</td>
+<td>"Shared workspace"</td>
+<td>Topic-keyed pub/sub. Agents subscribe to relevant topics. Scales farther.</td>
+</tr>
+<tr>
+<td>Provenance</td>
+<td>"Who wrote what"</td>
+<td>Metadata on each write: writer, timestamp, prompt, sources.</td>
+</tr>
+<tr>
+<td>Memory poisoning</td>
+<td>"Hallucinations spreading"</td>
+<td>One agent's error enters shared state, downstream agents adopt it as fact.</td>
+</tr>
+<tr>
+<td>Append-only</td>
+<td>"No in-place updates"</td>
+<td>Corrections are new entries that supersede. Preserves audit trail.</td>
+</tr>
+<tr>
+<td>Unwritable verifier</td>
+<td>"Independent auditor"</td>
+<td>Read-only agent that re-fetches sources and flags inconsistencies.</td>
+</tr>
+<tr>
+<td>Projection</td>
+<td>"Scoped view"</td>
+<td>Per-agent view computed from global state. LangGraph's per-node input and private state schemas are one implementation.</td>
+</tr>
+<tr>
+<td>Knowledge Source</td>
+<td>"Specialist agent"</td>
+<td>Hayes-Roth's 1985 term for a blackboard participant.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-connect zta"><div class="co-label">Build up to this</div><div class="co-title">Lessons that cover the basics first</div><div class="co-body"><p>These lessons teach the basics this one builds on. Read them first if the ideas are new; this lesson does not repeat them.</p><ul><li><a class="xref" href="#l0310">Lesson 14.11 · Memory II: long-term, episodic and procedural memory</a></li><li><a class="xref" href="#l0614">Lesson 14.64 · Memory: trimming threads and the long-term store</a></li></ul></div></aside>
+<h2>Problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When several agents work on one task, they need a shared place to put what they found. A <strong>message pool</strong> is a shared log that every agent reads. A <strong>blackboard</strong> splits the shared space into topics, and each agent sees only the topics it subscribes to. Either way, one agent's mistake can be read by every other agent as a fact. Memory for a single agent (trimming threads and the long-term store) is covered in Lessons 14.11 and 14.64 (linked above). This lesson tests the lesson's pool, blackboard and verifier on writes its demo does not make, adds lineage so a flag reaches derived entries, and tries a small model as summarizer and as verifier.</p></div></aside>
+
+<p>Multi-agent systems need a place for agents to share facts. A literal option is "pass everything in messages" — but that reinvents shared state with extra copying. Another is "give everyone a global log" — but global logs grow unbounded and poison easily. A third is "project a view per agent" — scalable but schema-heavy.</p>
+<p>When one of the agents hallucinates and writes the hallucination to shared state, every downstream agent that reads that state adopts the hallucination as fact. By the time the human notices, the reasoning chain is five steps deep and the root cause is the third message ever written. Debugging multi-agent accuracy decay is harder than debugging a crash.</p>
+<p>This is memory poisoning. MAST (Cemri et al., arXiv:2503.13657) does not name it; its closest failure modes are information withholding, ignoring other agents' input, and missing or incorrect verification. OWASP's Top 10 for Agentic Applications (December 2025) lists it as ASI06, Memory and Context Poisoning. It is structural: any shared-memory design without provenance and an unwritable verifier will exhibit it eventually.</p>
+<h2>Concept</h2>
+<h3>The two main topologies</h3>
+<p><strong>Full message pool.</strong> Every agent reads every message. AutoGen's GroupChat uses this. MetaGPT starts from a shared pool but lets each role subscribe to the messages its profile needs, which is closer to the blackboard below. Simple, transparent, inspectable, but does not scale past ~10 agents because each agent's context fills with other agents' work.</p>
+<figure class="diagram mmfig" data-mmd="a1613" data-h="15f971d40d"><div class="dg-scroll"><svg class="dg mm" id="mm15f971d40d" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 764.059px; background-color: transparent;" viewBox="0 0 764.05859375 328.769287109375" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm15f971d40d{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm15f971d40d .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm15f971d40d .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm15f971d40d .error-icon{fill:#f4efe7;}#mm15f971d40d .error-text{fill:#0b1018;stroke:#0b1018;}#mm15f971d40d .edge-thickness-normal{stroke-width:1px;}#mm15f971d40d .edge-thickness-thick{stroke-width:3.5px;}#mm15f971d40d .edge-pattern-solid{stroke-dasharray:0;}#mm15f971d40d .edge-thickness-invisible{stroke-width:0;fill:none;}#mm15f971d40d .edge-pattern-dashed{stroke-dasharray:3;}#mm15f971d40d .edge-pattern-dotted{stroke-dasharray:2;}#mm15f971d40d .marker{fill:#6c6357;stroke:#6c6357;}#mm15f971d40d .marker.cross{stroke:#6c6357;}#mm15f971d40d svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm15f971d40d p{margin:0;}#mm15f971d40d .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm15f971d40d .cluster-label text{fill:#0b1018;}#mm15f971d40d .cluster-label span{color:#0b1018;}#mm15f971d40d .cluster-label span p{background-color:transparent;}#mm15f971d40d .label text,#mm15f971d40d span{fill:#211c16;color:#211c16;}#mm15f971d40d .node rect,#mm15f971d40d .node circle,#mm15f971d40d .node ellipse,#mm15f971d40d .node polygon,#mm15f971d40d .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm15f971d40d .rough-node .label text,#mm15f971d40d .node .label text,#mm15f971d40d .image-shape .label,#mm15f971d40d .icon-shape .label{text-anchor:middle;}#mm15f971d40d .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm15f971d40d .rough-node .label,#mm15f971d40d .node .label,#mm15f971d40d .image-shape .label,#mm15f971d40d .icon-shape .label{text-align:center;}#mm15f971d40d .node.clickable{cursor:pointer;}#mm15f971d40d .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm15f971d40d .arrowheadPath{fill:#0b0b0b;}#mm15f971d40d .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm15f971d40d .flowchart-link{stroke:#6c6357;fill:none;}#mm15f971d40d .edgeLabel{background-color:#ffffff;text-align:center;}#mm15f971d40d .edgeLabel p{background-color:#ffffff;}#mm15f971d40d .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm15f971d40d .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm15f971d40d .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm15f971d40d .cluster text{fill:#0b1018;}#mm15f971d40d .cluster span{color:#0b1018;}#mm15f971d40d div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm15f971d40d .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm15f971d40d rect.text{fill:none;stroke-width:0;}#mm15f971d40d .icon-shape,#mm15f971d40d .image-shape{background-color:#ffffff;text-align:center;}#mm15f971d40d .icon-shape p,#mm15f971d40d .image-shape p{background-color:#ffffff;padding:2px;}#mm15f971d40d .icon-shape .label rect,#mm15f971d40d .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm15f971d40d .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm15f971d40d .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm15f971d40d .node .neo-node{stroke:#b5521b;}#mm15f971d40d [data-look="neo"].node rect,#mm15f971d40d [data-look="neo"].cluster rect,#mm15f971d40d [data-look="neo"].node polygon{stroke:url(#mm15f971d40d-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm15f971d40d [data-look="neo"].swimlane.cluster rect{filter:none;}#mm15f971d40d [data-look="neo"].node path{stroke:url(#mm15f971d40d-gradient);stroke-width:1px;}#mm15f971d40d [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm15f971d40d [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm15f971d40d [data-look="neo"].node circle{stroke:url(#mm15f971d40d-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm15f971d40d [data-look="neo"].node circle .state-start{fill:#000000;}#mm15f971d40d [data-look="neo"].icon-shape .icon{fill:url(#mm15f971d40d-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm15f971d40d [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm15f971d40d-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm15f971d40d :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm15f971d40d_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm15f971d40d_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm15f971d40d_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mm15f971d40d-BB" data-look="classic"><rect style="" x="8" y="8" width="448.02734375" height="312.769287109375"/><g class="cluster-label" transform="translate(132.333984375, 8)"><foreignObject width="199.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>Blackboard with subscriptions</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M212.156,122.321L195.337,132.646C178.518,142.971,144.88,163.62,128.061,181.278C111.242,198.936,111.242,213.603,111.242,220.936L111.242,228.269" id="mm15f971d40d-L_B_Y1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_Y1_0" data-points="W3sieCI6MjEyLjE1NjI1LCJ5IjoxMjIuMzIxMzkwNjAxNzc5NTZ9LHsieCI6MTExLjI0MjE4NzUsInkiOjE4NC4yNjkyODcxMDkzNzV9LHsieCI6MTExLjI0MjE4NzUsInkiOjIzMi4yNjkyODcxMDkzNzV9XQ==" data-look="classic" marker-end="url(#mm15f971d40d_flowchart-v2-pointEnd)"/><path d="M263.367,136.269L263.367,144.269C263.367,152.269,263.367,168.269,268.601,183.724C273.834,199.178,284.301,214.087,289.534,221.541L294.768,228.996" id="mm15f971d40d-L_B_Y2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_Y2_0" data-points="W3sieCI6MjYzLjM2NzE4NzUsInkiOjEzNi4yNjkyODcxMDkzNzV9LHsieCI6MjYzLjM2NzE4NzUsInkiOjE4NC4yNjkyODcxMDkzNzV9LHsieCI6Mjk3LjA2NjE2NzA5MTgzNjc1LCJ5IjoyMzIuMjY5Mjg3MTA5Mzc1fV0=" data-look="classic" marker-end="url(#mm15f971d40d_flowchart-v2-pointEnd)"/><path d="M332.871,232.269L338.488,224.269C344.104,216.269,355.337,200.269,352.567,183.26C349.797,166.25,333.023,148.231,324.636,139.221L316.249,130.211" id="mm15f971d40d-L_Y2_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_Y2_B_0" data-points="W3sieCI6MzMyLjg3MTMzMjkwODE2MzI1LCJ5IjoyMzIuMjY5Mjg3MTA5Mzc1fSx7IngiOjM2Ni41NzAzMTI1LCJ5IjoxODQuMjY5Mjg3MTA5Mzc1fSx7IngiOjMxMy41MjM1ODIyMDg2NDMyLCJ5IjoxMjcuMjgzMzcxMzYyMTAxMzl9XQ==" data-look="classic" marker-end="url(#mm15f971d40d_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel" transform="translate(111.2421875, 184.269287109375)"><g class="label" data-id="L_B_Y1_0" transform="translate(-56.21875, -10.5)"><foreignObject width="112.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>only 'hypothesis'</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(263.3671875, 184.269287109375)"><g class="label" data-id="L_B_Y2_0" transform="translate(-34.5390625, -10.5)"><foreignObject width="69.078125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>only 'data'</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(360.02712, 177.24021)"><g class="label" data-id="L_Y2_B_0" transform="translate(-48.6640625, -10.5)"><foreignObject width="97.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>writes findings</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm15f971d40d-flowchart-B-2" data-look="classic" transform="translate(263.3671875, 90.8846435546875)"><path d="M0,11.259017519752662 a51.2109375,11.259017519752662 0,0,0 102.421875,0 a51.2109375,11.259017519752662 0,0,0 -102.421875,0 l0,68.25901751975266 a51.2109375,11.259017519752662 0,0,0 102.421875,0 l0,-68.25901751975266" class="basic label-container outer-path" style="" transform="translate(-51.2109375, -45.38852627962899)"/><g class="label" style="" transform="translate(-43.7109375, -11)"><rect/><foreignObject width="87.421875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Blackboard<br />typed entries</p></span></div></foreignObject></g></g><g class="node default" id="mm15f971d40d-flowchart-Y1-3" data-look="classic" transform="translate(111.2421875, 257.769287109375)"><rect class="basic label-container" style="" x="-68.2421875" y="-25.5" width="136.484375" height="51"/><g class="label" style="" transform="translate(-38.2421875, -10.5)"><rect/><foreignObject width="76.484375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Critic agent</p></span></div></foreignObject></g></g><g class="node default" id="mm15f971d40d-flowchart-Y2-5" data-look="classic" transform="translate(314.96875, 257.769287109375)"><rect class="basic label-container" style="" x="-75.25" y="-25.5" width="150.5" height="51"/><g class="label" style="" transform="translate(-45.25, -10.5)"><rect/><foreignObject width="90.5" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Analyst agent</p></span></div></foreignObject></g></g></g></g><g class="root" transform="translate(498.02734375, 12.07891845703125)"><g class="clusters"><g class="cluster" id="mm15f971d40d-MP" data-look="classic"><rect style="" x="8" y="8" width="250.03125" height="288.61145782470703"/><g class="cluster-label" transform="translate(86.5703125, 8)"><foreignObject width="92.890625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5;"><span class="nodeLabel"><p>Message pool</p></span></div></foreignObject></g></g></g><g class="edgePaths"><path d="M133.016,112.111L133.016,118.361C133.016,124.611,133.016,137.111,133.016,148.945C133.016,160.778,133.016,171.945,133.016,177.528L133.016,183.111" id="mm15f971d40d-L_P_X1_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_P_X1_0" data-points="W3sieCI6MTMzLjAxNTYyNSwieSI6MTEyLjExMTQ1NzgyNDcwNzAzfSx7IngiOjEzMy4wMTU2MjUsInkiOjE0OS42MTE0NTc4MjQ3MDcwM30seyJ4IjoxMzMuMDE1NjI1LCJ5IjoxODcuMTExNDU3ODI0NzA3MDN9XQ==" data-look="classic" marker-end="url(#mm15f971d40d_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_P_X1_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm15f971d40d-flowchart-P-0" data-look="classic" transform="translate(133.015625, 78.80572891235352)"><path d="M0,10.2038174151069 a43.1015625,10.2038174151069 0,0,0 86.203125,0 a43.1015625,10.2038174151069 0,0,0 -86.203125,0 l0,46.2038174151069 a43.1015625,10.2038174151069 0,0,0 86.203125,0 l0,-46.2038174151069" class="basic label-container outer-path" style="" transform="translate(-43.1015625, -33.305726122660346)"/><g class="label" style="" transform="translate(-35.6015625, -0.5)"><rect/><foreignObject width="71.203125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Shared log</p></span></div></foreignObject></g></g><g class="node default" id="mm15f971d40d-flowchart-X1-1" data-look="classic" transform="translate(133.015625, 223.11145782470703)"><rect class="basic label-container" style="" x="-90.015625" y="-36" width="180.03125" height="72"/><g class="label" style="" transform="translate(-60.015625, -21)"><rect/><foreignObject width="120.03125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Every agent reads<br />every message</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mm15f971d40d-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm15f971d40d-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm15f971d40d-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">agent-A ──write──▶ ┌────────────────┐ ◀──read── agent-D
+                   │ message pool   │
+agent-B ──write──▶ │                │ ◀──read── agent-E
+                   │ (global log)   │
+agent-C ──write──▶ └────────────────┘ ◀──read── agent-F
+</code></pre></div>
+<p><strong>Blackboard with subscription.</strong> Agents declare interest in topics; the substrate routes only relevant messages. CA-MCP (arXiv:2601.11595) uses a central Shared Context Store that servers read, write and watch for trigger flags. Matrix (arXiv:2511.21686, from Meta) has no shared board at all: each task's state travels as a message through per-role queues. Scales further, but requires upfront schema design to make subscriptions meaningful.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">                   ┌─ topic: prices ──┐
+agent-A ──pub────▶ │                  │ ──▶ agent-D (subscribed)
+                   ├─ topic: orders ──┤
+agent-B ──pub────▶ │                  │ ──▶ agent-E (subscribed)
+                   ├─ topic: alerts ──┤
+agent-C ──pub────▶ │                  │ ──▶ agent-F (subscribed)
+                   └──────────────────┘
+</code></pre></div>
+<h3>When each wins</h3>
+<ul>
+<li><strong>Full pool</strong> wins when agents are few (&lt; 10), heterogeneous, and the conversation is short-horizon. Reasoning about who said what is trivial when everyone sees everything.</li>
+<li><strong>Blackboard</strong> wins when agents are many, homogeneous in role but numerous in instance (swarms), and the conversation is long-running. Routing saves token cost and context pollution.</li>
+</ul>
+<p>Production systems often mix: a small full pool at the top (planning layer), blackboards below (worker layer).</p>
+<h3>Memory poisoning, in one scenario</h3>
+<p>Three agents work on a research task. Agent A is a retrieval agent. Agent B is a summarizer. Agent C is an analyst.</p>
+<ol>
+<li>A fetches a page and writes a message to shared state: "The study reports a 42% accuracy improvement."</li>
+<li>The fetched page actually said "4.2% improvement." A hallucinated a decimal.</li>
+<li>B, reading shared state, writes: "Large 42% accuracy gain reported (source: A)."</li>
+<li>C, reading shared state, writes: "Recommend adoption — 42% lift is transformative."</li>
+<li>The final report cites a 42% number that never existed.</li>
+</ol>
+<p>No agent crashed. No test failed. The system "worked." The hallucination crossed from one agent's context into every downstream agent's reasoning via shared state.</p>
+<h3>Why this is structural</h3>
+<p>Without shared state, agent A's hallucination stays in A's context. Downstream agents would re-fetch or re-derive and might catch the error. With naive shared state, A's context becomes everyone's context, and the hallucination is laundered into fact.</p>
+<p>The problem is not shared state per se — it is shared state <strong>without provenance and without an independent verifier</strong>. Three mitigations address this:</p>
+<ol>
+<li><strong>Attribute provenance on every write.</strong> Every entry in shared state records who wrote it, when, under what prompt, and (if applicable) what source the agent cited. Downstream agents read with skepticism keyed to provenance.</li>
+<li><strong>Version writes; treat them as append-only.</strong> A correction is a new entry that supersedes the old, not an in-place update. The audit trail is preserved.</li>
+<li><strong>Keep at least one agent that cannot write to shared state.</strong> A read-only verifier agent samples entries, re-fetches sources, and flags inconsistencies. It still reads the pool, so it can be fooled by a bad entry, but it checks each entry against the original source and cannot write, so its verdicts never feed a poisoned fact back into shared state.</li>
+</ol>
+<h3>Blackboard precedent (Hayes-Roth, 1985)</h3>
+<p>The blackboard pattern predates LLM agents by about five decades. It comes from the Hearsay-II speech-understanding system of the 1970s (Erman et al., 1980), where specialist Knowledge Sources observe a global blackboard, contribute partial solutions, and trigger other sources. Hayes-Roth (1985, "A Blackboard Architecture for Control") extended it to control: deciding which Knowledge Source acts next. CA-MCP's shared context store is the same pattern with LLM agents and MCP servers as Knowledge Sources and JSON blobs as partial solutions. The old literature has documented solutions to write contention, opportunistic control, and consistency that modern systems rediscover.</p>
+<h3>Projection vs full view</h3>
+<p>A pure blackboard gives every subscriber the same projection (topic-scoped). A more aggressive design is <strong>per-agent projection</strong>: each agent gets a view customized to its role. In LangGraph, nodes and subgraphs can declare their own input and private state schemas, so each sees only a slice of the graph's state. Reducers handle the other direction: how updates from several nodes merge back into the shared state.</p>
+<p>Per-agent projection scales further but needs a schema. Without one, you rebuild ad-hoc projection in every agent's prompt.</p>
+<h3>Write-contention patterns</h3>
+<p>Multiple agents writing simultaneously is a concurrency problem, not just an LLM problem. Three patterns work:</p>
+<ul>
+<li><strong>Sequential writer (single producer).</strong> All writes go through one coordinator agent that serializes. Simple, but a bottleneck.</li>
+<li><strong>Optimistic concurrency with versioning.</strong> Each entry has a version; writers fail on version mismatch and retry. Classic database technique.</li>
+<li><strong>Topic partitioning.</strong> Different agents own different topics. No cross-topic contention. Requires designed partition boundaries.</li>
+</ul>
+<p>Many frameworks run one writer at a time, because LLM calls are slow enough that contention is rare and the bottleneck does not hurt. LangGraph runs nodes in parallel instead, and raises an INVALID_CONCURRENT_GRAPH_UPDATE error when two nodes write the same key in one step without a reducer to merge them.</p>
+<h3>The unwritable verifier</h3>
+<p>The most load-bearing mitigation is the read-only verifier. Implementation rules:</p>
+<ul>
+<li>Verifier shares state with the team (reads the blackboard or pool).</li>
+<li>Verifier has no write handle to shared state — only to a separate verification channel.</li>
+<li>Verifier independently fetches sources cited in writes. Flags disagreement.</li>
+<li>Verifier's own outputs are routed to a human or a separate decision agent, never fed back into the pool.</li>
+</ul>
+<p>Without this separation, the verifier's outputs become new entries in the pool, which means a poisoned pool poisons the verifier, which poisons its verifications.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="swarm-blackboard"></div></figure></p>
+
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Lineage.</strong> Give every entry <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">e</span></span></span></span> the set of entries it was built from, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">parents</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span></span></span></span>. An entry is tainted if it was flagged or if any parent is tainted:
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">flag</span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mclose">)</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">∨</span><span class="mspace"> </span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:2.566em;vertical-align:-1.516em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.05em;"><span style="top:-1.809em;margin-left:0em;"><span class="pstrut" style="height:3.05em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">p</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mrel mtight">∈</span><span class="mspace mtight" style="margin-right:0.1952em;"></span><span class="mord text mtight"><span class="mord mtight">parents</span></span><span class="mopen mtight">(</span><span class="mord mathnormal mtight">e</span><span class="mclose mtight">)</span></span></span></span><span style="top:-3.05em;"><span class="pstrut" style="height:3.05em;"></span><span><span class="mop op-symbol large-op">⋁</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.516em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mord">.</span></span></span></span></span></div>
+A flag on the root then reaches every summary and verdict built on it. Without parents, a flag stops at the entry it was put on.</p>
+<p><strong>Two ways a verifier errs.</strong> Over <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> writes, a verifier flags honest writes (false positives, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span></span></span></span>) and passes wrong ones (false negatives, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span></span></span></span>). Its accuracy is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span><span class="mclose">)</span><span class="mord">/</span><span class="mord mathnormal">n</span></span></span></span>. Exact string matching has <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">FN</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0</span></span></span></span> for cited writes and a large <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">FP</span></span></span></span>, since any honest paraphrase fails; it has no view of uncited writes at all.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Following one flag through the pool</div><div class="co-body"><ul>
+<li>Entry 0: the retriever writes "42% accuracy improvement", citing paper-1. Entry 1: the summarizer builds on entry 0 and cites nothing.</li>
+<li>The verifier re-fetches paper-1, sees "4.2%", and flags entry 0.</li>
+<li>The analyst reads only summaries. Entry 1 has no flag, so it recommends adoption.</li>
+<li>With lineage, entry 1 records parents <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">{</span><span class="mord">0</span><span class="mclose">}</span></span></span></span>, so <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord text"><span class="mord">taint</span></span><span class="mopen">(</span><span class="mord">0</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord text"><span class="mord">true</span></span></span></span></span>. The analyst has no clean summary and waits for a corrected retrieval.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Once the verifier flags the bad entry, the report is safe."<br>
+  ✓ In the lesson's run 2 the analyst read the unflagged summary built on it and still recommended adoption.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Comparing each write with its source text catches errors."<br>
+  ✓ Exact matching flagged two honest writes, one missing only a full stop, and passed an invented figure with no source.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Memory poisoning is a MAST failure category."<br>
+  ✓ MAST's 14 modes do not include it; OWASP's agentic Top 10 lists it as ASI06.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Publishing to a blackboard delivers to every subscriber."<br>
+  ✓ In the lesson's blackboard, one crashing subscriber stops delivery to the rest and raises into the publisher.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In the lesson's run 2, the verifier flags the retriever's 42% entry before the analyst runs. What does the analyst recommend? And of five writes, two of them wrong, how many does the exact-match verifier judge correctly? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Testing the lesson's pool, verifier and blackboard</div><div class="co-body"><p>The lesson's <code>MessagePool</code>, <code>verifier_agent</code> and <code>Blackboard</code>: a flag that does not reach a derived entry, five writes through the exact-match verifier, a failing subscriber and a late one, and lineage with taint as a fix. Runs in under a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># The lesson&#x27;s MessagePool, Blackboard and verifier (imported from main.py), pushed past the demo: does a flag
+# stop the poisoned figure? What does an exact-match verifier catch and miss? What happens to a derived entry,
+# a failing subscriber and a late subscriber? Then one fix: lineage plus taint. Runs in under a second.
+from main import (MessagePool, Blackboard, ProvenanceEntry, FAKE_SOURCES, retrieval_agent,
+                  summarizer_agent, analyst_agent, verifier_agent)
+
+print(&quot;1. the lesson&#x27;s run 2: the verifier flags, then the analyst runs&quot;)
+pool = MessagePool()
+retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+summarizer_agent(pool)
+findings = verifier_agent(pool)
+for eid, why in findings:
+    pool.flag(eid, why)
+analyst_agent(pool)
+for e in pool.read_all():
+    print(f&quot;   [{e.id}] {e.writer:10s} flagged={bool(e.flags)!s:5s} {e.content[:70]}&quot;)
+print(f&quot;   flags on: {[e.id for e in pool.read_all() if e.flags]}; the analyst read entry 1, which has no flag, and still recommends adoption&quot;)
+
+print(&quot;\n2. an exact-match verifier on five writes&quot;)
+P1, P2 = &quot;https://arxiv.org/paper-1&quot;, &quot;https://arxiv.org/paper-2&quot;
+writes = [  # (writer, content, source, really correct?)
+    (&quot;retriever&quot;, FAKE_SOURCES[P1], P1, True),                                   # verbatim copy
+    (&quot;retriever&quot;, &quot;Accuracy rose 4.2% over the baseline.&quot;, P1, True),            # honest paraphrase
+    (&quot;retriever&quot;, &quot;The study reports a 42% accuracy improvement over the baseline.&quot;, P1, False),
+    (&quot;retriever&quot;, &quot;Dataset size was 12,500 examples&quot;, P2, True),                # same text, no final period
+    (&quot;summarizer&quot;, &quot;The dataset had 125,000 examples.&quot;, None, False),           # invented, no source cited
+]
+pool = MessagePool()
+for w, c, s, _ in writes:
+    pool.write(w, c, &quot;task&quot;, source_uri=s)
+flagged = {eid for eid, _ in verifier_agent(pool)}
+for i, (w, c, s, ok) in enumerate(writes):
+    verdict = &quot;FLAG&quot; if i in flagged else &quot;pass&quot;
+    right = (verdict == &quot;FLAG&quot;) != ok
+    print(f&quot;   [{i}] {&#x27;correct&#x27; if ok else &#x27;WRONG  &#x27;}  {verdict}  {&#x27;ok &#x27; if right else &#x27;MISS&#x27;} {c[:55]}&quot;)
+print(f&quot;   {sum(((i in flagged) != ok) for i, (*_, ok) in enumerate(writes))} of 5 judged right: &quot;
+      &quot;two honest writes flagged, the uncited invention passed&quot;)
+
+print(&quot;\n3. the blackboard: a subscriber that fails, and one that joins late&quot;)
+bb = Blackboard()
+got = {&quot;risk&quot;: [], &quot;ledger&quot;: [], &quot;late&quot;: []}
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;risk&quot;].append(e.id))
+def broken(e):
+    raise ValueError(&quot;ledger agent crashed&quot;)
+bb.subscribe(&quot;prices&quot;, broken)
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;ledger&quot;].append(e.id))
+try:
+    bb.publish(&quot;scraper-1&quot;, &quot;prices&quot;, &quot;AAPL=192.4&quot;, &quot;poll&quot;)
+except ValueError as err:
+    print(f&quot;   publish raised into the scraper: {err}&quot;)
+print(f&quot;   stored: {[e.id for e in bb.read_topic(&#x27;prices&#x27;)]}; delivered: risk {got[&#x27;risk&#x27;]}, ledger {got[&#x27;ledger&#x27;]} &quot;
+      &quot;(after the crash, nobody else is called)&quot;)
+bb.subscribe(&quot;prices&quot;, lambda e: got[&quot;late&quot;].append(e.id))
+print(f&quot;   a subscriber that joins now has received {got[&#x27;late&#x27;]}; nothing replays entry 0 unless it reads the topic&quot;)
+
+print(&quot;\n4. one fix: record what each entry was derived from, and taint descendants of a flagged entry&quot;)
+class LineagePool(MessagePool):
+    def __init__(self):
+        super().__init__(); self.parents = {}
+    def write(self, writer, content, prompt, source_uri=None, derived_from=(), **kw):
+        eid = super().write(writer, content, prompt, source_uri, **kw)
+        self.parents[eid] = tuple(derived_from)
+        return eid
+    def tainted(self):
+        bad = {e.id for e in self.read_all() if e.flags}
+        changed = True
+        while changed:
+            new = {eid for eid, ps in self.parents.items() if set(ps) &amp; bad} - bad
+            bad |= new; changed = bool(new)
+        return bad
+lp = LineagePool()
+r = lp.write(&quot;retriever&quot;, &quot;The study reports a 42% accuracy improvement over the baseline.&quot;, &quot;fetch&quot;, P1)
+s = lp.write(&quot;summarizer&quot;, &quot;Summary: a significant 42% gain.&quot;, &quot;summarize&quot;, derived_from=[r])
+for eid, why in verifier_agent(lp):
+    lp.flag(eid, why)
+bad = lp.tainted()
+inputs = [e for e in lp.read_all() if e.writer == &quot;summarizer&quot; and e.id not in bad]
+print(f&quot;   flagged {[e.id for e in lp.read_all() if e.flags]}, tainted {sorted(bad)}; the analyst has &quot;
+      f&quot;{len(inputs)} usable summaries, so it waits for a corrected retrieval instead of recommending adoption&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. the lesson&#x27;s run 2: the verifier flags, then the analyst runs
+   [0] retriever  flagged=True  The study reports a 42% accuracy improvement over the baseline.
+   [1] summarizer flagged=False Summary: study reports a significant result -- The study reports a 42%
+   [2] analyst    flagged=False Analyst verdict: Recommend adoption (based on: Summary: study reports 
+   flags on: [0]; the analyst read entry 1, which has no flag, and still recommends adoption
+
+2. an exact-match verifier on five writes
+   [0] correct  pass  ok  The study reports a 4.2% accuracy improvement over the 
+   [1] correct  FLAG  MISS Accuracy rose 4.2% over the baseline.
+   [2] WRONG    FLAG  ok  The study reports a 42% accuracy improvement over the b
+   [3] correct  FLAG  MISS Dataset size was 12,500 examples
+   [4] WRONG    pass  MISS The dataset had 125,000 examples.
+   2 of 5 judged right: two honest writes flagged, the uncited invention passed
+
+3. the blackboard: a subscriber that fails, and one that joins late
+   publish raised into the scraper: ledger agent crashed
+   stored: [0]; delivered: risk [0], ledger [] (after the crash, nobody else is called)
+   a subscriber that joins now has received []; nothing replays entry 0 unless it reads the topic
+
+4. one fix: record what each entry was derived from, and taint descendants of a flagged entry
+   flagged [0], tainted [0, 1]; the analyst has 0 usable summaries, so it waits for a corrected retrieval instead of recommending adoption
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The flag did not stop the poisoned figure.</strong> The verifier flagged entry 0, the retriever's 42%. The analyst reads only summaries, and entry 1, the summary built on entry 0, had no flag and no source, so the analyst still recommended adoption. The lesson's expected "retraction" in run 2 does not happen.</p>
+<p><strong>Exact matching judged 2 of 5 writes right.</strong> It caught the 42% write and passed the verbatim copy. It flagged an honest paraphrase and a write that differed from the source only by a missing full stop. It passed "125,000 examples" because that write cited no source, so it was never checked.</p>
+<p><strong>One bad subscriber silences the rest.</strong> When the second subscriber raised an error, the entry was already stored, the publisher got the exception, and the third subscriber was never called. A subscriber that joined afterwards received nothing until it read the topic itself.</p>
+<p><strong>Lineage carries the flag.</strong> With <code>derived_from</code> on each write, the flag on entry 0 tainted entry 1 too, and the analyst had no clean summary to build on.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">A small model in the pool, and as a verifier</div><div class="co-body"><p>This block continues from the one above. Qwen2.5-0.5B-Instruct (greedy, CPU) summarizes the poisoned entry and then judges adoption from its own summary. Then it checks twelve claim/source pairs, scored by its Yes/No logit margin, against the lesson's exact match and a check that every number in the claim appears in the source. About 1 minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># This block continues from the one above. Qwen2.5-0.5B-Instruct (greedy, CPU) plays two roles. First, as the
+# summarizer and the analyst reading a pool that holds the poisoned 42% entry: does the figure survive two hops?
+# Second, as a verifier: for twelve claim/source pairs, does the claim agree with the source? Scored by the
+# Yes/No logit margin (yes when Yes outscores No), and compared with the lesson&#x27;s exact match and a number check.
+import os, re, warnings
+os.environ[&quot;HF_HUB_OFFLINE&quot;] = &quot;1&quot;
+warnings.filterwarnings(&quot;ignore&quot;)
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, logging as hf_logging
+hf_logging.set_verbosity_error(); hf_logging.disable_progress_bar()
+tok = AutoTokenizer.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;)
+llm = AutoModelForCausalLM.from_pretrained(&quot;Qwen/Qwen2.5-0.5B-Instruct&quot;).eval()
+
+def chat(prompt, n=60):
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: prompt}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        out = llm.generate(ids, max_new_tokens=n, do_sample=False)
+    return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+print(&quot;1. two hops through a poisoned pool&quot;)
+pool = MessagePool()
+retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+entry = pool.read_all()[0].content
+summary = chat(f&quot;Shared notes from the retrieval agent:\n{entry}\nWrite a one-sentence summary for the analyst.&quot;)
+pool.write(&quot;summarizer&quot;, summary, &quot;summarize&quot;)
+verdict = chat(f&quot;Shared notes:\n{summary}\nShould the team adopt the new method? Answer in one sentence.&quot;)
+print(f&quot;   summarizer: {summary}&quot;)
+print(f&quot;   analyst:    {verdict}&quot;)
+print(f&quot;   42% in summary: {&#x27;42%&#x27; in summary}; 42% or adoption in verdict: {&#x27;42&#x27; in verdict or &#x27;adopt&#x27; in verdict.lower()}&quot;)
+
+print(&quot;\n2. a model verifier on twelve claim/source pairs&quot;)
+SRC = {&quot;a&quot;: &quot;The study reports a 4.2% accuracy improvement over the baseline.&quot;,
+       &quot;b&quot;: &quot;Dataset size was 12,500 examples.&quot;,
+       &quot;c&quot;: &quot;Training took 3 days on 8 GPUs.&quot;,
+       &quot;d&quot;: &quot;The model was evaluated on 5 benchmarks and won 3.&quot;}
+PAIRS = [(&quot;a&quot;, &quot;Accuracy improved by 4.2% over the baseline.&quot;, True),
+         (&quot;a&quot;, &quot;Accuracy improved by 42% over the baseline.&quot;, False),
+         (&quot;a&quot;, &quot;The study found a small accuracy gain of 4.2%.&quot;, True),
+         (&quot;b&quot;, &quot;The dataset contained 12,500 examples.&quot;, True),
+         (&quot;b&quot;, &quot;The dataset contained 125,000 examples.&quot;, False),
+         (&quot;b&quot;, &quot;About twelve thousand five hundred examples were used.&quot;, True),
+         (&quot;c&quot;, &quot;Training ran for 3 days on 8 GPUs.&quot;, True),
+         (&quot;c&quot;, &quot;Training ran for 8 days on 3 GPUs.&quot;, False),
+         (&quot;c&quot;, &quot;Training took three days.&quot;, True),
+         (&quot;d&quot;, &quot;It won 3 of 5 benchmarks.&quot;, True),
+         (&quot;d&quot;, &quot;It won all 5 benchmarks.&quot;, False),
+         (&quot;d&quot;, &quot;It won 5 of 3 benchmarks.&quot;, False)]
+YES, NO = tok.encode(&quot;Yes&quot;)[0], tok.encode(&quot;No&quot;)[0]
+def margin(src, claim):
+    p = (f&quot;Source: {src}\nClaim: {claim}\nDoes the claim agree with the source? Answer Yes or No.&quot;)
+    ids = tok.apply_chat_template([{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: p}], add_generation_prompt=True,
+                                  return_tensors=&quot;pt&quot;, return_dict=True)[&quot;input_ids&quot;]
+    with torch.no_grad():
+        lg = llm(ids).logits[0, -1]
+    return (lg[YES] - lg[NO]).item()
+ms = [margin(SRC[k], c) for k, c, _ in PAIRS]
+nums = lambda s: set(re.findall(r&quot;\d[\d,.]*\d|\d&quot;, s.replace(&quot;,&quot;, &quot;&quot;)))
+for (k, c, ok), m in zip(PAIRS, ms):
+    print(f&quot;   {&#x27;agree   &#x27; if ok else &#x27;DISAGREE&#x27;} margin {m:+5.2f} model {&#x27;yes&#x27; if m &gt; 0 else &#x27;no &#x27;} &quot;
+          f&quot;numbers {&#x27;ok  &#x27; if nums(c) &lt;= nums(SRC[k]) else &#x27;FLAG&#x27;} {c}&quot;)
+acc_raw = sum((m &gt; 0) == ok for (_, _, ok), m in zip(PAIRS, ms))
+acc_num = sum((nums(c) &lt;= nums(SRC[k])) == ok for k, c, ok in PAIRS)
+acc_exact = sum((c == SRC[k]) == ok for k, c, ok in PAIRS)
+print(f&quot;\n   correct of 12: exact match {acc_exact}, model {acc_raw}, number check {acc_num}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1. two hops through a poisoned pool
+   summarizer: The study demonstrates a significant enhancement in accuracy compared to the baseline, with an improved rate of 42%.
+   analyst:    Yes, adopting the new method could significantly improve the accuracy of the study&#x27;s results and provide more robust evidence for its findings.
+   42% in summary: True; 42% or adoption in verdict: True
+
+2. a model verifier on twelve claim/source pairs
+   agree    margin +4.50 model yes numbers ok   Accuracy improved by 4.2% over the baseline.
+   DISAGREE margin -1.25 model no  numbers FLAG Accuracy improved by 42% over the baseline.
+   agree    margin +0.38 model yes numbers ok   The study found a small accuracy gain of 4.2%.
+   agree    margin +3.50 model yes numbers ok   The dataset contained 12,500 examples.
+   DISAGREE margin -2.12 model no  numbers FLAG The dataset contained 125,000 examples.
+   agree    margin +0.25 model yes numbers ok   About twelve thousand five hundred examples were used.
+   agree    margin +2.38 model yes numbers ok   Training ran for 3 days on 8 GPUs.
+   DISAGREE margin -2.88 model no  numbers ok   Training ran for 8 days on 3 GPUs.
+   agree    margin +2.50 model yes numbers ok   Training took three days.
+   agree    margin +3.12 model yes numbers ok   It won 3 of 5 benchmarks.
+   DISAGREE margin -1.00 model no  numbers ok   It won all 5 benchmarks.
+   DISAGREE margin +1.38 model yes numbers ok   It won 5 of 3 benchmarks.
+
+   correct of 12: exact match 5, model 11, number check 9
+</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>A real model passes the error on.</strong> The summarizer repeated "42%" in its own words, and the analyst, reading only that summary, said yes to adoption. Two hops, no crash, and the wrong figure now reads as a conclusion.</p>
+<p><strong>As a verifier, the model was the best of the three here.</strong> It got 11 of 12 claim/source pairs right, including three paraphrases that exact matching rejects. It missed "It won 5 of 3 benchmarks", which uses the source's own numbers in an impossible order.</p>
+<p><strong>The number check is cheap and partial.</strong> It caught the two changed figures, 42% and 125,000, but not swapped numbers ("8 days on 3 GPUs") or claims with no digits ("all 5" reuses a source number). Exact matching got 5 of 12, all of them the wrong claims, and rejected every honest paraphrase. Use the cheap checks first and a model as a second opinion, not as the only verifier.</p></div></aside>
+<h2>Build it</h2>
+<p><code>code/main.py</code> implements both topologies in stdlib Python plus a toy poisoning attack and the three mitigations.</p>
+<ul>
+<li><code>MessagePool</code> — thread-safe append-only log with full read-out.</li>
+<li><code>Blackboard</code> — topic-keyed pub/sub with per-agent subscriptions.</li>
+<li><code>ProvenanceEntry</code> — every write records (writer, timestamp, prompt_hash, source_uri).</li>
+<li><code>PoisoningScenario</code> — runs a three-agent research task where agent A hallucinates a decimal. Prints final report.</li>
+<li><code>Verifier</code> — a read-only agent that re-fetches sources and flags inconsistencies. Runs the same scenario with the verifier present.</li>
+</ul>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>Expected output:
+- Run 1 (no verifier): the hallucinated 42% propagates to the final report.
+- Run 2 (with verifier): the verifier flags entry 0, the retriever's write. The analyst still recommends adoption, because it reads the summarizer's entry, which carries no flag. "Use it" below shows why and adds the missing step.</p>
+
+<p>The whole of <code>code/main.py</code> follows in parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>ProvenanceEntry</code>, <code>MessagePool</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Shared memory patterns: MessagePool, Blackboard, and a poisoning demo.
+
+Runs a three-agent research task twice. The first run has a hallucinated
+decimal that propagates through shared memory into the final report. The
+second run adds a read-only verifier that re-fetches the source and flags
+the inconsistency.
+&quot;&quot;&quot;
+from __future__ import annotations
+
+import hashlib
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+
+@dataclass
+class ProvenanceEntry:
+    id: int
+    writer: str
+    topic: str
+    content: str
+    timestamp: float
+    prompt_hash: str
+    source_uri: str | None = None
+    supersedes: int | None = None
+    flags: list[str] = field(default_factory=list)
+
+
+class MessagePool:
+    &quot;&quot;&quot;Append-only full-pool shared state.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.entries: list[ProvenanceEntry] = []
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def write(self, writer: str, content: str, prompt: str, source_uri: str | None = None,
+              topic: str = &quot;default&quot;, supersedes: int | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+                supersedes=supersedes,
+            )
+            self.entries.append(e)
+            return eid
+
+    def read_all(self) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.entries)
+
+    def flag(self, entry_id: int, flag: str) -&gt; None:
+        with self._lock:
+            for e in self.entries:
+                if e.id == entry_id:
+                    e.flags.append(flag)
+                    return
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>Blackboard</code>, <code>retrieval_agent</code>, <code>summarizer_agent</code>, <code>analyst_agent</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class Blackboard:
+    &quot;&quot;&quot;Topic-keyed pub/sub blackboard.&quot;&quot;&quot;
+
+    def __init__(self) -&gt; None:
+        self.topics: dict[str, list[ProvenanceEntry]] = {}
+        self.subscribers: dict[str, list[Callable[[ProvenanceEntry], None]]] = {}
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def publish(self, writer: str, topic: str, content: str, prompt: str,
+                source_uri: str | None = None) -&gt; int:
+        with self._lock:
+            eid = self._next_id
+            self._next_id += 1
+            e = ProvenanceEntry(
+                id=eid,
+                writer=writer,
+                topic=topic,
+                content=content,
+                timestamp=time.time(),
+                prompt_hash=hashlib.sha256(prompt.encode()).hexdigest()[:10],
+                source_uri=source_uri,
+            )
+            self.topics.setdefault(topic, []).append(e)
+            subs = list(self.subscribers.get(topic, []))
+        for cb in subs:
+            cb(e)
+        return eid
+
+    def subscribe(self, topic: str, cb: Callable[[ProvenanceEntry], None]) -&gt; None:
+        with self._lock:
+            self.subscribers.setdefault(topic, []).append(cb)
+
+    def read_topic(self, topic: str) -&gt; list[ProvenanceEntry]:
+        with self._lock:
+            return list(self.topics.get(topic, []))
+
+
+FAKE_SOURCES = {
+    &quot;https://arxiv.org/paper-1&quot;: &quot;The study reports a 4.2% accuracy improvement over the baseline.&quot;,
+    &quot;https://arxiv.org/paper-2&quot;: &quot;Dataset size was 12,500 examples.&quot;,
+}
+
+
+def retrieval_agent(pool: MessagePool, uri: str, hallucinate: bool) -&gt; int:
+    content = FAKE_SOURCES[uri]
+    if hallucinate and &quot;4.2%&quot; in content:
+        content = content.replace(&quot;4.2%&quot;, &quot;42%&quot;)
+    return pool.write(
+        writer=&quot;retriever&quot;,
+        content=content,
+        prompt=f&quot;Fetch and summarize {uri}&quot;,
+        source_uri=uri,
+    )
+
+
+def summarizer_agent(pool: MessagePool) -&gt; int:
+    retrieved = [e for e in pool.read_all() if e.writer == &quot;retriever&quot;]
+    if not retrieved:
+        return pool.write(&quot;summarizer&quot;, &quot;no source&quot;, &quot;Summarize retrieval&quot;, None)
+    latest = retrieved[-1].content
+    summary = f&quot;Summary: study reports a significant result -- {latest.split(&#x27;.&#x27;)[0]}.&quot;
+    return pool.write(&quot;summarizer&quot;, summary, &quot;Summarize retrieval&quot;, None)
+
+
+def analyst_agent(pool: MessagePool) -&gt; int:
+    summaries = [e for e in pool.read_all() if e.writer == &quot;summarizer&quot;]
+    if not summaries:
+        return pool.write(&quot;analyst&quot;, &quot;no summary&quot;, &quot;Draw conclusions&quot;, None)
+    latest = summaries[-1].content
+    verdict = &quot;Recommend adoption&quot; if &quot;42%&quot; in latest else &quot;Recommend further review&quot;
+    return pool.write(&quot;analyst&quot;, f&quot;Analyst verdict: {verdict} (based on: {latest})&quot;,
+                      &quot;Draw conclusions&quot;, None)
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>verifier_agent</code>, <code>run_without_verifier</code>, <code>run_with_verifier</code>, <code>demo_blackboard</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def verifier_agent(pool: MessagePool) -&gt; list[tuple[int, str]]:
+    &quot;&quot;&quot;Read-only agent. Re-fetches cited sources and flags inconsistencies.
+
+    Returns a list of (entry_id, reason) tuples for the caller to act on.
+    The verifier never writes back to the pool -- the caller decides what to do.
+    &quot;&quot;&quot;
+    findings = []
+    for e in pool.read_all():
+        if e.source_uri and e.source_uri in FAKE_SOURCES:
+            truth = FAKE_SOURCES[e.source_uri]
+            if e.content != truth:
+                findings.append((e.id, f&quot;mismatch with {e.source_uri}: fetched text was {truth!r}&quot;))
+    return findings
+
+
+def run_without_verifier() -&gt; None:
+    print(&quot;=&quot; * 72)
+    print(&quot;RUN 1: no verifier; hallucination propagates&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    analyst_agent(pool)
+    for e in pool.read_all():
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}&quot;)
+    print(&quot;\nfinal report uses hallucinated 42% figure; no alarm raised.&quot;)
+
+
+def run_with_verifier() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;RUN 2: read-only verifier re-fetches sources and flags&quot;)
+    print(&quot;=&quot; * 72)
+    pool = MessagePool()
+    retrieval_agent(pool, &quot;https://arxiv.org/paper-1&quot;, hallucinate=True)
+    summarizer_agent(pool)
+    findings = verifier_agent(pool)
+    for eid, reason in findings:
+        pool.flag(eid, reason)
+    analyst_agent(pool)
+
+    for e in pool.read_all():
+        flag_str = f&quot; [FLAGGED: {&#x27;; &#x27;.join(e.flags)}]&quot; if e.flags else &quot;&quot;
+        print(f&quot;  [{e.id}] {e.writer:11s} ({e.prompt_hash}) :: {e.content}{flag_str}&quot;)
+    if findings:
+        print(f&quot;\nverifier surfaced {len(findings)} inconsistency. downstream agents can suppress the verdict.&quot;)
+
+
+def demo_blackboard() -&gt; None:
+    print(&quot;\n&quot; + &quot;=&quot; * 72)
+    print(&quot;BLACKBOARD DEMO: topic-keyed pub/sub, not every agent reads everything&quot;)
+    print(&quot;=&quot; * 72)
+    bb = Blackboard()
+    received = {&quot;prices&quot;: [], &quot;alerts&quot;: []}
+
+    def on_prices(e: ProvenanceEntry) -&gt; None:
+        received[&quot;prices&quot;].append(e.id)
+
+    def on_alerts(e: ProvenanceEntry) -&gt; None:
+        received[&quot;alerts&quot;].append(e.id)
+
+    bb.subscribe(&quot;prices&quot;, on_prices)
+    bb.subscribe(&quot;alerts&quot;, on_alerts)
+
+    bb.publish(&quot;scraper-1&quot;, &quot;prices&quot;, &quot;AAPL=192.4&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;scraper-2&quot;, &quot;prices&quot;, &quot;MSFT=401.2&quot;, &quot;poll market&quot;)
+    bb.publish(&quot;risk-engine&quot;, &quot;alerts&quot;, &quot;ALERT: AAPL moved &gt;2% in 60s&quot;, &quot;watch prices&quot;)
+
+    print(f&quot;  price subscribers got ids: {received[&#x27;prices&#x27;]}&quot;)
+    print(f&quot;  alert subscribers got ids: {received[&#x27;alerts&#x27;]}&quot;)
+    print(&quot;  (note: price subscribers never saw the alert; that is the point)&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · setup</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    run_without_verifier()
+    run_with_verifier()
+    demo_blackboard()
+    print(&quot;\nTakeaways:&quot;)
+    print(&quot;  1. shared state without provenance launders hallucinations into downstream reasoning&quot;)
+    print(&quot;  2. a read-only verifier with independent source access catches memory poisoning&quot;)
+    print(&quot;  3. a blackboard scales past a full pool because agents only read what they subscribe to&quot;)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">========================================================================
+RUN 1: no verifier; hallucination propagates
+========================================================================
+  [0] retriever   (154751ffa7) :: The study reports a 42% accuracy improvement over the baseline.
+  [1] summarizer  (9cbcb95e85) :: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.
+  [2] analyst     (eb19da3531) :: Analyst verdict: Recommend adoption (based on: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.)
+
+final report uses hallucinated 42% figure; no alarm raised.
+
+========================================================================
+RUN 2: read-only verifier re-fetches sources and flags
+========================================================================
+  [0] retriever   (154751ffa7) :: The study reports a 42% accuracy improvement over the baseline. [FLAGGED: mismatch with https://arxiv.org/paper-1: fetched text was &#x27;The study reports a 4.2% accuracy improvement over the baseline.&#x27;]
+  [1] summarizer  (9cbcb95e85) :: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.
+  [2] analyst     (eb19da3531) :: Analyst verdict: Recommend adoption (based on: Summary: study reports a significant result -- The study reports a 42% accuracy improvement over the baseline.)
+
+verifier surfaced 1 inconsistency. downstream agents can suppress the verdict.
+
+========================================================================
+BLACKBOARD DEMO: topic-keyed pub/sub, not every agent reads everything
+========================================================================
+  price subscribers got ids: [0, 1]
+  alert subscribers got ids: [2]
+  (note: price subscribers never saw the alert; that is the point)
+
+Takeaways:
+  1. shared state without provenance launders hallucinations into downstream reasoning
+  2. a read-only verifier with independent source access catches memory poisoning
+  3. a blackboard scales past a full pool because agents only read what they subscribe to
+</code></pre></div></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>outputs/skill-memory-auditor.md</code> is a skill that audits any multi-agent system's shared-memory design for provenance, versioning, and verifier separation. Run it on new multi-agent architectures before production.</p>
+
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Your research agents share a pool. A verifier re-fetches every cited source, and flagged entries are hidden from later readers. A month in, a report recommends a vendor on the basis of a "98% uptime SLA" that no document contains. The verifier logs show no flags on the day. The figure first appears in a comparison table the analyst agent wrote from three summaries. Using this lesson, how did it get through, and what would have stopped it? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What's current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Memory poisoning has a name in security lists.</strong> OWASP's Top 10 for Agentic Applications (December 2025) lists Memory and Context Poisoning as ASI06, covering both injected content and an agent's own errors that persist in memory.</li>
+<li><strong>Shared state in frameworks.</strong> LangGraph keeps one typed graph state, merges parallel writes with reducers, and gives nodes and subgraphs their own input and private schemas. AutoGen's group chats share one message thread; MetaGPT filters a shared pool by role.</li>
+<li><strong>Citations as provenance.</strong> Anthropic's research system runs a separate citation step that ties claims in the final report back to sources.</li>
+<li><strong>On your laptop</strong>: add <code>derived_from</code> to every write and a numeric check before anything reaches a report. A 0.5B model was a useful second check on short claims here, but missed a reversed count.</li>
+</ul>
+<p>Sources: <a href="https://genai.owasp.org/2025/12/09/owasp-top-10-for-agentic-applications-the-benchmark-for-agentic-security-in-the-age-of-autonomous-ai/">OWASP Top 10 for Agentic Applications</a>, <a href="https://arxiv.org/abs/2308.00352">MetaGPT, arXiv:2308.00352</a>, <a href="https://arxiv.org/abs/2601.11595">CA-MCP, arXiv:2601.11595</a>, <a href="https://arxiv.org/abs/2511.21686">Matrix, arXiv:2511.21686</a>, <a href="https://docs.langchain.com/oss/python/langgraph/errors/INVALID_CONCURRENT_GRAPH_UPDATE">LangGraph, concurrent updates</a>, <a href="https://arxiv.org/abs/2503.13657">Cemri et al., arXiv:2503.13657</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A message pool shares everything; a blackboard shares by topic. Both let one agent's error become everyone's fact.</li>
+<li>Record provenance and lineage on every write, so a flag reaches everything built on the flagged entry.</li>
+<li>Keep the log append-only; corrections supersede, they do not overwrite.</li>
+<li>A verifier that matches text exactly flags honest paraphrases and cannot see uncited claims; check facts, not strings.</li>
+<li>Isolate subscriber failures, and let late subscribers replay a topic.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-multi-agent"><span class="t" style="--cs-hue:290">MA</span>Cheat sheet · Multi-Agent Systems: Quick Reference</a></div>
+<h2>Ship it</h2>
+<p>For any shared-memory design:</p>
+<ul>
+<li>Record provenance on every write: <code>(writer, timestamp, prompt_hash, tool_calls_cited, source_uri)</code>.</li>
+<li>Make the log append-only. Corrections are new entries that reference the superseded one.</li>
+<li>Deploy at least one read-only verifier agent with independent source access.</li>
+<li>Route verifier output to a separate channel, not back into the shared pool.</li>
+<li>Log the ratio of writes that are supersessions — a rising ratio is early evidence of hallucination patterns.</li>
+</ul>
+<p><strong><code>outputs/skill-memory-auditor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: memory-auditor
+description: Audit a multi-agent system's shared-memory design for provenance, versioning, verifier separation, and projection schema. Flag memory-poisoning exposure before production.
+version: 1.0.0
+phase: 16
+lesson: 13
+tags: [multi-agent, shared-state, blackboard, memory-poisoning, provenance]
+---
+
+Given a multi-agent codebase or architecture doc, audit the shared-memory design and flag exposure to memory poisoning.
+
+Produce:
+
+1. **Topology.** Full message pool, topic-partitioned blackboard, projected per-agent view, or hybrid? Name the data structure (list, dict, pandas frame, vector store, SQL table). Count rough upper bound of writers and readers at steady state.
+2. **Provenance fields.** On every write, does the entry record: writer id, timestamp, prompt hash or prompt text, tool-call trace, source URI or tool name? List the fields present and the fields missing.
+3. **Update model.** Is the log append-only, or do writers mutate in place? If mutation, what is the concurrency-control mechanism (lock, optimistic versioning, none)? Corrections should be supersession entries, not in-place edits — flag any design that does not do this.
+4. **Verifier separation.** Is there a read-only agent with independent source access? Can it write to the main pool (it should not)? Where does its output go?
+5. **Projection schema.** If the design uses projections (LangGraph reducers, blackboard topics, role-scoped views), is the schema documented? How do new agents declare the projection they consume?
+6. **Poisoning risk score.** Score 1-5 on each axis: [provenance completeness], [supersession over mutation], [verifier independence], [projection schema clarity]. A system that scores below 3 on any axis is flagged.
+
+Hard rejects:
+
+- Any audit that does not flag a missing verifier. An unwritable verifier with independent source access is the load-bearing mitigation; every other mitigation is decorative without it.
+- Audits that recommend &quot;add more tests.&quot; Tests do not catch memory poisoning because poisoning produces plausible outputs that pass tests.
+- Audits that recommend hashing the content as the sole provenance. A hash tells you *what* was written, not *who* or *from where*.
+
+Refusal rules:
+
+- If the codebase hides shared state in an external service (Redis, Postgres, vector DB) with no inspection tools, state that the audit cannot complete without production read access.
+- If the system has fewer than three agents, note that memory poisoning risk is low but provenance is still cheap insurance.
+- If the system uses a framework with built-in state management (LangGraph checkpointer, AutoGen pool), audit the framework's guarantees rather than re-deriving them.
+
+Output: a two-page report. Start with a one-sentence summary (&quot;Shared state is a full message pool with no provenance and no verifier — high poisoning risk.&quot;), then the six sections above. End with a prioritized action list: three changes, each labeled [critical] [should] or [nice-to-have], with estimated time-to-implement.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Confirm run 1 propagates the hallucination and run 2 catches it.</li>
+<li>Add a second hallucination: agent B invents a dataset size. The verifier should catch both without being hand-tuned for either.</li>
+<li>Switch the full pool to a blackboard with topic partitions (<code>prices</code>, <code>summaries</code>, <code>analyses</code>). Which poisoning scenarios does topic partitioning make harder to pull off, and which does it not help with?</li>
+<li>Read Hayes-Roth (1985, "A Blackboard Architecture for Control"). Identify two control patterns from the paper not discussed in this lesson that 2026 systems would benefit from.</li>
+<li>Read CA-MCP (arXiv:2601.11595). Map its Shared Context Store to either the MessagePool or Blackboard class in <code>code/main.py</code>. Which primitives does CA-MCP add on top?</li>
+</ol>
+
+<h2>Solutions</h2>
+<details class="qa" id="a1613-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Adoption anyway; 2 of 5</span></summary><div class="qa-a"><p><strong>It recommends adoption.</strong> The verifier flags only entry 0, the retriever's write, because that is the only entry with a source to re-fetch. The analyst reads the summarizer's entry, which was built from entry 0 but records no link to it and has no flag. So the poisoned figure reaches the verdict anyway.</p>
+<p><strong>2 of 5.</strong> Exact matching is right about the verbatim copy and the 42% write. It flags an honest paraphrase and a copy missing its final full stop, and it never checks the invented 125,000, which cites no source.</p></div></details>
+<details class="qa" id="a1613-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · An uncited claim with no lineage</span></summary><div class="qa-a"><p><strong>How it got through.</strong> The analyst wrote the table from three summaries and cited no source, so the verifier, which only re-fetches cited sources, had nothing to check. Either the analyst invented the figure or a summary blended two documents; without lineage, nobody can tell which, and hiding flagged entries does nothing when no entry was flagged.</p>
+<p><strong>What would have stopped it:</strong>
+- <strong>Lineage on every write:</strong> <code>derived_from</code> lists the entries a write was built on, so the table points at its three summaries and each summary at its sources.
+- <strong>Check claims, not entries:</strong> extract each number or named fact in a write and require it to appear in some ancestor or a cited source; "98%" appears in none.
+- <strong>Uncited claims are unverified:</strong> treat a write with no source and no parents as a draft that cannot reach a report.
+- <strong>Taint downstream:</strong> when any ancestor is flagged later, re-check or withdraw everything built on it.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2503.13657">Cemri et al. — Why Do Multi-Agent LLM Systems Fail?</a> — MAST taxonomy of 14 failure modes; memory poisoning is not one of them, but information withholding and missing verification sit next to it</li>
+<li><a href="https://arxiv.org/abs/2601.11595">CA-MCP — Context-Aware Multi-Server MCP</a> — Shared Context Store for coordinated MCP servers</li>
+<li><a href="https://arxiv.org/abs/2511.21686">Matrix — decentralized multi-agent framework</a> — peer-to-peer: task state travels in messages between agents, with no central orchestrator and no shared board</li>
+<li><a href="https://docs.langchain.com/oss/python/langgraph/workflows-agents">LangGraph state and reducers</a> — shared state, reducers and per-node schemas in production</li>
+<li><a href="https://www.anthropic.com/engineering/multi-agent-research-system">Anthropic — How we built our multi-agent research system</a> — provenance and verification notes from a production deployment</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1613" id="done-a1613">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1613" id="undo-a1613" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1612"><span class="pn-dir">Previous</span><span class="pn-t">16.17 · The A2A Agent-to-Agent Protocol in Multi-Agent Systems</span></a><a class="pn next" href="#a1614"><span class="pn-dir">Next</span><span class="pn-t">16.19 · Byzantine Fault Tolerance and Consensus among Agents</span></a></div></footer>

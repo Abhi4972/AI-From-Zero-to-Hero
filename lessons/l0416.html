@@ -1,0 +1,529 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Text-to-SQL and structured-data agents</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.35</span><span class="chip">100 min</span><span class="chip chip-depth">Go deeper</span><span class="chip chip-done" data-done-chip="l0416" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Build a text-to-SQL agent step by step: schema linking, a semantic layer, generation, validation, execution and self-correction</li>
+<li>Make it safe: read-only enforcement, table allowlists, row limits, tenant filters injected into the query, and timeouts</li>
+<li>Evaluate it by execution accuracy instead of comparing SQL strings</li>
+<li>Map the pattern to Databricks Genie and to BigQuery and Fabric data agents</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l0407">Lesson 14.27</a>, <a class="xref" href="#l0302">Lesson 14.3</a></li>
+<li><strong>Depth</strong>: Deepen</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0416-0">Text-to-SQL</a></td>
+<td>Turning a natural-language question into a SQL query</td>
+<td>Introduction</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0416-1">Semantic layer</a></td>
+<td>One place that defines business metrics, dimensions and joins</td>
+<td>Step 2</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0416-2">Verified queries</a></td>
+<td>Checked question-and-SQL pairs for the most important questions</td>
+<td>Step 2</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0416-3">Schema linking</a></td>
+<td>Choosing the tables and columns a question needs</td>
+<td>Step 3</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0416-4">Row-level security</a></td>
+<td>Restricting which rows a user can see, enforced by the database or code</td>
+<td>Step 4</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0416-5">Execution accuracy</a></td>
+<td>Comparing the results of generated and gold queries</td>
+<td>Step 6</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">3</span><span class="lb-names">Prompt injection, Model Context Protocol (MCP), Knowledge graph</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>Prompt injection</td><td>Text that tricks a model into following an attacker&#x27;s instructions instead of yours</td><td><a class="xref" href="#l1002">Lesson 15.22</a></td></tr><tr><td>Model Context Protocol (MCP)</td><td>An open standard for connecting models to tools and data through small servers, so one integration works in many apps</td><td><a class="xref" href="#l0801">Lesson 13.7</a></td></tr><tr><td>Knowledge graph</td><td>Facts stored as things and the named relationships between them</td><td><a class="xref" href="#l0501">Lesson 14.38</a></td></tr></tbody></table></div></details>
+<p>The numbers that businesses ask about live in tables, not documents. "How many orders were late in Pune last week?" cannot be answered by retrieving passages; it needs a query. <strong><mark class="term" id="term-l0416-0" title="Industry term: Text-to-SQL. Turning a natural-language question into a SQL query">Text-to-SQL</mark></strong> turns a question into SQL, runs it and explains the result. It is one of the most requested enterprise agent patterns, and one of the easiest to get dangerously wrong, so this lesson builds it with every safeguard in place. The database is SQLite, so everything runs offline; where a model writes SQL, a stand-in returns what a model would, including its typical mistakes.</p>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Many business questions are about numbers stored in databases, which passages cannot answer. Models turned out to be good at writing SQL, and <strong>text-to-SQL</strong> became a major use case, along with the need to validate queries, run them safely and use semantic layers so terms mean what the business means.</p></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Translating questions into SQL, carefully</div><div class="co-body"><p>For questions about numbers in a database, the model writes a query instead of reading passages: find the relevant tables, write SQL, check it, run it with read-only permissions, and explain the result. Each step guards against a known failure: wrong tables, invented columns, huge scans, or a destructive statement. A <mark class="term" id="term-l0416-1" title="Industry term: Semantic layer. One place that defines business metrics, dimensions and joins">semantic layer</mark> that defines business terms such as "active customer" makes the model far more accurate.</p></div></aside>
+<h2>Step 1 · A database with realistic traps</h2>
+<p>Real schemas have cryptic column names, codes instead of labels and several tables to join. The lab database has all three.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import re, sqlite3, time
+import sqlglot
+from sqlglot import exp
+
+db = sqlite3.connect(&quot;:memory:&quot;)
+db.executescript(&quot;&quot;&quot;
+CREATE TABLE cust (cust_id INTEGER PRIMARY KEY, tenant_id INTEGER, city TEXT, tier TEXT);
+CREATE TABLE ord  (ord_id TEXT PRIMARY KEY, cust_id INTEGER, ord_dt DATE, amt_inr REAL, stat_cd TEXT,
+                   promised_dt DATE, delivered_dt DATE);
+CREATE TABLE stat_lkp (stat_cd TEXT PRIMARY KEY, stat_desc TEXT);
+INSERT INTO stat_lkp VALUES ('D', 'delivered'), ('C', 'cancelled'), ('P', 'processing'), ('R', 'returned');
+&quot;&quot;&quot;)
+cities = [&quot;Pune&quot;, &quot;Bengaluru&quot;, &quot;Delhi&quot;, &quot;Mumbai&quot;]
+for i in range(1, 41):
+    db.execute(&quot;INSERT INTO cust VALUES (?, ?, ?, ?)&quot;, (i, 1 if i &lt;= 30 else 2, cities[i % 4], &quot;gold&quot; if i % 5 == 0 else &quot;silver&quot;))
+for i in range(1, 201):
+    day = 1 + i % 28
+    late = i % 6 == 0
+    db.execute(&quot;INSERT INTO ord VALUES (?, ?, ?, ?, ?, ?, ?)&quot;,
+               (f&quot;A-{1000 + i}&quot;, 1 + i % 40, f&quot;2026-10-{day:02d}&quot;, 500 + (i * 37) % 4000,
+                &quot;DCPRD&quot;[i % 5], f&quot;2026-10-{min(day + 3, 28):02d}&quot;, f&quot;2026-10-{min(day + (5 if late else 2), 28):02d}&quot;))
+print(db.execute(&quot;SELECT COUNT(*) FROM ord&quot;).fetchone()[0], &quot;orders;&quot;,
+      db.execute(&quot;SELECT COUNT(*) FROM cust&quot;).fetchone()[0], &quot;customers in 2 tenants&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">200 orders; 40 customers in 2 tenants
+</code></pre></div></div></aside>
+<h2>Step 2 · A semantic layer: business meaning in one place</h2>
+<p>A model that sees only <code>ord.stat_cd</code> and <code>amt_inr</code> has to guess what "revenue", "late" or "delivered" mean, and different guesses give different numbers. A <strong>semantic layer</strong> defines them once: tables with descriptions, joins, dimensions and <strong>metrics</strong> with exact SQL, plus <strong><mark class="term" id="term-l0416-2" title="Industry term: Verified queries. Checked question-and-SQL pairs for the most important questions">verified queries</mark></strong> for the most important questions. This is what Databricks metric views, dbt's semantic layer, Cube and LookML provide; here it is a dictionary.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">SEMANTIC_LAYER = {
+    &quot;tables&quot;: {
+        &quot;ord&quot;: &quot;One row per order. amt_inr is the order value in rupees. stat_cd links to stat_lkp.&quot;,
+        &quot;cust&quot;: &quot;One row per customer, with city, loyalty tier and tenant_id.&quot;,
+        &quot;stat_lkp&quot;: &quot;Order status codes: D delivered, C cancelled, P processing, R returned.&quot;,
+    },
+    &quot;joins&quot;: [&quot;ord.cust_id = cust.cust_id&quot;, &quot;ord.stat_cd = stat_lkp.stat_cd&quot;],
+    &quot;metrics&quot;: {
+        &quot;revenue&quot;:         {&quot;sql&quot;: &quot;SUM(ord.amt_inr)&quot;, &quot;filter&quot;: &quot;ord.stat_cd = 'D'&quot;,
+                            &quot;description&quot;: &quot;Value of delivered orders only (cancelled and returned excluded)&quot;},
+        &quot;late deliveries&quot;: {&quot;sql&quot;: &quot;COUNT(*)&quot;, &quot;filter&quot;: &quot;ord.delivered_dt &gt; ord.promised_dt&quot;,
+                            &quot;description&quot;: &quot;Orders delivered after the promised date&quot;},
+        &quot;order count&quot;:     {&quot;sql&quot;: &quot;COUNT(*)&quot;, &quot;filter&quot;: None, &quot;description&quot;: &quot;All orders&quot;},
+    },
+    &quot;synonyms&quot;: {&quot;sales&quot;: &quot;revenue&quot;, &quot;gmv&quot;: &quot;revenue&quot;, &quot;delayed&quot;: &quot;late deliveries&quot;, &quot;location&quot;: &quot;city&quot;},
+    &quot;verified_queries&quot;: {
+        &quot;revenue by city&quot;: &quot;SELECT cust.city, SUM(ord.amt_inr) AS revenue FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+                           &quot;WHERE ord.stat_cd = 'D' GROUP BY cust.city ORDER BY revenue DESC&quot;,
+    },
+}
+
+def semantic_context(question: str) -&gt; str:
+    &quot;&quot;&quot;Build the prompt context: only the metrics and tables the question needs (schema linking, Step 3).&quot;&quot;&quot;
+    q = question.lower()
+    for word, canonical in SEMANTIC_LAYER[&quot;synonyms&quot;].items():
+        q = q.replace(word, canonical)
+    metrics = {m: d for m, d in SEMANTIC_LAYER[&quot;metrics&quot;].items() if m in q}
+    lines = [f&quot;Metric '{m}': {d['sql']}&quot; + (f&quot; WHERE {d['filter']}&quot; if d[&quot;filter&quot;] else &quot;&quot;) + f&quot;  -- {d['description']}&quot;
+             for m, d in metrics.items()]
+    return &quot;\n&quot;.join(lines) or &quot;(no metric matched; ask a clarifying question)&quot;
+
+print(semantic_context(&quot;What were sales by location last month?&quot;))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Metric 'revenue': SUM(ord.amt_inr) WHERE ord.stat_cd = 'D'  -- Value of delivered orders only (cancelled and returned excluded)
+</code></pre></div>
+<p>"Sales by location" became the defined revenue metric, with the rule that only delivered orders count. Without that line, a model would happily sum every order, including cancellations and returns, and report a number several times too high (Step 6 measures it), which nobody would notice until finance did.</p></div></aside>
+<h2>Step 3 · Schema linking: show the model only what it needs</h2>
+<p>Enterprise warehouses have thousands of tables; putting them all in the prompt is expensive and confuses the model. <strong><mark class="term" id="term-l0416-3" title="Industry term: Schema linking. Choosing the tables and columns a question needs">Schema linking</mark></strong> selects the relevant tables and columns first, by matching the question against table and column descriptions (with <span class="cx" data-c="203" tabindex="0">embeddings</span> or a model call in production).</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 860 250" role="img" aria-label="Text-to-SQL by narrowing (as in Uber&#x27;s QueryGPT): each step shrinks what the model must read, from thousands of tables to a few columns, so generation sees a small, relevant schema." style="min-width:560px"><defs><marker id="ah125" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah125a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah125p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah125k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah125r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah125w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><rect class="b" x="30.0" y="18" width="800" height="38" rx="6"/><text class="t" x="430" y="35" text-anchor="middle">Whole catalog</text><text class="s" x="430" y="50" text-anchor="middle">thousands of tables</text><rect class="a" x="120.0" y="64" width="620" height="38" rx="6"/><text class="t" x="430" y="81" text-anchor="middle">Business domain</text><text class="s" x="430" y="96" text-anchor="middle">intent agent picks a workspace</text><rect class="a" x="200.0" y="110" width="460" height="38" rx="6"/><text class="t" x="430" y="127" text-anchor="middle">Tables</text><text class="s" x="430" y="142" text-anchor="middle">proposed, user confirms</text><rect class="a" x="270.0" y="156" width="320" height="38" rx="6"/><text class="t" x="430" y="173" text-anchor="middle">Columns</text><text class="s" x="430" y="188" text-anchor="middle">prune: 40k to 60k tokens → a few k</text><rect class="ok" x="310.0" y="202" width="240" height="38" rx="6"/><text class="t" x="430" y="219" text-anchor="middle">SQL</text><text class="s" x="430" y="234" text-anchor="middle">generate, validate, run read-only</text></svg></div><figcaption>Text-to-SQL by narrowing (as in Uber&#x27;s QueryGPT): each step shrinks what the model must read, from thousands of tables to a few columns, so generation sees a small, relevant schema.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def schema_ddl(tables: list[str]) -&gt; str:
+    return &quot;\n&quot;.join(db.execute(&quot;SELECT sql FROM sqlite_master WHERE name = ?&quot;, (t,)).fetchone()[0] for t in tables)
+
+def link_schema(question: str) -&gt; list[str]:
+    &quot;&quot;&quot;Pick tables whose description shares words with the question; always add tables needed for joins.&quot;&quot;&quot;
+    q = set(re.findall(r&quot;[a-z]+&quot;, question.lower()))
+    picked = [t for t, desc in SEMANTIC_LAYER[&quot;tables&quot;].items() if q &amp; set(re.findall(r&quot;[a-z]+&quot;, desc.lower()))]
+    if any(w in q for w in (&quot;city&quot;, &quot;location&quot;, &quot;tier&quot;, &quot;gold&quot;, &quot;silver&quot;)) and &quot;cust&quot; not in picked:
+        picked.append(&quot;cust&quot;)
+    return picked
+
+tables = link_schema(&quot;Which city had the most late deliveries?&quot;)
+print(tables)
+print(schema_ddl(tables))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['ord', 'cust']
+CREATE TABLE ord  (ord_id TEXT PRIMARY KEY, cust_id INTEGER, ord_dt DATE, amt_inr REAL, stat_cd TEXT,
+                   promised_dt DATE, delivered_dt DATE)
+CREATE TABLE cust (cust_id INTEGER PRIMARY KEY, tenant_id INTEGER, city TEXT, tier TEXT)
+</code></pre></div></div></aside>
+<h2>Step 4 · Validate every query before it runs</h2>
+<p>Model-written SQL is untrusted input. Parse it with a real SQL parser (here <strong>sqlglot</strong>) and enforce rules on the parsed tree, not with string matching:</p>
+<ul>
+<li>exactly one statement, and it must be a <code>SELECT</code></li>
+<li>only allowlisted tables</li>
+<li>a row limit, added if missing</li>
+<li>the caller's tenant filter, injected into the query so it cannot be forgotten or bypassed</li>
+</ul>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">ALLOWED_TABLES = {&quot;ord&quot;, &quot;cust&quot;, &quot;stat_lkp&quot;}
+
+class UnsafeSQL(Exception):
+    pass
+
+def validate(sql: str, tenant_id: int, max_rows: int = 200) -&gt; str:
+    statements = sqlglot.parse(sql, read=&quot;sqlite&quot;)
+    if len(statements) != 1:
+        raise UnsafeSQL(&quot;exactly one statement is allowed&quot;)
+    tree = statements[0]
+    if not isinstance(tree, exp.Select):
+        raise UnsafeSQL(f&quot;only SELECT is allowed, got {type(tree).__name__.upper()}&quot;)
+    tables = {t.name for t in tree.find_all(exp.Table)}
+    if tables - ALLOWED_TABLES:
+        raise UnsafeSQL(f&quot;tables not allowed: {sorted(tables - ALLOWED_TABLES)}&quot;)
+    if &quot;cust&quot; not in tables:                                    # tenant scoping needs the customer table
+        raise UnsafeSQL(&quot;queries must join cust so they can be scoped to a tenant&quot;)
+    tree = tree.where(f&quot;cust.tenant_id = {int(tenant_id)}&quot;)      # row-level security, enforced by code
+    if not tree.args.get(&quot;limit&quot;):
+        tree = tree.limit(max_rows)
+    return tree.sql(dialect=&quot;sqlite&quot;)
+
+for attempt in [&quot;SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id GROUP BY cust.city&quot;,
+                &quot;DROP TABLE ord&quot;,
+                &quot;SELECT * FROM ord; DELETE FROM cust&quot;,
+                &quot;SELECT * FROM sqlite_master&quot;]:
+    try:
+        print(&quot;OK  &quot;, validate(attempt, tenant_id=1))
+    except (UnsafeSQL, sqlglot.errors.ParseError) as e:
+        print(&quot;DENY&quot;, e)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">OK   SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id WHERE cust.tenant_id = 1 GROUP BY cust.city LIMIT 200
+DENY only SELECT is allowed, got DROP
+DENY exactly one statement is allowed
+DENY tables not allowed: ['sqlite_master']
+</code></pre></div>
+<p>Validation is one layer. The others are just as important: connect with a <strong>read-only database role</strong> that can see only the allowed schemas (so even a validator bug cannot write), and let the database enforce <mark class="term" id="term-l0416-4" title="Industry term: Row-level security. Restricting which rows a user can see, enforced by the database or code">row-level security</mark> where it supports it (Postgres row-level security, Databricks row filters).</p></div></aside>
+<h2>Step 4b · Verify the tenant filter cannot be bypassed</h2>
+<p>Step 4 injects <code>cust.tenant_id = 1</code> into the outer <code>WHERE</code>. Before trusting it, attack it. Three queries a model (or a <span class="cx cx-later" data-c="468" tabindex="0">prompt injection</span><a class="cx-pill" href="#l1002" title="Taught later, in Lesson 10.2">later · 15.22</a>) could produce:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">for attempt in [&quot;SELECT (SELECT COUNT(*) FROM cust) AS all_customers FROM cust&quot;,                 # scalar subquery
+                &quot;WITH ord AS (SELECT city, tenant_id FROM cust) SELECT ord.city FROM ord JOIN cust ON 1 = 1&quot;,   # CTE shadows a table
+                &quot;SELECT * FROM ord JOIN cust c ON ord.cust_id = c.cust_id&quot;]:                     # alias
+    try:
+        safe = validate(attempt, tenant_id=1)
+        rows = db.execute(safe).fetchall()
+        print(&quot;LEAK?&quot; if &quot;all_customers&quot; in safe or &quot;ord.city&quot; in safe else &quot;OK   &quot;, len(rows), &quot;rows |&quot;, safe[:80])
+    except (UnsafeSQL, sqlite3.Error, sqlglot.errors.ParseError) as e:
+        print(&quot;ERROR&quot;, type(e).__name__, &quot;|&quot;, str(e)[:60])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">LEAK? 30 rows | SELECT (SELECT COUNT(*) FROM cust) AS all_customers FROM cust WHERE cust.tenant_
+LEAK? 200 rows | WITH ord AS (SELECT city, tenant_id FROM cust) SELECT ord.city FROM ord JOIN cus
+ERROR OperationalError | no such column: cust.tenant_id
+</code></pre></div>
+<p>Three holes. The scalar subquery counts <strong>all 40 customers</strong> across both tenants, while the outer filter scopes only the rows it sits on (30 rows, each carrying the leaked total). The CTE named <code>ord</code> reads <code>cust</code> for both tenants, and the outer filter on the real <code>cust</code> cannot touch it; the row cap trims the output to 200, but every one of those rows crosses the tenant line (the full result is 40 cities × 30 rows). The alias case is not a leak but a failure: <code>cust.tenant_id</code> does not exist once the table is called <code>c</code>.</p></div></aside>
+<p>The fix: refuse CTEs, and apply the filter to <strong>every <code>SELECT</code> scope</strong> using the alias that scope actually uses. Any scope that does not read <code>cust</code> is refused, which also closes subqueries over other tables.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def validate(sql: str, tenant_id: int, max_rows: int = 200) -&gt; str:
+    &quot;&quot;&quot;Hardened: one statement, SELECT root, allowlisted tables, no CTEs, tenant filter in every SELECT scope, row cap.&quot;&quot;&quot;
+    statements = sqlglot.parse(sql, read=&quot;sqlite&quot;)
+    if len(statements) != 1 or statements[0] is None:
+        raise UnsafeSQL(&quot;exactly one statement is allowed&quot;)
+    tree = statements[0]
+    if not isinstance(tree, exp.Select):
+        raise UnsafeSQL(f&quot;only SELECT is allowed, got {type(tree).__name__.upper()}&quot;)
+    if tree.args.get(&quot;with_&quot;):                                     # sqlglot 30 names the key with_
+        raise UnsafeSQL(&quot;WITH (CTEs) is not allowed; write the query without them&quot;)
+    tables = {t.name for t in tree.find_all(exp.Table)}
+    if tables - ALLOWED_TABLES:
+        raise UnsafeSQL(f&quot;tables not allowed: {sorted(tables - ALLOWED_TABLES)}&quot;)
+    for sel in tree.find_all(exp.Select):                          # the outer query AND every subquery
+        scope = [sel.args.get(&quot;from_&quot;)] + list(sel.args.get(&quot;joins&quot;) or [])   # sqlglot 30 names the key from_
+        aliases = [t.alias_or_name for part in scope if part is not None
+                   for t in part.find_all(exp.Table) if t.name == &quot;cust&quot;]
+        if not aliases:
+            raise UnsafeSQL(&quot;every SELECT, including subqueries, must join cust so it can be scoped to a tenant&quot;)
+        sel.where(f&quot;{aliases[0]}.tenant_id = {int(tenant_id)}&quot;, copy=False)   # uses the alias in use
+    cap = min(max_rows, int(tree.args[&quot;limit&quot;].expression.this)) if tree.args.get(&quot;limit&quot;) else max_rows
+    tree.set(&quot;limit&quot;, exp.Limit(expression=exp.Literal.number(cap)))          # min(existing, cap), never larger
+    return tree.sql(dialect=&quot;sqlite&quot;)
+
+for attempt in [&quot;SELECT (SELECT COUNT(*) FROM cust) AS all_customers FROM cust&quot;,
+                &quot;WITH ord AS (SELECT city, tenant_id FROM cust) SELECT ord.city FROM ord JOIN cust ON 1 = 1&quot;,
+                &quot;SELECT * FROM ord JOIN cust c ON ord.cust_id = c.cust_id LIMIT 50000&quot;,
+                &quot;SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id GROUP BY cust.city&quot;]:
+    try:
+        safe = validate(attempt, tenant_id=1)
+        print(&quot;OK   &quot;, len(db.execute(safe).fetchall()), &quot;rows |&quot;, safe[:95])
+    except (UnsafeSQL, sqlite3.Error, sqlglot.errors.ParseError) as e:
+        print(&quot;DENY &quot;, str(e)[:80])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">OK    30 rows | SELECT (SELECT COUNT(*) FROM cust WHERE cust.tenant_id = 1) AS all_customers FROM cust WHERE cu
+DENY  WITH (CTEs) is not allowed; write the query without them
+OK    150 rows | SELECT * FROM ord JOIN cust AS c ON ord.cust_id = c.cust_id WHERE c.tenant_id = 1 LIMIT 200
+OK    4 rows | SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id WHERE cust.tenant_i
+</code></pre></div>
+<p>The scalar subquery now counts only tenant 1 (the inner <code>SELECT</code> got its own filter), the CTE is refused, the alias works, <code>LIMIT 50000</code> became <code>LIMIT 200</code>, and the ordinary query is unchanged. Keep these four in a test file and run them on every change and every <code>sqlglot</code> upgrade: version 30 renamed the <code>from</code> and <code>with</code> argument keys to <code>from_</code> and <code>with_</code>, which silently breaks code that reads them. Derived tables in <code>FROM</code> (<code>SELECT ... FROM (SELECT ...) t</code>) are refused by the same rule because the outer scope sees no <code>cust</code>; that is a deliberate loss of some legitimate queries in exchange for a rule you can reason about.</p></div></aside>
+<h2>Step 4c · Cost pre-check and a warehouse-level timeout</h2>
+<p>The next step adds a timeout inside the Python process (<code>run_with_timeout</code>, in Step 5), which cancels a query that runs too long. That protects this process; it does not protect the warehouse from a query that your process forgot about, or from a second client. Two more layers, both on the database side:</p>
+<ul>
+<li><strong>Compile before you run.</strong> <code>EXPLAIN</code> parses and plans without executing. On SQLite it is cheap and catches bad columns; on Snowflake, <code>EXPLAIN USING TABULAR</code> also reports <code>partitionsAssigned</code> and <code>bytesAssigned</code>, which is an upper-bound estimate of what the query will scan, so you can refuse anything above a budget before spending a credit.</li>
+<li><strong>A timeout the database enforces.</strong> On Snowflake, set <code>STATEMENT_TIMEOUT_IN_SECONDS</code> on the warehouse the agent uses (and in the session if you like; when both are set, the lowest non-zero value wins). Postgres has <code>statement_timeout</code>; Databricks SQL warehouses have <code>STATEMENT_TIMEOUT</code> as well. The agent's warehouse should also be its own, small, with a resource monitor, so a runaway query cannot starve anyone else.</li>
+</ul>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def explain_check(sql: str, max_steps: int = 8) -&gt; str:
+    &quot;&quot;&quot;Plan without running. '' means OK; otherwise a reason the writer can act on.&quot;&quot;&quot;
+    try:
+        plan = db.execute(f&quot;EXPLAIN QUERY PLAN {sql}&quot;).fetchall()
+    except sqlite3.Error as e:
+        return f&quot;explain failed: {e}&quot;
+    if len(plan) &gt; max_steps:                                       # stand-in for a cost budget (Snowflake: bytesAssigned)
+        return f&quot;plan too large: {len(plan)} steps&quot;
+    if any(&quot;SCAN ord&quot; in row[-1] and &quot;USING&quot; not in row[-1] for row in plan) and &quot;ord_dt&quot; not in sql:
+        return &quot;full scan of ord without a date filter&quot;             # a house rule: date-bound the big table
+    return &quot;&quot;
+
+SNOWFLAKE_SETUP = &quot;&quot;&quot;
+ALTER WAREHOUSE agent_wh SET STATEMENT_TIMEOUT_IN_SECONDS = 30;   -- the database cancels, not the client
+ALTER SESSION   SET STATEMENT_TIMEOUT_IN_SECONDS = 30;             -- lowest non-zero of the two applies
+&quot;&quot;&quot;                                                                 # not run here: needs a warehouse
+
+print(repr(explain_check(&quot;SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+                         &quot;WHERE ord.ord_dt &gt;= '2026-10-20' AND cust.tenant_id = 1 GROUP BY cust.city&quot;)))
+print(repr(explain_check(&quot;SELECT * FROM ord JOIN cust ON ord.cust_id = cust.cust_id WHERE cust.tenant_id = 1&quot;)))
+print(repr(explain_check(&quot;SELECT nope FROM ord&quot;)))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">''
+'full scan of ord without a date filter'
+'explain failed: no such column: nope'
+</code></pre></div>
+<p>Put <code>explain_check</code> between <code>validate</code> and <code>run_with_timeout</code> in Step 5's loop; its message goes back to the writer like any other error. On Snowflake replace the step-count stand-in with a check on <code>bytesAssigned</code> from <code>EXPLAIN USING TABULAR</code>, and keep the warehouse timeout regardless: the pre-check estimates, the timeout enforces.</p></div></aside>
+<h2>Step 5 · Generate, execute, self-correct</h2>
+<p>The <span class="cx" data-c="20" tabindex="0">agent loop</span>: build the prompt from the semantic context and linked schema, generate SQL, validate, execute with a timeout, and if anything fails, send the error back for one or two repair attempts. The generator below plays a model that makes a classic first mistake (forgetting the status-code lookup) and fixes it when shown the error.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">PROMPT = &quot;&quot;&quot;You write SQLite for ShopKart analytics. Use only these tables:
+{schema}
+Business definitions you MUST use:
+{semantic}
+Question: {question}
+Return one SELECT statement and nothing else.&quot;&quot;&quot;
+
+def fake_llm_sql(prompt: str, attempt: int) -&gt; str:
+    &quot;&quot;&quot;Stands in for a model. First attempt uses a column that does not exist; the repair is correct.&quot;&quot;&quot;
+    if &quot;late deliveries&quot; in prompt:
+        if attempt == 1:
+            return (&quot;SELECT cust.city, COUNT(*) AS late FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+                    &quot;WHERE ord.delivery_status = 'late' GROUP BY cust.city ORDER BY late DESC&quot;)
+        return (&quot;SELECT cust.city, COUNT(*) AS late FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+                &quot;WHERE ord.delivered_dt &gt; ord.promised_dt GROUP BY cust.city ORDER BY late DESC&quot;)
+    return SEMANTIC_LAYER[&quot;verified_queries&quot;][&quot;revenue by city&quot;]
+
+def run_with_timeout(sql: str, seconds: float = 2.0):
+    deadline = time.monotonic() + seconds
+    db.set_progress_handler(lambda: 1 if time.monotonic() &gt; deadline else 0, 10_000)   # abort long queries
+    try:
+        cur = db.execute(sql)
+        return [d[0] for d in cur.description], cur.fetchall()
+    finally:
+        db.set_progress_handler(None, 0)
+
+def ask(question: str, tenant_id: int, max_attempts: int = 3) -&gt; dict:
+    prompt = PROMPT.format(schema=schema_ddl(link_schema(question)), semantic=semantic_context(question),
+                           question=question)
+    for attempt in range(1, max_attempts + 1):
+        sql = fake_llm_sql(prompt, attempt)
+        try:
+            safe = validate(sql, tenant_id)
+            columns, rows = run_with_timeout(safe)
+            return {&quot;sql&quot;: safe, &quot;columns&quot;: columns, &quot;rows&quot;: rows, &quot;attempts&quot;: attempt}
+        except (UnsafeSQL, sqlite3.Error, sqlglot.errors.ParseError) as e:
+            print(f&quot;  attempt {attempt} failed: {e}&quot;)
+            prompt += f&quot;\n\nYour previous query:\n{sql}\nfailed with: {e}\nFix it.&quot;
+    return {&quot;error&quot;: &quot;could not produce a valid query&quot;, &quot;attempts&quot;: max_attempts}
+
+result = ask(&quot;Which city had the most delayed orders?&quot;, tenant_id=1)
+print(result[&quot;sql&quot;])
+print(result[&quot;columns&quot;], result[&quot;rows&quot;][:2], &quot;| attempts:&quot;, result[&quot;attempts&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  attempt 1 failed: no such column: ord.delivery_status
+SELECT cust.city, COUNT(*) AS late FROM ord JOIN cust ON ord.cust_id = cust.cust_id WHERE ord.delivered_dt &gt; ord.promised_dt AND cust.tenant_id = 1 GROUP BY cust.city ORDER BY late DESC LIMIT 200
+['city', 'late'] [('Mumbai', 10), ('Bengaluru', 10)] | attempts: 2
+</code></pre></div>
+<p>The database's own error message ("no such column") was enough for the repair. Two more practices from production systems: <strong>show the SQL</strong> next to the answer so analysts can check it, and <strong>answer only from the result set</strong> (the summarizing model gets the rows, not freedom to add numbers).</p></div></aside>
+<h2>Step 6 · Evaluate by execution accuracy</h2>
+<p>Two correct queries can look completely different, so comparing SQL strings is useless. <strong><mark class="term" id="term-l0416-5" title="Industry term: Execution accuracy. Comparing the results of generated and gold queries">Execution accuracy</mark></strong> runs the generated query and a gold query and compares the result sets. Public benchmarks (Spider 2.0, BIRD) use the same idea; your own set of verified questions matters more.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">GOLD_SQL = {
+    &quot;Which city had the most delayed orders?&quot;:
+        &quot;SELECT cust.city, COUNT(*) FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+        &quot;WHERE ord.delivered_dt &gt; ord.promised_dt AND cust.tenant_id = 1 GROUP BY cust.city ORDER BY 2 DESC&quot;,
+    &quot;What were sales by location last month?&quot;:
+        &quot;SELECT cust.city, SUM(ord.amt_inr) FROM ord JOIN cust ON ord.cust_id = cust.cust_id &quot;
+        &quot;WHERE ord.stat_cd = 'D' AND cust.tenant_id = 1 GROUP BY cust.city ORDER BY 2 DESC&quot;,
+}
+
+def same_result(a_rows, b_rows) -&gt; bool:
+    &quot;&quot;&quot;Compare result sets ignoring column names; order matters only if both are sorted the same way.&quot;&quot;&quot;
+    norm = lambda rows: [tuple(round(v, 2) if isinstance(v, float) else v for v in r) for r in rows]
+    return norm(a_rows) == norm(b_rows)
+
+hits = 0
+for question, gold in GOLD_SQL.items():
+    got = ask(question, tenant_id=1)
+    ok = &quot;rows&quot; in got and same_result(got[&quot;rows&quot;], db.execute(gold).fetchall())
+    hits += ok
+    print((&quot;PASS &quot; if ok else &quot;FAIL &quot;) + question)
+print(f&quot;execution accuracy: {hits}/{len(GOLD_SQL)}&quot;)
+
+naive = &quot;SELECT cust.city, SUM(ord.amt_inr) FROM ord JOIN cust ON ord.cust_id = cust.cust_id WHERE cust.tenant_id = 1 GROUP BY cust.city&quot;
+print(&quot;naive revenue (all statuses) vs defined revenue, Pune:&quot;,
+      dict(db.execute(naive).fetchall())[&quot;Pune&quot;], &quot;vs&quot;, dict(db.execute(GOLD_SQL[&quot;What were sales by location last month?&quot;]).fetchall())[&quot;Pune&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  attempt 1 failed: no such column: ord.delivery_status
+PASS Which city had the most delayed orders?
+PASS What were sales by location last month?
+execution accuracy: 2/2
+naive revenue (all statuses) vs defined revenue, Pune: 84525.0 vs 24890.0
+</code></pre></div>
+<p>The last line is why the semantic layer exists: the naive query is valid SQL, runs without error, and overstates Pune's revenue more than threefold. An <span class="cx" data-c="219" tabindex="0">eval set</span> of verified questions with gold SQL catches this class of silent error; a "did it run?" check never will.</p></div></aside>
+<h2>Production design: the full picture</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Practice</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ambiguity</td>
+<td>Ask a clarifying question when a term is undefined ("which revenue: booked or delivered?"); never guess silently</td>
+</tr>
+<tr>
+<td>Business definitions</td>
+<td>A semantic layer with metrics, synonyms and verified queries, owned by the data team</td>
+</tr>
+<tr>
+<td>Schema size</td>
+<td>Schema linking with embeddings over table and column descriptions; curated subject areas</td>
+</tr>
+<tr>
+<td>Safety</td>
+<td>Read-only role, parsed-query validation, allowlists, injected tenant and permission filters, row limits, timeouts, cost limits on the warehouse</td>
+</tr>
+<tr>
+<td>Correctness</td>
+<td>Show the SQL, answer only from results, execution-accuracy evals, regression tests on verified questions</td>
+</tr>
+<tr>
+<td>Performance</td>
+<td>Cache frequent questions and results; route heavy questions to pre-aggregated tables</td>
+</tr>
+<tr>
+<td>Governance</td>
+<td>Log question, SQL, row count and user on every run; masking policies apply because the query runs as the user's role</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-platform"><div class="co-label">On the platforms</div><div class="co-title">Text-to-SQL on the platforms</div><div class="co-body"><ul>
+<li><strong>Databricks</strong>: <strong>Genie</strong> spaces over curated tables and metric views, also usable as an agent tool and through the managed <span class="cx cx-later" data-c="391" tabindex="0">MCP</span><a class="cx-pill" href="#l0801" title="Taught later, in Lesson 8.1">later · 13.7</a> server (<a class="xref" href="#l1307">Lesson 13.50</a>).</li>
+<li><strong>Google Cloud</strong>: BigQuery <strong>data agents</strong> and the Conversational Analytics API, Looker's semantic model (<a class="xref" href="#l1306">Lesson 15.30</a>).</li>
+<li><strong>Azure</strong>: <strong>Fabric data agents</strong> over lakehouses, warehouses and Power BI semantic models, usable from Foundry agents (<a class="xref" href="#l1304">Lesson 14.128</a>).</li>
+<li><strong>AWS</strong>: Bedrock <strong>Knowledge Bases structured data</strong> (natural language to SQL over Redshift and the Glue catalog) and Amazon Quick for business users (<a class="xref" href="#l1301">Lesson 14.125</a>).</li>
+</ul></div></aside>
+<aside class="co co-prod"><div class="co-label">In production</div><div class="co-title">Design a text-to-SQL system right from day one</div><div class="co-body"><ol>
+<li><strong>Scope by domain</strong>: one curated subject area per assistant (orders, payments, marketing), not the whole warehouse.</li>
+<li><strong>A semantic layer before prompts</strong>: table and column descriptions, synonyms, sample values for low-cardinality columns, metric definitions, and a few verified queries. This is where most accuracy comes from.</li>
+<li><strong>Read-only execution as the user's role</strong>, with row limits, timeouts and cost limits, so permissions and masking apply automatically.</li>
+<li><strong>Show the SQL and the assumptions</strong> with every answer, and ask a clarifying question when a term is ambiguous.</li>
+<li><strong>An eval set of real questions with verified results</strong>, scored by comparing result sets.</li>
+<li><strong>Logging of question, SQL, row count and user</strong>, so wrong answers can be traced and turned into new verified queries.</li>
+</ol></div></aside>
+<aside class="co co-scenario"><div class="co-label">Choose by scenario</div><div class="co-title">Text-to-SQL accuracy is low: symptom and next move</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Try first</th>
+<th>If it still fails</th>
+<th>Watch out</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Wrong tables chosen</td>
+<td>Retrieve tables by their descriptions and by summaries of past queries; let the user confirm the tables</td>
+<td>Narrow the search to one business domain first</td>
+<td>Undocumented tables are invisible to retrieval: documentation is the fix</td>
+</tr>
+<tr>
+<td>Schemas overflow the context or cost too much</td>
+<td>Prune to the columns relevant to the question</td>
+<td>Describe a curated view instead of raw tables</td>
+<td>Pruning too hard drops join keys</td>
+</tr>
+<tr>
+<td>Filters use the wrong values ("web" for "WEB")</td>
+<td>Put distinct values of low-cardinality columns in the context</td>
+<td>A value-lookup tool for high-cardinality columns</td>
+<td>Stale value lists after new categories appear</td>
+</tr>
+<tr>
+<td>Business metrics computed wrongly ("active customer", "net revenue")</td>
+<td>Define each metric once in the semantic layer</td>
+<td>Verified queries for the top questions</td>
+<td>Two teams defining the same metric differently: settle it before the model sees it</td>
+</tr>
+<tr>
+<td>Ambiguous questions answered confidently</td>
+<td>A clarifying question, or answer with stated assumptions</td>
+<td>Reject unanswerable questions with suggestions</td>
+<td>Too many clarifying questions annoy users; ask only when results would differ</td>
+</tr>
+<tr>
+<td>Queries fail to run</td>
+<td>Validate or <code>EXPLAIN</code> first and feed errors back for one or two repairs</td>
+<td>Generate several candidates and keep the one that runs and passes checks</td>
+<td>Endless repair loops: cap attempts</td>
+</tr>
+<tr>
+<td>Users do not trust the numbers</td>
+<td>Always show SQL, tables used and a plain explanation</td>
+<td>Link to the governed dashboard for the same metric</td>
+<td>A single visibly wrong number destroys adoption; start with a narrow, well-tested scope</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-field"><div class="co-label">From the field</div><div class="co-title">Four companies, one pattern: narrow the context, then generate</div><div class="co-body"><ul>
+<li><strong>Uber, QueryGPT</strong> (2024): about 1.2 million interactive queries a month on Uber's data platform. The first prototype retrieved tables and sample SQL by similarity and degraded as tables were added. The version that worked chains narrow agents: an intent agent maps the question to a business-domain workspace, a table agent proposes tables for the user to confirm, and a column-prune agent trims schemas that were 40,000 to 60,000 tokens. Evaluation uses a golden set with verified intent, tables and SQL, scoring each stage separately. In a limited release, 78% of users said it cut their query-writing time. <a href="https://www.uber.com/blog/query-gpt/">Uber Engineering</a></li>
+<li><strong>Pinterest</strong> (2024): table selection by <span class="cx" data-c="674" tabindex="0">vector search</span> over table summaries and summaries of historical queries, weighting table documentation more heavily, then an <span class="cx" data-c="346" tabindex="0">LLM</span> picks the final tables for the user to confirm. Table search hit rate rose from 40% without documentation to about 90% with it, and first-shot acceptance of generated SQL rose from 20% to over 40%. <a href="https://medium.com/pinterest-engineering/how-we-built-text-to-sql-at-pinterest-30bad30dabff">Pinterest Engineering</a></li>
+<li><strong>LinkedIn, SQL Bot</strong> (2025): a <span class="cx cx-later" data-c="322" tabindex="0">knowledge graph</span><a class="cx-pill" href="#l0501" title="Taught later, in Lesson 5.1">later · 14.38</a> built from table metadata, query logs, wikis and code, clustered by team, feeds an agent that retrieves context, writes SQL and fixes its own errors. Over 300 weekly users; expert review rated 53% of answers correct or close to correct on an internal benchmark, an honest number worth remembering when vendors quote 90%. <a href="https://arxiv.org/abs/2507.14372">Chen et al., arXiv</a></li>
+<li><strong>Swiggy, Hermes</strong> (India, 2026 write-up): a Slack-based analyst over the company's data warehouse. Historical SQL was explained in natural language by an LLM, indexed, and retrieved as <span class="cx" data-c="233" tabindex="0">few-shot</span> examples; a <span class="cx" data-c="492" tabindex="0">ReAct</span>-style orchestrator checks completeness, looks up metadata, asks clarifying questions and attaches assumptions and confidence to every answer. The team reports SQL accuracy rising from 54% to 93% across versions. <a href="https://www.infoq.com/news/2026/01/swiggy-hermes-conversational-ai">InfoQ</a></li>
+</ul>
+<p>Treat vendor and internal benchmarks as directional and build your own question set: the spread between 53% and 93% above is mostly about how narrow and well-described the data is.</p></div></aside>
+<aside class="co co-watch"><div class="co-label">Watch the practitioners</div><div class="co-body"><ul>
+<li><a href="https://www.youtube.com/watch?v=dZgA6btnb_s">Do Not Let Models Invent Numbers</a>: Vinoo Ganesh, Kepler, 21 min</li>
+<li><a href="https://www.youtube.com/watch?v=iUWwcG-C8OU">Why Can't Anyone Answer Questions About the Business?</a>: Garrett Galow</li>
+<li><a href="https://www.youtube.com/watch?v=5V8tP5jDZ8U">How OpenAI Built Its Data Agent</a>: ByteByteGo, 6 min</li>
+</ul>
+<p>More talks and design drills on real cases: <a class="xref" href="#l1501">Lesson 14.163</a>.</p></div></aside>
+<aside class="co co-repos"><div class="co-label">Code to study</div><div class="co-body"><ul>
+<li><a href="https://github.com/vanna-ai/vanna">vanna-ai/vanna</a>: text-to-SQL with retrieval of verified queries (archived, still a readable design)</li>
+</ul></div></aside>
+<aside class="co co-lab"><div class="co-label">Hands-on lab</div><div class="co-title">Lab 10A · A safe analyst for your warehouse</div><div class="co-body"><ol>
+<li>Add a "returned orders by tier" metric to the semantic layer and a verified query for it, then ask the question two different ways.</li>
+<li>Make <code>fake_llm_sql</code> return a query that reads the other tenant's data without a tenant filter, and show that <code>validate</code> still scopes it to tenant 1.</li>
+<li>Write a query that would run for a long time (a cross join of <code>ord</code> with itself three times) and confirm the timeout stops it.</li>
+<li>With a real model, replace <code>fake_llm_sql</code> and run ten questions from your own work through the full pipeline; record execution accuracy and the most common failure.</li>
+<li>Point the same pipeline at Postgres or Databricks through their SQL connectors, using a read-only role.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A prompt saying 'only SELECT' is enough protection."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Use a read-only database role; parsing and prompts are extra layers.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "If the SQL runs, the answer is right."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Valid SQL can answer a different question; check results and definitions.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Give the model the whole schema."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Retrieve only the relevant tables and their descriptions.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A tenant filter on the outer WHERE scopes the whole query."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Scalar subqueries and CTEs read the table unfiltered; filter every SELECT scope and refuse CTEs, then test the bypasses.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A client-side timeout protects the warehouse."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It protects your process; set the timeout on the warehouse too, and EXPLAIN before running.</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>The question "What was revenue last month?" goes to <code>link_schema</code>. Which tables should it return, and what can go wrong if it returns all of them? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Run model-generated SQL without the validation step. The model writes <code>DELETE FROM orders WHERE ...</code>. What protects you? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-body"><p>Revenue answers are 18% too high. The SQL is valid. Which trap from Step 1 is likely, and where should the fix live? (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Add a metric "net revenue" to the semantic layer (excluding cancelled orders and tax) and test it with three phrasings of the same question. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0416-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Show only what is needed</span></summary><div class="qa-a"><p>Only the tables with revenue and dates, through the semantic layer's definition of revenue. With all tables, the prompt is long and the model may pick a similar-looking wrong column, such as gross instead of net.</p></div></details>
+<details class="qa" id="l0416-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Validate and restrict</span></summary><div class="qa-a"><p>Nothing, if validation is skipped and the database user can write. Parse the SQL and allow only SELECT, run with a read-only role, limit rows and time, and validate tables and columns against the schema.</p></div></details>
+<details class="qa" id="l0416-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Business meaning belongs in the semantic layer</span></summary><div class="qa-a"><p>Likely double counting through a join (order lines times payments) or counting cancelled orders or including tax. The fix belongs in the semantic layer's metric definition, not in a prompt instruction, so every question uses the same definition.</p></div></details>
+<details class="qa" id="l0416-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · One definition, many phrasings</span></summary><div class="qa-a"><p>Define the metric once with its filters, expose it to the model with a description, and check that all three phrasings produce the same SQL result.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0416-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">What makes text-to-SQL hard in production, and how do you make it reliable?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Business meaning is not in the schema: which column is revenue, which orders count, how tables join. Reliability comes from a semantic layer that defines metrics and joins, schema linking that shows only relevant tables, validation and a read-only role, examples of good queries, and evaluation by comparing query results, not SQL text.</p>
+<p><strong>A plausible wrong answer.</strong> "Give the model the full schema and it will work." Large schemas and ambiguous columns cause most errors.</p>
+<p><strong>Follow-ups.</strong> How would you evaluate text-to-SQL?</p></div></details>
+<details class="qa" id="l0416-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">Text-to-SQL works on the demo database but fails on the real warehouse. Why?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Real schemas are larger, with cryptic names, many similar tables, and business rules in people's heads. Add a semantic layer, column descriptions, schema linking, and examples drawn from real analyst queries; test on real questions.</p>
+<p><strong>A plausible wrong answer.</strong> "The model is not good enough for SQL." The model lacks context the demo did not need.</p>
+<p><strong>Follow-ups.</strong> Where would you get example queries?</p></div></details>
+<details class="qa" id="l0416-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">A text-to-SQL agent or a semantic-layer product's built-in natural language interface?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> A platform's built-in interface (for example Databricks Genie or BigQuery and Fabric data agents) when your data and metrics live there and its semantic layer covers your questions; your own agent when you need custom tools, multiple sources or tight integration. Both depend on a good semantic layer.</p>
+<p><strong>A plausible wrong answer.</strong> "Build your own, it is more flexible." Flexibility without a semantic layer gives wrong numbers faster.</p>
+<p><strong>Follow-ups.</strong> How would you compare them on your questions?</p></div></details>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0416-q1"><p class="q-text"><span class="q-num">Q1</span>Why does a text-to-SQL system need a semantic layer?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0416-q1-o0"><span class="opt-key">A</span><span>To make queries faster</span></button><button type="button" class="opt" data-correct="true" id="l0416-q1-o1"><span class="opt-key">B</span><span>So business terms such as revenue have one exact definition, instead of each query guessing</span></button><button type="button" class="opt" data-correct="false" id="l0416-q1-o2"><span class="opt-key">C</span><span>To replace the database schema</span></button><button type="button" class="opt" data-correct="false" id="l0416-q1-o3"><span class="opt-key">D</span><span>Because models cannot write joins</span></button></div><p class="q-explain" hidden>Valid SQL with the wrong definition is the most common silent error.</p></div><div class="q" id="l0416-q2"><p class="q-text"><span class="q-num">Q2</span>Where should a tenant filter be enforced?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0416-q2-o0"><span class="opt-key">A</span><span>In the prompt ("only query tenant 1")</span></button><button type="button" class="opt" data-correct="true" id="l0416-q2-o1"><span class="opt-key">B</span><span>In code on the parsed query, and in the database through row-level security and a scoped role</span></button><button type="button" class="opt" data-correct="false" id="l0416-q2-o2"><span class="opt-key">C</span><span>In the final answer</span></button><button type="button" class="opt" data-correct="false" id="l0416-q2-o3"><span class="opt-key">D</span><span>It is not needed for read-only queries</span></button></div><p class="q-explain" hidden>Prompts are not a security boundary; injected filters and database policies are.</p></div><div class="q" id="l0416-q3"><p class="q-text"><span class="q-num">Q3</span>How should you evaluate generated SQL?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0416-q3-o0"><span class="opt-key">A</span><span>Compare the SQL text with a gold query</span></button><button type="button" class="opt" data-correct="true" id="l0416-q3-o1"><span class="opt-key">B</span><span>Execute it and compare the result set with the gold query's result (execution accuracy)</span></button><button type="button" class="opt" data-correct="false" id="l0416-q3-o2"><span class="opt-key">C</span><span>Check that it runs without error</span></button><button type="button" class="opt" data-correct="false" id="l0416-q3-o3"><span class="opt-key">D</span><span>Count the joins</span></button></div><p class="q-explain" hidden>Different SQL can be equally correct; only results tell you.</p></div><div class="q" id="l0416-q4"><p class="q-text"><span class="q-num">Q4</span>The first generated query fails with "no such column". What should the agent do?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0416-q4-o0"><span class="opt-key">A</span><span>Return the error to the user</span></button><button type="button" class="opt" data-correct="true" id="l0416-q4-o1"><span class="opt-key">B</span><span>Send the query and the error back to the model for a bounded number of repair attempts</span></button><button type="button" class="opt" data-correct="false" id="l0416-q4-o2"><span class="opt-key">C</span><span>Retry the same query</span></button><button type="button" class="opt" data-correct="false" id="l0416-q4-o3"><span class="opt-key">D</span><span>Switch to a larger model immediately</span></button></div><p class="q-explain" hidden>Database errors are precise feedback; most repairs succeed in one attempt.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0416" id="done-l0416">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0416" id="undo-l0416" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0414"><span class="pn-dir">Previous</span><span class="pn-t">14.34 · Debugging RAG: lessons from the field</span></a><a class="pn next" href="#l0417"><span class="pn-dir">Next</span><span class="pn-t">14.36 · Generative engine optimization</span></a></div></footer>

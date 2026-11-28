@@ -1,0 +1,785 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-13">Phase 13 · Tool Use, MCP and Agent Protocols</a></nav><h1>Type Recovery: Structs, Arrays, C++ Objects and DWARF</h1><div class="m-meta"><span class="chip chip-num">Lesson 13.45</span><span class="chip">140 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1341" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Read a struct member access as base register plus displacement, and an array access as base plus index times stride, from the Intel SDM addressing rules.</li>
+<li>Apply the System V alignment rules by hand to <code>struct account</code> and explain each padding byte.</li>
+<li>Build a type-recovery pass that turns the accesses in a listing into field offsets, widths, kinds, a stride, and a size, with the evidence for each.</li>
+<li>Write a DWARF 5 reader for <code>.debug_info</code>, <code>.debug_abbrev</code>, <code>.debug_str_offsets</code>, and <code>.debug_addr</code> of a relocatable object, and check it against <code>llvm-dwarfdump</code>.</li>
+<li>Compare the recovered layout with the DWARF layout and name every difference as missing evidence, a merged access, or an unprovable kind.</li>
+<li>Read an Itanium C++ vtable, its typeinfo, and its mangled names from relocations, and resolve a virtual call to a slot.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 13.37 (disassembly and control flow), Lesson 13.38 (lifting to pseudocode)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 140 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript, C, C++, x86-64 assembly. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A decompiler prints <code>a-&gt;balance</code> when it has a type table and <code>*(int *)(param_1 + 4)</code> when it does not. This lesson builds the table from the accesses, reads the real one from DWARF 5, and shows where the two agree.</p></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Machine code has no types. A struct field shows up only as an offset added to a pointer, such as <code>4(%rdi)</code> for a 4-byte member 4 bytes into the struct. To recover the struct, you collect every access through the same pointer, note each offset and width, and apply the platform's layout rules (alignment and padding) to fill the gaps. When the program was built with debug information, DWARF describes the types exactly, which gives you something to check against. C++ adds hidden data: a pointer to a virtual-method table (vtable) at the start of each object, and type information for <code>dynamic_cast</code> and exceptions. This lesson checks one struct three ways (the lesson's DWARF reader, pyelftools on GCC's DWARF, and the compiler's own <code>offsetof</code>), then reads C++ vtables from clang's and g++'s objects and from a live process in gdb.</p></div></aside>
+<p>You compiled <code>account.c</code> without <code>-g</code> and asked an agent what <code>bump</code> does. The agent sent the object to Ghidra 12.1.4 and got this back:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">void bump(long param_1,int param_2)
+{
+  *(int *)(param_1 + 4) = param_2 + *(int *)(param_1 + 4);
+  return;
+}
+</code></pre></div>
+<p>The same source compiled with <code>-g</code> gives this from the same decompiler:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">int bump(account *a,int by)
+{
+  a-&gt;balance = by + a-&gt;balance;
+  return a-&gt;balance;
+}
+</code></pre></div>
+<p>The instructions are identical in both objects. The difference is a type table. With the table the decompiler knows that the first parameter points at a 32-byte structure whose field at offset 4 is a 4-byte <code>int</code> named <code>balance</code>. Without it the decompiler knows only that something 8 bytes wide arrived in <code>%rdi</code> and that 4 bytes at <code>+4</code> were read and written.</p>
+<p>Everything in that table has a source. The offset 4 comes from the displacement byte of <code>addl 0x4(%rax), %ecx</code>. The width 4 comes from the <code>l</code> suffix. The name comes from a <code>DW_TAG_member</code> entry in <code>.debug_info</code>. This lesson builds both halves: a pass that recovers what the instructions prove, and a reader that decodes what the compiler recorded. The gap between them is what a type name costs.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="re-41-struct-recovery"></div></figure></p>
+<h2>A Member Access Is a Displacement</h2>
+<p>Intel SDM Volume 1, section 3.7.5, defines the effective address as <code>Offset = Base + (Index * Scale) + Displacement</code>, with a scale of 1, 2, 4, or 8 and a displacement of 8, 16, or 32 bits. Section 3.7.5.1 adds the 64-bit mode form <code>RIP + Displacement</code>. A struct member access uses the first form with no index: the base register holds the address of the object and the displacement is the member offset. An array access adds the index term, and the scale or a separate multiply carries the element size.</p>
+<figure class="diagram mmfig" data-mmd="a1341" data-h="9bcf5ce1f9"><div class="dg-scroll"><svg class="dg mm" id="mm9bcf5ce1f9" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 685.484px; background-color: transparent;" viewBox="0 0 685.484375 641" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm9bcf5ce1f9{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm9bcf5ce1f9 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm9bcf5ce1f9 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm9bcf5ce1f9 .error-icon{fill:#f4efe7;}#mm9bcf5ce1f9 .error-text{fill:#0b1018;stroke:#0b1018;}#mm9bcf5ce1f9 .edge-thickness-normal{stroke-width:1px;}#mm9bcf5ce1f9 .edge-thickness-thick{stroke-width:3.5px;}#mm9bcf5ce1f9 .edge-pattern-solid{stroke-dasharray:0;}#mm9bcf5ce1f9 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm9bcf5ce1f9 .edge-pattern-dashed{stroke-dasharray:3;}#mm9bcf5ce1f9 .edge-pattern-dotted{stroke-dasharray:2;}#mm9bcf5ce1f9 .marker{fill:#6c6357;stroke:#6c6357;}#mm9bcf5ce1f9 .marker.cross{stroke:#6c6357;}#mm9bcf5ce1f9 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm9bcf5ce1f9 p{margin:0;}#mm9bcf5ce1f9 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm9bcf5ce1f9 .cluster-label text{fill:#0b1018;}#mm9bcf5ce1f9 .cluster-label span{color:#0b1018;}#mm9bcf5ce1f9 .cluster-label span p{background-color:transparent;}#mm9bcf5ce1f9 .label text,#mm9bcf5ce1f9 span{fill:#211c16;color:#211c16;}#mm9bcf5ce1f9 .node rect,#mm9bcf5ce1f9 .node circle,#mm9bcf5ce1f9 .node ellipse,#mm9bcf5ce1f9 .node polygon,#mm9bcf5ce1f9 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm9bcf5ce1f9 .rough-node .label text,#mm9bcf5ce1f9 .node .label text,#mm9bcf5ce1f9 .image-shape .label,#mm9bcf5ce1f9 .icon-shape .label{text-anchor:middle;}#mm9bcf5ce1f9 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm9bcf5ce1f9 .rough-node .label,#mm9bcf5ce1f9 .node .label,#mm9bcf5ce1f9 .image-shape .label,#mm9bcf5ce1f9 .icon-shape .label{text-align:center;}#mm9bcf5ce1f9 .node.clickable{cursor:pointer;}#mm9bcf5ce1f9 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm9bcf5ce1f9 .arrowheadPath{fill:#0b0b0b;}#mm9bcf5ce1f9 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm9bcf5ce1f9 .flowchart-link{stroke:#6c6357;fill:none;}#mm9bcf5ce1f9 .edgeLabel{background-color:#ffffff;text-align:center;}#mm9bcf5ce1f9 .edgeLabel p{background-color:#ffffff;}#mm9bcf5ce1f9 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm9bcf5ce1f9 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm9bcf5ce1f9 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm9bcf5ce1f9 .cluster text{fill:#0b1018;}#mm9bcf5ce1f9 .cluster span{color:#0b1018;}#mm9bcf5ce1f9 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm9bcf5ce1f9 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm9bcf5ce1f9 rect.text{fill:none;stroke-width:0;}#mm9bcf5ce1f9 .icon-shape,#mm9bcf5ce1f9 .image-shape{background-color:#ffffff;text-align:center;}#mm9bcf5ce1f9 .icon-shape p,#mm9bcf5ce1f9 .image-shape p{background-color:#ffffff;padding:2px;}#mm9bcf5ce1f9 .icon-shape .label rect,#mm9bcf5ce1f9 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm9bcf5ce1f9 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm9bcf5ce1f9 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm9bcf5ce1f9 .node .neo-node{stroke:#b5521b;}#mm9bcf5ce1f9 [data-look="neo"].node rect,#mm9bcf5ce1f9 [data-look="neo"].cluster rect,#mm9bcf5ce1f9 [data-look="neo"].node polygon{stroke:url(#mm9bcf5ce1f9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm9bcf5ce1f9 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm9bcf5ce1f9 [data-look="neo"].node path{stroke:url(#mm9bcf5ce1f9-gradient);stroke-width:1px;}#mm9bcf5ce1f9 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm9bcf5ce1f9 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm9bcf5ce1f9 [data-look="neo"].node circle{stroke:url(#mm9bcf5ce1f9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm9bcf5ce1f9 [data-look="neo"].node circle .state-start{fill:#000000;}#mm9bcf5ce1f9 [data-look="neo"].icon-shape .icon{fill:url(#mm9bcf5ce1f9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm9bcf5ce1f9 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm9bcf5ce1f9-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm9bcf5ce1f9 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm9bcf5ce1f9_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm9bcf5ce1f9_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M257.578,59L257.578,63.167C257.578,67.333,257.578,75.667,257.578,83.333C257.578,91,257.578,98,257.578,101.5L257.578,105" id="mm9bcf5ce1f9-L_ACC_DISP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ACC_DISP_0" data-points="W3sieCI6MjU3LjU3ODEyNSwieSI6NTl9LHsieCI6MjU3LjU3ODEyNSwieSI6ODR9LHsieCI6MjU3LjU3ODEyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M257.578,181L257.578,185.167C257.578,189.333,257.578,197.667,257.578,205.333C257.578,213,257.578,220,257.578,223.5L257.578,227" id="mm9bcf5ce1f9-L_DISP_COL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DISP_COL_0" data-points="W3sieCI6MjU3LjU3ODEyNSwieSI6MTgxfSx7IngiOjI1Ny41NzgxMjUsInkiOjIwNn0seyJ4IjoyNTcuNTc4MTI1LCJ5IjoyMzF9XQ==" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M257.578,303L257.578,307.167C257.578,311.333,257.578,319.667,266.882,327.742C276.185,335.817,294.793,343.634,304.096,347.542L313.4,351.451" id="mm9bcf5ce1f9-L_COL_LAY_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_COL_LAY_0" data-points="W3sieCI6MjU3LjU3ODEyNSwieSI6MzAzfSx7IngiOjI1Ny41NzgxMjUsInkiOjMyOH0seyJ4IjozMTcuMDg3NjAyNDU5MDE2NCwieSI6MzUzfV0=" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M120.875,425L120.875,429.167C120.875,433.333,120.875,441.667,133.98,449.886C147.084,458.106,173.294,466.212,186.398,470.265L199.503,474.318" id="mm9bcf5ce1f9-L_DW_CMP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DW_CMP_0" data-points="W3sieCI6MTIwLjg3NSwieSI6NDI1fSx7IngiOjEyMC44NzUsInkiOjQ1MH0seyJ4IjoyMDMuMzI0NDkxMjc5MDY5NzgsInkiOjQ3NS41fV0=" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M402.781,425L402.781,429.167C402.781,433.333,402.781,441.667,389.843,449.884C376.904,458.102,351.026,466.203,338.088,470.254L325.149,474.305" id="mm9bcf5ce1f9-L_LAY_CMP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_LAY_CMP_0" data-points="W3sieCI6NDAyLjc4MTI1LCJ5Ijo0MjV9LHsieCI6NDAyLjc4MTI1LCJ5Ijo0NTB9LHsieCI6MzIxLjMzMTc1ODcyMDkzMDIsInkiOjQ3NS41fV0=" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M262.328,511.5L262.245,515.583C262.161,519.667,261.995,527.833,261.911,535.417C261.828,543,261.828,550,261.828,553.5L261.828,557" id="mm9bcf5ce1f9-L_CMP_REP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CMP_REP_0" data-points="W3sieCI6MjYyLjMyODEyNSwieSI6NTExLjV9LHsieCI6MjYxLjgyODEyNSwieSI6NTM2fSx7IngiOjI2MS44MjgxMjUsInkiOjU2MX1d" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/><path d="M547.984,292.5L547.984,298.417C547.984,304.333,547.984,316.167,538.681,325.992C529.377,335.817,510.77,343.634,501.466,347.542L492.163,351.451" id="mm9bcf5ce1f9-L_VT_LAY_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_VT_LAY_0" data-points="W3sieCI6NTQ3Ljk4NDM3NSwieSI6MjkyLjV9LHsieCI6NTQ3Ljk4NDM3NSwieSI6MzI4fSx7IngiOjQ4OC40NzQ4OTc1NDA5ODM2LCJ5IjozNTN9XQ==" data-look="classic" marker-end="url(#mm9bcf5ce1f9_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_ACC_DISP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DISP_COL_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_COL_LAY_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DW_CMP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_LAY_CMP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_CMP_REP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_VT_LAY_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm9bcf5ce1f9-flowchart-ACC-0" data-look="classic" transform="translate(257.578125, 33.5)"><rect class="basic label-container" style="" x="-95.7265625" y="-25.5" width="191.453125" height="51"/><g class="label" style="" transform="translate(-65.7265625, -10.5)"><rect/><foreignObject width="131.453125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>mov eax, [rdi+0x10]</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-DISP-1" data-look="classic" transform="translate(257.578125, 145)"><rect class="basic label-container" style="" x="-99.1640625" y="-36" width="198.328125" height="72"/><g class="label" style="" transform="translate(-69.1640625, -21)"><rect/><foreignObject width="138.328125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Base + displacement<br />= field at offset 16</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-COL-3" data-look="classic" transform="translate(257.578125, 267)"><rect class="basic label-container" style="" x="-110.90625" y="-36" width="221.8125" height="72"/><g class="label" style="" transform="translate(-80.90625, -21)"><rect/><foreignObject width="161.8125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Collect offsets and sizes<br />across every function</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-LAY-5" data-look="classic" transform="translate(402.78125, 389)"><rect class="basic label-container" style="" x="-119.03125" y="-36" width="238.0625" height="72"/><g class="label" style="" transform="translate(-89.03125, -21)"><rect/><foreignObject width="178.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Inferred struct layout<br />(System V alignment rules)</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-DW-6" data-look="classic" transform="translate(120.875, 389)"><rect class="basic label-container" style="" x="-112.875" y="-36" width="225.75" height="72"/><g class="label" style="" transform="translate(-82.875, -21)"><rect/><foreignObject width="165.75" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>DWARF .debug_info<br />the true layout, if present</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-CMP-7" data-look="classic" transform="translate(261.828125, 493)"><polygon points="9,0 160.703125,0 169.703125,-18 160.703125,-36 9,-36 0,-18" class="label-container" transform="translate(-84.8515625,18)"/><g class="label" style="" transform="translate(-68.3515625, -10.5)"><rect/><foreignObject width="136.703125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Compare the layouts</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-REP-11" data-look="classic" transform="translate(261.828125, 597)"><rect class="basic label-container" style="" x="-86.5546875" y="-36" width="173.109375" height="72"/><g class="label" style="" transform="translate(-56.5546875, -21)"><rect/><foreignObject width="113.109375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Matched, missed<br />and wrong fields</p></span></div></foreignObject></g></g><g class="node default" id="mm9bcf5ce1f9-flowchart-VT-12" data-look="classic" transform="translate(547.984375, 267)"><rect class="basic label-container" style="" x="-129.5" y="-25.5" width="259" height="51"/><g class="label" style="" transform="translate(-99.5, -10.5)"><rect/><foreignObject width="199" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>C++: vtable pointer at offset 0</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm9bcf5ce1f9-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm9bcf5ce1f9-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm9bcf5ce1f9-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>Take <code>bump</code> at <code>-O0</code>. The listing from <code>llvm-objdump -d -r</code> reads:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">       4: 48 89 7d f8                   movq    %rdi, -0x8(%rbp)
+       e: 48 8b 45 f8                   movq    -0x8(%rbp), %rax
+      12: 03 48 04                      addl    0x4(%rax), %ecx
+      15: 89 48 04                      movl    %ecx, 0x4(%rax)
+</code></pre></div>
+<p>Decode <code>03 48 04</code> with the rules from lesson 33. <code>03</code> is <code>ADD r32, r/m32</code>. ModRM <code>48</code> is <code>01 001 000</code>: <code>mod = 01</code> means a memory operand with an 8-bit displacement, <code>reg = 001</code> is <code>%ecx</code>, <code>r/m = 000</code> is <code>%rax</code>. The displacement byte is <code>04</code>. The instruction reads 4 bytes at <code>%rax + 4</code> and adds them into <code>%ecx</code>. The <code>l</code> suffix that <code>llvm-objdump</code> prints is the operand size, so the field is 4 bytes wide. The <code>%rax</code> came from the frame slot at <code>-0x8(%rbp)</code>, and that slot received <code>%rdi</code>, the first integer argument under the System V calling convention. Three facts follow: the first parameter is a pointer, the object it points at has a 4-byte field at offset 4, and <code>bump</code> reads and writes that field.</p>
+<p>Nothing in these bytes says <code>int</code>, <code>balance</code>, or <code>struct account</code>. Nothing says how big the object is. The remaining 28 bytes of the struct are invisible to <code>bump</code>.</p>
+<h2>The System V Layout Rules</h2>
+<p>The x86-64 psABI, section 3.1.2, gives three rules for aggregates. "Structures and unions assume the alignment of their most strictly aligned component. Each member is assigned to the lowest available offset with the appropriate alignment. The size of any object is always a multiple of the object's alignment." Figure 3.1 of the same document gives the scalar sizes and alignments: <code>char</code> 1 and 1, <code>short</code> 2 and 2, <code>int</code> 4 and 4, <code>double</code> 8 and 8, any pointer 8 and 8.</p>
+<p>Apply the rules to the struct in <code>account.c</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-c">struct account {
+    char kind;
+    int balance;
+    short code;
+    double rate;
+    const char *label;
+};
+</code></pre></div>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Member</th>
+<th>Size</th>
+<th>Alignment</th>
+<th>Lowest offset that fits</th>
+<th>Padding before</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>kind</code></td>
+<td>1</td>
+<td>1</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>balance</code></td>
+<td>4</td>
+<td>4</td>
+<td>4</td>
+<td>3 (bytes 1 to 3)</td>
+</tr>
+<tr>
+<td><code>code</code></td>
+<td>2</td>
+<td>2</td>
+<td>8</td>
+<td>0</td>
+</tr>
+<tr>
+<td><code>rate</code></td>
+<td>8</td>
+<td>8</td>
+<td>16</td>
+<td>6 (bytes 10 to 15)</td>
+</tr>
+<tr>
+<td><code>label</code></td>
+<td>8</td>
+<td>8</td>
+<td>24</td>
+<td>0</td>
+</tr>
+</tbody>
+</table></div>
+<p>The last member ends at 32. The strictest alignment is 8, and 32 is a multiple of 8, so the size is 32 with no tail padding. Nine bytes of the 32 are padding, and the psABI says "The contents of any padding is undefined".</p>
+<p>The order of the members decides the size. The same five members as <code>double, pointer, int, short, char</code> fill offsets 0, 8, 16, 20, 22 and end at 23, which rounds up to 24. <code>sysv_layout()</code> in <code>code/main.py</code> applies the three rules and produces both results. Python's <code>ctypes</code> module applies the same rules through the host compiler's convention, and <code>ctypes.sizeof</code>, <code>ctypes.alignment</code>, and the <code>.offset</code> of each field give 32, 8, and <code>0, 4, 8, 16, 24</code> for the same struct. The program itself prints the third copy when you build and run it on this machine:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">sizeof 32 align 8
+kind 0 balance 4 code 8 rate 16 label 24
+sum 315 tag -3 projected 318.75 label_length 7
+</code></pre></div>
+<p>That native build is arm64. The Arm AAPCS64 states the same aggregate rules in its section 5.10.1, and Apple's arm64 document keeps these five scalar sizes, so the numbers agree across the two targets. The lesson's x86-64 objects are compiled with <code>-target x86_64-unknown-linux-gnu</code> so that the ELF reader from lesson 33 and the DWARF reader below work on them.</p>
+<h2>Read the Rest of the Struct by Hand</h2>
+<p><code>bump</code> sees one field. The other four functions in <code>account.c</code> see the rest, and each one shows a different instruction form. All addresses below are from <code>account-x86_64-O0-g.objdump.txt</code>.</p>
+<p><code>sum_balances</code> indexes an array of the struct:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      51: 48 8b 45 f8                   movq    -0x8(%rbp), %rax
+      55: 48 63 4d ec                   movslq  -0x14(%rbp), %rcx
+      59: 48 c1 e1 05                   shlq    $0x5, %rcx
+      5d: 48 01 c8                      addq    %rcx, %rax
+      60: 8b 40 04                      movl    0x4(%rax), %eax
+</code></pre></div>
+<p><code>%rax</code> is <code>list</code>, <code>%rcx</code> is <code>i</code> sign-extended to 64 bits, and <code>shlq $0x5</code> multiplies it by 32. After the <code>addq</code>, <code>%rax</code> is <code>list + 32 * i</code>, and the load reads 4 bytes at offset 4 of element <code>i</code>. The shift count is the only place in this object where the size of the struct appears as a number. The loop that contains these instructions runs from <code>0x49</code> to the <code>jmp 0x49</code> at <code>0x72</code>.</p>
+<p><code>tag</code> reads two narrow fields:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      8c: 0f be 00                      movsbl  (%rax), %eax
+      98: 0f bf 48 08                   movswl  0x8(%rax), %ecx
+</code></pre></div>
+<p><code>movsbl</code> loads one byte at offset 0 and sign-extends it, so the field at 0 is a signed 1-byte integer. <code>movswl</code> loads two bytes at offset 8 with sign extension, so the field at 8 is a signed 2-byte integer. At <code>-O1</code> the first access becomes <code>cmpb $0x6c, (%rdi)</code>, which still says 1 byte at offset 0 and says nothing about the sign.</p>
+<p><code>projected</code> reads a float:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      cc: f2 0f 2a 40 04                cvtsi2sdl   0x4(%rax), %xmm0
+      d5: f2 0f 59 40 10                mulsd   0x10(%rax), %xmm0
+</code></pre></div>
+<p><code>cvtsi2sdl</code> converts a signed 32-bit integer from memory to a double, which confirms that offset 4 holds a signed 4-byte integer. <code>mulsd</code> multiplies by a double from memory, so offset 16 holds an 8-byte floating-point value.</p>
+<p><code>label_length</code> reads a pointer and then follows it:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      f3: 48 8b 40 18                   movq    0x18(%rax), %rax
+      f7: 48 63 4d f4                   movslq  -0xc(%rbp), %rcx
+      fb: 80 3c 08 00                   cmpb    $0x0, (%rax,%rcx)
+</code></pre></div>
+<p>The <code>movq</code> reads 8 bytes at offset 24. On its own that is an 8-byte integer or a pointer. The <code>cmpb</code> uses the loaded value as the base of a memory operand. A value that is used as an address is a pointer. The <code>cmpb</code> reads 1 byte at index <code>%rcx</code> from it, and at <code>-O1</code> the pointer is advanced with <code>leaq 0x1(%rcx), %rcx</code> inside the loop, so the pointed-to elements are 1 byte apart.</p>
+<p>Put the five functions together and the struct is <code>{ i8 at 0, i32 at 4, i16 at 8, f64 at 16, pointer at 24 }</code> with a stride of 32. The gaps at 1 to 3 and 10 to 15 are exactly the padding the psABI rules predicted. What the instructions do not say: the member names, that the pointer is <code>const char *</code>, the declared type of the signed byte at 0, which the source spells <code>char</code>, and that the five functions receive the same type. The last claim comes from <code>main</code>, which passes one frame object to all five. At <code>-O0</code> the call sites make that visible: <code>leaq -0x70(%rbp), %rdi</code> followed by <code>addq $0x20, %rdi</code> before <code>callq bump</code>, and <code>addq $0x40, %rdi</code> before <code>callq tag</code>. The offsets 0, <code>0x20</code>, and <code>0x40</code> are three elements of one array, and the <code>memcpy</code> of <code>0x60</code> bytes that fills it is 96 bytes, which is three elements of 32.</p>
+<h2>The Pass</h2>
+<p><code>trace_function()</code> in <code>code/main.py</code> walks one function's instructions in address order and keeps a small abstract state. A holder is a 64-bit register or a frame slot such as <code>-0x8(%rbp)</code>. Each holder has one of three values. A <code>Pointer</code> is a root plus a constant offset plus a set of strides, where a stride records that an unknown multiple of that many bytes was added. An <code>Index</code> is an integer of unknown value that is a multiple of a scale. Anything else is nothing.</p>
+<p>The state starts with the six System V argument registers holding <code>Pointer("param0", 0)</code> through <code>Pointer("param5", 0)</code>. Then each instruction applies one rule:</p>
+<ul>
+<li>A <code>movq</code> between a 64-bit register and a frame slot copies the value. A 32-bit or narrower write to a register makes it an <code>Index</code> with scale 1.</li>
+<li>A <code>leaq</code> with a pointer base produces a pointer with the displacement added, and with an index register it adds <code>scale * index_scale</code> to the strides. A <code>leaq</code> whose base is <code>%rbp</code> or <code>%rsp</code> names a frame object, which is how <code>main</code> passes <code>rows</code>.</li>
+<li><code>shlq $n</code> on an <code>Index</code> multiplies its scale by <code>2^n</code>, and <code>imulq $k</code> multiplies by <code>k</code>.</li>
+<li><code>addq</code> of a pointer and an index keeps the pointer and adds the index scale to the strides. <code>addq $k</code> to a pointer moves its offset and is also recorded as an increment of that register.</li>
+<li>A call makes every caller-saved register unknown, and the argument registers that hold pointers are recorded as a call site.</li>
+<li>Any memory operand whose base register holds a pointer becomes an <code>Access</code> with the pointer's root and offset, the width and kind from the mnemonic, and a store flag.</li>
+</ul>
+<p>Width and kind come from the mnemonic alone. <code>access_width()</code> maps the <code>b</code>, <code>w</code>, <code>l</code>, and <code>q</code> suffixes to 1, 2, 4, and 8 bytes, <code>movsbl</code> and <code>movswl</code> to signed narrow loads, <code>movzbl</code> to unsigned, the <code>sd</code> and <code>ss</code> scalar SSE instructions to 8-byte and 4-byte floats, <code>cvtsi2sdl</code> to a signed 4-byte integer source, and the 16-byte <code>movaps</code> family to a vector. <code>leaq</code> and the <code>nop</code> forms are not accesses.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">if memory.base in FRAME_REGISTERS:
+    return Pointer(f&quot;frame({memory.base}{format_signed(memory.displacement) if memory.displacement else ''})&quot;, 0)
+base = env.get(memory.base)
+if not isinstance(base, Pointer):
+    return Unknown
+strides = set(base.strides)
+if memory.index is not None:
+    index_value = env.get(memory.index)
+    strides.add((index_value.scale if isinstance(index_value, Index) else 1) * memory.scale)
+return Pointer(base.root, base.offset + memory.displacement, frozenset(strides), base.origin)
+</code></pre></div>
+
+<p>A load of 8 bytes through a pointer produces a new pointer whose root names the field it came from, such as <code>param0-&gt;0x18</code>. When that value is later used as a base, or advanced with <code>leaq</code>, the field it came from is marked as a proven pointer. That is the rule that turns offset 24 from "8 bytes" into "pointer".</p>
+<h3>Four kinds of stride evidence</h3>
+<p><code>infer_layout()</code> merges the accesses of every witness function and collects the stride from four sources, each with the instruction that produced it.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Where it comes from</th>
+<th>Build that shows it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>scale</code></td>
+<td>an <code>Index</code> with scale above 1 reached a pointer, from <code>shlq $0x5</code> or <code>imulq</code></td>
+<td><code>-O0</code>, <code>shlq $0x5, %rcx</code> at <code>0x59</code></td>
+</tr>
+<tr>
+<td><code>loop-step</code></td>
+<td>a 64-bit increment of the base or index register inside a loop that also contains the access</td>
+<td><code>-O1</code>, <code>addq $0x20, %rdx</code> at <code>0x24</code></td>
+</tr>
+<tr>
+<td><code>offset-delta</code></td>
+<td>same-width accesses through one base register inside one loop, at offsets a constant apart</td>
+<td><code>-O2</code>, eight loads 32 apart</td>
+</tr>
+<tr>
+<td><code>call-site</code></td>
+<td>the offsets at which one frame object is passed to the witness functions</td>
+<td><code>-O0</code>, <code>main</code> passes <code>rows</code>, <code>rows+0x20</code>, <code>rows+0x40</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>A loop is a backward <code>jmp</code> or conditional branch, and an increment counts only when the loop range contains both the increment and the access. That rule excludes the <code>addl $0x1, %eax</code> that advances <code>i</code> at <code>-O0</code>, because it is a 32-bit add and because the access does not go through <code>%eax</code>. The final stride is the greatest common divisor of every value found. The size is the stride when the stride is at least as large as the end of the last field.</p>
+<h3>The vectorised loop at -O2</h3>
+<p>At <code>-O2</code> clang vectorises <code>sum_balances</code>. The loop body from <code>0x50</code> to <code>0xaa</code> reads eight elements per pass:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">      3b: 48 8d 87 e4 00 00 00          leaq    0xe4(%rdi), %rax
+      50: 66 0f 6e 50 80                movd    -0x80(%rax), %xmm2
+      55: 66 0f 6e 98 60 ff ff ff       movd    -0xa0(%rax), %xmm3
+      61: 66 0f 6e 90 40 ff ff ff       movd    -0xc0(%rax), %xmm2
+      69: 66 0f 6e a0 20 ff ff ff       movd    -0xe0(%rax), %xmm4
+      7d: 66 0f 6e 10                   movd    (%rax), %xmm2
+      81: 66 0f 6e 58 e0                movd    -0x20(%rax), %xmm3
+      8a: 66 0f 6e 50 c0                movd    -0x40(%rax), %xmm2
+      8f: 66 0f 6e 60 a0                movd    -0x60(%rax), %xmm4
+      a0: 48 05 00 01 00 00             addq    $0x100, %rax
+      aa: 75 a4                         jne 0x50 &lt;sum_balances+0x40&gt;
+</code></pre></div>
+<p><code>%rax</code> starts at <code>list + 0xe4</code>. The eight displacements place the loads at offsets <code>0x04, 0x24, 0x44, 0x64, 0x84, 0xa4, 0xc4, 0xe4</code> from <code>list</code>, which are <code>4, 36, 68, 100, 132, 164, 196, 228</code>. The increment is <code>0x100</code>, which is 256. A pass that records offsets as it sees them reports eight fields and a struct of at least 232 bytes. The listing is correct and the conclusion is wrong.</p>
+<p><code>fold_unrolled()</code> applies one rule. Inside one loop, take the same-width accesses through one base register. Their offsets are <code>d</code> apart, here 32. If the loop step is <code>k * d</code> and there are exactly <code>k</code> distinct offsets, the loop was unrolled <code>k</code> times, and every access is the same element access at offset <code>(offset - lowest) mod d</code>. Here <code>256 = 8 * 32</code> with eight offsets, so all eight loads fold onto offset 4, and the stride evidence records <code>offset-delta 32</code>, <code>unrolled 32</code>, and <code>loop-step 256</code>. The scalar remainder loop at <code>0xe0</code> adds <code>scale 32</code> from <code>shlq $0x5, %rdx</code> and <code>loop-step 32</code> from <code>addq $0x20, %rdx</code>. The greatest common divisor of all five values is 32.</p>
+<p>The figure has a button that turns folding off. With it off, the <code>-O2</code> build shows seven fields past byte 32 and no size. That state is what a reader sees who trusts the displacement without the loop.</p>
+<h2>DWARF 5 From the Bytes</h2>
+<p>The <code>-g</code> build of <code>account.c</code> carries eight debug sections. <code>.debug_info</code> is 493 bytes, <code>.debug_abbrev</code> 179, <code>.debug_str</code> 230, <code>.debug_str_offsets</code> 124, <code>.debug_addr</code> 112, <code>.debug_line</code> 312, <code>.debug_line_str</code> 12, and <code>.debug_frame</code> 264. The introduction of the DWARF 5 standard lists <code>.debug_str_offsets</code>, <code>.debug_addr</code>, and <code>.debug_line_str</code> as new in Version 5. The reader in <code>code/main.py</code> needs the first five.</p>
+<h3>The unit header</h3>
+<p>Section 7.5.1.1 of the standard gives the full compilation unit header: <code>unit_length</code>, <code>version</code>, <code>unit_type</code>, <code>address_size</code>, and <code>debug_abbrev_offset</code>. The first twelve bytes of <code>.debug_info</code> are:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">e9 01 00 00   unit_length = 0x1e9 = 489
+05 00         version = 5
+01            unit_type = DW_UT_compile
+08            address_size = 8
+00 00 00 00   debug_abbrev_offset = 0
+</code></pre></div>
+<p>The <code>unit_type</code> byte is new in Version 5, and the standard says so in the same section. The length counts the bytes after itself, so the next unit would start at <code>4 + 489 = 493</code>, the end of the section. <code>llvm-dwarfdump --debug-info</code> prints the same five values on its <code>Compile Unit:</code> line, and the first test parses that line and compares.</p>
+<h3>Abbreviations</h3>
+<p>Section 2.1 says each debugging information entry "consists of an identifying tag and a series of attributes". The entry itself stores only an abbreviation code. The code selects a declaration in <code>.debug_abbrev</code> (section 7.5.3) that names the tag, says whether children follow, and lists each attribute with its form. This object has 14 declarations. Two matter here:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[12] DW_TAG_structure_type  DW_CHILDREN_yes
+     DW_AT_name              DW_FORM_strx1
+     DW_AT_byte_size         DW_FORM_data1
+     DW_AT_decl_file         DW_FORM_data1
+     DW_AT_decl_line         DW_FORM_data1
+[13] DW_TAG_member           DW_CHILDREN_no
+     DW_AT_name              DW_FORM_strx1
+     DW_AT_type              DW_FORM_ref4
+     DW_AT_decl_file         DW_FORM_data1
+     DW_AT_decl_line         DW_FORM_data1
+     DW_AT_data_member_location  DW_FORM_data1
+</code></pre></div>
+<p><code>parse_abbreviations()</code> reads ULEB128 code, ULEB128 tag, one children byte, then attribute and form pairs until a <code>0, 0</code> pair. Section 7.5.6 gives the form encodings: <code>data1</code> is one byte, <code>ref4</code> is a 4-byte offset relative to the unit, <code>strx1</code> is a 1-byte index into the string offsets table, <code>sec_offset</code> and <code>data4</code> are 4 bytes, <code>addrx</code> is a ULEB128 index into the address table, <code>exprloc</code> is a ULEB128 length and that many bytes, and <code>flag_present</code> has no bytes at all.</p>
+<h3>Decode the balance member by hand</h3>
+<p>The structure entry for <code>account</code> starts at offset <code>0x195</code> with the bytes <code>0c 15 20 00 03</code>. The abbreviation code is 12, the structure. <code>DW_AT_name</code> is string index <code>0x15</code>, <code>DW_AT_byte_size</code> is <code>0x20</code> = 32, <code>DW_AT_decl_file</code> is 0, and <code>DW_AT_decl_line</code> is 3, which is the line of <code>struct account {</code> in the source.</p>
+<p>The second member entry starts at <code>0x1a3</code> with <code>0d 10 88 01 00 00 00 05 04</code>:</p>
+<ol>
+<li><code>0d</code> is abbreviation 13, a member.</li>
+<li><code>10</code> is <code>DW_AT_name</code> as <code>strx1</code>: string index 16.</li>
+<li><code>88 01 00 00</code> is <code>DW_AT_type</code> as <code>ref4</code>: offset <code>0x188</code> from the unit start, which is the <code>DW_TAG_base_type</code> entry named <code>int</code>.</li>
+<li><code>00</code> is <code>DW_AT_decl_file</code> and <code>05</code> is <code>DW_AT_decl_line</code>: line 5 of <code>account.c</code>.</li>
+<li><code>04</code> is <code>DW_AT_data_member_location</code>: offset 4.</li>
+</ol>
+<p>Section 5.7.6 says a member entry "may have either a DW_AT_data_member_location attribute or a DW_AT_data_bit_offset attribute" and that an integer constant "is the offset in bytes from the beginning of the containing entity". That byte is the same number as the displacement in <code>addl 0x4(%rax), %ecx</code>, and <code>compare_layouts()</code> is the function that puts the two side by side.</p>
+<h3>Strings and addresses go through two tables</h3>
+<p>String index 16 is not an offset into <code>.debug_str</code>. The reader takes <code>DW_AT_str_offsets_base</code> from the unit entry, which is 8, and reads the 4-byte entry at <code>8 + 4 * 16</code> in <code>.debug_str_offsets</code>. That entry holds the offset of <code>"balance"</code> in <code>.debug_str</code>. The same indirection applies to addresses. The entry for <code>sum_balances</code> starts with the bytes <code>07 07</code>: abbreviation 7, a subprogram, then <code>DW_AT_low_pc</code> as <code>addrx</code> index 7. The 8-byte entry at <code>8 + 8 * 7</code> in <code>.debug_addr</code> is <code>0x30</code>, the address of the function in <code>.text</code>. The first six entries of that table are the addresses of the six string literals.</p>
+<p>In a relocatable object neither table holds its final values. Every entry in <code>.debug_str_offsets</code> is zero in the file, and <code>.rela.debug_str_offsets</code> holds 29 <code>R_X86_64_32</code> relocations against <code>.debug_str</code> with the real offset in the addend. <code>.debug_addr</code> has 13 <code>R_X86_64_64</code> relocations against <code>.text</code> and <code>.rodata.str1.1</code>. <code>.debug_info</code> has four relocations of its own: the abbreviation offset, <code>DW_AT_str_offsets_base</code> as <code>.debug_str_offsets+0x8</code>, <code>DW_AT_stmt_list</code>, and <code>DW_AT_addr_base</code> as <code>.debug_addr+0x8</code>. <code>ElfObject.relocated()</code> applies <code>S + A</code> for the 32-bit and 64-bit types before the reader parses a section. A section symbol has value 0 in an object file, so the field receives the addend. <code>llvm-dwarfdump</code> does the same resolution, which is why its output shows names and addresses with every index resolved.</p>
+<h3>Types, functions, and locations</h3>
+<p><code>DwarfInfo.type_name()</code> follows <code>DW_AT_type</code> references. The <code>label</code> member points at a <code>DW_TAG_pointer_type</code>, which points at a <code>DW_TAG_const_type</code>, which points at the <code>char</code> base type, so the name composes to <code>const char *</code>. <code>type_size()</code> returns <code>DW_AT_byte_size</code> for base types and structures, 8 for a pointer, and count times element size for an array. <code>type_kind()</code> reduces the <code>DW_AT_encoding</code> of a base type to <code>int</code> with a sign, or <code>float</code>, and a pointer type to <code>pointer</code>, which is the vocabulary the comparison uses.</p>
+<p><code>DwarfInfo.functions()</code> reads six <code>DW_TAG_subprogram</code> entries. <code>bump</code> runs from <code>0x0</code> to <code>0x21</code>, which is <code>DW_AT_low_pc</code> plus the <code>DW_AT_high_pc</code> length. Its frame base is <code>DW_OP_reg6 RBP</code>, and its parameter <code>a</code> has the location expression <code>91 78</code>: <code>DW_OP_fbreg</code> with the SLEB128 value <code>0x78</code>, which is -8. That is the frame slot <code>-0x8(%rbp)</code> into which the listing stored <code>%rdi</code> at address <code>0x4</code>. The debug information and the instructions describe the same slot from two sides.</p>
+<h2>Compare the Two Layouts</h2>
+<p><code>compare_layouts()</code> walks the DWARF members and looks for an inferred field at the same offset. A member with no field is <code>no-evidence</code>. A field of a different size is <code>size-mismatch</code>. A pointer member whose field was never dereferenced is <code>pointer-unproven</code>. A kind that disagrees, such as a float where the instructions used integer arithmetic, is <code>kind-mismatch</code>. Inferred fields that start inside a member or inside padding are <code>unexpected</code>. The size compares the stride with <code>DW_AT_byte_size</code>.</p>
+<p>The numbers for the three builds, from <code>python3 code/main.py</code>:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Build</th>
+<th>Accesses through the first parameter</th>
+<th>Fields</th>
+<th>Stride evidence</th>
+<th>Members matched</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-O0</code></td>
+<td>11</td>
+<td>5</td>
+<td><code>scale 32</code>, <code>call-site 32</code>, <code>call-site 64</code></td>
+<td>5 of 5</td>
+<td>32, match</td>
+</tr>
+<tr>
+<td><code>-O1</code></td>
+<td>9</td>
+<td>5</td>
+<td><code>loop-step 32</code></td>
+<td>5 of 5</td>
+<td>32, match</td>
+</tr>
+<tr>
+<td><code>-O2</code></td>
+<td>17</td>
+<td>5 after folding, 12 before</td>
+<td><code>offset-delta 32</code>, <code>unrolled 32</code>, <code>loop-step 256</code>, <code>scale 32</code>, <code>loop-step 32</code></td>
+<td>5 of 5</td>
+<td>32, match</td>
+</tr>
+</tbody>
+</table></div>
+<p>The inferred gaps are bytes 1 to 3 and 10 to 15 in every build, and those are exactly the padding bytes of the DWARF layout. Every inferred field sits at a multiple of its own size, which is what the psABI rules require, and <code>natural_alignment_ok()</code> records that.</p>
+<p>Add the functions one at a time and the picture changes. With <code>bump</code> alone the layout is one field at offset 4, the size is unknown, and the lower bound is 8. <code>sum_balances</code> adds the stride. <code>tag</code> adds offsets 0 and 8. <code>projected</code> adds the float at 16. <code>label_length</code> adds the pointer at 24 and proves it is a pointer. <code>main</code> adds the call sites at <code>-O0</code> and adds nothing at <code>-O1</code> and <code>-O2</code>, because the compiler inlined every call. The figure steps through this order for each build.</p>
+<p>Three things stay out of reach. The names are not in the instructions. The qualifier <code>const</code> is not in the instructions. The pointee type of <code>label</code> is only "elements 1 byte apart" from the <code>leaq 0x1(%rcx), %rcx</code> in the string loop, which is consistent with <code>char</code> and with <code>unsigned char</code> and <code>_Bool</code>. At <code>-O1</code> the sign of the byte at offset 0 is unknown, because <code>cmpb $0x6c, (%rdi)</code> compares without extending. The pass reports <code>int8</code> there and <code>i8</code> at <code>-O0</code>, where <code>movsbl</code> sign-extends. These are the facts lesson 35 records as unknowns.</p>
+<h2>C++ Objects</h2>
+<p><code>shapes.cpp</code> defines <code>Shape</code> with a virtual destructor, a pure virtual <code>area()</code>, and a virtual <code>name()</code>, and <code>Rect</code>, which derives from <code>Shape</code> and adds two <code>int</code> members. The Itanium C++ ABI governs how clang lays these out on x86-64 Linux.</p>
+<h3>Mangled names</h3>
+<p>Section 5.1.2 of the ABI says "a name is mangled by prefixing <code>_Z</code> to an encoding of its name". The object has 19 such symbols. <code>_ZNK4Rect4areaEv</code> reads as <code>_Z</code>, then <code>N</code> for a nested name, <code>K</code> for a const member function, <code>4Rect</code> and <code>4area</code> as length-prefixed source names, <code>E</code> to close the nested name, and <code>v</code> for an empty parameter list. <code>llvm-cxxfilt</code> prints <code>Rect::area() const</code>. <code>_Z8describeRK5Shapei</code> is <code>describe(Shape const&amp;, int)</code>: <code>R</code> is a reference, <code>K</code> is const, <code>5Shape</code> is the class, <code>i</code> is <code>int</code>. The special names in section 5.1.4 are <code>_ZTV</code> for a vtable, <code>_ZTI</code> for typeinfo, and <code>_ZTS</code> for the typeinfo name string. Constructors and destructors are <code>C1</code>, <code>C2</code>, <code>D0</code>, <code>D1</code>, and <code>D2</code>, so <code>_ZN4RectD0Ev</code> and <code>_ZN4RectD2Ev</code> both print as <code>Rect::~Rect()</code>: the deleting destructor and the base-object destructor share a source name.</p>
+<p><code>Demangler</code> in <code>code/main.py</code> covers that subset plus the builtin type codes of section 5.1.5.2 and the <code>S_</code> substitutions of section 5.1.10. The test runs it on all 19 names and compares with the captured <code>llvm-cxxfilt --no-strip-underscore</code> output. The flag matters on macOS, where the tool strips one leading underscore by default and then fails to recognise <code>Z8describe...</code>.</p>
+<h3>The vtable from its relocations</h3>
+<p>Section 2.5.2 of the ABI lists the components of a virtual table in order: virtual call offsets, virtual base offsets, offset to top, the typeinfo pointer, and then the virtual function pointers. The address point, the value an object's vptr holds, is the address of the first function pointer (section 2.6.2). <code>Rect</code> has no virtual bases, so its table is offset to top, typeinfo, and functions.</p>
+<p>The symbol <code>_ZTV4Rect</code> is 0x30 bytes, six 8-byte slots. In the object every byte is zero. The contents are in <code>.rela.data.rel.ro._ZTV4Rect</code>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">0000000000000008 R_X86_64_64              _ZTI4Rect
+0000000000000010 R_X86_64_64              _ZN4RectD2Ev
+0000000000000018 R_X86_64_64              _ZN4RectD0Ev
+0000000000000020 R_X86_64_64              _ZNK4Rect4areaEv
+0000000000000028 R_X86_64_64              _ZNK4Rect4nameEv
+</code></pre></div>
+<p>Slot 0 holds the offset to top, which is 0 and needs no relocation. Slot 1 is the typeinfo. The address point is at <code>+16</code>. From there, slot 0 is the complete-object destructor, slot 1 the deleting destructor, slot 2 <code>area</code>, slot 3 <code>name</code>. <code>read_vtable()</code> reads the symbol size, the relocations in its range, and the zero at offset 0. <code>Shape</code>'s table has the same shape with <code>__cxa_pure_virtual</code> in slot 2, which is the runtime function that a pure virtual call reaches.</p>
+<h3>RTTI</h3>
+<p>Section 2.9.4 describes <code>std::type_info</code> as a vptr followed by a pointer to the mangled type name, and lists the derived classes. <code>_ZTI4Rect</code> has three relocations: <code>_ZTVN10__cxxabiv120__si_class_type_infoE+0x10</code>, <code>_ZTS4Rect</code>, and <code>_ZTI5Shape</code>. The first is the vtable of <code>__si_class_type_info</code>, the class the ABI uses for a type with a single public non-virtual base at offset zero, and the <code>+0x10</code> is that vtable's address point. The second points at the string <code>4Rect</code>, which is the mangled type name, and <code>name()</code> on a <code>type_info</code> returns exactly that string. The third is the base. <code>_ZTI5Shape</code> uses <code>__class_type_info</code> and has no base pointer. <code>read_typeinfo()</code> returns these three facts.</p>
+<h3>The virtual call</h3>
+<p><code>describe</code> at <code>-O0</code> makes one virtual call:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">       f: 48 8b 7d f8                   movq    -0x8(%rbp), %rdi
+      13: 48 8b 07                      movq    (%rdi), %rax
+      16: ff 50 10                      callq   *0x10(%rax)
+</code></pre></div>
+<p>The first <code>movq</code> loads the object pointer. The second reads 8 bytes at offset 0 of the object, which is the vptr, because the ABI places it first in a class with virtual functions. The <code>callq</code> goes through <code>0x10</code> past the vptr, and <code>0x10 / 8</code> is slot 2. <code>find_virtual_calls()</code> matches the pattern and reports both candidates: <code>Rect::area() const</code> from <code>_ZTV4Rect</code> and <code>__cxa_pure_virtual</code> from <code>_ZTV5Shape</code>. Which one runs depends on the object, which is why the call is indirect.</p>
+<p>DWARF records the same slot. The <code>DW_TAG_subprogram</code> entries for <code>area</code> in both classes carry <code>DW_AT_vtable_elem_location (DW_OP_constu 0x2)</code>, <code>name</code> carries slot 3, and the destructors carry slot 0. <code>Rect</code> is a <code>DW_TAG_structure_type</code> of 16 bytes with a <code>DW_TAG_inheritance</code> entry for <code>Shape</code> at offset 0 and members <code>w</code> at 8 and <code>h</code> at 12. <code>Shape</code> is 8 bytes with one artificial member <code>_vptr$Shape</code>. Two independent derivations give slot 2 for <code>area</code>: the relocation table and the debug entries.</p>
+<p>At <code>-O1</code> the object has no vtable at all. <code>main</code> constructs <code>Rect</code> as a local, so the compiler resolved <code>r.name()</code> and <code>describe(r, 2)</code> at compile time and inlined them. Nothing takes the address of the table, so the table is not emitted. <code>describe</code> still contains <code>movq (%rdi), %rax</code> and <code>callq *0x10(%rax)</code>, because its parameter can be any <code>Shape</code>. A missing vtable is a fact about one object file, and the test <code>test_the_optimised_object_keeps_the_call_pattern_but_drops_the_vtables</code> checks both halves.</p>
+<p>The Microsoft ABI differs in every one of these details. Decorated names start with <code>?</code> and encode the calling convention, so <code>void test(void)</code> compiled as C++ <code>__cdecl</code> is <code>?test@@ZAXXZ</code>. The RTTI locator sits at <code>vfptr[-1]</code> as a <code>_RTTICompleteObjectLocator</code>, and the symbols are <code>??_7</code> for a vftable and <code>??_R4</code> for the locator. Microsoft's own documentation says there are "no standards for C++ naming between compiler vendors". This lesson's fixtures are Itanium only.</p>
+<h2>How the Tools Present Recovered Types</h2>
+<p>Every row below that names an output was produced on this machine and captured into <code>code/fixtures/tools/</code>. Rows for tools that are not installed here describe their documentation and say so.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Version, licence</th>
+<th>Where types live</th>
+<th>On our fixtures</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ghidra</td>
+<td>12.1.4, 2026-09-21, Apache-2.0</td>
+<td>Data Type Manager with built-in, user-defined, and derived types; <code>.gdt</code> archives; types used by a program are copied into it</td>
+<td>With DWARF: <code>/DWARF/account.c/account size=32 align=8</code> and <code>a-&gt;balance = by + a-&gt;balance;</code>. Without: <code>*(int *)(param_1 + 4)</code> with <code>long param_1</code>, <code>tag(char *param_1)</code>, and <code>*(char **)(param_1 + 0x18)</code></td>
+</tr>
+<tr>
+<td>IDA Pro</td>
+<td>9.4, 2026-07-13, commercial; IDA Free is non-commercial with a cloud decompiler for x86 only</td>
+<td>Local Types window, <code>.til</code> type libraries, DWARF and PDB import into a <code>dwarf</code> or <code>pdb</code> folder</td>
+<td>Not installed. Documentation only</td>
+</tr>
+<tr>
+<td>Binary Ninja</td>
+<td>6.0, 2026-09-03, commercial with a Free edition</td>
+<td>Type editing, header import and export, type archives, debug info from DWARF and PDB, type libraries, platform types</td>
+<td>Not installed. Documentation only</td>
+</tr>
+<tr>
+<td>radare2</td>
+<td>6.2.4, 2026-10-05, LGPLv3</td>
+<td><code>ts</code>, <code>tsc</code>, <code>afvd</code></td>
+<td><code>ts</code> and <code>tsc account</code> printed nothing for the relocatable object with <code>bin.dbginfo=true</code>; <code>pdf</code> shows <code>mov dword [rax + 4], ecx</code> with source line comments from DWARF</td>
+</tr>
+<tr>
+<td>rizin</td>
+<td>0.9.1, 2026-06-29, LGPL core</td>
+<td><code>ts</code>, <code>tsc</code>, <code>afvd</code></td>
+<td><code>tsc account</code> printed <code>struct account { char kind; int balance; short code; double rate; const char *label; };</code> from DWARF; the build without <code>-g</code> lists only its bundled header types</td>
+</tr>
+<tr>
+<td>lldb</td>
+<td>lldb-1703.0.236.21</td>
+<td><code>image lookup -t</code></td>
+<td><code>byte-size = 32</code> and the full <code>compiler_type</code> text from the ELF object</td>
+</tr>
+<tr>
+<td>gdb</td>
+<td>not installed here</td>
+<td><code>ptype /o</code> prints "the offsets and sizes of fields in a struct" with holes marked</td>
+<td>Documentation only</td>
+</tr>
+<tr>
+<td>pyelftools</td>
+<td>0.33, public domain</td>
+<td>Python API over <code>.debug_info</code></td>
+<td>A 43-line script prints the same five members and <code>unit version 5</code></td>
+</tr>
+<tr>
+<td>llvm-dwarfdump</td>
+<td>Apple LLVM 17.0.0</td>
+<td><code>--debug-info</code>, <code>--debug-abbrev</code>, <code>--debug-str-offsets</code></td>
+<td>The oracle for every reader test</td>
+</tr>
+</tbody>
+</table></div>
+<p>Ghidra's output without DWARF shows the same two rules at work. Its decompiler assigned <code>char *</code> to the parameter of <code>tag</code> because the function compares one byte through it, and <code>char **</code> to the field at <code>0x18</code> because <code>label_length</code> dereferences the loaded value and compares bytes. Those are the same two rules the pass in this lesson applies: width from the instruction, pointer from the dereference. Ghidra's decompiler documentation says that p-code varnodes "do not necessarily have a data-type associated with them" and that the decompiler "ultimately assigns a formal data-type" by propagation. The option "Infer constant pointers" extends the same propagation to constants. Ghidra 12.1 added bitfield recovery to the decompiler, which this lesson's fixtures do not exercise.</p>
+<p>The hand-made table is the other half of the story. Ghidra's Data Type Manager, IDA's Local Types, Binary Ninja's type archives, and rizin's <code>td</code> all let you type the struct from the recovered layout and watch the decompiler re-render. The pass tells you what to type and which fields you are guessing.</p>
+<p>rea 6.5.0 with its Ghidra provider returns the decompiler text as a record. Everything in the Ghidra row applies to it, and the record carries the type names without the evidence that produced them. Running <code>python3 code/main.py infer</code> on the same listing gives you that evidence.</p>
+<h2>Type Inference Research</h2>
+<p>The pass here is the constraint-generation half of a type inference system, restricted to one struct reached from a parameter. The field has gone further.</p>
+<ul>
+<li>TIE (Lee, Avgerinos, Brumley, NDSS 2011) framed type reconstruction as constraint generation and solving over a binary IR, measured conservativeness and precision, and compared against a commercial decompiler on 87 coreutils programs.</li>
+<li>Retypd (Noonan, Loginov, Cok, PLDI 2016) added subtyping, polymorphism, and recursive types, and reported reconstruction of pointer <code>const</code> annotations with 98% recall. An open-source implementation exists under GrammaTech's name.</li>
+<li>OSPREY (Zhang and others, IEEE S&amp;P 2021) treats each memory location as a random variable and infers the most probable types.</li>
+<li>DIRTY (Chen and others, USENIX Security 2022) and ReSym (Xie and others, CCS 2024) post-process decompiler output with learned models, and ReSym reports 72.9% precision on full struct layouts.</li>
+<li>RecStruct (Chen and others, USENIX Security 2026) recovers nested structs without a decompiler, with flow-insensitive symbolic execution and union-find over stack slots.</li>
+</ul>
+<p>The stack struct is the first thing this lesson's pass skips. At <code>-O1</code>, <code>main</code> keeps <code>rows</code> on the stack and the inlined code reads <code>0x24(%rsp)</code>, <code>0x40(%rsp)</code>, <code>0x48(%rsp)</code>, <code>0x30(%rsp)</code>, and <code>0x38(%rsp)</code>. Those offsets modulo 32 are 4, 0, 8, 16, and 24: the same struct, with no parameter to seed from. The Practice Lab asks you to recover it.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Layout rules (System V).</strong> Each member is placed at the next offset that is a multiple of its alignment <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> (its size for scalars):
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3011em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">1</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">0</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.0963em;vertical-align:-0.836em;"></span><span class="mord"><span class="delimsizing size2">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">i</span><span class="mbin mtight">−</span><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2083em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.836em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">⌉</span></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord text"><span class="mord">sizeof</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.9463em;vertical-align:-0.686em;"></span><span class="mord"><span class="delimsizing size2">⌈</span></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.2603em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">A</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord"><span class="mord mathnormal">o</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal">s</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">n</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.686em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord"><span class="delimsizing size2">⌉</span></span><span class="mord mathnormal">A</span><span class="mpunct">,</span><span class="mspace" style="margin-right:1em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">A</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.1582em;vertical-align:-0.7277em;"></span><span class="mop op-limits"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.4306em;"><span style="top:-2.3723em;margin-left:0em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span><span class="mop">max</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7277em;"><span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal">a</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mord">.</span></span></span></span></span></div></p>
+<p><strong>From accesses to members.</strong> An access <code>disp(%reg)</code> of width <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span> through a pointer to the struct is evidence of a member at offset <code>disp</code> with size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.02691em;">w</span></span></span></span>; accesses <code>disp(%reg,%idx,S)</code> with a loop stride <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span></span></span></span> give the struct size (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05764em;">S</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord text"><span class="mord">sizeof</span></span></span></span></span> for arrays of structs).</p>
+<p><strong>Virtual calls.</strong> For an object at address <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal">p</span></span></span></span>, the call to virtual slot <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> is
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord texttt">call *</span></span><span class="mord"><span class="delimsizing size1">(</span></span><span class="mord">8</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord texttt">*</span></span><span class="mopen">(</span><span class="mord mathnormal">p</span><span class="mclose">)</span><span class="mord"><span class="delimsizing size1">)</span></span><span class="mpunct">,</span></span></span></span></span></div>
+the vtable pointer at offset 0, then the slot; the vtable symbol <code>_ZTV</code> points 16 bytes before the first slot (offset-to-top and typeinfo come first).</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Laying out `struct account` by hand</div><div class="co-body"><ul>
+<li><code>char kind</code> at 0 (1 byte). <code>int balance</code> needs 4-alignment: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">1/4</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>, so offset 4 and bytes 1-3 are padding.</li>
+<li><code>short code</code> at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">8/2</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>. <code>double rate</code> needs 8: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">⌈</span><span class="mord">10/8</span><span class="mclose">⌉</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">16</span></span></span></span>, so bytes 10-15 are padding.</li>
+<li><code>const char *label</code> at 24. The end is 32, already a multiple of the largest alignment 8, so <code>sizeof</code> is 32.</li>
+<li>Padding bytes: 1, 2, 3 and 10 to 15, nine in all. In code, <code>bump</code> touches <code>4(%rdi)</code> (4 bytes), <code>tag</code> reads <code>(%rdi)</code> (1 byte) and <code>8(%rdi)</code> (2 bytes): every access lands on a member start with the member's width.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Field names survive compilation."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Only offsets and widths do; names come from DWARF, if it is there.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A gap between accesses is an unused member."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It may be padding; apply the alignment rules before inventing fields.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "All DWARF 5 producers encode things the same way."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Forms differ (clang favours <code>strx</code>, GCC <code>strp</code> and <code>implicit_const</code>); a reader must handle both.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A C++ object starts with its first declared member."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A polymorphic object starts with its vtable pointer.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Will the lesson's DWARF reader, pyelftools reading GCC's DWARF, and GCC's own <code>offsetof</code> agree on <code>struct account</code>? Will the lesson's reader handle GCC's DWARF too? (Solution P1.)</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">One struct, three sources of truth</div><div class="co-body"><p>The lesson's <code>DwarfInfo</code> reads clang's fixture; pyelftools reads GCC 13's DWARF 5 for the same <code>account.c</code>; and a small program compiled here prints <code>sizeof</code> and <code>offsetof</code> for every member. Finally the lesson's reader is tried on GCC's object. About a second.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># struct account three ways: the lesson's DWARF 5 reader on clang's object, pyelftools on GCC's object,
+# and the compiler's own answer (offsetof and sizeof, printed by a program GCC builds here).
+import pathlib, subprocess, tempfile
+from elftools.elf.elffile import ELFFile
+from main import ElfObject, DwarfInfo, FIXTURES
+tmp = pathlib.Path(tempfile.mkdtemp())
+clang = DwarfInfo(ElfObject((FIXTURES / &quot;account-x86_64-O0-g.o&quot;).read_bytes())).struct(&quot;account&quot;)
+mine = {m.name: (m.offset, m.size) for m in clang.members}
+
+gcc_obj = tmp / &quot;account-gcc.o&quot;
+subprocess.run([&quot;gcc&quot;, &quot;-O0&quot;, &quot;-g&quot;, &quot;-c&quot;, str(FIXTURES / &quot;account.c&quot;), &quot;-o&quot;, str(gcc_obj)], check=True)
+with open(gcc_obj, &quot;rb&quot;) as f:
+    dw = ELFFile(f).get_dwarf_info(); cu = next(dw.iter_CUs())
+    st = next(d for d in cu.iter_DIEs() if d.tag == &quot;DW_TAG_structure_type&quot; and d.attributes.get(&quot;DW_AT_name&quot;) and d.attributes[&quot;DW_AT_name&quot;].value == b&quot;account&quot;)
+    pe = {c.attributes[&quot;DW_AT_name&quot;].value.decode(): c.attributes[&quot;DW_AT_data_member_location&quot;].value for c in st.iter_children() if c.tag == &quot;DW_TAG_member&quot;}
+    pe_size = st.attributes[&quot;DW_AT_byte_size&quot;].value; version = cu[&quot;version&quot;]
+
+(tmp / &quot;truth.c&quot;).write_text('#include &lt;stdio.h&gt;\n#include &lt;stddef.h&gt;\n'
+    + (FIXTURES / &quot;account.c&quot;).read_text().split(&quot;int bump&quot;)[0].replace(&quot;int printf(const char *format, ...);&quot;, &quot;&quot;)
+    + 'int main(void) { printf(&quot;%zu&quot;, sizeof(struct account));\n'
+    + &quot;&quot;.join(f'  printf(&quot; %zu&quot;, offsetof(struct account, {n}));\n' for n in mine) + &quot;  return 0; }\n&quot;)
+subprocess.run([&quot;gcc&quot;, str(tmp / &quot;truth.c&quot;), &quot;-o&quot;, str(tmp / &quot;truth&quot;)], check=True)
+size, *offsets = map(int, subprocess.run([str(tmp / &quot;truth&quot;)], capture_output=True, text=True).stdout.split())
+truth = dict(zip(mine, offsets))
+print(f&quot;{'member':&lt;8} {'lesson reader (clang DWARF)':&gt;28} {'pyelftools (GCC DWARF ' + str(version) + ')':&gt;25} {'offsetof (GCC run)':&gt;19}&quot;)
+for n, (off, sz) in mine.items():
+    print(f&quot;{n:&lt;8} {f'offset {off}, {sz} bytes':&gt;28} {pe[n]:&gt;25} {truth[n]:&gt;19}&quot;)
+print(f&quot;{'sizeof':&lt;8} {clang.size:&gt;28} {pe_size:&gt;25} {size:&gt;19}   padding bytes: {clang.padding()}&quot;)
+try:
+    DwarfInfo(ElfObject(gcc_obj.read_bytes())).struct(&quot;account&quot;)
+    print(&quot;lesson reader on GCC's object: OK&quot;)
+except Exception as e:
+    print(f&quot;lesson reader on GCC's object: {type(e).__name__}: {e}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">member    lesson reader (clang DWARF)  pyelftools (GCC DWARF 5)  offsetof (GCC run)
+kind                offset 0, 1 bytes                         0                   0
+balance             offset 4, 4 bytes                         4                   4
+code                offset 8, 2 bytes                         8                   8
+rate               offset 16, 8 bytes                        16                  16
+label              offset 24, 8 bytes                        24                  24
+sizeof                             32                        32                  32   padding bytes: [1, 2, 3, 10, 11, 12, 13, 14, 15]
+lesson reader on GCC&#x27;s object: TypeError: can only concatenate str (not &quot;int&quot;) to str</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Three independent sources agree exactly.</strong> The lesson's reader on clang's DWARF, pyelftools on GCC's DWARF 5 and GCC's own <code>offsetof</code> all place <code>kind</code>, <code>balance</code>, <code>code</code>, <code>rate</code> and <code>label</code> at 0, 4, 8, 16 and 24, with <code>sizeof</code> 32. The padding the lesson computes (bytes 1-3 and 10-15) is exactly what the alignment rules predict.</p>
+<p><strong>The lesson's reader does not handle GCC's DWARF.</strong> It fails with a <code>TypeError</code> while building a type name: GCC stores names as <code>DW_FORM_strp</code> offsets into <code>.debug_str</code>, which the reader reads as a number but never resolves into a string, while clang's fixture uses <code>strx</code> forms the reader does resolve. Same standard, different encoding choices, and a reader tested on one producer breaks on the other. pyelftools, which handles both, is the cross-check.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">C++ objects: vtables, demangling, and a live object</div><div class="co-body"><p>This block continues from the one above. The lesson's <code>read_vtable</code> and <code>read_typeinfo</code> read clang's and g++'s objects for <code>shapes.cpp</code>; its <code>demangle</code> is compared with <code>c++filt</code> on every mangled name g++ produced; then gdb stops in <code>describe(const Shape &amp;s)</code> and prints the vtable of the actual object passed in. About two seconds.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># Continues from the block above. C++ objects: the lesson's vtable and typeinfo readers on clang's and
+# g++'s objects, its demangler against c++filt, and gdb reading the live vtable of the object at run time.
+import os, re
+from main import read_vtable, read_typeinfo, demangle, DemangleError
+gpp_obj = tmp / &quot;shapes-gpp.o&quot;
+subprocess.run([&quot;g++&quot;, &quot;-O0&quot;, &quot;-g&quot;, &quot;-c&quot;, str(FIXTURES / &quot;shapes.cpp&quot;), &quot;-o&quot;, str(gpp_obj)], check=True)
+for label, path in ((&quot;clang&quot;, FIXTURES / &quot;shapes-x86_64-O0-g.o&quot;), (&quot;g++&quot;, gpp_obj)):
+    elf = ElfObject(path.read_bytes())
+    for vt in (&quot;_ZTV5Shape&quot;, &quot;_ZTV4Rect&quot;):
+        v = read_vtable(elf, vt)
+        print(f&quot;{label:&lt;5} {v.class_name:&lt;5} slots: {[sym for _slot, sym, _pretty in v.functions]}&quot;)
+    ti = read_typeinfo(elf, &quot;_ZTI4Rect&quot;); print(f&quot;{label:&lt;5} typeinfo for Rect: {ti.kind}, base {ti.base}&quot;)
+
+syms = sorted(set(re.findall(r&quot;\b(_Z\w+)&quot;, subprocess.run([&quot;nm&quot;, str(gpp_obj)], capture_output=True, text=True).stdout)))
+filt = subprocess.run([&quot;c++filt&quot;], input=&quot;\n&quot;.join(syms), capture_output=True, text=True).stdout.splitlines()
+def safe(sym):
+    try: return demangle(sym)
+    except DemangleError as e: return f&quot;(unsupported: {e})&quot;
+same = [(s, safe(s), f) for s, f in zip(syms, filt)]
+print(f&quot;\ndemangler vs c++filt on {len(syms)} g++ symbols: {sum(a == b for _, a, b in same)} identical&quot;)
+for s, a, b in same:
+    if a != b: print(f&quot;   {s:&lt;22} lesson: {a[:46]:&lt;46} c++filt: {b}&quot;)
+
+exe = tmp / &quot;shapes&quot;
+subprocess.run([&quot;g++&quot;, &quot;-O0&quot;, &quot;-g&quot;, str(FIXTURES / &quot;shapes.cpp&quot;), &quot;-o&quot;, str(exe)], check=True)
+(tmp / &quot;v.gdb&quot;).write_text(&quot;set pagination off\nbreak describe\nrun\ninfo vtbl s\nprint s.area()\ncontinue\n&quot;)
+env = {k: v for k, v in os.environ.items() if k not in (&quot;PYTHONPATH&quot;, &quot;PYTHONHOME&quot;)}
+out = subprocess.run([&quot;gdb&quot;, &quot;-q&quot;, &quot;-batch&quot;, &quot;-x&quot;, str(tmp / &quot;v.gdb&quot;), str(exe)], capture_output=True, text=True, env=env, timeout=60).stdout
+print(&quot;\ngdb at describe(s), s is a Rect passed as const Shape &amp;:&quot;)
+for line in out.splitlines():
+    if line.startswith((&quot;vtable for&quot;, &quot;$1&quot;)) or re.match(r&quot;\[\d+\]:&quot;, line): print(&quot;  &quot;, line)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">clang Shape slots: [&#x27;_ZN5ShapeD2Ev&#x27;, &#x27;_ZN5ShapeD0Ev&#x27;, &#x27;__cxa_pure_virtual&#x27;, &#x27;_ZNK5Shape4nameEv&#x27;]
+clang Rect  slots: [&#x27;_ZN4RectD2Ev&#x27;, &#x27;_ZN4RectD0Ev&#x27;, &#x27;_ZNK4Rect4areaEv&#x27;, &#x27;_ZNK4Rect4nameEv&#x27;]
+clang typeinfo for Rect: __si_class_type_info, base _ZTI5Shape
+g++   Shape slots: [&#x27;(null)&#x27;, &#x27;(null)&#x27;, &#x27;__cxa_pure_virtual&#x27;, &#x27;_ZNK5Shape4nameEv&#x27;]
+g++   Rect  slots: [&#x27;_ZN4RectD1Ev&#x27;, &#x27;_ZN4RectD0Ev&#x27;, &#x27;_ZNK4Rect4areaEv&#x27;, &#x27;_ZNK4Rect4nameEv&#x27;]
+g++   typeinfo for Rect: __si_class_type_info, base _ZTI5Shape
+
+demangler vs c++filt on 27 g++ symbols: 23 identical
+   _ZN4RectC5Eii          lesson: (unsupported: unsupported name at 8 in _ZN4Rec c++filt: Rect::Rect(int, int)
+   _ZN4RectD5Ev           lesson: (unsupported: unsupported name at 8 in _ZN4Rec c++filt: Rect::~Rect()
+   _ZN5ShapeC5Ev          lesson: (unsupported: unsupported name at 9 in _ZN5Sha c++filt: Shape::Shape()
+   _ZN5ShapeD5Ev          lesson: (unsupported: unsupported name at 9 in _ZN5Sha c++filt: Shape::~Shape()
+
+gdb at describe(s), s is a Rect passed as const Shape &amp;:
+   vtable for &#x27;Shape&#x27; @ 0x555555557d18 (subobject @ 0x7fffffff62d0):
+   [0]: 0x5555555553a4 &lt;Rect::~Rect()&gt;
+   [1]: 0x5555555553d2 &lt;Rect::~Rect()&gt;
+   [2]: 0x55555555536e &lt;Rect::area() const&gt;
+   [3]: 0x55555555538e &lt;Rect::name() const&gt;
+   $1 = 12</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Both compilers lay out the same vtables.</strong> For <code>Rect</code>, slots 0-3 are two destructors, <code>area</code> and <code>name</code>; <code>Shape</code> has <code>__cxa_pure_virtual</code> in the <code>area</code> slot because it is pure virtual. Both typeinfos say <code>Rect</code> is a single-inheritance class (<code>__si_class_type_info</code>) derived from <code>Shape</code>.</p>
+<p><strong>The details differ.</strong> clang's <code>Rect</code> vtable points at <code>D2</code> (base-object destructor) where g++ uses <code>D1</code> (complete-object destructor), and in g++'s <code>Shape</code> vtable the two destructor slots have no relocation, so the reader shows <code>(null)</code> instead of guessing.</p>
+<p><strong>The demangler misses GCC-specific names.</strong> 23 of 27 g++ symbols demangle exactly as <code>c++filt</code> does; the four it rejects are <code>C5</code>/<code>D5</code> names, which GCC uses for the comdat groups of its unified constructors and destructors and which the lesson's demangler does not know.</p>
+<p><strong>The live object settles which vtable is used.</strong> Inside <code>describe(const Shape &amp;s)</code>, gdb follows the object's vtable pointer and finds <code>Rect</code>'s functions, and the virtual call <code>s.area()</code> returns 12 (3 × 4): the static type is <code>Shape</code>, the dynamic type is <code>Rect</code>.</p></div></aside>
+<h2>Build it</h2>
+<p>Run the demo:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/41-recovering-data-and-types
+python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<p>The output is one JSON report with five parts. <code>dwarf</code> holds the unit header, the structures, and the functions of the <code>-O0</code> object. <code>oracles</code> holds the psABI rule layout, the <code>ctypes</code> layout, the DWARF layout, the native run, and an <code>agree</code> flag. <code>builds</code> holds the accesses, the inferred layout, and the comparison for each of the three objects. <code>cxx</code> holds the demangled names, both vtables, both typeinfo records, the virtual call, and the DWARF slots. <code>tools</code> lists the captured tool outputs.</p>
+<p>Expected shape:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;dwarf&quot;: {&quot;unit&quot;: {&quot;unitLength&quot;: 489, &quot;version&quot;: 5, &quot;unitType&quot;: &quot;DW_UT_compile&quot;, &quot;addressSize&quot;: 8, &quot;abbrevOffset&quot;: 0}, &quot;...&quot;: &quot;...&quot;},
+  &quot;oracles&quot;: {&quot;agree&quot;: true, &quot;psabiRules&quot;: {&quot;size&quot;: 32, &quot;align&quot;: 8, &quot;...&quot;: &quot;...&quot;}, &quot;...&quot;: &quot;...&quot;},
+  &quot;builds&quot;: {
+    &quot;O0&quot;: {&quot;layout&quot;: {&quot;stride&quot;: 32, &quot;size&quot;: 32, &quot;gaps&quot;: [1, 2, 3, 10, 11, 12, 13, 14, 15], &quot;...&quot;: &quot;...&quot;}, &quot;comparison&quot;: {&quot;matches&quot;: 5, &quot;members&quot;: 5, &quot;...&quot;: &quot;...&quot;}},
+    &quot;O1&quot;: {&quot;...&quot;: &quot;...&quot;},
+    &quot;O2&quot;: {&quot;...&quot;: &quot;...&quot;}
+  },
+  &quot;cxx&quot;: {&quot;virtualCalls&quot;: [{&quot;slot&quot;: 2, &quot;candidates&quot;: {&quot;Shape&quot;: &quot;__cxa_pure_virtual&quot;, &quot;Rect&quot;: &quot;_ZNK4Rect4areaEv&quot;}, &quot;...&quot;: &quot;...&quot;}], &quot;...&quot;: &quot;...&quot;}
+}
+</code></pre></div>
+<p>Read <code>code/main.py</code> in this order:</p>
+<ol>
+<li><code>ElfObject</code> reads sections, symbols, and relocations, and <code>relocated()</code> applies <code>S + A</code> to a debug section.</li>
+<li><code>parse_abbreviations()</code> and <code>DwarfInfo._parse_unit()</code> read the header, the abbreviation table, and the entries, then resolve <code>strx</code> and <code>addrx</code> through the two tables.</li>
+<li><code>DwarfInfo.struct_layouts()</code> and <code>functions()</code> turn entries into <code>StructLayout</code> and <code>FunctionInfo</code> records, with <code>type_name()</code>, <code>type_size()</code>, and <code>type_kind()</code>.</li>
+<li><code>parse_listing()</code>, <code>parse_memory()</code>, and <code>access_width()</code> read the <code>llvm-objdump</code> text.</li>
+<li><code>trace_function()</code> is the abstract state machine, and <code>fold_unrolled()</code> and <code>infer_layout()</code> turn accesses into a layout.</li>
+<li><code>compare_layouts()</code> produces the status rows, and <code>sysv_layout()</code> and <code>ctypes_layout()</code> are the two other oracles.</li>
+<li><code>Demangler</code>, <code>read_vtable()</code>, <code>read_typeinfo()</code>, and <code>find_virtual_calls()</code> cover the C++ object.</li>
+</ol>
+<p>Four more commands exist. <code>python3 code/main.py dwarf FILE.o</code> prints the structures and functions of any DWARF 5 relocatable object. <code>python3 code/main.py infer LISTING.txt [FILE.o]</code> runs the pass on a listing and, with an object, compares against its DWARF. <code>python3 code/main.py demangle NAME...</code> and <code>python3 code/main.py vtable FILE.o</code> cover the C++ half.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>On a new object you built yourself:</p>
+<ol>
+<li>Capture <code>llvm-objdump -d -r</code> of the object and keep it beside the object. The pass reads that text.</li>
+<li>Run <code>python3 code/main.py infer</code> on the listing. Read the witnesses line first: it names the functions whose first parameter was used as a memory base. If a function is missing, its parameter never reached a memory operand, or it reached one through a path the pass does not track.</li>
+<li>Read each field with its access count. One access is one witness. Record a field with a single witness as inferred.</li>
+<li>Read the stride evidence. A <code>call-site</code> or <code>scale</code> entry is strong. A single <code>loop-step</code> entry with no other kind is weak, because an unrolled loop reports the step of several elements. If <code>unrolled</code> appears, check the fold by hand.</li>
+<li>If a <code>-g</code> build exists, run the comparison and read every row that is not <code>match</code>. A <code>no-evidence</code> row names a member no function touched. An <code>unexpected</code> row names an access the pass could not place.</li>
+<li>Type the layout into your tool's type manager as a struct, and record which fields, names, and kinds are guesses.</li>
+</ol>
+<p>Keep the three oracles in reach. When the rules, <code>ctypes</code>, and DWARF disagree on a layout you wrote, you have found a packed struct, a bit-field, or a target with different rules.</p>
+<h2>Interactive Lab</h2>
+<h3>Lab A: decode the member entry</h3>
+<p>From the <code>code</code> directory, open Python:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/41-recovering-data-and-types/code
+python3 -q
+</code></pre></div>
+<p>Run:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from main import *
+elf = load_object(&quot;account-x86_64-O0-g.o&quot;)
+dwarf = DwarfInfo(elf)
+dwarf.header()
+elf.section(&quot;.debug_info&quot;).data[0x1a3:0x1ac].hex(&quot; &quot;)
+dwarf.dies[0x1a3].attributes
+dwarf.type_name(dwarf.type_of(dwarf.dies[0x1a3]))
+</code></pre></div>
+
+<p>Decode the nine bytes on paper with abbreviation 13 before you look at the dictionary. Then read the raw section without relocations, <code>elf.section(".debug_str_offsets").data[8:16].hex()</code>, and the relocated one, <code>elf.relocated(".debug_str_offsets")[8:16].hex()</code>, and explain the difference.</p>
+<h3>Lab B: trace one function</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">listing = load_listing(&quot;account-x86_64-O0-g.objdump.txt&quot;)
+trace = trace_function(&quot;label_length&quot;, listing[&quot;label_length&quot;])
+[(hex(a.address), a.root, a.offset, a.width, a.kind) for a in trace.accesses]
+trace.pointer_uses
+trace_function(&quot;sum_balances&quot;, listing[&quot;sum_balances&quot;]).loops
+</code></pre></div>
+
+<p>Write down, before running, which access proves that offset 24 is a pointer. Then run the same lines on the <code>-O1</code> listing and find the <code>leaq 0x1(%rcx), %rcx</code> in <code>trace.increments</code>.</p>
+<h3>Lab C: fold the vectorised loop</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">o2 = load_listing(&quot;account-x86_64-O2-g.objdump.txt&quot;)
+trace = trace_function(&quot;sum_balances&quot;, o2[&quot;sum_balances&quot;])
+sorted({a.offset for a in trace.accesses})
+folded, evidence = fold_unrolled(trace, trace.accesses)
+sorted({a.offset for a in folded}), [(e.kind, e.value, e.text) for e in evidence]
+</code></pre></div>
+
+<p>Then run <code>analyze_build("O2", fold=False)["comparison"]</code> and count the <code>unexpected</code> rows. Change the fold rule so it requires the loop step to be exactly <code>k * d</code> with <code>k</code> at least 2, and confirm that the <code>-O1</code> loop, with one access and step 32, is left alone.</p>
+<h3>Lab D: the vtable and the names</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">shapes = load_object(&quot;shapes-x86_64-O0-g.o&quot;)
+read_vtable(shapes, &quot;_ZTV4Rect&quot;)
+read_typeinfo(shapes, &quot;_ZTI4Rect&quot;)
+demangle(&quot;_ZNK4Rect4areaEv&quot;), demangle(&quot;_Z8describeRK5Shapei&quot;)
+find_virtual_calls(load_listing(&quot;shapes-x86_64-O0-g.objdump.txt&quot;), [read_vtable(shapes, &quot;_ZTV5Shape&quot;), read_vtable(shapes, &quot;_ZTV4Rect&quot;)])
+</code></pre></div>
+
+<p>Compute the slot from <code>callq *0x10(%rax)</code> on paper, then confirm it against <code>DwarfInfo(shapes).struct("Rect").virtual_methods</code>. Then load <code>shapes-x86_64-O1-g.o</code> and try <code>read_vtable</code> on it. Read the <code>ElfError</code> and explain why the symbol is absent.</p>
+<h2>Practice Lab</h2>
+<p>Recover the stack struct in <code>main</code> at <code>-O1</code>.</p>
+<p>Requirements:</p>
+<ul>
+<li>Extend <code>trace_function()</code> so that a frame slot region can be a root. Seed it from the <code>movaps</code> stores that fill <code>0x0(%rsp)</code> to <code>0x5f(%rsp)</code> from <code>.data.rel.ro</code>, which is the 96-byte initializer of <code>rows</code>.</li>
+<li>Attribute the inlined accesses <code>0x24(%rsp)</code>, <code>0x40(%rsp)</code>, <code>0x48(%rsp)</code>, <code>0x30(%rsp)</code>, and <code>0x38(%rsp)</code> to that root and report their offsets modulo a candidate stride.</li>
+<li>Derive the stride 32 from the loop at <code>0x120</code> to <code>0x12c</code>, where <code>%r14</code> starts at 4 and advances by <code>0x20</code> until <code>0x64</code>, and show that the loop bound <code>0x64</code> is three elements plus the field offset.</li>
+<li>Compare the result with the DWARF layout and reach five matches, and record which kinds stay unproven.</li>
+<li>Add a test that fails when the frame root is attributed to a parameter.</li>
+</ul>
+<p>Success means <code>python3 code/main.py infer</code> on the <code>-O1</code> listing lists <code>main</code> as a witness with a frame root, and the comparison shows five matches from <code>main</code> alone.</p>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>From accesses <code>0(%rdi)</code> (1 byte), <code>4(%rdi)</code> (4 bytes) and <code>16(%rdi)</code> (8 bytes, <code>movsd</code>), an analyst declares <code>struct { char a; int b; double c; }</code> and moves on. Later a function reads <code>8(%rdi)</code> with 2 bytes and another reads <code>24(%rdi)</code> with 8. What went wrong in the method, not just the result? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Type recovery in tools</strong>: Ghidra's decompiler parameter-ID and "Auto Create Structure", IDA's Lumina and type libraries, Binary Ninja's type propagation, and angr's TypeHoon-style inference recover structs from accesses; all import DWARF and PDB when present.</li>
+<li><strong>Research</strong>: learned type inference (for example DIRTY, and LLM-based field naming studies in 2024-2026) predicts names and types from context, with good average accuracy but confident errors on unusual layouts, so DWARF or runtime checks remain the reference.</li>
+<li><strong>DWARF in practice</strong>: GCC 11+ and clang 14+ default to DWARF 5; split DWARF (<code>-gsplit-dwarf</code>) and compressed sections (<code>.debug_*</code> with zstd) are common; <code>pahole</code>, <code>llvm-dwarfdump</code> and pyelftools read them.</li>
+<li><strong>On your laptop</strong>: all of this is CPU-only; on Windows, PDB files play the role of DWARF and Visual Studio's debugger reads them.</li>
+</ul>
+<p>Sources: <a href="https://dwarfstd.org/dwarf5std.html">DWARF 5 standard</a>, <a href="https://github.com/eliben/pyelftools">pyelftools</a>, <a href="https://itanium-cxx-abi.github.io/cxx-abi/abi.html">Itanium C++ ABI (vtables, mangling)</a>, <a href="https://gitlab.com/x86-psABIs/x86-64-ABI">x86-64 psABI</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Members appear as displacement and width; apply alignment rules before naming gaps.</li>
+<li>Strides of indexed accesses reveal <code>sizeof</code> for arrays of structs.</li>
+<li>DWARF is the exact reference when present; read it with a reader that handles every producer's forms.</li>
+<li>C++ objects carry a vtable pointer; virtual calls index the vtable; typeinfo links classes.</li>
+<li>Cross-check against the compiler (<code>offsetof</code>) or a live object (gdb) whenever you can.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a1341-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Three agree; the reader fails on GCC</span></summary><div class="qa-a"><p>Yes, the three agree on every offset and on the size of 32. No, the lesson's reader stops on GCC's object with a <code>TypeError</code>: GCC encodes names with <code>DW_FORM_strp</code>, which the reader reads but does not resolve through <code>.debug_str</code>, so a name arrives as a number. A reader built and tested on clang's output handles clang's forms; GCC's output needs the other ones.</p></div></details>
+<details class="qa" id="a1341-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Declaring before collecting</span></summary><div class="qa-a"><p>The analyst declared the struct after seeing three accesses, instead of collecting every access through that pointer type across the whole program first. The later accesses reveal a 2-byte member at 8 (<code>short code</code>) and an 8-byte member at 24 (<code>label</code>), so the struct is at least 32 bytes and has five members.</p>
+<p>They also skipped the layout rules: with <code>char</code> at 0, <code>int</code> at 4 and <code>double</code> at 16, bytes 8-15 are not necessarily padding; an 8-byte-aligned <code>double</code> after an <code>int</code> ending at 8 would be at 8, not 16, so the gap at 8-15 was itself a sign of a missing member. And with no evidence for the struct's size (a loop stride, an allocation size, a <code>memcpy</code> length), they could not know where it ends.</p>
+<p>Method: gather accesses (offset, width, signedness, float or integer) from every function, use strides and allocation sizes for <code>sizeof</code>, apply the ABI's alignment rules to explain each gap, and leave unknown bytes marked unknown rather than inventing fields.</p></div></details>
+<h2>Lesson Artifact</h2>
+<p>This lesson includes <code>outputs/skill-recovering-data-and-types.md</code>. Use it to turn a listing and an optional debug build into a struct layout with evidence per field, a stride with its sources, a comparison against DWARF, and a list of what stayed unknown. It requires the access table, the stride evidence, the fold check, the DWARF oracle when one exists, and a statement of names and qualifiers that no instruction can supply.</p>
+<h2>Verify It</h2>
+<p>Run the demo and the deterministic suite:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">cd phases/13-tools-and-protocols/41-recovering-data-and-types
+python3 code/main.py
+npx tsx code/main.ts
+python3 -m unittest discover -s code/tests -v
+</code></pre></div>
+<p>Verification should prove:</p>
+<ul>
+<li>the unit header, the 14 abbreviations, and the five member offsets agree with <code>llvm-dwarfdump</code></li>
+<li>names arrive through the relocated <code>.debug_str_offsets</code> table and the unit's <code>str_offsets_base</code> and <code>addr_base</code> are 8</li>
+<li>six functions carry the ranges, <code>DW_OP_reg6 RBP</code>, and <code>DW_OP_fbreg</code> locations the dump shows, and their low addresses equal the listing's function starts</li>
+<li>an object without <code>.debug_info</code> raises, and the LEB128 decoders handle <code>0x78</code> as -8</li>
+<li><code>pyelftools</code> and <code>lldb</code> print the same layout as the reader</li>
+<li>the psABI rules, <code>ctypes</code>, DWARF, and the native run give offsets <code>0, 4, 8, 16, 24</code> and size 32, and the reordered struct is 24 bytes</li>
+<li>the listing parser reads 13 instructions in <code>bump</code>, attaches <code>R_X86_64_PLT32 bump-0x4</code> to the call at <code>0x194</code>, and finds the backward jump at <code>0x72</code></li>
+<li>memory operands, widths, kinds, and signs decode from the AT&amp;T text and the mnemonic</li>
+<li><code>bump</code> at <code>-O0</code> reads its pointer back from the frame slot and makes three accesses at offset 4</li>
+<li>the stride comes from <code>shlq $0x5</code> at <code>-O0</code>, from <code>addq $0x20, %rdx</code> at <code>-O1</code>, and from eight loads folded by a step of 256 at <code>-O2</code></li>
+<li><code>label_length</code> proves the pointer at offset 24 by dereferencing it</li>
+<li><code>main</code> passes one frame object at offsets 0, <code>0x20</code>, and <code>0x40</code> at <code>-O0</code> and calls nothing but <code>printf</code> at <code>-O1</code></li>
+<li>every build matches five of five members with size 32 and gaps equal to the DWARF padding</li>
+<li>without folding the <code>-O2</code> build reports seven fields past byte 32 and no size</li>
+<li>the demangler reproduces all 19 <code>llvm-cxxfilt</code> strings</li>
+<li>both vtables, both typeinfo records, and the virtual call at <code>0x16</code> resolve to slot 2, and DWARF agrees</li>
+<li>the <code>-O1</code> C++ object keeps the call pattern and has no vtable</li>
+<li>the Ghidra, rizin, and radare2 captures show the struct with DWARF and the raw offsets without it</li>
+<li>the interactive figure embeds the same data the analysis produces</li>
+</ul>
+<h2>Production Failure Modes</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Failure</th>
+<th>What the weak tool reports</th>
+<th>What the analysis must prove</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Unrolled loop</td>
+<td>Eight fields 32 bytes apart and a 232-byte struct</td>
+<td>Loop step 256 equals 8 times the offset delta 32, so one field at offset 4</td>
+</tr>
+<tr>
+<td>Stride read from one increment</td>
+<td><code>sizeof</code> 256 from <code>addq $0x100</code></td>
+<td>The greatest common divisor of every stride source, with the scalar tail's <code>addq $0x20</code></td>
+</tr>
+<tr>
+<td>8-byte field called a pointer</td>
+<td><code>void *</code> at offset 24</td>
+<td>A later access uses the loaded value as a base, or the kind stays <code>int64</code></td>
+</tr>
+<tr>
+<td>Pointer called an integer</td>
+<td><code>long</code> at offset 24</td>
+<td>The dereference at <code>0xfb</code>, recorded as pointer proof</td>
+</tr>
+<tr>
+<td>Narrow compare</td>
+<td><code>char</code> with a sign</td>
+<td><code>cmpb</code> carries no sign; only <code>movsbl</code> or <code>movzbl</code> does</td>
+</tr>
+<tr>
+<td>Five functions assumed to share a type</td>
+<td>One struct with no evidence of aliasing</td>
+<td>Call sites in <code>main</code> that pass one frame object, or an explicit analyst assertion</td>
+</tr>
+<tr>
+<td>Strings read from <code>.debug_str</code> by index</td>
+<td>Garbage names from a relocatable object</td>
+<td><code>str_offsets_base</code> plus the relocated <code>.debug_str_offsets</code> entry</td>
+</tr>
+<tr>
+<td>Addresses read as numbers</td>
+<td><code>low_pc</code> of 0 for every function</td>
+<td><code>addrx</code> through the relocated <code>.debug_addr</code> table</td>
+</tr>
+<tr>
+<td>DWARF 4 object</td>
+<td>A reader that misparses the header</td>
+<td>Version check on the second header field; 4 has no <code>unit_type</code> byte</td>
+</tr>
+<tr>
+<td>Missing vtable</td>
+<td>"the class has no virtual functions"</td>
+<td>The <code>-O1</code> object inlined every call; the <code>-O0</code> object has the table and its relocations</td>
+</tr>
+<tr>
+<td>Vtable slot read from the wrong base</td>
+<td>Off-by-two slot numbers</td>
+<td>The address point is 16 bytes past the symbol, after offset-to-top and typeinfo</td>
+</tr>
+<tr>
+<td>Mangled name stripped</td>
+<td><code>Z8describeRK5Shapei</code> left as is</td>
+<td><code>--no-strip-underscore</code> on macOS, or a demangler that checks for <code>_Z</code></td>
+</tr>
+<tr>
+<td>Struct typed from one tool's guess</td>
+<td><code>char *param_1</code> taken as the field type</td>
+<td>The width and the dereference, written as evidence, and the name marked as a guess</td>
+</tr>
+</tbody>
+</table></div>
+<h2>Operational Rule</h2>
+<p>Recover a field from an access and a stride from a loop, and attach the instruction to each. Fold unrolled loops before you trust an offset past the stride. Read DWARF through its abbreviations and its relocated tables, never by index into a string section. Compare field by field and write every member without evidence, every unproven pointer, and every name as unknown. In a C++ object, read the vtable from its relocations and the slot from the call, then use DWARF to confirm the slot you read.</p>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-reverse-engineering"><span class="t" style="--cs-hue:200">RE</span>Cheat sheet · Reverse Engineering with the rea Toolkit</a></div>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://gitlab.com/x86-psABIs/x86-64-ABI">System V Application Binary Interface, AMD64 Architecture Processor Supplement, section 3.1.2: Data Representation</a></li>
+<li><a href="https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst">Procedure Call Standard for the Arm 64-bit Architecture (AAPCS64), section 5.10: Composite Types</a></li>
+<li><a href="https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms">Writing ARM64 code for Apple platforms</a></li>
+<li><a href="https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html">Intel 64 and IA-32 Architectures Software Developer's Manual, Volume 1, section 3.7.5: Specifying an Offset</a></li>
+<li><a href="https://dwarfstd.org/doc/DWARF5.pdf">DWARF Debugging Information Format Version 5, sections 2.1, 5.7.6, 7.5.1.1, 7.5.3, 7.5.6</a></li>
+<li><a href="https://itanium-cxx-abi.github.io/cxx-abi/abi.html">Itanium C++ ABI, sections 2.5 (Virtual Table Layout), 2.9 (Run-Time Type Information), 5.1 (External Names)</a></li>
+<li><a href="https://learn.microsoft.com/en-us/cpp/build/reference/decorated-names?view=msvc-170">Microsoft Learn: Decorated names</a> and <a href="https://learn.microsoft.com/en-us/cpp/error-messages/tool-errors/name-decoration?view=msvc-170">Name Decoration</a></li>
+<li><a href="https://llvm.org/docs/CommandGuide/llvm-dwarfdump.html">llvm-dwarfdump command guide</a> and <a href="https://llvm.org/docs/CommandGuide/llvm-cxxfilt.html">llvm-cxxfilt command guide</a></li>
+<li><a href="https://docs.python.org/3/library/ctypes.html">Python ctypes: Structure layout, sizeof, alignment</a></li>
+<li><a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Base/src/main/help/help/topics/DataTypeManagerPlugin/data_type_manager_description.htm">Ghidra Data Type Manager</a>, <a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/main/help/help/topics/DecompilePlugin/DecompilerConcepts.html">Decompiler Concepts</a>, <a href="https://github.com/NationalSecurityAgency/ghidra/blob/master/Ghidra/Features/Decompiler/src/main/help/help/topics/DecompilePlugin/DecompilerOptions.html">Decompiler Options</a>, and <a href="https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build">Ghidra 12.1.4 release</a></li>
+<li><a href="https://docs.hex-rays.com/9.1/user-guide/types">IDA 9.1 user guide: Types</a>, <a href="https://hex-rays.com/blog/ida-9.4-release-a-new-dyld-shared-cache-swift-analysis-new-teams-add-on-and-more-">IDA 9.4 release post</a>, and <a href="https://hex-rays.com/ida-free">IDA Free</a></li>
+<li><a href="https://docs.binary.ninja/guide/types/">Binary Ninja user guide: Types</a> and <a href="https://binary.ninja/2026/09/03/binary-ninja-6.0-krypton.html">Binary Ninja 6.0 Krypton</a></li>
+<li><a href="https://github.com/radareorg/radare2/releases/tag/6.2.4">radare2 6.2.4 release</a> and <a href="https://github.com/rizinorg/rizin/releases/tag/v0.9.1">rizin v0.9.1 release</a></li>
+<li><a href="https://sourceware.org/gdb/current/onlinedocs/gdb.html/Symbols.html">GDB manual: Examining the Symbol Table, ptype /o</a></li>
+<li><a href="https://pypi.org/project/pyelftools/">pyelftools on PyPI</a></li>
+<li><a href="https://www.ndss-symposium.org/ndss2011/tie-principled-reverse-engineering-of-types-in-binary-programs/">Lee, Avgerinos, Brumley, "TIE: Principled Reverse Engineering of Types in Binary Programs" (NDSS 2011)</a></li>
+<li><a href="https://arxiv.org/abs/1603.05495">Noonan, Loginov, Cok, "Polymorphic Type Inference for Machine Code" (PLDI 2016)</a> and <a href="https://github.com/GrammaTech/retypd">the retypd repository</a></li>
+<li><a href="https://ieeexplore.ieee.org/document/9519451/">Zhang et al., "OSPREY: Recovery of Variable and Data Structure via Probabilistic Analysis for Stripped Binary" (IEEE S&amp;P 2021)</a></li>
+<li><a href="https://www.usenix.org/conference/usenixsecurity22/presentation/chen-qibin">Chen et al., "Augmenting Decompiler Output with Learned Variable Names and Types" (USENIX Security 2022)</a></li>
+<li><a href="https://dl.acm.org/doi/10.1145/3658644.3670340">Xie et al., "ReSym: Harnessing LLMs to Recover Variable and Data Structure Symbols from Stripped Binaries" (CCS 2024)</a></li>
+<li><a href="https://www.usenix.org/conference/usenixsecurity26/presentation/chen-yuxin">Chen et al., "RecStruct" (USENIX Security 2026)</a></li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1341" id="done-a1341">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1341" id="undo-a1341" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1340"><span class="pn-dir">Previous</span><span class="pn-t">13.44 · Stripped Binaries, Linking and Loading: PLT, GOT, Imports and Fixups</span></a><a class="pn next" href="#a1342"><span class="pn-dir">Next</span><span class="pn-t">13.46 · Dynamic Analysis with Debuggers and Traces</span></a></div></footer>

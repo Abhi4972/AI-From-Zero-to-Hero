@@ -1,0 +1,649 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-02">Phase 2 · Machine Learning Algorithms</a></nav><h1>Training-Serving Skew and Feature Stores</h1><div class="m-meta"><span class="chip chip-num">Lesson 2.27</span><span class="chip">100 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a0221" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Describe the offline store, the online store, entities, event timestamps, and TTLs, and the job of each one</li>
+<li>Implement a point-in-time correct join and show how a naive join copies future values into training data</li>
+<li>Name four causes of training-serving skew: two code paths, stale features, different defaults, and time travel</li>
+<li>Build a feature registry in which one definition feeds both the training path and the serving path</li>
+<li>Backfill a new feature over past dates without reading data from after each date</li>
+<li>Detect skew by comparing logged serving features with the training path for the same entity and time</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 2.12 (Feature Engineering), 13 (Scikit-learn ML Pipelines), 15 (Time Series), and 19 (ML System Design)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 100 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript. The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>A feature has one definition and two readers. Training reads its history as of each label time, and serving reads its latest value. When the two readers disagree, the model sees inputs that it never trained on.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Feature store</td>
+<td>"A database for features"</td>
+<td>A system that computes features from one set of definitions and serves them to training and to serving</td>
+</tr>
+<tr>
+<td>Offline store</td>
+<td>"The training data"</td>
+<td>Full feature history with event timestamps, read by training jobs and backfills</td>
+</tr>
+<tr>
+<td>Online store</td>
+<td>"The feature cache"</td>
+<td>The latest value per entity, read by the serving path in milliseconds</td>
+</tr>
+<tr>
+<td>Entity</td>
+<td>"The ID"</td>
+<td>The key that a feature describes, such as a user or a card</td>
+</tr>
+<tr>
+<td>Event timestamp</td>
+<td>"When it happened"</td>
+<td>The time at which a feature value became true</td>
+</tr>
+<tr>
+<td>Point-in-time join</td>
+<td>"An as-of join"</td>
+<td>A join that pairs each label with the latest feature row at or before the label time</td>
+</tr>
+<tr>
+<td>TTL</td>
+<td>"Expiry"</td>
+<td>The maximum age of a feature value before a reader treats it as missing</td>
+</tr>
+<tr>
+<td>Materialization</td>
+<td>"Syncing to online"</td>
+<td>The job that copies the latest feature values from the offline store to the online store</td>
+</tr>
+<tr>
+<td>Backfill</td>
+<td>"Computing history"</td>
+<td>Running a feature definition at past dates to create its history</td>
+</tr>
+<tr>
+<td>Training-serving skew</td>
+<td>"It worked offline"</td>
+<td>A difference between the features or behavior in training and in serving</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A feature such as "days since the last purchase" is read twice: by training, which needs its value <strong>as it was</strong> at each past label time, and by serving, which needs its value <strong>now</strong>. If the two reads use different code, different defaults, different freshness, or if training accidentally reads values from after the label time, the model is tested on inputs unlike the ones it learned from. A feature store prevents this with one registry of definitions, a point-in-time join for training, and an online store for serving.</p></div></aside>
+<p>A team builds a churn model. Each label says whether a user made no purchase in the 30 days after a label day. The team joins the labels to the user feature table on <code>user_id</code> and trains a rule on <code>days_since_last_purchase</code>. Offline accuracy is 0.948.</p>
+<p>On live traffic, the model does worse than an older and simpler version. The feature table held the newest value for each user, from weeks after the label days. A user whose last purchase was on day 115 showed 60 idle days in the day 175 snapshot, so the feature contained the answer. Meanwhile, another team wrote the serving features again in a different service. Their 30-day window included one extra day, and their default for a new user was -1 instead of 365.</p>
+<p>Both defects have the same cause. Training and serving computed "the same feature" in two different ways. This lesson builds the pieces of a feature store from scratch. You write a registry, a backfill, a point-in-time join, an online store with a TTL, and a skew check. The demo reproduces both defects with numbers.</p>
+<h2>Idea 1 · Two readers of the same feature</h2>
+<p>Training and serving ask for features in different shapes:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Property</th>
+<th>Training (offline)</th>
+<th>Serving (online)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Question</td>
+<td>"What was the value for each of 10 million (entity, time) pairs?"</td>
+<td>"What is the value for this one entity now?"</td>
+</tr>
+<tr>
+<td>Time</td>
+<td>Many points in the past</td>
+<td>The present</td>
+</tr>
+<tr>
+<td>Volume</td>
+<td>Millions of rows per job</td>
+<td>One row per request</td>
+</tr>
+<tr>
+<td>Latency</td>
+<td>Minutes are fine</td>
+<td>A few milliseconds</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Offline store: full history with timestamps, in columnar files or a warehouse</td>
+<td>Online store: the latest value per entity, in a key-value database</td>
+</tr>
+</tbody>
+</table></div>
+<p>A feature store keeps both stores filled from one set of feature definitions. Materialization is the job that copies the latest values from the offline store to the online store.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmd83952d6ea" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1715px; background-color: transparent;" viewBox="0 0 1715 204.25" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmd83952d6ea{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmd83952d6ea .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmd83952d6ea .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmd83952d6ea .error-icon{fill:#f4efe7;}#mmd83952d6ea .error-text{fill:#0b1018;stroke:#0b1018;}#mmd83952d6ea .edge-thickness-normal{stroke-width:1px;}#mmd83952d6ea .edge-thickness-thick{stroke-width:3.5px;}#mmd83952d6ea .edge-pattern-solid{stroke-dasharray:0;}#mmd83952d6ea .edge-thickness-invisible{stroke-width:0;fill:none;}#mmd83952d6ea .edge-pattern-dashed{stroke-dasharray:3;}#mmd83952d6ea .edge-pattern-dotted{stroke-dasharray:2;}#mmd83952d6ea .marker{fill:#6c6357;stroke:#6c6357;}#mmd83952d6ea .marker.cross{stroke:#6c6357;}#mmd83952d6ea svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmd83952d6ea p{margin:0;}#mmd83952d6ea .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmd83952d6ea .cluster-label text{fill:#0b1018;}#mmd83952d6ea .cluster-label span{color:#0b1018;}#mmd83952d6ea .cluster-label span p{background-color:transparent;}#mmd83952d6ea .label text,#mmd83952d6ea span{fill:#211c16;color:#211c16;}#mmd83952d6ea .node rect,#mmd83952d6ea .node circle,#mmd83952d6ea .node ellipse,#mmd83952d6ea .node polygon,#mmd83952d6ea .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmd83952d6ea .rough-node .label text,#mmd83952d6ea .node .label text,#mmd83952d6ea .image-shape .label,#mmd83952d6ea .icon-shape .label{text-anchor:middle;}#mmd83952d6ea .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmd83952d6ea .rough-node .label,#mmd83952d6ea .node .label,#mmd83952d6ea .image-shape .label,#mmd83952d6ea .icon-shape .label{text-align:center;}#mmd83952d6ea .node.clickable{cursor:pointer;}#mmd83952d6ea .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmd83952d6ea .arrowheadPath{fill:#0b0b0b;}#mmd83952d6ea .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmd83952d6ea .flowchart-link{stroke:#6c6357;fill:none;}#mmd83952d6ea .edgeLabel{background-color:#ffffff;text-align:center;}#mmd83952d6ea .edgeLabel p{background-color:#ffffff;}#mmd83952d6ea .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd83952d6ea .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmd83952d6ea .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmd83952d6ea .cluster text{fill:#0b1018;}#mmd83952d6ea .cluster span{color:#0b1018;}#mmd83952d6ea div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmd83952d6ea .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmd83952d6ea rect.text{fill:none;stroke-width:0;}#mmd83952d6ea .icon-shape,#mmd83952d6ea .image-shape{background-color:#ffffff;text-align:center;}#mmd83952d6ea .icon-shape p,#mmd83952d6ea .image-shape p{background-color:#ffffff;padding:2px;}#mmd83952d6ea .icon-shape .label rect,#mmd83952d6ea .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmd83952d6ea .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmd83952d6ea .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmd83952d6ea .node .neo-node{stroke:#b5521b;}#mmd83952d6ea [data-look="neo"].node rect,#mmd83952d6ea [data-look="neo"].cluster rect,#mmd83952d6ea [data-look="neo"].node polygon{stroke:url(#mmd83952d6ea-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd83952d6ea [data-look="neo"].swimlane.cluster rect{filter:none;}#mmd83952d6ea [data-look="neo"].node path{stroke:url(#mmd83952d6ea-gradient);stroke-width:1px;}#mmd83952d6ea [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd83952d6ea [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmd83952d6ea [data-look="neo"].node circle{stroke:url(#mmd83952d6ea-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd83952d6ea [data-look="neo"].node circle .state-start{fill:#000000;}#mmd83952d6ea [data-look="neo"].icon-shape .icon{fill:url(#mmd83952d6ea-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd83952d6ea [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmd83952d6ea-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmd83952d6ea :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmd83952d6ea_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmd83952d6ea_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmd83952d6ea_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M143.953,99.75L148.12,99.75C152.286,99.75,160.62,99.75,168.286,99.75C175.953,99.75,182.953,99.75,186.453,99.75L189.953,99.75" id="mmd83952d6ea-L_R_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_D_0" data-points="W3sieCI6MTQzLjk1MzEyNSwieSI6OTkuNzV9LHsieCI6MTY4Ljk1MzEyNSwieSI6OTkuNzV9LHsieCI6MTkzLjk1MzEyNSwieSI6OTkuNzV9XQ==" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M376.828,99.75L380.995,99.75C385.161,99.75,393.495,99.75,401.161,99.75C408.828,99.75,415.828,99.75,419.328,99.75L422.828,99.75" id="mmd83952d6ea-L_D_O_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_D_O_0" data-points="W3sieCI6Mzc2LjgyODEyNSwieSI6OTkuNzV9LHsieCI6NDAxLjgyODEyNSwieSI6OTkuNzV9LHsieCI6NDI2LjgyODEyNSwieSI6OTkuNzV9XQ==" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M621.83,63.75L629.723,60.458C637.616,57.167,653.402,50.583,676.489,47.292C699.576,44,729.964,44,760.352,44C790.74,44,821.128,44,857.344,44C893.56,44,935.604,44,977.648,44C1019.693,44,1061.737,44,1100.665,44C1139.594,44,1175.406,44,1211.219,44C1247.031,44,1282.844,44,1304.25,44C1325.656,44,1332.656,44,1336.156,44L1339.656,44" id="mmd83952d6ea-L_O_J_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_O_J_0" data-points="W3sieCI6NjIxLjgzMDEyMTkxNzA0MDQsInkiOjYzLjc1fSx7IngiOjY2OS4xODc1LCJ5Ijo0NH0seyJ4Ijo3NjAuMzUxNTYyNSwieSI6NDR9LHsieCI6ODUxLjUxNTYyNSwieSI6NDR9LHsieCI6OTc3LjY0ODQzNzUsInkiOjQ0fSx7IngiOjExMDMuNzgxMjUsInkiOjQ0fSx7IngiOjEyMTEuMjE4NzUsInkiOjQ0fSx7IngiOjEzMTguNjU2MjUsInkiOjQ0fSx7IngiOjEzNDMuNjU2MjUsInkiOjQ0fV0=" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M1517.219,36.237L1521.385,35.864C1525.552,35.491,1533.885,34.746,1541.754,34.373C1549.622,34,1557.026,34,1560.728,34L1564.43,34" id="mmd83952d6ea-L_J_T_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_J_T_0" data-points="W3sieCI6MTUxNy4yMTg3NSwieSI6MzYuMjM2NTExMDQyNzczMjd9LHsieCI6MTU0Mi4yMTg3NSwieSI6MzR9LHsieCI6MTU2OC40Mjk2ODc1LCJ5IjozNH1d" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M615.053,135.75L624.075,139.833C633.098,143.917,651.143,152.083,663.665,156.167C676.188,160.25,683.188,160.25,686.688,160.25L690.188,160.25" id="mmd83952d6ea-L_O_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_O_M_0" data-points="W3sieCI6NjE1LjA1Mjc1MDUxNjUyODksInkiOjEzNS43NX0seyJ4Ijo2NjkuMTg3NSwieSI6MTYwLjI1fSx7IngiOjY5NC4xODc1LCJ5IjoxNjAuMjV9XQ==" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M826.516,160.25L830.682,160.25C834.849,160.25,843.182,160.25,850.849,160.25C858.516,160.25,865.516,160.25,869.016,160.25L872.516,160.25" id="mmd83952d6ea-L_M_N_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_N_0" data-points="W3sieCI6ODI2LjUxNTYyNSwieSI6MTYwLjI1fSx7IngiOjg1MS41MTU2MjUsInkiOjE2MC4yNX0seyJ4Ijo4NzYuNTE1NjI1LCJ5IjoxNjAuMjV9XQ==" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M1078.781,160.25L1082.948,160.25C1087.115,160.25,1095.448,160.25,1103.115,160.25C1110.781,160.25,1117.781,160.25,1121.281,160.25L1124.781,160.25" id="mmd83952d6ea-L_N_S_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_N_S_0" data-points="W3sieCI6MTA3OC43ODEyNSwieSI6MTYwLjI1fSx7IngiOjExMDMuNzgxMjUsInkiOjE2MC4yNX0seyJ4IjoxMTI4Ljc4MTI1LCJ5IjoxNjAuMjV9XQ==" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M1293.656,160.25L1297.823,160.25C1301.99,160.25,1310.323,160.25,1318.408,160.25C1326.492,160.25,1334.328,160.25,1338.246,160.25L1342.164,160.25" id="mmd83952d6ea-L_S_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_S_L_0" data-points="W3sieCI6MTI5My42NTYyNSwieSI6MTYwLjI1fSx7IngiOjEzMTguNjU2MjUsInkiOjE2MC4yNX0seyJ4IjoxMzQ2LjE2NDA2MjUsInkiOjE2MC4yNX1d" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M1514.711,160.25L1519.296,160.25C1523.88,160.25,1533.049,160.25,1541.138,159.881C1549.226,159.512,1556.233,158.773,1559.737,158.404L1563.241,158.035" id="mmd83952d6ea-L_L_K_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_K_0" data-points="W3sieCI6MTUxNC43MTA5Mzc1LCJ5IjoxNjAuMjV9LHsieCI6MTU0Mi4yMTg3NSwieSI6MTYwLjI1fSx7IngiOjE1NjcuMjE4NzUsInkiOjE1Ny42MTUzODc3ODE5ODU4NX1d" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/><path d="M1510.123,80L1515.472,82.417C1520.822,84.833,1531.52,89.667,1544.876,96.787C1558.232,103.908,1574.245,113.316,1582.251,118.02L1590.258,122.724" id="mmd83952d6ea-L_J_K_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_J_K_0" data-points="W3sieCI6MTUxMC4xMjMxNDM1NjQzNTY1LCJ5Ijo4MH0seyJ4IjoxNTQyLjIxODc1LCJ5Ijo5NC41fSx7IngiOjE1OTMuNzA2NDg4MjI4Njk5NSwieSI6MTI0Ljc1fV0=" data-look="classic" marker-end="url(#mmd83952d6ea_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R_D_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_D_O_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_O_J_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_J_T_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_O_M_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_M_N_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_N_S_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_S_L_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_L_K_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_J_K_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmd83952d6ea-flowchart-R-0" data-look="classic" transform="translate(75.9765625, 99.75)"><rect class="basic label-container" style="" x="-67.9765625" y="-25.5" width="135.953125" height="51"/><g class="label" style="" transform="translate(-37.9765625, -10.5)"><rect/><foreignObject width="75.953125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Raw events</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-D-1" data-look="classic" transform="translate(285.390625, 99.75)"><rect class="basic label-container" style="" x="-91.4375" y="-36" width="182.875" height="72"/><g class="label" style="" transform="translate(-61.4375, -21)"><rect/><foreignObject width="122.875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Feature definitions<br />in the registry</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-O-3" data-look="classic" transform="translate(535.5078125, 99.75)"><rect class="basic label-container" style="" x="-108.6796875" y="-36" width="217.359375" height="72"/><g class="label" style="" transform="translate(-78.6796875, -21)"><rect/><foreignObject width="157.359375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Offline store<br />history with timestamps</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-J-5" data-look="classic" transform="translate(1430.4375, 44)"><rect class="basic label-container" style="" x="-86.78125" y="-36" width="173.5625" height="72"/><g class="label" style="" transform="translate(-56.78125, -21)"><rect/><foreignObject width="113.5625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Point-in-time join<br />with labels</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-T-7" data-look="classic" transform="translate(1637.109375, 34)"><rect class="basic label-container" style="" x="-68.6796875" y="-25.5" width="137.359375" height="51"/><g class="label" style="" transform="translate(-38.6796875, -10.5)"><rect/><foreignObject width="77.359375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Training set</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-M-9" data-look="classic" transform="translate(760.3515625, 160.25)"><rect class="basic label-container" style="" x="-66.1640625" y="-25.5" width="132.328125" height="51"/><g class="label" style="" transform="translate(-36.1640625, -10.5)"><rect/><foreignObject width="72.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Materialize</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-N-11" data-look="classic" transform="translate(977.6484375, 160.25)"><rect class="basic label-container" style="" x="-101.1328125" y="-36" width="202.265625" height="72"/><g class="label" style="" transform="translate(-71.1328125, -21)"><rect/><foreignObject width="142.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Online store<br />latest value per entity</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-S-13" data-look="classic" transform="translate(1211.21875, 160.25)"><rect class="basic label-container" style="" x="-82.4375" y="-25.5" width="164.875" height="51"/><g class="label" style="" transform="translate(-52.4375, -10.5)"><rect/><foreignObject width="104.875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Serving request</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-L-15" data-look="classic" transform="translate(1430.4375, 160.25)"><rect class="basic label-container" style="" x="-84.2734375" y="-25.5" width="168.546875" height="51"/><g class="label" style="" transform="translate(-54.2734375, -10.5)"><rect/><foreignObject width="108.546875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Logged features</p></span></div></foreignObject></g></g><g class="node default" id="mmd83952d6ea-flowchart-K-17" data-look="classic" transform="translate(1637.109375, 150.25)"><rect class="basic label-container" style="" x="-69.890625" y="-25.5" width="139.78125" height="51"/><g class="label" style="" transform="translate(-39.890625, -10.5)"><rect/><foreignObject width="79.78125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Skew check</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmd83952d6ea-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmd83952d6ea-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmd83952d6ea-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<figure class="xv" data-xv="feature-store" aria-label="Plate: the lesson&#x27;s demo feature store, from one definition through the offline and online stores to the skew check."></figure>
+<h2>Idea 2 · Entities, timestamps, and TTL</h2>
+<p>Four terms describe every feature row:</p>
+<ul>
+<li><strong>Entity.</strong> The key that a feature describes, such as <code>user_id</code> or <code>card_id</code>.</li>
+<li><strong>Event timestamp.</strong> The time at which the value became true. A purchase count "as of day 14" has the event timestamp day 14.</li>
+<li><strong>Created timestamp.</strong> The time at which the system wrote the row. A backfill that runs today writes rows with old event timestamps and a new created timestamp.</li>
+<li><strong>TTL (time to live).</strong> The maximum age of a value. A value older than the TTL counts as missing, so the reader uses the default.</li>
+</ul>
+<p>A group of features with the same entity, source, and TTL is often called a feature view.</p>
+<h2>Idea 3 · Point-in-time correct joins</h2>
+<p>A training row pairs a label with the feature values that existed at the label time. The point-in-time join does this for each label:</p>
+<ol>
+<li>Find the feature rows of the same entity.</li>
+<li>Keep the rows whose event timestamp is at or before the label timestamp.</li>
+<li>Take the latest of those rows.</li>
+<li>Drop it if the label timestamp minus its event timestamp is more than the TTL.</li>
+</ol>
+<p>Here is one user, a label at day 16, and weekly feature rows:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature row day</th>
+<th><code>purchases_30d</code></th>
+<th>Point-in-time join</th>
+<th>Naive join on <code>user_id</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7</td>
+<td>4</td>
+<td></td>
+<td></td>
+</tr>
+<tr>
+<td>14</td>
+<td>3</td>
+<td>Selected</td>
+<td></td>
+</tr>
+<tr>
+<td>21</td>
+<td>1</td>
+<td>Future</td>
+<td></td>
+</tr>
+<tr>
+<td>28</td>
+<td>0</td>
+<td>Future</td>
+<td>Selected</td>
+</tr>
+</tbody>
+</table></div>
+<p>The label asks whether the user buys anything in days 17 to 46. The day 28 row already counts the quiet days after the label day. It shows 0 purchases because the user stopped buying, which is the event that the label measures. The naive join copies the answer into the input.</p>
+<p>We split data by time in the time-series lesson for the same reason. A point-in-time join applies that rule to every row instead of to one split point.</p>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Higher offline accuracy means the training data is fine."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The naive join scores 0.948 offline against 0.893 for the point-in-time join, then 0.763 against 0.876 on new data. A leak makes offline numbers better and production worse.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Joining on the entity ID is enough."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> An entity has many rows over time. Without the time condition, every label gets the newest row, which in the demo came from after the label day for 100 percent of rows.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Fresher serving features are always better."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The model learned from weekly snapshots up to six days old. Fresh values differ from what training saw on 83 percent of requests for <code>days_since_last_purchase</code>; consistency matters more than freshness.</li>
+</ul></div></aside>
+<h2>Idea 4 · Causes of training-serving skew</h2>
+<p>Google's Rules of Machine Learning define training-serving skew as a difference between performance during training and performance during serving. They name three causes: different data handling in the two pipelines, a change in the data between training and serving, and a feedback loop. In feature pipelines, four concrete causes appear again and again:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Cause</th>
+<th>What happens</th>
+<th>Example from the demo</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Two code paths</td>
+<td>Training and serving compute the feature with different code</td>
+<td>The serving window includes day <code>now - 30</code>, and the training window does not</td>
+</tr>
+<tr>
+<td>Stale features</td>
+<td>The value that serving reads has a different age from the value that training used</td>
+<td>Training reads weekly snapshots, and a new service computes fresh values</td>
+</tr>
+<tr>
+<td>Different defaults</td>
+<td>The two paths fill a missing value differently</td>
+<td>Training uses 365 for "no purchase yet", and serving uses -1</td>
+</tr>
+<tr>
+<td>Time travel</td>
+<td>Training reads a value from after the label time</td>
+<td>The naive join reads the newest snapshot for every label</td>
+</tr>
+</tbody>
+</table></div>
+<p>Rule #32 of the same guide says to reuse code between the training pipeline and the serving pipeline whenever possible. A feature store follows that rule with one definition that both paths call.</p>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Two small differences, one big effect</div><div class="co-body"><p>On day 145 the registry's 30-day window covers days 116 to 145 (<code>e.day &gt; as_of - 30</code>). The second code path uses <code>now - 30 &lt;= e.day &lt;= now</code>, days 115 to 145: 31 days. A purchase on day 115 counts in serving and not in training.</p>
+<p>The default matters more. For a user with no purchases yet, training fills <code>days_since_last_purchase</code> with 365 and the second path with −1. The point-in-time rule predicts churn when idle days exceed 19, so every new user flips: 365 says "churn", −1 says "stays". Twenty new users in the request log, twenty wrong answers, and no error anywhere.</p></div></aside>
+<h2>Idea 5 · A feature registry</h2>
+<p>The registry is the catalog of feature definitions. Each entry holds a name, an entity, a source, a transformation, a window, a default value, a TTL, an owner, a version, and a description.</p>
+<p>Two rules keep it safe:</p>
+<ul>
+<li>Both paths read the definition from the registry. No service keeps a private copy of the transformation.</li>
+<li>A change to a definition creates a new version. The old version stays, so old models keep the feature that they trained on.</li>
+</ul>
+<h2>Idea 6 · Backfills</h2>
+<p>A new feature has no history, but training needs its value at every old label time. A backfill runs the definition at each past date and writes one row per entity and date. Each run reads only the events with timestamps at or before its date.</p>
+<p>Backfills cost compute that grows with the number of entities times the number of dates. They also bring a subtle leak. A backfill that runs today writes rows with old event timestamps, but it can read data that arrived late or was corrected later. A strict point-in-time join also checks that the created timestamp is at or before the label time.</p>
+<h2>Idea 7 · Detecting skew</h2>
+<p>Rule #29 of the same guide says to log the features at serving time and use them in training. Even a small logged sample lets you check consistency. Compare each logged value with the value that the training path produces for the same entity and time. For each feature, report the share of mismatches and the mean absolute difference.</p>
+<p>To find the cause, compare three pairs:</p>
+<ol>
+<li>Online store read versus training join. This tests the whole system and should show zero skew.</li>
+<li>Fresh computation versus training join. This isolates staleness.</li>
+<li>Second code path versus fresh computation. This isolates code differences, such as windows and defaults.</li>
+</ol>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="mlprod-pit-join"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Point-in-time join.</strong> For a label of entity <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">e</span></span></span></span> at time <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>, the training row must use the value the online store would have served at <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">v</span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">∗</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mpunct">,</span><span class="mspace" style="margin-right:2em;"></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.7387em;"><span style="top:-3.113em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">∗</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">{</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">≤</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">t</span><span class="mclose">}</span><span class="mspace"> </span><span class="mord text"><span class="mord"> among the feature’s event times for </span></span><span class="mord mathnormal">e</span></span></span></span></span></div></p>
+<p>and the value counts as missing (use the default) if <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6984em;vertical-align:-0.0833em;"></span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0391em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">∗</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord text"><span class="mord">TTL</span></span></span></span></span>. A strict join also requires the row's <em>created</em> time to be at or before <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6151em;"></span><span class="mord mathnormal">t</span></span></span></span>, so late-arriving or corrected data cannot leak backwards. A plain "latest value" join uses <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6887em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.6887em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mbin mtight">∗</span></span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mop">max</span><span class="mopen">{</span><span class="mord mathnormal" style="margin-right:0.1132em;">τ</span><span class="mclose">}</span></span></span></span> over all time, including the future.</p>
+<p><strong>Skew.</strong> Training–serving skew is any difference between <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">train</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mclose">)</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">serve</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">e</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">t</span><span class="mclose">)</span></span></span></span> for the same entity and time: different code, different windows, stale values. Measured by logging served features and recomputing them offline, the mismatch rate is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8451em;"><span style="top:-2.655em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.10903em;">N</span></span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.394em;"><span class="pstrut" style="height:3em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mtight">1</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.345em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.162em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2997em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord">1</span><span class="mord"><span class="delimsizing size1">[</span></span><span class="mord">∣</span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6644em;"><span style="top:-2.4413em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">serve</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.1078em;vertical-align:-0.2587em;"></span><span class="mord"><span class="mord mathnormal">x</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-2.4413em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">offline</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2587em;"><span></span></span></span></span></span></span><span class="mord">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1.2em;vertical-align:-0.35em;"></span><span class="mord text"><span class="mord">tol</span></span><span class="mord"><span class="delimsizing size1">]</span></span></span></span></span> per feature.</p>
+<p><strong>Backfill cost</strong> grows with entities × dates × features: two million users over 365 days is 730 million rows per feature.</p></div></aside>
+<h2>Step 1 · Feature definitions and the registry</h2>
+<p>The code in <code>code/main.py</code> uses only the standard library. Time is a whole number of days. A weekly batch job writes feature snapshots on days 7, 14, and so on up to 175.</p>
+<p>A <code>FeatureDefinition</code> holds the transformation as data: an aggregate, a window, and a default. Its <code>compute</code> method never reads events after <code>as_of</code>.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass(frozen=True)
+class FeatureDefinition:
+    name: str
+    entity: str
+    aggregate: str
+    window_days: int | None
+    default: float
+    version: int = 1
+    owner: str = &quot;growth-team&quot;
+    description: str = &quot;&quot;
+
+    def compute(self, events: list[Event], as_of: int) -&gt; float:
+        visible = [e for e in events if e.day &lt;= as_of]
+        if self.window_days is not None:
+            visible = [e for e in visible if e.day &gt; as_of - self.window_days]
+        if self.aggregate == &quot;count&quot;:
+            return float(len(visible))
+        if self.aggregate == &quot;sum&quot;:
+            return round(sum(e.amount for e in visible), 2)
+        if self.aggregate == &quot;days_since_last&quot;:
+            return float(as_of - max(e.day for e in visible)) if visible else self.default
+        raise ValueError(f&quot;unknown aggregate {self.aggregate!r}&quot;)
+</code></pre></div>
+
+<p><code>FeatureRegistry.register</code> accepts the same definition twice, but it rejects a different definition with the same name and version. <code>fill_defaults</code> gives both paths the same default for a missing value.</p>
+<p>A model pins a definition with a reference such as <code>spend_30d@1</code>. <code>compute</code> and <code>fill_defaults</code> resolve the reference, and a name without <code>@</code> reads the latest version. A reference with <code>@</code> and no version number raises <code>ValueError</code>, so a typo cannot read the latest version without a warning. The reference is also the key in each stored row, so the backfill, the online store, and the serving read all use the pinned definition.</p>
+<h2>Step 2 · Backfill the offline store</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def backfill(registry: FeatureRegistry, names: list[str], events: list[Event], days: list[int]) -&gt; list[FeatureRow]:
+    rows = []
+    for entity, entity_events in sorted(group_events(events).items()):
+        for day in days:
+            rows.append(FeatureRow(entity, day, registry.compute(names, entity_events, day)))
+    return rows
+</code></pre></div>
+
+<p>The demo backfills three features for 299 users on 25 snapshot days, which gives 7475 rows.</p>
+<h2>Step 3 · The point-in-time join</h2>
+<p>Sort each entity's rows by day once. For each label, <code>bisect_right</code> finds the last row at or before the label day. The TTL check drops a row that is too old.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def point_in_time_join(labels: list[LabelRow], rows: list[FeatureRow], ttl_days: int | None = None) -&gt; list[JoinedRow]:
+    by_entity: dict[str, list[FeatureRow]] = defaultdict(list)
+    for row in rows:
+        by_entity[row.entity].append(row)
+    days_index = {}
+    for entity, entity_rows in by_entity.items():
+        entity_rows.sort(key=lambda r: r.day)
+        days_index[entity] = [r.day for r in entity_rows]
+    joined = []
+    for label in labels:
+        days = days_index.get(label.entity, [])
+        pos = bisect.bisect_right(days, label.day) - 1
+        match = by_entity[label.entity][pos] if pos &gt;= 0 else None
+        if match is not None and ttl_days is not None and label.day - match.day &gt; ttl_days:
+            match = None
+        joined.append(JoinedRow(
+            label.entity, label.day, label.label,
+            match.day if match else None, match.values if match else None,
+        ))
+    return joined
+</code></pre></div>
+
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Set the TTL to 3 days instead of 10 (Exercise 2). Training labels sit on days 100, 120 and 140, and snapshots are written every 7 days. How many of the 897 training rows lose their features? Then test the rule on day 145. What happens? (Solution P1.)</p></div></aside>
+<h2>Step 4 · Measure the leak from a naive join</h2>
+<p><code>naive_latest_join</code> joins on the entity only, so it returns the newest row for every label. The demo builds labels on days 100, 120, and 140 and fits a one-feature rule on each training set. It then tests both rules on labels from day 145, with point-in-time features:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-console">  naive join used a snapshot from after the label day for 100% of rows
+  offline accuracy, naive join: 0.948 (rule: idle &gt; 53 days)
+  offline accuracy, PIT join:   0.893 (rule: idle &gt; 19 days)
+  accuracy on day 145, trained with naive join: 0.763
+  accuracy on day 145, trained with PIT join:   0.876
+</code></pre></div>
+<p>The naive join looks better offline, 0.948 against 0.893. On new data it is worse, 0.763 against 0.876. The leaked feature moved the fitted threshold from 19 to 53 idle days.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-body"><p><code>days_since_last_purchase</code> for the 897 training labels, split by the true label. Left: the point-in-time join. Right: the naive join, which reads the day-175 snapshot for every label.</p>
+<details class="plot-code"><summary>Show the code that draws this</summary>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import numpy as np
+import matplotlib.pyplot as plt
+
+registry = build_registry()
+events, _ = make_events()
+offline = backfill(registry, FEATURES, events, SNAPSHOT_DAYS)
+train_labels = make_labels(events, [100, 120, 140])
+y_train = np.array([r.label for r in train_labels])
+views = {&quot;point-in-time join&quot;: point_in_time_join(train_labels, offline, TTL_DAYS),
+         &quot;naive join (newest row)&quot;: naive_latest_join(train_labels, offline)}
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.5), sharey=True)
+bins = np.arange(0, 181, 6)
+for ax, (title, joined) in zip(axes, views.items()):
+    idle = np.array([f[&quot;days_since_last_purchase&quot;] for f in training_features(registry, FEATURES, joined)])
+    threshold, acc = fit_idle_rule(training_features(registry, FEATURES, joined), list(y_train))
+    ax.hist(idle[y_train == 0], bins=bins, color=&quot;#474d9a&quot;, alpha=0.65, label=&quot;stays (label 0)&quot;)
+    ax.hist(idle[y_train == 1], bins=bins, color=&quot;#b24a1d&quot;, alpha=0.65, label=&quot;churns (label 1)&quot;)
+    ax.axvline(threshold + 0.5, color=&quot;#171a21&quot;, ls=&quot;--&quot;, lw=1)
+    ax.set_title(f&quot;{title}: rule idle &gt; {threshold:g}, accuracy {acc:.3f}&quot;, fontsize=9)
+    ax.set_xlabel(&quot;days since last purchase&quot;); ax.spines[[&quot;top&quot;, &quot;right&quot;]].set_visible(False)
+    print(f&quot;{title:24} churners' median idle days {np.median(idle[y_train == 1]):5.1f}, stayers' {np.median(idle[y_train == 0]):4.1f}&quot;)
+axes[0].set_ylabel(&quot;labels&quot;); axes[0].legend(frameon=False, fontsize=8)
+plt.tight_layout(); plt.show()
+</code></pre></div>
+</details>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">point-in-time join       churners&#x27; median idle days  41.0, stayers&#x27;  2.0
+naive join (newest row)  churners&#x27; median idle days  96.0, stayers&#x27;  4.0</code></pre></div></div><img class="run-fig" alt="Plot drawn by the code above" loading="lazy" src="figs/79047020d6e3b2bf.png"></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With the point-in-time join the two groups overlap: some churners had bought recently on the label day and only stopped afterwards, which is exactly what makes churn hard to predict. The naive join pulls the churners far to the right, because the day-175 snapshot already counts the idle days <em>after</em> the label day. The classes separate cleanly, the rule moves to 53 days, and none of that separation exists when the model meets a live user.</p></div></aside>
+<h2>Step 5 · The online store and materialization</h2>
+<p>The online store keeps one row per entity and refuses rows older than the TTL. <code>materialize</code> writes only rows whose day is at or before the job time.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class OnlineStore:
+    def __init__(self, ttl_days: int):
+        self.ttl_days = ttl_days
+        self._latest: dict[str, FeatureRow] = {}
+
+    def write(self, row: FeatureRow) -&gt; None:
+        current = self._latest.get(row.entity)
+        if current is None or row.day &gt;= current.day:
+            self._latest[row.entity] = row
+
+    def read(self, entity: str, now: int) -&gt; dict[str, float] | None:
+        row = self._latest.get(entity)
+        if row is None or row.day &gt; now or now - row.day &gt; self.ttl_days:
+            return None
+        return dict(row.values)
+</code></pre></div>
+
+<p>With a TTL of 10 days, a read on day 145 returns the day 140 row. A read on day 160, with no new materialization, returns the defaults, because the row is 20 days old.</p>
+<h2>Step 6 · The skew check</h2>
+<p><code>detect_skew</code> compares two views keyed by <code>(entity, day)</code>. It reports the mismatch rate and the mean absolute difference per feature and flags a feature when more than 1 percent of values differ. It raises <code>ValueError</code> when the two views have different keys or no keys. A missing request can hide skew, and a check with no requests shows nothing.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def detect_skew(
+    training: dict[tuple[str, int], dict[str, float]],
+    serving: dict[tuple[str, int], dict[str, float]],
+    features: list[str],
+    tolerance: float = 1e-6,
+    max_mismatch_rate: float = 0.01,
+) -&gt; list[SkewReport]:
+    if set(training) != set(serving):
+        raise ValueError(f&quot;{len(set(training) ^ set(serving))} keys are in only one view: log and compare the same requests&quot;)
+    if not training:
+        raise ValueError(&quot;no requests to compare&quot;)
+    keys = sorted(training)
+    reports = []
+    for feature in features:
+        diffs = [abs(training[k][feature] - serving[k][feature]) for k in keys]
+        mismatches = sum(1 for d in diffs if d &gt; tolerance)
+        rate = mismatches / len(keys)
+        mean_diff = sum(diffs) / len(keys)
+        reports.append(SkewReport(feature, len(keys), rate, mean_diff, rate &gt; max_mismatch_rate))
+    return reports
+</code></pre></div>
+
+<p>The demo logs requests on days 141 to 150 and runs the three comparisons from the concept section. The request pool includes 20 new users with no history.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">python3 code/main.py
+npx tsx code/main.ts
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-console">=== Skew checks on 383 logged requests, days 141 to 150 ===
+  online store read  vs  training join (one definition, same snapshots)
+    ok   days_since_last_purchase   mismatch   0.0%  mean |diff|    0.00
+    ok   purchases_30d              mismatch   0.0%  mean |diff|    0.00
+    ok   spend_30d                  mismatch   0.0%  mean |diff|    0.00
+  fresh compute      vs  training join (staleness only)
+    SKEW days_since_last_purchase   mismatch  83.0%  mean |diff|    2.77
+    SKEW purchases_30d              mismatch  30.5%  mean |diff|    0.38
+    SKEW spend_30d                  mismatch  37.1%  mean |diff|   16.77
+  second code path   vs  fresh compute (code differences only)
+    SKEW days_since_last_purchase   mismatch   5.5%  mean |diff|   20.07
+    SKEW purchases_30d              mismatch  12.5%  mean |diff|    0.13
+    SKEW spend_30d                  mismatch  12.5%  mean |diff|    5.09
+</code></pre></div>
+<p>Read the three blocks in order:</p>
+<ul>
+<li><strong>One definition, same snapshots.</strong> The online store and the training join read the same materialized rows, so skew is zero.</li>
+<li><strong>Staleness.</strong> A fresh value differs from the weekly snapshot on most requests. Fresher data is not automatically better here, because the model learned from values up to six days old.</li>
+<li><strong>Code differences.</strong> The second code path differs on 12.5 percent of window counts, because its window includes one extra day. It differs on <code>days_since_last_purchase</code> for new users only, but by a large amount: -1 against 365.</li>
+</ul>
+<p>The whole demo, run on this page (imported fresh from <code>code/main.py</code>, because the shortened <code>OnlineStore</code> shown in Step 5 leaves out its <code>age</code> method):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import main as feature_store_demo
+feature_store_demo.main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== Feature registry ===
+  days_since_last_purchase   v1  entity=user  window=all  default=365  days since the last purchase
+  purchases_30d              v1  entity=user  window=30d  default=0  purchases in the last 30 days
+  spend_30d                  v1  entity=user  window=30d  default=0  spend in the last 30 days
+  backfilled 7475 rows on 25 weekly snapshot days
+
+=== Point-in-time join versus naive latest join ===
+  897 labels, churn rate 0.35
+  naive join used a snapshot from after the label day for 100% of rows
+  offline accuracy, naive join: 0.948 (rule: idle &gt; 53 days)
+  offline accuracy, PIT join:   0.893 (rule: idle &gt; 19 days)
+  accuracy on day 145, trained with naive join: 0.763
+  accuracy on day 145, trained with PIT join:   0.876
+
+=== Online store with a TTL of 10 days ===
+  day 145: u001 row age 5 days -&gt; {&#x27;days_since_last_purchase&#x27;: 22.0, &#x27;purchases_30d&#x27;: 3.0, &#x27;spend_30d&#x27;: 102.97}
+  day 160: u001 row age 20 days -&gt; {&#x27;days_since_last_purchase&#x27;: 365.0, &#x27;purchases_30d&#x27;: 0.0, &#x27;spend_30d&#x27;: 0.0} (expired, defaults)
+
+=== Skew checks on 383 logged requests, days 141 to 150 ===
+  online store read  vs  training join (one definition, same snapshots)
+    ok   days_since_last_purchase   mismatch   0.0%  mean |diff|    0.00
+    ok   purchases_30d              mismatch   0.0%  mean |diff|    0.00
+    ok   spend_30d                  mismatch   0.0%  mean |diff|    0.00
+  fresh compute      vs  training join (staleness only)
+    SKEW days_since_last_purchase   mismatch  83.0%  mean |diff|    2.77
+    SKEW purchases_30d              mismatch  30.5%  mean |diff|    0.38
+    SKEW spend_30d                  mismatch  37.1%  mean |diff|   16.77
+  second code path   vs  fresh compute (code differences only)
+    SKEW days_since_last_purchase   mismatch   5.5%  mean |diff|   20.07
+    SKEW purchases_30d              mismatch  12.5%  mean |diff|    0.13
+    SKEW spend_30d                  mismatch  12.5%  mean |diff|    5.09</code></pre></div></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Simulate a backfill that reads late-arriving data: build the offline rows with <code>registry.compute(FEATURES, entity_events, day + 7)</code> instead of <code>day</code>, so each snapshot sees one week of the future. Fit the idle rule on point-in-time joined labels from days 100, 120 and 140, and test it on day 145 with honest features. Compare with the honest backfill. (Solution B1.)</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p>Feast is an open-source feature store. Each piece of the from-scratch code has a Feast counterpart:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>From scratch</th>
+<th>Feast</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FeatureDefinition</code>, <code>FeatureRegistry</code></td>
+<td><code>Entity</code>, <code>FeatureView</code>, and <code>Field</code> in a feature repository, registered with <code>feast apply</code></td>
+</tr>
+<tr>
+<td><code>FeatureRow</code> history</td>
+<td>An offline store, for example a <code>FileSource</code> over Parquet files or a warehouse table</td>
+</tr>
+<tr>
+<td><code>point_in_time_join</code> with a TTL</td>
+<td><code>store.get_historical_features(entity_df=..., features=[...])</code></td>
+</tr>
+<tr>
+<td><code>materialize</code></td>
+<td><code>feast materialize-incremental &lt;end time&gt;</code></td>
+</tr>
+<tr>
+<td><code>OnlineStore.read</code></td>
+<td><code>store.get_online_features(features=[...], entity_rows=[...])</code></td>
+</tr>
+<tr>
+<td>Created timestamp check</td>
+<td><code>created_timestamp_column</code> on the source and <code>filter_by_created_timestamp=True</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>The definitions look like this. The code follows the Feast quickstart and is not needed to run this lesson.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from datetime import timedelta
+
+from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Float32, Int64
+
+user = Entity(name=&quot;user&quot;, join_keys=[&quot;user_id&quot;])
+
+user_activity_source = FileSource(
+    name=&quot;user_activity_source&quot;,
+    path=&quot;data/user_activity.parquet&quot;,
+    timestamp_field=&quot;event_timestamp&quot;,
+    created_timestamp_column=&quot;created&quot;,
+)
+
+user_activity = FeatureView(
+    name=&quot;user_activity&quot;,
+    entities=[user],
+    ttl=timedelta(days=10),
+    schema=[
+        Field(name=&quot;purchases_30d&quot;, dtype=Int64),
+        Field(name=&quot;spend_30d&quot;, dtype=Float32),
+        Field(name=&quot;days_since_last_purchase&quot;, dtype=Int64),
+    ],
+    source=user_activity_source,
+)
+</code></pre></div>
+
+<p>Training and serving then read the same feature view:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from feast import FeatureStore
+
+store = FeatureStore(repo_path=&quot;.&quot;)
+
+training_df = store.get_historical_features(
+    entity_df=labels_df,
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    filter_by_created_timestamp=True,
+).to_df()
+
+online = store.get_online_features(
+    features=[&quot;user_activity:purchases_30d&quot;, &quot;user_activity:days_since_last_purchase&quot;],
+    entity_rows=[{&quot;user_id&quot;: 42}],
+).to_dict()
+</code></pre></div>
+
+<p><code>labels_df</code> holds one row per label with <code>user_id</code>, <code>event_timestamp</code>, and the label. The Feast documentation states that the TTL is relative to each timestamp in the entity dataframe, not to the time of the query. That matches the TTL check in <code>point_in_time_join</code>. The same page describes <code>filter_by_created_timestamp=True</code>, which keeps backfilled values from leaking into training data. Not every offline store supports this option. A store without support raises an error instead of ignoring the option.</p>
+<p>Tecton, Hopsworks, and the feature stores in the large cloud ML platforms use the same split between offline and online stores. For the skew check, TensorFlow Data Validation can compare training data with serving data to detect skew. Breck et al. describe the data validation system in TFX, Google's end-to-end ML platform, including training-serving skew.</p>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>One registry of feature definitions feeds both training and serving; no private copies of the transformation.</li>
+<li>Training needs a point-in-time join: the latest row at or before each label time, within the TTL.</li>
+<li>Skew comes from two code paths, stale features, different defaults and time travel.</li>
+<li>The TTL must cover the gap between snapshots plus any delay, or serving falls back to defaults.</li>
+<li>Log serving features and compare them with the training path for the same entity and time.</li>
+</ul></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="a0221-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Training is fine, serving is not</span></summary><div class="qa-a"><p><strong>None</strong> of the training rows lose their features: the label days 100, 120 and 140 sit 2, 1 and 0 days after the snapshots on days 98, 119 and 140. But on day 145 the newest snapshot is 5 days old, so <strong>all 299</strong> day-145 rows expire and get the defaults. With <code>days_since_last_purchase = 365</code>, the rule (idle &gt; 19) predicts churn for everyone, and accuracy drops from 0.876 to <strong>0.445</strong>, the share of users who really churn. The TTL must be longer than the time between snapshots plus the job delay; training data cannot tell you that.</p></div></details>
+<details class="qa" id="a0221-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · A week of the future</span></summary><div class="qa-a"><p>The leaky backfill scores <strong>0.934</strong> offline against 0.893 for the honest one, and moves the rule from 19 to 16 idle days. On day 145, with honest features, it reaches 0.873 against 0.876: the four-point offline gain was never real. A backfill must read only data that existed at each snapshot date; store a created timestamp and filter on it, as Feast's <code>filter_by_created_timestamp</code> does.</p></div></details>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Feature stores moved into data platforms.</strong> Databricks acquired Tecton in 2025; Databricks (Unity Catalog), Snowflake, Vertex AI and SageMaker all offer built-in feature stores, and Feast is the main open-source option.</li>
+<li><strong>Real-time features for agents.</strong> The same online stores now serve fresh customer context to LLM agents, not only to classic models, which was Databricks' stated reason for the Tecton deal.</li>
+</ul>
+<p>Sources: <a href="https://www.databricks.com/blog/tecton-joining-databricks-power-real-time-data-personalized-ai-agents">Tecton joins Databricks</a>, <a href="https://feast.dev/">Feast</a>, <a href="https://docs.snowflake.com/en/developer-guide/snowflake-ml/feature-store/overview">Snowflake Feature Store</a>, <a href="https://cloud.google.com/vertex-ai/docs/featurestore/latest/overview">Vertex AI Feature Store</a>.</p></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-ml-system-design"><span class="t" style="--cs-hue:220">MS</span>Cheat sheet · Feature Stores, Drift and ML System Design</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-feature-skew-audit.md</code>. The skill audits a feature pipeline for time travel and training-serving skew. It walks through the join, the definitions, the defaults, the freshness of each path, and the logging that a skew check needs.</p>
+<p><strong><code>outputs/skill-feature-skew-audit.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-feature-skew-audit
+description: Audit a feature pipeline for time travel and training-serving skew
+version: 1.0.0
+phase: 2
+lesson: 21
+tags: [feature-store, point-in-time, training-serving-skew, leakage, backfill]
+---
+
+# Feature Skew Audit
+
+Use this skill when a model scores well offline and worse in production. Also use it when a team adds a feature store, and before a new feature goes live. Work through the steps in order and record each finding.
+
+## Step 1: Map both paths
+
+For every feature, write down two lines:
+
+```text
+training path: &lt;source table&gt; -&gt; &lt;transformation code&gt; -&gt; &lt;join to labels&gt;
+serving path:  &lt;source&gt; -&gt; &lt;transformation code&gt; -&gt; &lt;store or request-time compute&gt;
+```
+
+If the two lines name different transformation code, mark the feature &quot;two code paths&quot;. That is the first skew risk.
+
+## Step 2: Check the training join for time travel
+
+- The join uses the label timestamp, not only the entity key.
+- The join takes the latest row with event time at or before the label time.
+- The join drops rows older than the TTL.
+- Backfilled or corrected rows carry a created timestamp, and the join ignores rows created after the label time.
+- Aggregation windows end at the label time. A window such as &quot;the 30 days around the label&quot; leaks.
+
+Quick test: count the training rows whose feature row is later than the label. Any count above zero is a leak.
+
+## Step 3: Compare the definitions
+
+For each feature, compare the two paths on these points:
+
+| Point | Question |
+|---|---|
+| Window edges | Is each window edge inclusive or exclusive in both paths? |
+| Missing values | Do both paths use the same default for no history and for expired values? |
+| Units and types | Same currency, same time zone, same integer or float type? |
+| Rounding | Same rounding, at the same step? |
+| Category mapping | Same vocabulary, same handling of unknown values? |
+
+## Step 4: Compare freshness
+
+- How old is a training value at its label time, on average and at most?
+- How old is a serving value at request time, on average and at most?
+- What happens when materialization fails? The TTL must turn old values into defaults, not serve them silently.
+
+A model that trained on values up to a week old can behave differently on fresh values. Match the freshness, or retrain on values with the serving freshness.
+
+## Step 5: Measure skew
+
+1. Log the feature values that the serving path used, with the entity and the request time.
+2. Recompute the same keys with the training path.
+3. Per feature, report the mismatch rate and the mean absolute difference.
+4. Split the cause with three comparisons: store read versus training, fresh compute versus training, second path versus fresh compute.
+
+Flag a feature when more than 1 percent of values differ, unless the difference is a documented freshness gap.
+
+## Step 6: Write the audit result
+
+```text
+Feature: &lt;name, version&gt;
+Paths: shared definition | two code paths
+Time travel: none found | &lt;rows affected and cause&gt;
+Definition gaps: &lt;window edges, defaults, units, rounding&gt;
+Freshness: training &lt;age&gt;, serving &lt;age&gt;, TTL &lt;days&gt;
+Measured skew: &lt;mismatch rate, mean |diff|&gt;
+Fix: &lt;move both paths to one registry definition | fix join | align default | align TTL&gt;
+```
+
+Fix order: remove time travel first, then move both paths to one definition, then align freshness.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Change the snapshot interval from 7 days to 1 day. Rerun the staleness comparison and explain the result.</li>
+<li>Set the TTL to 3 days. Count the training rows that lose their features and get defaults.</li>
+<li>Add a created day to <code>FeatureRow</code>. Make the join ignore rows written after the label day.</li>
+<li>Register <code>spend_7d</code> as version 2 of <code>spend_30d</code>. Backfill it and print both versions from the registry.</li>
+<li>Fix <code>legacy_serving_features</code> until the third skew check passes. List each change.</li>
+</ol>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins">Feast, Point-in-time joins</a>: TTL semantics and the created timestamp filter</li>
+<li><a href="https://docs.feast.dev/">Feast documentation</a>: feature views, offline stores, online stores, and materialization</li>
+<li><a href="https://developers.google.com/machine-learning/guides/rules-of-ml">Google, Rules of Machine Learning</a>: the training-serving skew rules, from Rule #29 to Rule #37</li>
+<li><a href="https://research.google/pubs/data-validation-for-machine-learning/">Breck et al., Data Validation for Machine Learning (SysML 2019)</a>: data validation at Google, including training-serving skew</li>
+<li><a href="https://www.tensorflow.org/tfx/guide/tfdv">TensorFlow Data Validation guide</a>: schema checks, skew detection, and drift detection</li>
+<li><a href="https://papers.nips.cc/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html">Sculley et al., Hidden Technical Debt in Machine Learning Systems (NeurIPS 2015)</a>: data dependencies and pipeline debt around a model</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0221" id="done-a0221">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0221" id="undo-a0221" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0220"><span class="pn-dir">Previous</span><span class="pn-t">2.26 · Data Drift and Concept Drift: Model Monitoring in Production</span></a><a class="pn next" href="#cs-classical-ml"><span class="pn-dir">Next</span><span class="pn-t">Cheat sheet · Classical ML Algorithms: Quick Reference</span></a></div></footer>

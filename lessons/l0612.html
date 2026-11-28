@@ -1,0 +1,375 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Persistence: checkpoints, threads, resume and time travel</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.62</span><span class="chip">60 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0612" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Save a graph's state after every step with a checkpointer, and read it back per thread</li>
+<li>Resume a failed run from the step that failed, in a new process, without repeating the steps that succeeded</li>
+<li>Go back to an earlier checkpoint, change the state, and run a new branch from there</li>
+<li>Know which side effects a resume can repeat, and design nodes so they are safe</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons <a class="xref" href="#l0611">14.61</a> and <a class="xref" href="#l0305">14.6</a> (checkpoints and resume, by hand). <a class="xref" href="#l0304">Lesson 14.5</a> for idempotency.</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 60 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langgraph</code> 1.2.24, <code>langgraph-checkpoint</code> 4.3.1 and <code>langgraph-checkpoint-sqlite</code> 3.1.3.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0612-0">Durable execution</a></td>
+<td>Running so that progress survives failures and restarts and only unfinished work is redone</td>
+<td>Idea 3</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0612-1">Time travel</a></td>
+<td>Going back to an earlier checkpoint, changing state and running a new branch</td>
+<td>Idea 4</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0612-2">Fork</a></td>
+<td>A new branch of checkpoints written from an earlier one</td>
+<td>Idea 4</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">No model on this page</div><div class="co-body"><p>The nodes are plain functions, and the failing order service is a flag. The checkpointers are the real libraries, including a real SQLite database file.</p></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-bash">uv add langgraph langgraph-checkpoint-sqlite      # langgraph-checkpoint-postgres for production
+</code></pre></div>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Agents that ran in memory lost everything on a crash or redeploy. <span class="cx" data-c="327" tabindex="0">LangGraph</span> built in <strong>checkpointers</strong> from the start, borrowing <mark class="term" id="term-l0612-0" title="Industry term: Durable execution. Running so that progress survives failures and restarts and only unfinished work is redone">durable execution</mark> from workflow engines, so every step is saved and runs can resume, be inspected and be replayed.</p></div></aside>
+<h2>The problem: runs outlive processes</h2>
+<p>A refund run waits for an order service that is down, or for a person's approval that comes tomorrow. Meanwhile the process restarts for a deploy. In <a class="xref" href="#l0305">Lesson 14.6</a> you wrote run state to <span class="cx" data-c="311" tabindex="0">JSON</span> files after every step so that a run could resume; in <a class="xref" href="#l0609">Lesson 14.59</a> your engine appended checkpoints to a list. LangGraph does this for every graph with a <strong>checkpointer</strong>: after every step, the whole state, what runs next and some metadata are saved, grouped by <strong>thread</strong>.</p>
+<h2>The idea in plain words</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Autosave with named save slots</div><div class="co-body"><p>A <strong>checkpointer</strong> saves a copy of the state after every step, the way a game autosaves. The <strong>thread ID</strong> is the name of the save slot: call the graph again with the same thread ID and it loads that slot and carries on; a new thread ID is a new game. Each saved copy is a <strong>checkpoint</strong>.</p></div></aside>
+<p>The whole idea in plain Python:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">saved = {}                                        # thread_id -&gt; list of snapshots
+
+def run_turn(thread_id, user_text):
+    history = saved.get(thread_id, [[]])[-1]      # load the latest snapshot, or start empty
+    history = history + [f&quot;user: {user_text}&quot;]
+    saved.setdefault(thread_id, []).append(history)          # snapshot after step 1
+    history = history + [f&quot;bot: reply to {user_text!r}&quot;]
+    saved[thread_id].append(history)                          # snapshot after step 2
+    return history
+
+run_turn(&quot;chat-1&quot;, &quot;I want a refund&quot;)
+print(run_turn(&quot;chat-1&quot;, &quot;It is order A-1077&quot;))  # same thread: the earlier turn is loaded
+print(run_turn(&quot;chat-2&quot;, &quot;It is order A-1077&quot;))  # new thread: starts empty
+print(len(saved[&quot;chat-1&quot;]), &quot;snapshots for chat-1&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['user: I want a refund', &quot;bot: reply to 'I want a refund'&quot;, 'user: It is order A-1077', &quot;bot: reply to 'It is order A-1077'&quot;]
+['user: It is order A-1077', &quot;bot: reply to 'It is order A-1077'&quot;]
+4 snapshots for chat-1
+</code></pre></div></div></aside>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Plain Python above</th>
+<th>LangGraph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The <code>saved</code> dictionary</td>
+<td>A checkpointer: <code>InMemorySaver()</code>, or SQLite and Postgres savers</td>
+</tr>
+<tr>
+<td><code>thread_id</code></td>
+<td><code>{"configurable": {"thread_id": "..."}}</code> in the config</td>
+</tr>
+<tr>
+<td>Loading the latest snapshot</td>
+<td>Done for you on every <code>invoke</code></td>
+</tr>
+<tr>
+<td>Appending after each step</td>
+<td>Done for you after every step</td>
+</tr>
+<tr>
+<td><code>saved["chat-1"]</code></td>
+<td><code>graph.get_state_history(config)</code></td>
+</tr>
+</tbody>
+</table></div>
+<p>What LangGraph adds is everything hard to write yourself: real databases, the full history for going back (Idea 4), and records of unfinished work so a crashed or paused run can continue (Idea 3 and <a class="xref" href="#l0613">Lesson 14.63</a>). A checkpoint holds the <strong>whole state</strong>, not just messages: every key, what runs next, and metadata.</p>
+<h2>Idea 1 · A checkpointer and a thread</h2>
+<p>Compile the same kind of graph with a <strong>checkpointer</strong> and it saves the state after every step. The saves are filed under a <strong>thread ID</strong> that you pass with each call. Run the graph, then ask for the saved state of that thread: everything the run produced is still there, along with which node would run next.</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 880 300" role="img" aria-label="Checkpoints and threads. With a checkpointer, LangGraph saves the full state after every step, filed under a thread_id. Invoking again with the same thread_id continues from the last checkpoint, in the same process or a new one. Any earlier checkpoint can be loaded, and running from it starts a new branch without erasing the original." style="min-width:560px"><defs><marker id="ah145" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah145a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah145p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah145k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah145r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah145w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><text class="m" x="20" y="34" text-anchor="start">thread_id = &quot;customer-42&quot;</text><rect class="p" x="20" y="60" width="100" height="50" rx="8"/><text class="h" x="70" y="82" text-anchor="middle">checkpoint 1</text><text class="s" x="70" y="100" text-anchor="middle">input</text><path class="l" d="M 122.0 85.0 L 168.0 85.0" marker-end="url(#ah145)"/><rect class="p" x="170" y="60" width="100" height="50" rx="8"/><text class="h" x="220" y="82" text-anchor="middle">checkpoint 2</text><text class="s" x="220" y="100" text-anchor="middle">after classify</text><path class="l" d="M 272.0 85.0 L 318.0 85.0" marker-end="url(#ah145)"/><rect class="p" x="320" y="60" width="100" height="50" rx="8"/><text class="h" x="370" y="82" text-anchor="middle">checkpoint 3</text><text class="s" x="370" y="100" text-anchor="middle">after lookup</text><path class="l" d="M 422.0 85.0 L 468.0 85.0" marker-end="url(#ah145)"/><rect class="p" x="470" y="60" width="100" height="50" rx="8"/><text class="h" x="520" y="82" text-anchor="middle">checkpoint 4</text><text class="s" x="520" y="100" text-anchor="middle">after draft</text><path class="l" d="M 572.0 85.0 L 618.0 85.0" marker-end="url(#ah145)"/><rect class="p" x="620" y="60" width="100" height="50" rx="8"/><text class="h" x="670" y="82" text-anchor="middle">checkpoint 5</text><text class="s" x="670" y="100" text-anchor="middle">after send</text><text class="s" x="145" y="134" text-anchor="middle">run 1</text><line class="axis" x1="20" y1="120" x2="420" y2="120"/><text class="s" x="595" y="134" text-anchor="middle">run 2, later, same thread_id: continues</text><line class="axis" x1="470" y1="120" x2="720" y2="120"/><rect class="w" x="470" y="190" width="100" height="50" rx="8"/><text class="h" x="520" y="212" text-anchor="middle">checkpoint 4′</text><text class="s" x="520" y="230" text-anchor="middle">edited draft</text><rect class="w" x="620" y="190" width="100" height="50" rx="8"/><text class="h" x="670" y="212" text-anchor="middle">checkpoint 5′</text><text class="s" x="670" y="230" text-anchor="middle">after send</text><path class="l w" d="M 370 112 C 370 200, 400 215, 468 215" marker-end="url(#ah145w)"/><path class="l w" d="M 572.0 215.0 L 618.0 215.0" marker-end="url(#ah145w)"/><text class="w" x="250" y="216" text-anchor="middle">time travel: load checkpoint 3,</text><text class="w" x="250" y="234" text-anchor="middle">change the state, run again</text><text class="s" x="440" y="280" text-anchor="middle">a different thread_id is a different, separate conversation</text></svg></div><figcaption>Checkpoints and threads. With a checkpointer, LangGraph saves the full state after every step, filed under a thread_id. Invoking again with the same thread_id continues from the last checkpoint, in the same process or a new one. Any earlier checkpoint can be loaded, and running from it starts a new branch without erasing the original.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+
+class RefundState(TypedDict, total=False):
+    msg: str
+    intent: str
+    order: dict
+    done: str
+
+CALLS = []                                   # which nodes actually ran, to see what a resume repeats
+SERVICE = {&quot;down&quot;: False}
+
+def classify(state):
+    CALLS.append(&quot;classify&quot;)
+    return {&quot;intent&quot;: &quot;refund&quot; if &quot;refund&quot; in state[&quot;msg&quot;].lower() else &quot;other&quot;}
+
+def lookup(state):
+    CALLS.append(&quot;lookup&quot;)
+    if SERVICE[&quot;down&quot;]:
+        raise ConnectionError(&quot;order service unavailable&quot;)
+    return {&quot;order&quot;: {&quot;id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 7999}}
+
+def refund(state):
+    CALLS.append(&quot;refund&quot;)
+    return {&quot;done&quot;: f&quot;refunded INR {state['order']['amount']:,}&quot;}
+
+def build(checkpointer):
+    b = StateGraph(RefundState)
+    for name, fn in [(&quot;classify&quot;, classify), (&quot;lookup&quot;, lookup), (&quot;refund&quot;, refund)]:
+        b.add_node(name, fn)
+    b.add_edge(START, &quot;classify&quot;); b.add_edge(&quot;classify&quot;, &quot;lookup&quot;)
+    b.add_edge(&quot;lookup&quot;, &quot;refund&quot;); b.add_edge(&quot;refund&quot;, END)
+    return b.compile(checkpointer=checkpointer)
+
+graph = build(InMemorySaver())
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;refund-A-1077&quot;}}
+graph.invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;}, cfg)
+
+snap = graph.get_state(cfg)
+print(&quot;values:&quot;, snap.values)
+print(&quot;next:  &quot;, snap.next, &quot;| step:&quot;, snap.metadata[&quot;step&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">values: {'msg': 'I want a refund for A-1077', 'intent': 'refund', 'order': {'id': 'A-1077', 'amount': 7999}, 'done': 'refunded INR 7,999'}
+next:   () | step: 3
+</code></pre></div></div></aside>
+<p><code>get_state</code> returns a <strong>snapshot</strong> of the thread's latest checkpoint: the state's <code>values</code>, the nodes that will run <code>next</code> (none: the run finished), and metadata such as the step number. The thread ID in config chooses the thread; one thread per conversation or per case is the usual design (<a class="xref" href="#l0605">Lesson 14.55</a> used one per customer conversation).</p>
+<h2>Idea 2 · The history of a thread</h2>
+<p>The checkpointer keeps every save, not only the latest. <code>get_state_history</code> returns them newest first. Each one records which step it was, which node was due to run next, and what the state held at that moment:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">for snap in graph.get_state_history(cfg):                    # newest first
+    print(f&quot;step {snap.metadata['step']:&gt;2} | next {str(snap.next):14} | keys {sorted(snap.values)}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">step  3 | next ()             | keys ['done', 'intent', 'msg', 'order']
+step  2 | next ('refund',)    | keys ['intent', 'msg', 'order']
+step  1 | next ('lookup',)    | keys ['intent', 'msg']
+step  0 | next ('classify',)  | keys ['msg']
+step -1 | next ('__start__',) | keys []
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Read it from the bottom up to replay the run:
+- <strong>step -1</strong>, next <code>('__start__',)</code>, no keys: the input arrived but is not in the state yet.
+- <strong>step 0</strong>, next <code>('classify',)</code>: the input was written into the state (<code>msg</code>); <code>classify</code> is due.
+- <strong>steps 1 and 2</strong>: each node finished and added its key (<code>intent</code>, then <code>order</code>); <code>next</code> names the node due after it.
+- <strong>step 3</strong>, next <code>()</code>: <code>refund</code> finished; nothing is left to run.</p>
+<p><code>next</code> is the column to read when debugging: empty means the run finished; a node name means it stopped before that node, because it crashed or is waiting for a person.</p></div></aside>
+<p>One checkpoint per step, newest first: before anything ran (step -1), and after each node. This is what makes LangGraph runs debuggable after the fact: for any run, you can see the state at every step, not just the end.</p>
+<h2>Idea 3 · Crash, then resume in a new process</h2>
+<p>Now the order service is down, and the checkpoints go to a database file:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import os, sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+if os.path.exists(&quot;refunds.db&quot;):
+    os.remove(&quot;refunds.db&quot;)
+CALLS.clear()
+SERVICE[&quot;down&quot;] = True
+
+durable = build(SqliteSaver(sqlite3.connect(&quot;refunds.db&quot;, check_same_thread=False)))
+cfg2 = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;refund-A-2001&quot;}}
+try:
+    durable.invoke({&quot;msg&quot;: &quot;I want a refund for A-2001&quot;}, cfg2)
+except ConnectionError as e:
+    print(&quot;run failed:&quot;, e)
+
+snap = durable.get_state(cfg2)
+print(&quot;saved values:&quot;, snap.values)
+print(&quot;next:&quot;, snap.next, &quot;| error:&quot;, snap.tasks[0].error)
+print(&quot;ran so far:&quot;, CALLS)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">run failed: order service unavailable
+saved values: {'msg': 'I want a refund for A-2001', 'intent': 'refund'}
+next: ('lookup',) | error: ConnectionError('order service unavailable')
+ran so far: ['classify', 'lookup']
+</code></pre></div></div></aside>
+<p>The run failed in <code>lookup</code>. The checkpoint after <code>classify</code> was saved, and the snapshot records that <code>lookup</code> is next and why it failed. Now the service comes back, and a new process, with a new graph object and only the database in common, continues the thread:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">SERVICE[&quot;down&quot;] = False
+restarted = build(SqliteSaver(sqlite3.connect(&quot;refunds.db&quot;, check_same_thread=False)))   # a new process, same database
+
+print(restarted.invoke(None, cfg2)[&quot;done&quot;])                     # None: no new input, continue the thread
+print(&quot;ran in total:&quot;, CALLS)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">refunded INR 7,999
+ran in total: ['classify', 'lookup', 'lookup', 'refund']
+</code></pre></div></div></aside>
+<p>Invoking with <code>None</code> as input means "no new input, continue this thread". <code>classify</code> did not run again; <code>lookup</code> ran a second time, now successfully, and the run finished. That is <strong>durable execution</strong>: a run's progress survives failures and restarts, and only unfinished work is redone. In production the database is Postgres (<code>PostgresSaver</code> from <code>langgraph-checkpoint-postgres</code>, which needs <code>setup()</code> once to create its tables), or the platform's built-in persistence (<a class="xref" href="#l0617">Lesson 14.67</a>).</p>
+<h2>Idea 4 · Time travel: go back and branch</h2>
+<p>A reviewer finds that the refund amount should have been INR 4,999. Go back to the checkpoint before <code>refund</code>, correct the state there, and run from that point:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">history = list(graph.get_state_history(cfg))
+before_refund = next(s for s in history if s.next == (&quot;refund&quot;,))
+print(&quot;going back to step&quot;, before_refund.metadata[&quot;step&quot;], &quot;with order&quot;, before_refund.values[&quot;order&quot;])
+
+forked = graph.update_state(before_refund.config, {&quot;order&quot;: {&quot;id&quot;: &quot;A-1077&quot;, &quot;amount&quot;: 4999}})   # a corrected amount
+print(graph.invoke(None, forked)[&quot;done&quot;])
+print(&quot;checkpoints in the thread now:&quot;, len(list(graph.get_state_history(cfg))))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">going back to step 2 with order {'id': 'A-1077', 'amount': 7999}
+refunded INR 4,999
+checkpoints in the thread now: 7
+</code></pre></div></div></aside>
+<p><code>update_state</code> writes a new checkpoint that branches from the old one (a <strong><mark class="term" id="term-l0612-2" title="Industry term: Fork. A new branch of checkpoints written from an earlier one">fork</mark></strong>); the original history is kept, which is why the thread now has more checkpoints. Invoking with the fork's config runs only what came after that point. Uses: replaying a failed production run from just before the failure with a fix, testing "what if the tool had returned this", and letting a person correct an agent's state before it continues.</p>
+<h2>What to keep in state</h2>
+<p>Checkpoints save the state after every step, so the state's contents decide the cost and the risk:</p>
+<ul>
+<li><strong>Keep</strong>: what the run must remember after a pause: messages, decisions, IDs, results of expensive steps.</li>
+<li><strong>Do not keep</strong>: database connections, clients and secrets (pass them as context, <a class="xref" href="#l0611">Lesson 14.61</a>), and large blobs such as files or images (store them elsewhere and keep a reference).</li>
+<li><strong>Serialization</strong>: values must be serializable by the checkpointer's serializer, which handles JSON types, <span class="cx" data-c="326" tabindex="0">LangChain</span> messages, <span class="cx" data-c="477" tabindex="0">Pydantic</span> models and dataclasses. Checkpointers can encrypt state at rest with an encrypted serializer.</li>
+<li><strong>Retention</strong>: every step of every thread is stored; plan deletion of old threads, both for cost and for data-protection rules (<a class="xref" href="#l1004">Lesson 15.25</a>).</li>
+</ul>
+<h2>What the library replaces</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>You wrote</th>
+<th>LangGraph gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>DurableAgent</code> saving JSON to <code>runs/</code> (<a class="xref" href="#l0305">Lesson 14.6</a>)</td>
+<td>Checkpointers: in memory, SQLite, Postgres and others</td>
+</tr>
+<tr>
+<td>A run ID</td>
+<td>A thread ID in config</td>
+</tr>
+<tr>
+<td><code>checkpoints[-1]["next"]</code> and <code>resume=True</code> (<a class="xref" href="#l0609">Lesson 14.59</a>)</td>
+<td><code>get_state(...).next</code>, and <code>invoke(None, config)</code></td>
+</tr>
+<tr>
+<td>Reading old JSON files to debug</td>
+<td><code>get_state_history</code></td>
+</tr>
+<tr>
+<td>Nothing</td>
+<td><code>update_state</code> forks and replays from any checkpoint</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Persistence</em> (threads, checkpoints, <code>get_state</code>, <code>get_state_history</code>, <code>update_state</code>), <em>Durable execution</em>, <em><mark class="term" id="term-l0612-1" title="Industry term: Time travel. Going back to an earlier checkpoint, changing state and running a new branch">Time travel</mark></em>.</li>
+<li><strong>Versions</strong>: <code>langgraph</code> 1.2.24, <code>langgraph-checkpoint</code> 4.3.1, <code>langgraph-checkpoint-sqlite</code> 3.1.3.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InMemorySaver</code>, <code>SqliteSaver</code>, <code>PostgresSaver</code></td>
+<td>Stable; in-memory and SQLite for development, Postgres for production</td>
+</tr>
+<tr>
+<td>Resume with <code>invoke(None, config)</code>; <code>get_state_history</code>; <code>update_state</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>durability</code> argument (<code>"exit"</code>, <code>"async"</code>, <code>"sync"</code>)</td>
+<td>Documented; controls when checkpoints are written</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>In Idea 3, suppose the graph had a fourth node after <code>refund</code>, and the process crashed during <code>refund</code>. After the restart, which nodes run? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Compile the graph without a checkpointer and ask for its state:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">plain = build(None)
+plain.invoke({&quot;msg&quot;: &quot;I want a refund for A-1077&quot;})
+try:
+    plain.get_state(cfg)
+except ValueError as e:
+    print(&quot;ValueError:&quot;, e)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ValueError: No checkpointer set
+</code></pre></div>
+<p>The run itself worked. Why can't LangGraph tell you anything about it afterwards? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: two refunds for one order</div><div class="co-body"><p>A refund node sends money and then writes an accounting entry. The ledger was briefly down, the run was resumed, and finance reports a double refund.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">CHARGES = []
+LEDGER = {&quot;up&quot;: False}
+
+def refund_and_record(state):
+    CHARGES.append(state[&quot;order&quot;][&quot;id&quot;])                       # sends money to the customer
+    if not LEDGER[&quot;up&quot;]:
+        raise ConnectionError(&quot;ledger unavailable&quot;)            # then writes the accounting entry
+    return {&quot;done&quot;: &quot;refunded and recorded&quot;}
+
+b = StateGraph(RefundState)
+b.add_node(&quot;lookup&quot;, lookup); b.add_node(&quot;refund&quot;, refund_and_record)
+b.add_edge(START, &quot;lookup&quot;); b.add_edge(&quot;lookup&quot;, &quot;refund&quot;); b.add_edge(&quot;refund&quot;, END)
+pay = b.compile(checkpointer=InMemorySaver())
+c = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;pay-1&quot;}}
+try:
+    pay.invoke({&quot;msg&quot;: &quot;refund&quot;}, c)
+except ConnectionError:
+    pass
+LEDGER[&quot;up&quot;] = True
+pay.invoke(None, c)
+print(&quot;money sent for:&quot;, CHARGES)
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">money sent for: ['A-1077', 'A-1077']
+</code></pre></div>
+<p>Explain exactly why the money was sent twice, and redesign the nodes. (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Use <code>update_state</code> to replay the refund of Idea 4 with a different amount, then print the thread's history and point out the two branches. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0612-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · The failed node runs again, from its start</span></summary><div class="qa-a"><p><code>refund</code> and the fourth node. The last checkpoint was saved after <code>lookup</code>, so the resume starts at <code>refund</code>, from the beginning of the node; LangGraph cannot resume halfway through a function. Anything <code>refund</code> did before the crash, it does again, which is the problem in the debugging exercise.</p></div></details>
+<details class="qa" id="l0612-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Nothing was saved</span></summary><div class="qa-a"><p>Without a checkpointer, the state lives only during the run and is gone when <code>invoke</code> returns, so there is no thread to look up, and LangGraph raises <code>ValueError: No checkpointer set</code>. You also lose resume, approvals and time travel. Any graph that must survive a restart, pause, or be debugged later needs a checkpointer.</p></div></details>
+<details class="qa" id="l0612-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · A node is the unit of retry</span></summary><div class="qa-a"><p>The money was sent, then the same node failed on the ledger. The last checkpoint was before the node, so the resume ran the whole node again and sent the money a second time. Two fixes, best together: put each side effect in its own node, so a later failure does not repeat it, and make the side effect itself <span class="cx" data-c="292" tabindex="0">idempotent</span> with a key the payment provider checks (<a class="xref" href="#l0304">Lesson 14.5</a>).</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">CHARGES.clear(); LEDGER[&quot;up&quot;] = False
+SENT = set()
+
+def send_refund(state):
+    key = f&quot;refund:{state['order']['id']}&quot;                      # an idempotency key (Lesson 3.7)
+    if key not in SENT:                                         # the payment provider checks this in real life
+        SENT.add(key); CHARGES.append(state[&quot;order&quot;][&quot;id&quot;])
+    return {}
+
+def record(state):
+    if not LEDGER[&quot;up&quot;]:
+        raise ConnectionError(&quot;ledger unavailable&quot;)
+    return {&quot;done&quot;: &quot;refunded and recorded&quot;}
+
+b = StateGraph(RefundState)
+b.add_node(&quot;lookup&quot;, lookup); b.add_node(&quot;send_refund&quot;, send_refund); b.add_node(&quot;record&quot;, record)
+b.add_edge(START, &quot;lookup&quot;); b.add_edge(&quot;lookup&quot;, &quot;send_refund&quot;); b.add_edge(&quot;send_refund&quot;, &quot;record&quot;); b.add_edge(&quot;record&quot;, END)
+pay = b.compile(checkpointer=InMemorySaver())
+c = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;pay-2&quot;}}
+try:
+    pay.invoke({&quot;msg&quot;: &quot;refund&quot;}, c)
+except ConnectionError:
+    pass
+LEDGER[&quot;up&quot;] = True
+print(pay.invoke(None, c)[&quot;done&quot;], &quot;| money sent for:&quot;, CHARGES)
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">refunded and recorded | money sent for: ['A-1077']
+</code></pre></div>
+<p>Durable execution makes resuming easy; it does not make side effects safe. That part is always the node's job.</p></div></details>
+<details class="qa" id="l0612-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Fork and inspect</span></summary><div class="qa-a"><p>Call <code>graph.update_state(before_refund.config, {"order": {"id": "A-1077", "amount": 2999}})</code>, invoke with the returned config, then print <code>get_state_history(cfg)</code>. You will see two checkpoints with <code>next ('refund',)</code> at step 2 and two final checkpoints, one with INR 7,999 and one with the new amount; each checkpoint's <code>parent_config</code> shows which checkpoint it came from. The original run is untouched, which is what makes forking safe for investigation.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0612-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">What does a LangGraph checkpointer do, and what does it enable?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> After every step, it saves the graph's state, the next nodes to run, pending writes and metadata, keyed by thread ID. That enables conversation memory across calls, resuming after a failure or restart from the last completed step, pausing for human input and resuming later, inspecting the state at every step of a past run, and forking from an earlier checkpoint to replay with changes. In production it is backed by a database such as Postgres.</p>
+<p><strong>A plausible wrong answer.</strong> "It caches model calls." It saves the graph's state; caching model responses is a separate feature.</p>
+<p><strong>Follow-ups.</strong> What should never be put in checkpointed state?</p></div></details>
+<details class="qa" id="l0612-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">After a resume, a customer got two confirmation emails. What happened, and how do you prevent it?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> The email was sent inside a node that then failed, or was interrupted, before the node finished. A resume reruns the whole node, so the email went out again. Prevent it by putting each external side effect in its own node at the end of what it depends on, by making side effects idempotent with a key the receiving system checks, and by recording "sent" in state immediately after the side effect. Then test the failure by making the step after the side effect fail.</p>
+<p><strong>A plausible wrong answer.</strong> "LangGraph replayed the whole run." Only the unfinished node was rerun; the node design caused the duplicate.</p>
+<p><strong>Follow-ups.</strong> How would you handle a side effect that cannot be made idempotent?</p></div></details>
+<details class="qa" id="l0612-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Durable execution in LangGraph checkpoints, or a workflow engine such as Temporal?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> LangGraph's checkpoints when the durability needed is the agent's own: conversation state, pauses for approval, resume after a crash, replay for debugging, all inside one graph. A workflow engine when the process spans many services, needs retries with timers over days, strict exactly-once activity semantics and mature operational tooling, or the organization already runs one; the agent can then run as an activity inside it (<a class="xref" href="#l1208">Lesson 14.112</a>). They also combine: a Temporal workflow that calls a LangGraph agent per step.</p>
+<p><strong>A plausible wrong answer.</strong> "Checkpoints make LangGraph exactly-once." They make progress durable; side effects can still repeat unless nodes are idempotent.</p>
+<p><strong>Follow-ups.</strong> Where would the approval wait live in each design?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Add a checkpointer, run a graph, and print its snapshot and history.</li>
+<li>Make a node fail, restart with a new graph object on the same database, and resume with <code>invoke(None, config)</code>.</li>
+<li>Fork from an earlier checkpoint with changed state, and show both branches in the history.</li>
+<li>Explain why a node with two side effects can repeat the first one after a resume, and fix it.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0612-q1"><p class="q-text"><span class="q-num">Q1</span>How do you continue a thread that failed part-way, without new input?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0612-q1-o0"><span class="opt-key">A</span><span>Invoke with the original input again</span></button><button type="button" class="opt" data-correct="true" id="l0612-q1-o1"><span class="opt-key">B</span><span>Invoke with None and the thread's config</span></button><button type="button" class="opt" data-correct="false" id="l0612-q1-o2"><span class="opt-key">C</span><span>Call get_state</span></button><button type="button" class="opt" data-correct="false" id="l0612-q1-o3"><span class="opt-key">D</span><span>Create a new thread</span></button></div><p class="q-explain" hidden>The run continues from the last checkpoint; completed steps are not repeated.</p></div><div class="q" id="l0612-q2"><p class="q-text"><span class="q-num">Q2</span>A node sends money, then fails. The run is resumed. What happens?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0612-q2-o0"><span class="opt-key">A</span><span>Nothing is repeated</span></button><button type="button" class="opt" data-correct="true" id="l0612-q2-o1"><span class="opt-key">B</span><span>The whole node runs again, so the money can be sent twice unless the step is idempotent</span></button><button type="button" class="opt" data-correct="false" id="l0612-q2-o2"><span class="opt-key">C</span><span>LangGraph undoes the payment</span></button><button type="button" class="opt" data-correct="false" id="l0612-q2-o3"><span class="opt-key">D</span><span>The resume fails</span></button></div><p class="q-explain" hidden>The node is the unit of retry; put each side effect in its own node and make it idempotent.</p></div><div class="q" id="l0612-q3"><p class="q-text"><span class="q-num">Q3</span>What does update_state on an earlier checkpoint do?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0612-q3-o0"><span class="opt-key">A</span><span>Deletes the later checkpoints</span></button><button type="button" class="opt" data-correct="true" id="l0612-q3-o1"><span class="opt-key">B</span><span>Writes a new checkpoint that branches from it, keeping the original history</span></button><button type="button" class="opt" data-correct="false" id="l0612-q3-o2"><span class="opt-key">C</span><span>Changes the past checkpoint in place</span></button><button type="button" class="opt" data-correct="false" id="l0612-q3-o3"><span class="opt-key">D</span><span>Restarts the whole thread</span></button></div><p class="q-explain" hidden>This is how you replay a run from a point with changes.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0612" id="done-l0612">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0612" id="undo-l0612" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0611"><span class="pn-dir">Previous</span><span class="pn-t">14.61 · Routing, loops and the agent as a graph</span></a><a class="pn next" href="#l0613"><span class="pn-dir">Next</span><span class="pn-t">14.63 · Human in the loop: interrupt and Command</span></a></div></footer>

@@ -1,0 +1,365 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-07">Phase 7 · Transformer Architecture and Attention</a></nav><h1>Train your own small GPT on a laptop</h1><div class="m-meta"><span class="chip chip-num">Lesson 7.22</span><span class="chip">70 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l2604" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Train a small GPT from scratch on Tiny Shakespeare, on a CPU, in a few minutes</li>
+<li>Initialise a transformer sensibly, and use the first loss value as a sanity check</li>
+<li>Use the standard recipe: AdamW, warm-up and cosine decay, gradient clipping, and a held-out validation loss</li>
+<li>Generate text from your model, and compare it with the counting and recurrent models of the <a class="xref" href="#l2501"><em>Language as data: NLP foundations</em></a> section</li>
+<li>Explain what changes, and what does not, between this model and a real LLM</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l2603">Lesson 7.8</a> (the GPT code), <a class="xref" href="#l2506">Lesson 5.13</a> (training a character language model), <a class="xref" href="#l2404">Lesson 3.12</a> (initialisation, AdamW, schedules).</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 70 minutes, including about three minutes of training. <strong>Next</strong>: <a class="xref" href="#l2605">Lesson 7.19</a> looks at how text is generated from a model's probabilities.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l2604-0">nanoGPT</a></td>
+<td>Andrej Karpathy's small, readable GPT training code, the model for this lesson</td>
+<td>Learning transformers</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">2</span><span class="lb-names">KV cache, Mixture-of-experts (MoE)</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>KV cache</td><td>Stored keys and values of earlier tokens, reused so each new token is cheap to generate</td><td><a class="xref" href="#l2605">Lesson 7.19</a></td></tr><tr><td>Mixture-of-experts (MoE)</td><td>Only part of the model runs per token</td><td><a class="xref" href="#l0104">Lesson 7.17</a></td></tr></tbody></table></div></details>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>In 2022 Andrej Karpathy released <strong><mark class="term" id="term-l2604-0" title="Industry term: nanoGPT. Andrej Karpathy&#x27;s small, readable GPT training code, the model for this lesson">nanoGPT</mark></strong>, about 300 lines that train a GPT, and a video building it from an empty file. Training a tiny model on Tiny Shakespeare became the "hello world" of language models, because it shows every moving part of real <span class="cx" data-c="346" tabindex="0">LLM</span> training at a size that runs on a laptop. In 2024 his llm.c project reproduced the full 124-million-parameter GPT-2 in about 90 minutes on one rented server for roughly 20 dollars, a run that had cost OpenAI far more in 2019. The code in this lesson follows the same design, scaled down further.</p></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Same recipe, smaller pot</div><div class="co-body"><p>Training a <span class="cx" data-c="330" tabindex="0">large language model</span> and training this one use the same recipe: cut text into tokens, show the model chunks of text, ask it to predict every next token, measure the cross-entropy, and nudge all the weights downhill, millions of times. What differs is scale: their vocabulary has 100,000+ tokens (yours: 65 characters), their model has billions of parameters (yours: under a million), their data is trillions of tokens (yours: one million characters), and they use thousands of <span class="cx" data-c="266" tabindex="0">GPUs</span> for months (you: a laptop for three minutes). Watching the small version learn makes the big one far less mysterious.</p></div></aside>
+<h2>Step 1 · Data and model</h2>
+<p>The same data preparation as <a class="xref" href="#l2506">Lesson 5.13</a>, and the GPT code of <a class="xref" href="#l2603">Lesson 7.8</a> (copied here so this lesson runs on its own):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import math
+import time
+import requests
+import torch
+from torch import nn
+import torch.nn.functional as F
+from dataclasses import dataclass
+
+URL = &quot;https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt&quot;
+text = requests.get(URL, timeout=60).text
+chars = sorted(set(text))
+stoi = {c: i for i, c in enumerate(chars)}
+itos = {i: c for c, i in stoi.items()}
+data = torch.tensor([stoi[c] for c in text])
+split = int(0.9 * len(data))
+train_ids, val_ids = data[:split], data[split:]
+
+@dataclass
+class GPTConfig:
+    vocab_size: int = 65
+    block_size: int = 64          # context: 64 characters
+    n_layer: int = 4
+    n_head: int = 4
+    d_model: int = 128
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_head = cfg.n_head
+        self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
+        self.proj = nn.Linear(cfg.d_model, cfg.d_model)
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.qkv(x).split(C, dim=-1)
+        q, k, v = [t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v)]
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.proj(out.transpose(1, 2).contiguous().view(B, T, C))
+
+class MLP(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.up, self.down = nn.Linear(cfg.d_model, 4 * cfg.d_model), nn.Linear(4 * cfg.d_model, cfg.d_model)
+    def forward(self, x):
+        return self.down(F.gelu(self.up(x), approximate=&quot;tanh&quot;))
+
+class Block(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.ln1, self.attn = nn.LayerNorm(cfg.d_model), CausalSelfAttention(cfg)
+        self.ln2, self.mlp = nn.LayerNorm(cfg.d_model), MLP(cfg)
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        return x + self.mlp(self.ln2(x))
+
+class GPT(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.d_model)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight
+    def forward(self, idx):
+        T = idx.shape[1]
+        x = self.tok_emb(idx) + self.pos_emb(torch.arange(T, device=idx.device))
+        for block in self.blocks:
+            x = block(x)
+        return self.head(self.ln_f(x))
+
+cfg = GPTConfig()
+print(len(chars), &quot;characters,&quot;, len(train_ids), &quot;training ids&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">65 characters, 1003854 training ids
+</code></pre></div></div></aside>
+<figure class="xfig" id="fig-l2604-dlv-shift"><div class="xfig-frame"><img src="img/dlv-shift.webp" alt="The target sequence is the input sequence shifted one position to the left" loading="lazy" decoding="async"></div><figcaption>How a language model's training pairs are made. The target is the input moved one position along, so at every position the model is asked for the token that comes next. <code>get_batch</code> in the code above builds exactly these pairs. <span class="xfig-credit">Figure: <a href="https://github.com/dvgodoy/dl-visuals" target="_blank" rel="noopener">Daniel Voigt Godoy, dl-visuals</a>, <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.</span></figcaption></figure>
+<h2>Step 2 · Initialise, then check the first loss</h2>
+<p><span class="cx" data-c="478" tabindex="0">PyTorch</span>'s default initialisation suits ordinary networks, but a <span class="cx" data-c="652" tabindex="0">transformer</span> with a tied <span class="cx" data-c="203" tabindex="0">embedding</span> table needs smaller starting weights. GPT-2 draws every weight matrix from a normal distribution with spread 0.02 and sets biases to 0:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def make_model(seed=0):
+    torch.manual_seed(seed)
+    model = GPT(cfg)
+    for name, p in model.named_parameters():
+        if p.dim() &gt;= 2:
+            nn.init.normal_(p, mean=0.0, std=0.02)    # weight matrices and embedding tables
+        elif name.endswith(&quot;bias&quot;):
+            nn.init.zeros_(p)
+    return model
+
+def get_batch(ids, size, gen):
+    starts = torch.randint(len(ids) - cfg.block_size - 1, (size,), generator=gen)
+    x = torch.stack([ids[i:i + cfg.block_size] for i in starts])
+    y = torch.stack([ids[i + 1:i + cfg.block_size + 1] for i in starts])   # next characters
+    return x, y
+
+val_x, val_y = get_batch(val_ids, 200, torch.Generator().manual_seed(1))  # a fixed validation set
+
+@torch.no_grad()
+def val_loss(model):
+    model.eval()
+    loss = F.cross_entropy(model(val_x).reshape(-1, cfg.vocab_size), val_y.reshape(-1)).item()
+    model.train()
+    return loss
+
+model = make_model()
+print(f&quot;parameters: {sum(p.numel() for p in model.parameters()):,}&quot;)
+print(f&quot;loss before training: {val_loss(model):.3f}   (a uniform guess over 65 characters: {math.log(65):.3f})&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">parameters: 809,856
+loss before training: 4.241   (a uniform guess over 65 characters: 4.174)
+</code></pre></div></div></aside>
+<p>The first loss should be close to log(65) ≈ 4.17: an untrained model should be equally unsure about every character. This is a cheap, powerful check from Karpathy's "recipe for training neural networks". If the first loss were 20 or 80, the outputs would be wildly overconfident, and training would waste its first steps undoing that, or fail. With PyTorch's default initialisation this model starts at a loss of about 80; try it by skipping the <code>nn.init</code> lines.</p>
+<h2>Step 3 · Train</h2>
+<p>The loop is the one from <a class="xref" href="#l2403">Lesson 3.16</a>, with the refinements of <a class="xref" href="#l2404">Lesson 3.12</a>: <span class="cx" data-c="6" tabindex="0">AdamW</span> with weight decay, a short warm-up then cosine decay of the learning rate, and <span class="cx" data-c="269" tabindex="0">gradient</span> clipping.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">STEPS, BATCH, PEAK_LR, WARMUP = 2000, 32, 3e-3, 100
+
+def lr_at(step):
+    warm = min(1.0, step / WARMUP)
+    cosine = 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / STEPS))   # from the peak down to 10%
+    return PEAK_LR * warm * cosine
+
+opt = torch.optim.AdamW(model.parameters(), lr=PEAK_LR, weight_decay=0.1)
+gen = torch.Generator().manual_seed(0)
+start = time.time()
+for step in range(1, STEPS + 1):
+    for group in opt.param_groups:
+        group[&quot;lr&quot;] = lr_at(step)
+    x, y = get_batch(train_ids, BATCH, gen)
+    loss = F.cross_entropy(model(x).reshape(-1, cfg.vocab_size), y.reshape(-1))
+    opt.zero_grad()
+    loss.backward()
+    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    if step % 400 == 0:
+        print(f&quot;step {step:&gt;4}  training loss {loss.item():.3f}  validation loss {val_loss(model):.3f}&quot;)
+print(&quot;finished in under ten minutes:&quot;, time.time() - start &lt; 600)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">step  400  training loss 1.959  validation loss 2.056
+step  800  training loss 1.740  validation loss 1.867
+step 1200  training loss 1.609  validation loss 1.739
+step 1600  training loss 1.430  validation loss 1.660
+step 2000  training loss 1.505  validation loss 1.618
+finished in under ten minutes: True
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li>Each step trains on 32 chunks of 64 characters: 2,048 next-character predictions at once (<a class="xref" href="#l2602">Lesson 7.5</a>'s <span class="cx" data-c="103" tabindex="0">causal mask</span> makes each chunk 64 examples).</li>
+<li>The training loss is noisy (one random batch); the validation loss, on a fixed held-out set, is the number to watch. It is still falling at the end, so the model is not yet <span class="cx" data-c="431" tabindex="0">overfitting</span>: it has seen each part of the training text only about 4 times on average (2,000 × 2,048 ÷ 1,003,854).</li>
+<li>On this course's test machine the run took about three minutes on two CPU cores. A laptop with more cores is usually faster; a GPU would take a few seconds.</li>
+<li>The peak learning rate, 3e-3, is higher than you would use for a big model; small models tolerate (and need) larger steps. With 1e-3 this run ends about 0.1 worse.</li>
+</ul></div></aside>
+<h2>Step 4 · Write some Shakespeare</h2>
+<p>Generation works exactly like the <span class="cx" data-c="360" tabindex="0">LSTM</span>'s in <a class="xref" href="#l2506">Lesson 5.13</a>, except that the model rereads the last 64 characters at every step (<a class="xref" href="#l2605">Lesson 7.19</a> shows how real systems avoid that with a <span class="cx cx-later" data-c="324" tabindex="0">KV cache</span><a class="cx-pill" href="#l2605" title="Taught later, in Lesson F6.5">later · 7.19</a>):</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@torch.no_grad()
+def generate(model, prompt=&quot;ROMEO:\n&quot;, length=400, temperature=0.8, seed=0):
+    torch.manual_seed(seed)
+    model.eval()
+    idx = torch.tensor([[stoi[c] for c in prompt]])
+    for _ in range(length):
+        logits = model(idx[:, -cfg.block_size:])[0, -1]          # only the last 64 characters fit
+        probs = F.softmax(logits / temperature, dim=-1)
+        idx = torch.cat([idx, torch.multinomial(probs, 1).view(1, 1)], dim=1)
+    model.train()
+    return &quot;&quot;.join(itos[int(i)] for i in idx[0])
+
+print(generate(model))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">ROMEO:
+Thou must know self Warwick expain, in I the eage
+For word bind beare hath the seements of she
+dister so your weaker ancossider foer none.
+
+DUKE VINCENTIO:
+What's I see the death of the well-den.
+Should you, praye-mild me tongues your scopes,
+And my intering the tears.
+
+KING EDWARD IV:
+Nor stay, madam, we word hear help to the lack.
+I would to be and or heavens made for for well will
+Than hour pin
+</code></pre></div></div></aside>
+<h2>Step 5 · How it compares</h2>
+<p>The validation loss above averages over every position in each 64-character chunk, including the first few, where the model has almost no context. Split it by position to see how much context helps:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@torch.no_grad()
+def loss_by_position(model):
+    model.eval()
+    logits = model(val_x)
+    per_token = F.cross_entropy(logits.reshape(-1, cfg.vocab_size), val_y.reshape(-1), reduction=&quot;none&quot;).view(val_y.shape)
+    model.train()
+    for lo, hi in [(1, 4), (5, 16), (17, 32), (33, 64)]:
+        print(f&quot;predicting character {lo:&gt;2} to {hi:&gt;2} of a chunk: loss {per_token[:, lo - 1:hi].mean():.3f}&quot;)
+
+loss_by_position(model)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">predicting character  1 to  4 of a chunk: loss 2.039
+predicting character  5 to 16 of a chunk: loss 1.588
+predicting character 17 to 32 of a chunk: loss 1.582
+predicting character 33 to 64 of a chunk: loss 1.595
+</code></pre></div></div></aside>
+<p>The first few characters of a chunk, where the model has almost no context, are much harder (a loss of about 2.0) than the rest (about 1.59). Beyond about 16 characters this small, briefly trained model gains little from extra context; bigger models trained for longer learn to use far more. Measured on positions with some context, the tiny GPT beats every earlier model in this course:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Model</th>
+<th>Lesson</th>
+<th>What it sees</th>
+<th>Validation loss (nats per character)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>uniform guess</td>
+<td>F5.5</td>
+<td>nothing</td>
+<td>4.17</td>
+</tr>
+<tr>
+<td>bigram counts</td>
+<td>F5.5</td>
+<td>1 character</td>
+<td>2.48</td>
+</tr>
+<tr>
+<td>best n-gram counts</td>
+<td>F5.5</td>
+<td>3 characters</td>
+<td>1.78</td>
+</tr>
+<tr>
+<td>window network</td>
+<td>F5.6</td>
+<td>8 characters</td>
+<td>1.86</td>
+</tr>
+<tr>
+<td>LSTM, 1,000 steps</td>
+<td>F5.6</td>
+<td>everything so far, through one hidden state</td>
+<td>1.64</td>
+</tr>
+<tr>
+<td><strong>tiny GPT, 2,000 steps</strong></td>
+<td>this lesson</td>
+<td>up to 64 characters, through attention</td>
+<td>see Step 3 (all positions) and the table above (by position)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The numbers come from slightly different validation samples and training budgets, so treat small differences with care, but the direction is clear. Train the GPT longer, or make it bigger, and the gap widens: nanoGPT's slightly larger Shakespeare model (6 layers, width 384, 256 characters of context) reaches about 1.47 after a few minutes on a GPU, and its samples read like plausible, if meaningless, Shakespeare.</p>
+<h2>Step 6 · From this to a real LLM</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>This lesson</th>
+<th>GPT-2 small (2019)</th>
+<th>A modern frontier-scale model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tokens</td>
+<td>65 characters</td>
+<td>50,257 <span class="cx" data-c="86" tabindex="0">BPE</span> tokens</td>
+<td>100,000 to 250,000 BPE tokens</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>64</td>
+<td>1,024</td>
+<td>100,000 to 1,000,000+</td>
+</tr>
+<tr>
+<td>Parameters</td>
+<td>about 0.8 million</td>
+<td>124 million</td>
+<td>hundreds of billions or more (often <span class="cx cx-later" data-c="384" tabindex="0">mixture-of-experts</span><a class="cx-pill" href="#l0104" title="Taught later, in Lesson 1.4">later · 7.17</a>)</td>
+</tr>
+<tr>
+<td>Training text</td>
+<td>1 million characters</td>
+<td>about 9 billion tokens (WebText, 40 GB)</td>
+<td>10 to 30+ trillion tokens</td>
+</tr>
+<tr>
+<td>Hardware and time</td>
+<td>a laptop, minutes</td>
+<td>dozens of GPUs, days</td>
+<td>tens of thousands of GPUs, months</td>
+</tr>
+<tr>
+<td>After <span class="cx cx-later" data-c="458" tabindex="0">pretraining</span></td>
+<td>nothing</td>
+<td>nothing</td>
+<td><span class="cx cx-later" data-c="302" tabindex="0">instruction tuning</span>, <span class="cx cx-later" data-c="455" tabindex="0">preference tuning</span>, reasoning training (the <a class="xref" href="#l2701"><em>From language model to assistant</em></a> section)</td>
+</tr>
+</tbody>
+</table></div>
+<p>The code barely changes between the columns. The engineering does: data pipelines that clean and deduplicate trillions of tokens (Lessons <a class="xref" href="#l2701">10.6</a> and <a class="xref" href="#l1101">10.1</a>), splitting the model and data across thousands of GPUs (<a class="xref" href="#l2406">Lesson 3.20</a>), and keeping a months-long run stable. And a <span class="cx" data-c="457" tabindex="0">pretrained model</span> is still only a text continuer; turning it into an assistant is the <a class="xref" href="#l2701"><em>From language model to assistant</em></a> section.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><ul>
+<li>training objective: minimise L = −(1/(B·T)) Σ_b Σ_t log p(x_{b,t+1} | x_{b,1…t}) over batches of B chunks of length T</li>
+<li>sanity check at initialisation: L ≈ log V for a vocabulary of V symbols</li>
+<li>learning rate: η(s) = η_max · min(1, s/s_warm) · (0.1 + 0.9 · ½(1 + cos(π s / S)))</li>
+<li>tokens seen = steps × batch × context; epochs = tokens seen ÷ training tokens</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Training an LLM needs a completely different algorithm from this."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The objective, architecture and optimiser are the same; scale, data and engineering differ.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A lower training loss means the samples will be better."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Watch the validation loss. If training loss keeps falling while validation rises, the model is memorising the training text.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The model learned Shakespeare's grammar rules."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It learned to predict characters. Rules emerge implicitly from that objective, in whatever form helps prediction.</li>
+</ul></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-body"><p>These are well-known explanations whose pictures belong to their authors, so they are linked here and not copied. Each covers the same ground as this lesson, drawn a different way.</p>
+<ul>
+<li><a href="https://www.youtube.com/watch?v=kCc8FmEb1nY">Let's build GPT: from scratch, in code, spelled out</a>: Andrej Karpathy builds and trains the model of this lesson on the same Shakespeare text</li>
+</ul></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>If you change <code>block_size</code> from 64 to 16 and retrain, will the validation loss be higher or lower, and roughly how close will it get to the window network of <a class="xref" href="#l2506">Lesson 5.13</a>? (Solution P1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Train on a different text: download another public-domain book (for example from Project Gutenberg, saved as a <code>.txt</code> file) and train the same model on it. Remember to rebuild <code>chars</code>, <code>stoi</code> and <code>itos</code> and set <code>vocab_size</code> to the new number of characters. (Solution M1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-body"><p>A learner changes <code>PEAK_LR</code> to 1e-2 and removes the warm-up. The loss drops for a few hundred steps, then jumps to about 3.3 and stays there; samples are mostly spaces and the letter "e". What happened, and what fixes it? (Solution D1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l2604-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · A shorter context</span></summary><div class="qa-a"><p>Higher. With 16 characters of context the model can no longer use anything further back, so it loses information about the speaker, the line and the rhythm. It still beats the 8-character window network, since 16 characters is more context and attention uses it well, but it falls behind the 64-character model. Context length is one of the most valuable resources a language model has.</p></div></details>
+<details class="qa" id="l2604-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Your own text</span></summary><div class="qa-a"><p>Character-level models adapt to any text: a novel gives prose and dialogue in that author's spelling; code gives code-shaped text with brackets and indentation. With a smaller text (under 500,000 characters), validation loss will stop improving sooner, so watch for overfitting and consider fewer steps or more <span class="cx" data-c="193" tabindex="0">dropout</span>. Choose texts that are in the public domain or that you are allowed to use.</p></div></details>
+<details class="qa" id="l2604-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · Learning rate too high</span></summary><div class="qa-a"><p>The large learning rate pushed the model into a bad state it could not recover from: it collapsed to predicting the most common characters regardless of context (a loss around 3.3 is roughly what letter frequencies alone give). Lower the peak learning rate (1e-3 to 3e-3 for a model this size), restore the warm-up, and keep gradient clipping. When a run collapses, restart from the last good checkpoint rather than hoping it recovers.</p></div></details>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-body"><ul>
+<li>A small GPT trains on a laptop CPU in minutes with the same recipe as real LLMs: next-token prediction, cross-entropy, AdamW, warm-up and cosine decay, clipping.</li>
+<li>Initialise weight matrices with a small spread (0.02); the first loss should be close to log of the vocabulary size.</li>
+<li>Watch validation loss, not training loss, and count how many times the model has seen the data.</li>
+<li>Attention over 64 characters beats counting models and the recurrent network from the <a class="xref" href="#l2501"><em>Language as data: NLP foundations</em></a> section.</li>
+<li>Real LLMs differ in scale, data and engineering, not in the core algorithm; turning a pretrained model into an assistant is the subject of the <a class="xref" href="#l2701"><em>From language model to assistant</em></a> section.</li>
+</ul></div></aside>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l2604-q1"><p class="q-text"><span class="q-num">Q1</span>Before training, a model with a vocabulary of 65 characters shows a loss of about 4.17. What does that tell you?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l2604-q1-o0"><span class="opt-key">A</span><span>The model is already trained</span></button><button type="button" class="opt" data-correct="true" id="l2604-q1-o1"><span class="opt-key">B</span><span>It is equally unsure about all characters, which is the healthy starting point</span></button><button type="button" class="opt" data-correct="false" id="l2604-q1-o2"><span class="opt-key">C</span><span>The learning rate is too high</span></button><button type="button" class="opt" data-correct="false" id="l2604-q1-o3"><span class="opt-key">D</span><span>The data is corrupted</span></button></div><p class="q-explain" hidden>log(65) ≈ 4.17 is the loss of a uniform guess.</p></div><div class="q" id="l2604-q2"><p class="q-text"><span class="q-num">Q2</span>With batches of 32 chunks of 64 characters, how many next-character predictions does one training step make?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l2604-q2-o0"><span class="opt-key">A</span><span>32</span></button><button type="button" class="opt" data-correct="false" id="l2604-q2-o1"><span class="opt-key">B</span><span>64</span></button><button type="button" class="opt" data-correct="true" id="l2604-q2-o2"><span class="opt-key">C</span><span>2,048</span></button><button type="button" class="opt" data-correct="false" id="l2604-q2-o3"><span class="opt-key">D</span><span>65</span></button></div><p class="q-explain" hidden>Every position of every chunk predicts its next character.</p></div><div class="q" id="l2604-q3"><p class="q-text"><span class="q-num">Q3</span>What mainly separates this small GPT from a frontier LLM?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l2604-q3-o0"><span class="opt-key">A</span><span>A different training objective</span></button><button type="button" class="opt" data-correct="false" id="l2604-q3-o1"><span class="opt-key">B</span><span>A different kind of neural network</span></button><button type="button" class="opt" data-correct="true" id="l2604-q3-o2"><span class="opt-key">C</span><span>Scale (data, parameters, compute), engineering, and post-training into an assistant</span></button><button type="button" class="opt" data-correct="false" id="l2604-q3-o3"><span class="opt-key">D</span><span>They use no attention</span></button></div><p class="q-explain" hidden>The core recipe is shared.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l2604" id="done-l2604">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l2604" id="undo-l2604" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0714"><span class="pn-dir">Previous</span><span class="pn-t">7.21 · Capstone: a Transformer Built from Scratch</span></a><a class="pn next" href="#a0715"><span class="pn-dir">Next</span><span class="pn-t">7.23 · Sliding-Window, Sparse and Differential Attention</span></a></div></footer>

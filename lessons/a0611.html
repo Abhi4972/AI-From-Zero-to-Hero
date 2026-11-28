@@ -1,0 +1,445 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-06">Phase 6 · Speech and Audio AI</a></nav><h1>Real-Time Audio Processing and Streaming</h1><div class="m-meta"><span class="chip chip-num">Lesson 6.11</span><span class="chip">75 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a0611" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 6.2 (Spectrograms), Lesson 6.4 (ASR), Lesson 6.7 (TTS)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 75 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Batch pipelines process a file. Real-time pipelines process the next 20 milliseconds before the next 20 arrive. Every conversational AI, broadcast studio, and telephony bot lives and dies by this latency budget.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Ring buffer</td>
+<td>The circular queue</td>
+<td>Fixed-size, lock-free (or SPSC-locked) FIFO for audio frames.</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silence gate</td>
+<td>Model or heuristic marking speech vs non-speech.</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>Real-time STT</td>
+<td>Emits partial text as audio arrives; bounded lookahead.</td>
+</tr>
+<tr>
+<td>Jitter buffer</td>
+<td>Network smoother</td>
+<td>Queue reordering out-of-order packets; usually tens of ms, adaptive.</td>
+</tr>
+<tr>
+<td>AEC</td>
+<td>Echo cancellation</td>
+<td>Subtracts speaker-to-mic feedback path.</td>
+</tr>
+<tr>
+<td>Barge-in</td>
+<td>User interrupt</td>
+<td>System detects user speech mid-TTS; must cancel playback.</td>
+</tr>
+<tr>
+<td>Full duplex</td>
+<td>Simultaneous both ways</td>
+<td>User and bot can talk at the same time; Moshi is full duplex.</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Everything so far processed a finished recording. A live system gets audio 20 milliseconds at a time and must finish with each piece before the next arrives, forever, while a person waits for an answer. Three ideas carry it. A <em>ring buffer</em> holds the most recent audio in a fixed amount of memory. A <em>voice activity detector</em> decides, frame by frame, whether anyone is talking, so the expensive models only run when needed. And every model downstream works in <em>streaming</em> mode: it produces partial results from the audio seen so far, accepting some loss of accuracy for not knowing what comes next. The craft is a latency budget: how long each stage may take, and what you give up to meet it. This lesson measures two of those trade-offs on real speech: two voice activity detectors in rising noise, and a speech recogniser fed in chunks of different sizes, with and without look-ahead. Nothing is trained.</p></div></aside>
+<p>You want a voice assistant that feels alive. In conversation, the typical gap between one person stopping and the next starting is about 200 ms, across languages (Stivers et al., 2009). Delays well beyond that feel increasingly unnatural, and a second or more feels broken. A typical target budget for a full <strong>hear → understand → respond → speak</strong> loop:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Budget</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Mic → buffer</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>10 ms</td>
+</tr>
+<tr>
+<td>ASR (streaming)</td>
+<td>150 ms</td>
+</tr>
+<tr>
+<td>LLM (first token)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>TTS (first chunk)</td>
+<td>100 ms</td>
+</tr>
+<tr>
+<td>Render → speaker</td>
+<td>20 ms</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>~400 ms</strong></td>
+</tr>
+</tbody>
+</table></div>
+<p>Moshi (Kyutai, 2024) reports about 200 ms in practice, full-duplex. OpenAI reported GPT-4o answering spoken input in 320 ms on average (May 2024), against 2.8 s and 5.4 s for its earlier cascaded Voice Mode with GPT-3.5 and GPT-4. The 10× improvement came from three techniques: (1) streaming everywhere, (2) asynchronous pipelining with partial results, (3) interruptible generation.</p>
+<h2>The idea</h2>
+<p><img alt="Streaming audio pipeline with ring buffer, VAD gate, interruption" src="repo-assets/phases/06-speech-and-audio/11-real-time-audio-processing/assets/real-time.svg" /></p>
+<figure class="diagram mmfig" data-mmd="a0611" data-h="dc7f324714"><div class="dg-scroll"><svg class="dg mm" id="mmdc7f324714" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 480.375px; background-color: transparent;" viewBox="0 0 480.375 549.9633178710938" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmdc7f324714{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmdc7f324714 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmdc7f324714 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmdc7f324714 .error-icon{fill:#f4efe7;}#mmdc7f324714 .error-text{fill:#0b1018;stroke:#0b1018;}#mmdc7f324714 .edge-thickness-normal{stroke-width:1px;}#mmdc7f324714 .edge-thickness-thick{stroke-width:3.5px;}#mmdc7f324714 .edge-pattern-solid{stroke-dasharray:0;}#mmdc7f324714 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmdc7f324714 .edge-pattern-dashed{stroke-dasharray:3;}#mmdc7f324714 .edge-pattern-dotted{stroke-dasharray:2;}#mmdc7f324714 .marker{fill:#6c6357;stroke:#6c6357;}#mmdc7f324714 .marker.cross{stroke:#6c6357;}#mmdc7f324714 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmdc7f324714 p{margin:0;}#mmdc7f324714 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmdc7f324714 .cluster-label text{fill:#0b1018;}#mmdc7f324714 .cluster-label span{color:#0b1018;}#mmdc7f324714 .cluster-label span p{background-color:transparent;}#mmdc7f324714 .label text,#mmdc7f324714 span{fill:#211c16;color:#211c16;}#mmdc7f324714 .node rect,#mmdc7f324714 .node circle,#mmdc7f324714 .node ellipse,#mmdc7f324714 .node polygon,#mmdc7f324714 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmdc7f324714 .rough-node .label text,#mmdc7f324714 .node .label text,#mmdc7f324714 .image-shape .label,#mmdc7f324714 .icon-shape .label{text-anchor:middle;}#mmdc7f324714 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmdc7f324714 .rough-node .label,#mmdc7f324714 .node .label,#mmdc7f324714 .image-shape .label,#mmdc7f324714 .icon-shape .label{text-align:center;}#mmdc7f324714 .node.clickable{cursor:pointer;}#mmdc7f324714 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmdc7f324714 .arrowheadPath{fill:#0b0b0b;}#mmdc7f324714 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmdc7f324714 .flowchart-link{stroke:#6c6357;fill:none;}#mmdc7f324714 .edgeLabel{background-color:#ffffff;text-align:center;}#mmdc7f324714 .edgeLabel p{background-color:#ffffff;}#mmdc7f324714 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmdc7f324714 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmdc7f324714 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmdc7f324714 .cluster text{fill:#0b1018;}#mmdc7f324714 .cluster span{color:#0b1018;}#mmdc7f324714 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmdc7f324714 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmdc7f324714 rect.text{fill:none;stroke-width:0;}#mmdc7f324714 .icon-shape,#mmdc7f324714 .image-shape{background-color:#ffffff;text-align:center;}#mmdc7f324714 .icon-shape p,#mmdc7f324714 .image-shape p{background-color:#ffffff;padding:2px;}#mmdc7f324714 .icon-shape .label rect,#mmdc7f324714 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmdc7f324714 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmdc7f324714 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmdc7f324714 .node .neo-node{stroke:#b5521b;}#mmdc7f324714 [data-look="neo"].node rect,#mmdc7f324714 [data-look="neo"].cluster rect,#mmdc7f324714 [data-look="neo"].node polygon{stroke:url(#mmdc7f324714-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmdc7f324714 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmdc7f324714 [data-look="neo"].node path{stroke:url(#mmdc7f324714-gradient);stroke-width:1px;}#mmdc7f324714 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmdc7f324714 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmdc7f324714 [data-look="neo"].node circle{stroke:url(#mmdc7f324714-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmdc7f324714 [data-look="neo"].node circle .state-start{fill:#000000;}#mmdc7f324714 [data-look="neo"].icon-shape .icon{fill:url(#mmdc7f324714-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmdc7f324714 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmdc7f324714-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmdc7f324714 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmdc7f324714_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmdc7f324714_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmdc7f324714_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M213.781,59L213.781,63.167C213.781,67.333,213.781,75.667,213.781,83.333C213.781,91,213.781,98,213.781,101.5L213.781,105" id="mmdc7f324714-L_MIC_CH_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_MIC_CH_0" data-points="W3sieCI6MjEzLjc4MTI1LCJ5Ijo1OX0seyJ4IjoyMTMuNzgxMjUsInkiOjg0fSx7IngiOjIxMy43ODEyNSwieSI6MTA5fV0=" data-look="classic" marker-end="url(#mmdc7f324714_flowchart-v2-pointEnd)"/><path d="M213.781,160L213.781,164.167C213.781,168.333,213.781,176.667,213.781,184.333C213.781,192,213.781,199,213.781,202.5L213.781,206" id="mmdc7f324714-L_CH_RB_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CH_RB_0" data-points="W3sieCI6MjEzLjc4MTI1LCJ5IjoxNjB9LHsieCI6MjEzLjc4MTI1LCJ5IjoxODV9LHsieCI6MjEzLjc4MTI1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mmdc7f324714_flowchart-v2-pointEnd)"/><path d="M213.781,276.963L213.781,281.13C213.781,285.297,213.781,293.63,213.781,301.297C213.781,308.963,213.781,315.963,213.781,319.463L213.781,322.963" id="mmdc7f324714-L_RB_PROC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RB_PROC_0" data-points="W3sieCI6MjEzLjc4MTI1LCJ5IjoyNzYuOTYzMzAyNjEyMzA0N30seyJ4IjoyMTMuNzgxMjUsInkiOjMwMS45NjMzMDI2MTIzMDQ3fSx7IngiOjIxMy43ODEyNSwieSI6MzI2Ljk2MzMwMjYxMjMwNDd9XQ==" data-look="classic" marker-end="url(#mmdc7f324714_flowchart-v2-pointEnd)"/><path d="M149.035,398.963L138.394,404.88C127.752,410.797,106.47,422.63,95.829,435.547C85.188,448.463,85.188,462.463,85.188,469.463L85.188,476.463" id="mmdc7f324714-L_PROC_OUT_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PROC_OUT_0" data-points="W3sieCI6MTQ5LjAzNDc0NjUwMzQ5NjUsInkiOjM5OC45NjMzMDI2MTIzMDQ3fSx7IngiOjg1LjE4NzUsInkiOjQzNC40NjMzMDI2MTIzMDQ3fSx7IngiOjg1LjE4NzUsInkiOjQ4MC40NjMzMDI2MTIzMDQ3fV0=" data-look="classic" marker-end="url(#mmdc7f324714_flowchart-v2-pointEnd)"/><path d="M278.528,398.963L289.169,404.88C299.81,410.797,321.093,422.63,331.734,433.797C342.375,444.963,342.375,455.463,342.375,460.713L342.375,465.963" id="mmdc7f324714-L_PROC_X_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_PROC_X_0" data-points="W3sieCI6Mjc4LjUyNzc1MzQ5NjUwMzQ2LCJ5IjozOTguOTYzMzAyNjEyMzA0N30seyJ4IjozNDIuMzc1LCJ5Ijo0MzQuNDYzMzAyNjEyMzA0N30seyJ4IjozNDIuMzc1LCJ5Ijo0NjkuOTYzMzAyNjEyMzA0N31d" data-look="classic" marker-end="url(#mmdc7f324714_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_MIC_CH_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_CH_RB_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RB_PROC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_PROC_OUT_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(342.375, 434.4633026123047)"><g class="label" data-id="L_PROC_X_0" transform="translate(-61.3046875, -10.5)"><foreignObject width="122.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>too slow: dropouts</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mmdc7f324714-flowchart-MIC-0" data-look="classic" transform="translate(213.78125, 33.5)"><rect class="basic label-container" style="" x="-42.0234375" y="-25.5" width="84.046875" height="51"/><g class="label" style="" transform="translate(-12.0234375, -10.5)"><rect/><foreignObject width="24.046875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Mic</p></span></div></foreignObject></g></g><g class="node default" id="mmdc7f324714-flowchart-CH-1" data-look="classic" transform="translate(213.78125, 134.5)"><rect class="basic label-container" style="" x="-76.40625" y="-25.5" width="152.8125" height="51"/><g class="label" style="" transform="translate(-46.40625, -10.5)"><rect/><foreignObject width="92.8125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>20 ms chunks</p></span></div></foreignObject></g></g><g class="node default" id="mmdc7f324714-flowchart-RB-3" data-look="classic" transform="translate(213.78125, 243.48165130615234)"><path d="M0,10.321100917431192 a43.9453125,10.321100917431192 0,0,0 87.890625,0 a43.9453125,10.321100917431192 0,0,0 -87.890625,0 l0,46.321100917431195 a43.9453125,10.321100917431192 0,0,0 87.890625,0 l0,-46.321100917431195" class="basic label-container outer-path" style="" transform="translate(-43.9453125, -33.481651376146786)"/><g class="label" style="" transform="translate(-36.4453125, -0.5)"><rect/><foreignObject width="72.890625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Ring buffer</p></span></div></foreignObject></g></g><g class="node default" id="mmdc7f324714-flowchart-PROC-5" data-look="classic" transform="translate(213.78125, 362.9633026123047)"><rect class="basic label-container" style="" x="-104.96875" y="-36" width="209.9375" height="72"/><g class="label" style="" transform="translate(-74.96875, -21)"><rect/><foreignObject width="149.9375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Process the chunk<br />before the next arrives</p></span></div></foreignObject></g></g><g class="node default" id="mmdc7f324714-flowchart-OUT-7" data-look="classic" transform="translate(85.1875, 505.9633026123047)"><rect class="basic label-container" style="" x="-77.1875" y="-25.5" width="154.375" height="51"/><g class="label" style="" transform="translate(-47.1875, -10.5)"><rect/><foreignObject width="94.375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Output stream</p></span></div></foreignObject></g></g><g class="node default" id="mmdc7f324714-flowchart-X-9" data-look="classic" transform="translate(342.375, 505.9633026123047)"><rect class="basic label-container" style="" x="-130" y="-36" width="260" height="72"/><g class="label" style="" transform="translate(-100, -21)"><rect/><foreignObject width="200" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;"><span class="nodeLabel"><p>Budget: compute &lt; chunk length</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mmdc7f324714-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmdc7f324714-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmdc7f324714-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p><strong>Frame / chunk / window.</strong> Real-time audio flows as fixed-size blocks. Common choice: 20 ms (320 samples at 16 kHz). Everything downstream must keep up with this cadence.</p>
+<p><strong>Ring buffer.</strong> Fixed-size circular buffer. Producer thread writes new frames, consumer thread reads. Prevents allocations in the hot path. Size ≈ maximum-latency × sample-rate; a 2-second 16 kHz ring = 32,000 samples.</p>
+<p><strong>VAD (Voice Activity Detection).</strong> Gates downstream work when nobody is speaking. Silero VAD (v5, 2024) processes a 30 ms chunk in under 1 ms on one CPU thread. <code>webrtcvad</code> is the older alternative.</p>
+<p><strong>Streaming ASR.</strong> Models that emit partial transcripts as audio arrives. NVIDIA NeMo's cache-aware streaming FastConformer models are trained with limited look-ahead, so they stay accurate on chunks of a few hundred milliseconds; the run under Step 3 shows what happens to a model <em>not</em> trained that way. Whisper-Streaming (Macháček et al., 2023) re-runs Whisper on a growing buffer for near-streaming with a few seconds of latency.</p>
+<p><strong>Interruption.</strong> When the user speaks while the assistant is talking, you must (a) detect the barge-in, (b) stop the TTS, (c) discard the remaining LLM output. All within 100 ms, or the user perceives deaf assistant.</p>
+<p><strong>WebRTC Opus transport.</strong> Typically 20 ms frames at 48 kHz with adaptive bitrate (Opus supports 6 to 510 kbps). Standard for browser and mobile. LiveKit, Daily (with its open-source Pipecat framework) and Pion are common foundations for voice apps.</p>
+<p><strong>Jitter buffer.</strong> Network packets arrive out of order / late. The jitter buffer reorders and smooths; too small → audible gaps, too large → latency. Adaptive jitter buffers usually hold a few tens of milliseconds.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>Frames and buffers.</strong> A frame of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord">Δ</span></span></span></span> seconds at sample rate <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> holds <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.10903em;">N</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord">Δ</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> samples (20 ms at 16 kHz: 320). A ring buffer that can hold <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span></span></span></span> seconds needs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.05017em;">B</span><span class="mord"><span class="mord mathnormal" style="margin-right:0.10764em;">f</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:-0.1076em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">s</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> samples, and its fill level is the queueing delay it adds.</p>
+<p><strong>Keeping up.</strong> If each chunk of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span></span></span></span> seconds takes <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> seconds to process, the real-time factor is <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord"><span class="mord mathrm">RTF</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">c</span><span class="mord">/</span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span></span></span></span>. With <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord"><span class="mord mathrm">RTF</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> the system keeps up; with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7224em;vertical-align:-0.0391em;"></span><span class="mord"><span class="mord mathrm">RTF</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&gt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1</span></span></span></span> the backlog after <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> chunks grows as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mopen">(</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="mclose">)</span></span></span></span> and latency rises without bound.</p>
+<p><strong>Streaming delay.</strong> A word that ends at the start of a chunk is ready after the chunk fills, the look-ahead <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span></span></span></span> arrives and the model runs:</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.9386em;vertical-align:-0.2441em;"></span><span class="mord"><span class="mord text"><span class="mord">delay</span></span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.0573em;"><span style="top:-2.4559em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2441em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.07153em;">C</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord mathnormal" style="margin-right:0.00773em;">R</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span></span></div></p>
+<p>Larger chunks and look-ahead give the model more context and lower error; smaller ones give lower delay.</p>
+<p><strong>End-to-end latency</strong> is the sum of the stages in the user's path: <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal" style="margin-right:0.13889em;">T</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.2806em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">capture</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9703em;vertical-align:-0.3552em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3448em;"><span style="top:-2.5198em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">VAD/end-of-turn</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3552em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3283em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">ASR</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">LLM, first token</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">TTS, first audio</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.9012em;vertical-align:-0.2861em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">playback</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.2861em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">network</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>. Streaming overlaps the stages so that each starts on partial input, which is how pipelines get under 500 ms.</p>
+<p><strong>VAD as detection.</strong> Each frame is a binary decision with a miss rate (speech labelled silence: clipped words) and a false-alarm rate (noise labelled speech: wasted compute, phantom turns), traded off by a threshold, like the speaker verification of Lesson 6.6.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A latency budget by hand</div><div class="co-body"><p><strong>Samples.</strong> 20 ms frames: 320 samples at 16 kHz, 960 at 48 kHz. A 2-second ring buffer at 16 kHz: 32,000 samples, 64 KB as 16-bit PCM.</p>
+<p><strong>Streaming ASR.</strong> 320 ms chunks, 320 ms look-ahead, 211 ms of compute per chunk: worst-case delay <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">320</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">320</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">211</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">851</span></span></span></span> ms of waiting and average compute (the run's worst case, 972 ms, uses the slowest chunk), plus the end-of-turn wait. RTF <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.3669em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">211/320</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.66</span></span></span></span>: it keeps up, with a third of the time to spare.</p>
+<p><strong>A backlog.</strong> If compute were 400 ms per 320 ms chunk (RTF 1.25), after one minute (187 chunks) the system would be <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">187</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">×</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">80</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.8389em;vertical-align:-0.1944em;"></span><span class="mord">15</span><span class="mord"><span class="mpunct">,</span></span><span class="mord">000</span></span></span></span> ms behind.</p>
+<p><strong>A full turn.</strong> VAD end-of-turn 300 ms + ASR final 150 ms + LLM first token 200 ms + TTS first audio 150 ms + network 100 ms = 900 ms. Streaming the LLM into the TTS and starting the LLM on a confident partial transcript are the usual ways to cut it in half.</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A bigger buffer makes the system safer."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> A buffer's fill level is added latency. Size it for real jitter, no more.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Any ASR model can stream if you feed it chunks."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Models trained on whole utterances degrade badly on short chunks without context; streaming models are trained with the limited context they will see.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "An energy threshold is a good enough VAD."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It works in a quiet room and fails as soon as background noise is as loud as the threshold.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Under Step 3, wav2vec 2.0 (trained on whole utterances, 4.4% WER offline) is fed audio in 320 ms or 1 s chunks, with or without 2 s of earlier audio and with or without a little look-ahead. Which setting comes close to the offline WER, and what does it cost in delay? (Solution P1.)</p></div></aside>
+<h2>Idea 1 · Common gotchas</h2>
+<ul>
+<li><strong>Thread contention.</strong> Python's GIL + heavy models can starve the audio thread. Use a C-callback audio library (sounddevice, PortAudio) and keep Python off the hot path.</li>
+<li><strong>Sample-rate conversion latency.</strong> Resampling filters add delay, from a few milliseconds to tens depending on the filter. Resample once, at the edge of the pipeline, with a streaming resampler.</li>
+<li><strong>TTS priming.</strong> The first request to any model is slower (memory allocation, kernel selection, caches). Load the model at start-up and warm it with a dummy run before the first real turn.</li>
+<li><strong>Echo cancellation.</strong> Without AEC, TTS output re-enters the mic and triggers ASR on the bot's own voice. WebRTC AEC3 is the open-source default.</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="nyquist-aliasing"></div></figure></p>
+<h2>Step 1 · ring buffer</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import collections
+
+class RingBuffer:
+    def __init__(self, capacity):
+        self.buf = collections.deque(maxlen=capacity)
+    def write(self, frame):
+        self.buf.extend(frame)
+    def read(self, n):
+        return [self.buf.popleft() for _ in range(min(n, len(self.buf)))]
+    def level(self):
+        return len(self.buf)
+</code></pre></div>
+
+<p>Capacity determines max buffering latency. 32,000 samples at 16 kHz = 2 s.</p>
+<h2>Step 2 · VAD gate</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simple_energy_vad(frame, threshold=0.01):
+    return sum(x * x for x in frame) / len(frame) &gt; threshold ** 2
+</code></pre></div>
+
+<p>Replace with Silero VAD in production:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+vad, _ = torch.hub.load(&quot;snakers4/silero-vad&quot;, &quot;silero_vad&quot;)
+is_speech = vad(torch.tensor(frame), 16000).item() &gt; 0.5
+</code></pre></div>
+
+<p>The Silero line is not run here: <code>torch.hub</code> fetches the model from GitHub, which this page's environment cannot reach. The comparison below uses WebRTC's VAD (the <code>webrtcvad</code> package), the long-standing classical alternative.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">The repository&#x27;s simulation</div><div class="co-body"><p><code>main.py</code>'s <code>main()</code>: simulated 20 ms chunks, an energy VAD and a latency breakdown with fake STT, LLM and TTS stages.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== Step 1: simulate 1.5 s of user speech as 20 ms chunks ===
+  generated 95 chunks, 20 ms each = 1900 ms
+
+=== Step 2: VAD-gate and buffer speech ===
+  buffered 1.500 s of speech
+
+=== Step 3: simulate STT / LLM / TTS with timing ===
+  user said: &#x27;hello world&#x27;
+  agent replied: &#x27;sure, one second&#x27;
+
+  latency breakdown:
+    STT          155.2 ms  ###############
+    LLM          150.3 ms  ###############
+    TTS TTFA     100.2 ms  ##########
+  end-to-end: 405.7 ms   (target: &amp;lt; 500 ms)
+
+=== Step 4: where the 2026 production budget goes ===
+  | stage           | typical ms |
+  | network in      |     50-100 |
+  | VAD             |      20-80 |
+  | STT stream      |    100-300 |
+  | LLM stream      |    100-500 |
+  | TTS TTFA        |    100-300 |
+  | network out     |     50-100 |
+  | TOTAL           |   400-1400 |
+
+  sub-500 ms: LiveKit + Silero + Deepgram + GPT-4o + Cartesia
+  sub-200 ms: Moshi (full-duplex) or Sesame CSM — different architecture (see lesson 15)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The simulation adds up stage delays to about 400 ms, the shape of a real budget. The stage timings are invented (sleeps), and the "&lt; 500 ms" and provider list at the end are the repository's; the runs below measure real components.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Two VADs on real speech in rising noise</div><div class="co-body"><p>Two LibriSpeech utterances with a 1 s pause, cut into 20 ms frames. Reference labels come from the clean signal's energy. Step 2's energy gate and WebRTC's VAD (aggressiveness 2) are run on the clean audio and with white noise at 20, 10 and 0 dB SNR.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import io, time
+import numpy as np, soundfile as sf, webrtcvad
+from datasets import load_dataset, Audio
+
+libri = load_dataset(&quot;hf-internal-testing/librispeech_asr_dummy&quot;, &quot;clean&quot;, split=&quot;validation&quot;).cast_column(&quot;audio&quot;, Audio(decode=False))
+def clip(i):
+    return sf.read(io.BytesIO(libri[i][&quot;audio&quot;][&quot;bytes&quot;]), dtype=&quot;float32&quot;)[0]
+
+SR, FRAME = 16000, 320                                             # 20 ms frames
+speech = np.concatenate([clip(0), np.zeros(SR, np.float32), clip(1)])   # two utterances with a 1 s pause
+frames = lambda x: x[: len(x) // FRAME * FRAME].reshape(-1, FRAME)
+# Reference labels from the clean signal: a frame is speech if its energy is within 35 dB of the loudest frame.
+e_clean = 10 * np.log10((frames(speech) ** 2).mean(1) + 1e-12)
+ref = e_clean &gt; e_clean.max() - 35
+print(f&quot;{len(speech) / SR:.1f} s of audio = {len(ref)} frames of 20 ms; {ref.mean():.0%} labelled speech&quot;)
+
+wvad = webrtcvad.Vad(2)                                            # aggressiveness 0 (lenient) to 3 (strict)
+def webrtc_labels(x):
+    pcm = (np.clip(x, -1, 1) * 32767).astype(np.int16)
+    return np.array([wvad.is_speech(f.tobytes(), SR) for f in frames(pcm)])
+def energy_labels(x, threshold=0.01):                              # Step 2's energy gate, vectorised
+    return (frames(x) ** 2).mean(1) &gt; threshold ** 2
+
+rng = np.random.default_rng(0)
+for snr in [None, 20, 10, 0]:
+    if snr is None:
+        x = speech
+    else:
+        noise = rng.standard_normal(len(speech)).astype(np.float32)
+        x = speech + noise * np.sqrt((speech ** 2).mean() / (noise ** 2).mean() / 10 ** (snr / 10))
+    for name, lab in [(&quot;energy gate&quot;, energy_labels(x)), (&quot;WebRTC VAD&quot;, webrtc_labels(x))]:
+        miss = np.mean(~lab[ref]); false_alarm = np.mean(lab[~ref])
+        print(f&quot;{'clean' if snr is None else f'{snr} dB SNR':&gt;9s}  {name:11s}  speech frames missed {miss:5.1%}, &quot;
+              f&quot;silence frames flagged {false_alarm:5.1%}&quot;)
+t0 = time.perf_counter(); webrtc_labels(speech); per = (time.perf_counter() - t0) / len(ref)
+print(f&quot;WebRTC VAD cost: {per * 1e6:.0f} microseconds per 20 ms frame ({per / 0.02:.3%} of real time)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">11.7 s of audio = 583 frames of 20 ms; 70% labelled speech
+    clean  energy gate  speech frames missed  5.1%, silence frames flagged  0.0%
+    clean  WebRTC VAD   speech frames missed  0.0%, silence frames flagged 40.1%
+20 dB SNR  energy gate  speech frames missed  2.9%, silence frames flagged  0.0%
+20 dB SNR  WebRTC VAD   speech frames missed  0.2%, silence frames flagged 33.1%
+10 dB SNR  energy gate  speech frames missed  0.0%, silence frames flagged 100.0%
+10 dB SNR  WebRTC VAD   speech frames missed  1.2%, silence frames flagged 27.3%
+ 0 dB SNR  energy gate  speech frames missed  0.0%, silence frames flagged 100.0%
+ 0 dB SNR  WebRTC VAD   speech frames missed  0.0%, silence frames flagged 100.0%
+WebRTC VAD cost: 3 microseconds per 20 ms frame (0.016% of real time)</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The energy gate is the most accurate detector on clean audio (5% of speech frames missed, no false alarms) and fails abruptly: at 10 dB SNR the noise alone exceeds its threshold, and every silent frame is called speech. WebRTC's VAD looks at the spectrum, not just the level, so it degrades gradually (27% false alarms at 10 dB) until 0 dB, where it too flags everything. Of its false alarms on clean audio (40% of silent frames), about half fall within 200 ms after speech: like most production VADs, it keeps "speech" on for a moment after the voice stops (hangover) so that word endings are not clipped. The rest are in the gaps, where it reacts to breaths and room sound that the energy-based reference counts as silence. It costs 3 microseconds per 20 ms frame. Neural VADs such as Silero hold up much better in noise at a cost still well under a millisecond.</p></div></aside>
+<h2>Step 3 · streaming ASR</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># NeMo runs streaming recognition through an example script for its cache-aware streaming models
+# (there is no `transcribe_streaming` method), for example:
+#   python examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
+#       model_path=&lt;a cache-aware streaming .nemo model&gt; audio_file=clip.wav
+# The run below builds chunked streaming by hand around a model that was NOT trained for it.
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Streaming a recogniser that was not trained to stream</div><div class="co-body"><p>wav2vec 2.0 base on three longer LibriSpeech utterances. Each new chunk is processed with optional earlier audio (left context) and optional look-ahead, keeping only the new chunk's frames; WER against the reference, compute time per chunk and the worst-case delay before a word's text exists.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import torch
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+proc = Wav2Vec2Processor.from_pretrained(&quot;facebook/wav2vec2-base-960h&quot;)
+w2v = Wav2Vec2ForCTC.from_pretrained(&quot;facebook/wav2vec2-base-960h&quot;).eval()
+
+def ctc_text(logits):
+    ids = logits.argmax(-1).tolist(); out, prev = [], None
+    for i in ids:
+        if i != prev and i != proc.tokenizer.pad_token_id:
+            out.append(i)
+        prev = i
+    return &quot;&quot;.join(proc.tokenizer.convert_ids_to_tokens(out)).replace(&quot;|&quot;, &quot; &quot;).strip()
+
+def stream(audio, chunk_s, left_s=2.0, right_s=0.0):
+    &quot;&quot;&quot;Process audio as it arrives: each new chunk is run with up to left_s seconds of earlier audio and right_s
+    seconds of look-ahead (which the system must wait for), keeping only the new chunk's frames (one per 20 ms).&quot;&quot;&quot;
+    C, L, R = int(chunk_s * SR), int(left_s * SR), int(right_s * SR)
+    frames_out, compute = [], []
+    for start in range(0, len(audio), C):
+        ctx_start = max(0, start - L)
+        seg = audio[ctx_start:start + C + R]
+        seg = np.pad(seg, (0, (start - ctx_start) + C + R - len(seg)))   # the last chunk may be short: pad with silence
+        x = proc(seg, sampling_rate=SR, return_tensors=&quot;pt&quot;).input_values
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            lg = w2v(x).logits[0]
+        compute.append(time.perf_counter() - t0)
+        skip = (start - ctx_start) // 320                           # frames that belong to the context, not the new chunk
+        frames_out.append(lg[skip: skip + C // 320])
+    return ctc_text(torch.cat(frames_out)), np.array(compute)
+
+def wer(ref, hyp):
+    r, h = ref.split(), hyp.split(); d = list(range(len(h) + 1))
+    for i, a in enumerate(r, 1):
+        prev, d[0] = d[0], i
+        for j, b in enumerate(h, 1):
+            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (a != b))
+    return d[-1] / len(r)
+
+utts = [2, 5, 9]                                                     # three longer utterances
+audio_all = {i: clip(i) for i in utts}
+with torch.no_grad():
+    offline = {i: ctc_text(w2v(proc(audio_all[i], sampling_rate=SR, return_tensors=&quot;pt&quot;).input_values).logits[0]) for i in utts}
+off_wer = np.mean([wer(libri[i][&quot;text&quot;], offline[i]) for i in utts])
+print(f&quot;offline (whole utterance at once): WER {off_wer:.1%}&quot;)
+for chunk_s, left_s, right_s in [(0.32, 0.0, 0.0), (0.32, 2.0, 0.0), (0.32, 2.0, 0.32), (1.0, 2.0, 0.0), (1.0, 2.0, 0.5)]:
+    res = [stream(audio_all[i], chunk_s, left_s, right_s) for i in utts]
+    w = np.mean([wer(libri[i][&quot;text&quot;], txt) for i, (txt, _) in zip(utts, res)])
+    comp = np.concatenate([c for _, c in res])
+    print(f&quot;chunk {chunk_s * 1000:4.0f} ms, left {left_s:.0f} s, look-ahead {right_s * 1000:3.0f} ms: WER {w:5.1%}; &quot;
+          f&quot;compute {comp.mean() * 1000:4.0f} ms per chunk ({comp.mean() / chunk_s:.2f}x real time); &quot;
+          f&quot;worst-case delay {(chunk_s + right_s + comp.max()) * 1000:5.0f} ms&quot;)
+print(&quot;example, 320 ms chunks without context:&quot;, repr(stream(audio_all[2], 0.32, 0.0)[0][:80]))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">offline (whole utterance at once): WER 4.4%
+chunk  320 ms, left 0 s, look-ahead   0 ms: WER 90.1%; compute   74 ms per chunk (0.23x real time); worst-case delay   418 ms
+chunk  320 ms, left 2 s, look-ahead   0 ms: WER 50.9%; compute  185 ms per chunk (0.58x real time); worst-case delay   625 ms
+chunk  320 ms, left 2 s, look-ahead 320 ms: WER 12.0%; compute  211 ms per chunk (0.66x real time); worst-case delay   972 ms
+chunk 1000 ms, left 2 s, look-ahead   0 ms: WER 22.8%; compute  244 ms per chunk (0.24x real time); worst-case delay  1331 ms
+chunk 1000 ms, left 2 s, look-ahead 500 ms: WER  2.9%; compute  271 ms per chunk (0.27x real time); worst-case delay  1862 ms
+example, 320 ms chunks without context: &#x27;TLTATSESEE  NOG THE HEAR WIS ISTMAISO BMNG BROSLLY DRAWN EATING S ALMUS EADLO M&#x27;</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Offline, the model scores 4.4%. Fed isolated 320 ms chunks it collapses to 90% WER: most words are cut by a chunk boundary, and the model never saw such fragments in training. Two seconds of earlier audio halves the damage (51%); adding just 320 ms of look-ahead brings it to 12%, because the model can now see how each word ends. With 1 s chunks and 500 ms of look-ahead it reaches 2.9%, even below offline on these three utterances, at a worst-case delay of about 1.9 s. The other numbers are the budget: compute stays below the chunk length (RTF 0.23–0.66 on this CPU), so every setting keeps up. Streaming-trained models (NeMo's cache-aware FastConformers, Parakeet) are built to reach the accuracy of the last rows at the delay of the first.</p></div></aside>
+<h2>Step 4 · interruption handler</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class Dialog:
+    def __init__(self):
+        self.tts_task = None
+
+    def on_user_speech(self, frame):
+        if self.tts_task and not self.tts_task.done():
+            self.tts_task.cancel()   # barge-in
+        # then feed to streaming ASR
+
+    def on_final_user_utterance(self, text):
+        self.tts_task = asyncio.create_task(self.reply(text))
+
+    async def reply(self, text):
+        async for tts_chunk in llm_then_tts(text):
+            speaker.write(tts_chunk)
+</code></pre></div>
+
+<p>Hinges on async I/O and cancellable TTS streaming. WebRTC peerconnection.stop() on the audio track is the canonical way.</p>
+<h2>Use it: the same idea with real libraries</h2>
+<p>The 2026 stack:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Layer</th>
+<th>Pick</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transport</td>
+<td>LiveKit (WebRTC) or Pion (Go)</td>
+</tr>
+<tr>
+<td>VAD</td>
+<td>Silero VAD (v5) or WebRTC VAD</td>
+</tr>
+<tr>
+<td>Streaming ASR</td>
+<td>NeMo cache-aware streaming FastConformer / Parakeet, or a hosted streaming STT API</td>
+</tr>
+<tr>
+<td>LLM first-token</td>
+<td>Groq, Cerebras, vLLM-streaming</td>
+</tr>
+<tr>
+<td>Streaming TTS</td>
+<td>Kokoro or ElevenLabs Flash</td>
+</tr>
+<tr>
+<td>Echo cancel</td>
+<td>WebRTC AEC3</td>
+</tr>
+<tr>
+<td>End-to-end native</td>
+<td>OpenAI Realtime API or Moshi</td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>In the streaming run, keep 320 ms chunks and 2 s of left context, but give the model 320 ms of look-ahead <em>without</em> waiting for it, using audio from the future (as an offline evaluation script easily does by mistake). What WER do you measure, and what delay would a live user actually experience? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Voice-agent frameworks.</strong> LiveKit Agents and Pipecat (by Daily) are widely used open frameworks that wire VAD, streaming STT, an LLM and streaming TTS over WebRTC, with turn detection and interruption handling built in.</li>
+<li><strong>Turn detection beyond VAD.</strong> Production stacks add a small model that decides whether the user has finished a thought (not just stopped making sound) before replying; Lesson 6.15 covers it.</li>
+<li><strong>Speech-to-speech APIs.</strong> OpenAI's Realtime API (gpt-realtime) and Gemini's Live API take audio in and give audio out over a streaming connection, removing the separate STT and TTS stages (Lesson 6.16).</li>
+</ul>
+<p>Sources: <a href="https://www.pnas.org/doi/10.1073/pnas.0903616106">Stivers et al. 2009, turn-taking across languages</a>, <a href="https://openai.com/index/hello-gpt-4o/">OpenAI GPT-4o announcement</a>, <a href="https://github.com/snakers4/silero-vad">Silero VAD</a>, <a href="https://docs.livekit.io/agents/">LiveKit Agents</a>, <a href="https://github.com/pipecat-ai/pipecat">Pipecat</a>.</p></div></aside>
+<h2>Pitfalls</h2>
+<ul>
+<li><strong>Buffering 500 ms to be safe.</strong> The buffer <em>is</em> your latency floor. Shrink it.</li>
+<li><strong>Not pinning threads.</strong> Audio callback on a priority-lower-than-UI thread = glitches under load.</li>
+<li><strong>TTS chunks too small.</strong> Very short chunks can leave audible seams at chunk boundaries; stream at the chunk size your TTS was built for, and crossfade if needed.</li>
+<li><strong>No jitter buffer.</strong> Real networks are jittery; without smoothing you get pops.</li>
+<li><strong>Single-shot error handling.</strong> Audio pipelines must be crash-proof. One exception kills the session.</li>
+</ul>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Live audio arrives in fixed frames (20 ms); every stage must keep its real-time factor below 1.</li>
+<li>Buffers and chunk sizes are latency; size them deliberately.</li>
+<li>Streaming accuracy depends on context and look-ahead, and on whether the model was trained to stream; delay = chunk + look-ahead + compute.</li>
+<li>Energy VADs fail in noise; spectral and neural VADs degrade more gracefully. Tune hangover and thresholds on your audio.</li>
+<li>Overlap stages (stream LLM into TTS), support barge-in, and measure end-to-end latency, not stage averages.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-voice-assistants-realtime"><span class="t" style="--cs-hue:285">RT</span>Cheat sheet · Voice Assistants in Real Time</a></div>
+<h2>Ship it</h2>
+<p>Save as <code>outputs/skill-realtime-designer.md</code>. Design a real-time audio pipeline with concrete latency budgets per stage.</p>
+<p><strong><code>outputs/skill-realtime-pipeline.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: realtime-voice-pipeline
+description: Pick transport, VAD, streaming STT, LLM, streaming TTS, and orchestration for a target end-to-end latency.
+version: 1.0.0
+phase: 6
+lesson: 11
+tags: [voice-agent, livekit, pipecat, silero, streaming, latency]
+---
+
+Given the target (latency P50/P95, language, channel, offline vs cloud, call volume), output:
+
+1. Transport. WebRTC (LiveKit / Daily) · WebSocket · SIP trunking (Twilio / Telnyx). Reason tied to jitter tolerance + use case.
+2. VAD + turn-taking. Silero VAD (open, 99.5% TPR) · Cobra (commercial) · LiveKit turn-detector. Threshold, min speech duration, silence hang-over.
+3. Streaming STT. Parakeet TDT (fastest open) · Kyutai STT (with flush trick) · Deepgram Nova-3 (API, ~150 ms) · Whisper-streaming. Reason.
+4. LLM + streaming. Pin the first 20 tokens before TTS kicks in. Model + streaming config + guardrails for prompt injection.
+5. Streaming TTS. Kokoro-82M (~100 ms TTFA) · Orpheus · Cartesia Sonic · ElevenLabs Turbo. Voice-pack or cloning guard (Lesson 8).
+6. Orchestration. LiveKit Agents · Pipecat · Vapi · Retell · custom Rust. Reason tied to team skills + scale.
+7. Observability. P50/P95/P99 per-stage histograms; false-positive interruption rate; drop-call rate; WER on call samples.
+
+Refuse deploys that buffer entire utterances before STT. Refuse TTS that does not stream. Refuse evaluation by average latency — require P95. Refuse managed platforms (Vapi / Retell) for &amp;gt; 100k minutes/month without a cost-comparison to build-your-own.
+
+Example input: &quot;Voice agent for car insurance quoting. &amp;lt; 500 ms P95. English, US. 50k minutes/week. Compliance: HIPAA-adjacent (no PII in logs).&quot;
+
+Example output:
+- Transport: LiveKit Agents + Twilio SIP. Proven at call-center scale, HIPAA-mode opt-in.
+- VAD: Silero VAD @ threshold 0.45, min speech 220 ms, silence hang-over 400 ms. LiveKit turn-detector overlay.
+- STT: Deepgram Nova-3 English (~150 ms P95); fall-back to Parakeet-TDT if on-prem audit required.
+- LLM: GPT-4o streaming via OpenAI realtime API; guard against prompt injection with a post-filter; pin first 20 tokens to TTS.
+- TTS: Cartesia Sonic 2 (~150 ms TTFA, voice cloning not used — predefined voice).
+- Orchestration: LiveKit Agents. Observability via Hamming AI for production.
+- Logs: strip CVV / SSN / DOB with a regex + NER pass before persistence. Retain 30 days.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li><strong>Easy.</strong> Run <code>code/main.py</code>. Simulates a ring buffer + energy VAD; prints stage latencies for a fake 10-second stream.</li>
+<li><strong>Medium.</strong> Using <code>sounddevice</code>, build a passthrough loop that processes your mic in 20 ms frames and prints VAD state at each frame.</li>
+<li><strong>Hard.</strong> Build a full duplex echo test with <code>aiortc</code>: browser → WebRTC → Python → WebRTC → browser. Measure glass-to-glass latency with a 1 kHz pulse.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a0611-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Context and look-ahead buy accuracy with delay</span></summary><div class="qa-a"><p>Only the settings with look-ahead come close: 320 ms chunks with 2 s of left context and 320 ms of look-ahead give 12%, and 1 s chunks with 500 ms of look-ahead give 2.9%, at a worst-case delay of about 0.9 s and 1.9 s respectively. Without look-ahead, even 1 s chunks give 23%. Isolated 320 ms chunks give 90%.</p></div></details>
+<details class="qa" id="a0611-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Offline numbers, online delay</span></summary><div class="qa-a"><p>The WER is the 12% of the look-ahead row: the model sees exactly the same audio. But a live system cannot have audio from the future, so it must wait for it: the 320 ms of look-ahead adds 320 ms to every word's delay. An evaluation that reads ahead in the file reports the accuracy of the slower system with the latency of the faster one. Always simulate streaming by feeding audio in real time, or account for the look-ahead in the reported delay.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://arxiv.org/abs/2307.14743">Macháček et al. (2023). Whisper-Streaming</a> — chunked near-streaming Whisper.</li>
+<li><a href="https://kyutai.org/Moshi.pdf">Kyutai (2024). Moshi</a> — full-duplex 200 ms latency.</li>
+<li><a href="https://docs.livekit.io/agents/">LiveKit Agents framework (2024)</a> — production audio agent orchestration.</li>
+<li><a href="https://github.com/snakers4/silero-vad">Silero VAD repo</a> — under 1 ms per 30 ms chunk on a CPU thread, MIT licence.</li>
+<li><a href="https://webrtc.googlesource.com/src/+/main/modules/audio_processing/aec3/">WebRTC AEC3 paper</a> — echo cancellation under open source.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a0611" id="done-a0611">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a0611" id="undo-a0611" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a0610"><span class="pn-dir">Previous</span><span class="pn-t">6.10 · Audio-Language Models: Qwen2.5-Omni, Audio Flamingo and GPT-4o Audio</span></a><a class="pn next" href="#a0612"><span class="pn-dir">Next</span><span class="pn-t">6.12 · Capstone: a Voice Assistant Pipeline</span></a></div></footer>

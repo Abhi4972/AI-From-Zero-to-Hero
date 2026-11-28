@@ -1,0 +1,789 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-14">Phase 14 · AI Agents: Design and Engineering</a></nav><h1>Memory: trimming threads and the long-term store</h1><div class="m-meta"><span class="chip chip-num">Lesson 14.64</span><span class="chip">80 min</span><span class="chip chip-core">Core</span><span class="chip chip-done" data-done-chip="l0614" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Keep a long conversation inside a token budget without breaking tool calls</li>
+<li>Save facts that outlive one conversation in LangGraph's store, namespaced per customer</li>
+<li>Read and write the store from nodes, and search it by meaning</li>
+<li>Keep one customer's memories away from another's, and delete them on request</li>
+<li>Choose where to trim: the saved thread or only the model's input, and clear or offload bulky tool results</li>
+<li>Give an agent memory tools safely, and combine automatic loading with on-demand recall</li>
+<li>Say when memories are written and how they are kept free of duplicates and contradictions</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: <a class="xref" href="#l0612">Lesson 14.62</a>. Lessons <a class="xref" href="#l0309">14.10</a> and <a class="xref" href="#l0310">14.11</a> cover the ideas behind memory; <a class="xref" href="#l0208">Lesson 11.8</a> covers context budgets.</li>
+<li><strong>Depth</strong>: Core. <strong>Time</strong>: about 80 minutes.</li>
+<li>Checked on 22 November 2026 with <code>langgraph</code> 1.2.24 and <code>langchain-core</code> 1.8.4.</li>
+</ul></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Industry term</th>
+<th>What it means</th>
+<th>Where it shows up</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><a class="term-jump" href="#term-l0614-0">Short-term memory</a></td>
+<td>A thread's own history, kept per conversation</td>
+<td>The problem</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0614-1">Long-term memory</a></td>
+<td>Facts kept across conversations, in a store</td>
+<td>The problem</td>
+</tr>
+<tr>
+<td><a class="term-jump" href="#term-l0614-2">Namespace</a></td>
+<td>The tuple path under which store items live, such as one per customer</td>
+<td>Idea 2</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<details class="later-box"><summary><span class="lb-t">Mentioned here, taught later</span><span class="lb-n">1</span><span class="lb-names">Distillation</span></summary><p>This lesson mentions the ideas below before the lesson that teaches them. The one-line meaning is all you need for now; each is marked <span class="cx-pill">later</span> where it first appears.</p><div class="tbl"><table><thead><tr><th>Idea</th><th>What it means, in one line</th><th>Taught in</th></tr></thead><tbody><tr><td>Distillation</td><td>Training a small student model to copy a larger teacher model</td><td><a class="xref" href="#l1105">Lesson 14.136</a></td></tr></tbody></table></div></details>
+<aside class="co co-fake"><div class="co-label">About the model on this page</div><div class="co-title">The model on this page is the lab rig</div><div class="co-body"><p>Nodes decide what to remember with a keyword rule where a real system would ask a model to extract facts, and <span class="cx" data-c="674" tabindex="0">semantic search</span> uses a tiny stand-in <span class="cx" data-c="203" tabindex="0">embedding</span>. The agents in Idea 1 use <code>chat</code>, a <span class="cx" data-c="326" tabindex="0">LangChain</span> chat model pointed at <code>mockllm</code> (<a class="xref" href="#l0601">Lesson 14.51</a>): it calls <code>get_order_status</code> once per order ID it sees and otherwise answers with a fixed sentence. It is not a language model. The trimming, middleware, store and namespaces are the real libraries.</p></div></aside>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from mockllm import start                       # the lab rig (Lesson 6.1)
+from langchain.chat_models import init_chat_model
+
+chat = init_chat_model(&quot;openai:mock-model&quot;, base_url=start(), api_key=&quot;mock&quot;, temperature=0)
+</code></pre></div>
+<aside class="co co-why"><div class="co-label">Why this came about</div><div class="co-body"><p>Users wanted agents that remember them across conversations, while long conversations outgrew <span class="cx" data-c="135" tabindex="0">context windows</span>. <span class="cx" data-c="327" tabindex="0">LangGraph</span> added a long-term <strong>store</strong> beside per-thread checkpoints, and middleware for trimming, summarizing and clearing context.</p></div></aside>
+<h2>The problem: two kinds of memory</h2>
+<p>A checkpointer gives each thread its conversation (<a class="xref" href="#l0612">Lesson 14.62</a>). That raises two problems. A thread keeps growing, and every model call resends all of it, until it no longer fits or costs too much. And some facts belong to the customer, not to one conversation: "reply in Hindi", "refunds to UPI, please". Next week's conversation is a new thread and should still know them. <a class="xref" href="#l0309">Lesson 14.10</a> called these <strong>short-term</strong> and <strong>long-term</strong> memory. LangGraph handles the first in the thread's messages and the second in a <strong>store</strong>.</p>
+<h2>In plain words</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Your head and your notebook</div><div class="co-body"><ul>
+<li><strong><mark class="term" id="term-l0614-0" title="Industry term: Short-term memory. A thread&#x27;s own history, kept per conversation">Short-term memory</mark></strong> is what is in your head during one meeting: what was said a minute ago, what you are halfway through. When the meeting ends, it is gone.</li>
+<li><strong><mark class="term" id="term-l0614-1" title="Industry term: Long-term memory. Facts kept across conversations, in a store">Long-term memory</mark></strong> is the notebook you carry between meetings: a few short notes about each person ("replies in Hindi", "refunds to UPI"). You read it before the next meeting, even weeks later.</li>
+</ul>
+<p>In LangGraph the "head" is the thread's state, saved by the checkpointer under a <code>thread_id</code> (<a class="xref" href="#l0612">Lesson 14.62</a>). The "notebook" is a separate database called the <strong>store</strong>. A new thread starts with an empty head but the same notebook.</p></div></aside>
+<p>The notebook fits in plain Python, as a dictionary that outlives each conversation:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">notebook = {}                                   # long-term memory: survives every conversation
+
+def remember(customer_id, fact):                # write a note on that customer's page
+    notebook.setdefault(customer_id, []).append(fact)
+
+def recall(customer_id):                        # read that customer's page
+    return notebook.get(customer_id, [])
+
+monday = [&quot;customer: Please talk to me in Hindi.&quot;]
+remember(&quot;C-42&quot;, &quot;Prefers replies in Hindi&quot;)
+
+tuesday = [&quot;customer: Hello&quot;]                    # a new conversation: no history at all
+print(&quot;Tuesday's history:&quot;, tuesday)
+print(&quot;notebook for C-42:&quot;, recall(&quot;C-42&quot;))      # ...but the notebook remembers
+print(&quot;notebook for C-77:&quot;, recall(&quot;C-77&quot;))      # and keeps customers apart
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Tuesday's history: ['customer: Hello']
+notebook for C-42: ['Prefers replies in Hindi']
+notebook for C-77: []
+</code></pre></div></div></aside>
+<p>Every long-term memory system, LangGraph's included, is this notebook plus answers to four questions: <strong>whose page</strong> is it (the <mark class="term" id="term-l0614-2" title="Industry term: Namespace. The tuple path under which store items live, such as one per customer">namespace</mark>), <strong>how to find the right note</strong> among hundreds (search by meaning), <strong>who decides</strong> when to read and write (your code or the model), and <strong>when</strong> notes are written (during or after the conversation). This lesson answers them in that order, after first dealing with the head that keeps growing.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Plain Python above</th>
+<th>LangGraph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>notebook</code></td>
+<td>A store: <code>InMemoryStore()</code> here, <code>PostgresStore</code> in production</td>
+</tr>
+<tr>
+<td><code>"C-42"</code> as the page</td>
+<td>A namespace tuple: <code>("customers", "C-42", "profile")</code></td>
+</tr>
+<tr>
+<td><code>remember(...)</code>, <code>recall(...)</code></td>
+<td><code>store.put(namespace, key, value)</code>, <code>store.search(namespace, query=...)</code></td>
+</tr>
+<tr>
+<td><code>monday</code>, <code>tuesday</code></td>
+<td>Two threads, each saved by the checkpointer</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>What a memory is, and what it is not.</strong> A memory is not a saved question and answer; the checkpointer already keeps the raw conversation. A memory is a short fact <strong><span class="cx cx-later" data-c="184" tabindex="0">distilled</span><a class="cx-pill" href="#l1105" title="Taught later, in Lesson 11.10">later · 14.136</a></strong> from conversations. From "I'm ordering a gift for my mother, please send refunds to UPI, and keep it short", three memories are worth keeping: "Buys gifts for family", "Refunds to UPI", "Prefers short replies". In one line: <strong>the checkpointer keeps what was said; the store keeps what was learned from it.</strong></p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Question</th>
+<th>Options</th>
+<th>Where in this lesson</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>What kind of memory?</td>
+<td>Fact or preference (semantic), past episode, procedure or rule</td>
+<td><a class="xref" href="#l0310">Lesson 14.11</a> has the full taxonomy</td>
+</tr>
+<tr>
+<td>How is it read?</td>
+<td>Automatically by your code every turn, or on demand by the model through a tool</td>
+<td>Ideas 5 and 6</td>
+</tr>
+<tr>
+<td>When is it written?</td>
+<td>During the conversation (the "hot path"), or after it by a background job</td>
+<td>Idea 7</td>
+</tr>
+</tbody>
+</table></div>
+<p>The three choices are independent: any kind of memory can be read either way and written at either time.</p>
+<h2>Idea 1 · Trim a thread without breaking it</h2>
+<p>Three turns, each with a <span class="cx" data-c="637" tabindex="0">tool call</span>:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage, trim_messages
+from langchain_core.messages.utils import count_tokens_approximately
+
+def turn(n, order, status):
+    return [HumanMessage(f&quot;Where is {order}?&quot;),
+            AIMessage(&quot;&quot;, tool_calls=[{&quot;name&quot;: &quot;get_order_status&quot;, &quot;args&quot;: {&quot;order_id&quot;: order}, &quot;id&quot;: f&quot;c{n}&quot;}]),
+            ToolMessage(f&quot;{order} is {status}&quot;, tool_call_id=f&quot;c{n}&quot;),
+            AIMessage(f&quot;{order} is {status}.&quot;)]
+
+history = [SystemMessage(&quot;You are ShopKart support. Be brief.&quot;)]
+history += turn(1, &quot;A-1001&quot;, &quot;shipped&quot;) + turn(2, &quot;A-1002&quot;, &quot;processing&quot;) + turn(3, &quot;A-1003&quot;, &quot;delivered&quot;)
+print(len(history), &quot;messages,&quot;, count_tokens_approximately(history), &quot;tokens (approximately)&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">13 messages, 186 tokens (approximately)
+</code></pre></div></div></aside>
+<p>Keep only the most recent messages that fit in 45 tokens:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">cut = trim_messages(history, max_tokens=45, strategy=&quot;last&quot;, token_counter=count_tokens_approximately)
+print([type(m).__name__ for m in cut])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['ToolMessage', 'AIMessage']
+</code></pre></div></div></aside>
+<p>The cut fell in the middle of a turn: the kept history starts with a <code>ToolMessage</code> whose tool call was trimmed away, and the system message is gone. A provider rejects that conversation (<a class="xref" href="#l0301">Lesson 14.2</a>'s rule that every tool result follows its call). Tell the trimmer where a valid history may start:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">kept = trim_messages(history, max_tokens=80, strategy=&quot;last&quot;, token_counter=count_tokens_approximately,
+                     include_system=True, start_on=&quot;human&quot;)      # keep the system message; start on a human turn
+print([type(m).__name__ for m in kept])
+print(kept[1].content)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['SystemMessage', 'HumanMessage', 'AIMessage', 'ToolMessage', 'AIMessage']
+Where is A-1003?
+</code></pre></div></div></aside>
+<p><code>include_system=True</code> keeps the instructions, and <code>start_on="human"</code> drops messages until the history begins with a person's turn, so tool calls and results stay together. Token counts here are approximate; use the provider's counter when the limit is tight.</p>
+<h3>Trim the saved thread, or only what the model sees</h3>
+<p>There are two places to apply that trim, and the difference matters more than the trim itself.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The archive and the photocopy</div><div class="co-body"><ul>
+<li><strong>Option A, change the saved thread.</strong> Delete old messages from the state. The checkpointer saves the shorter version, and the deleted turns are gone from the thread for good. Like shredding the old pages of a case file.</li>
+<li><strong>Option B, change only the request.</strong> Just before each model call, send a trimmed <strong>copy</strong>. The saved thread stays complete. Like photocopying the last few pages for the model while the full file stays in the archive.</li>
+</ul></div></aside>
+<p>Middleware (<a class="xref" href="#l0606">Lesson 14.56</a>) gives you both. A <code>@before_model</code> hook returns state updates, so its <code>RemoveMessage</code> really deletes. A <code>@wrap_model_call</code> hook receives the request about to be sent, and <code>request.override(messages=...)</code> changes that one request only:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents import create_agent
+from langchain.agents.middleware import before_model, wrap_model_call
+from langchain_core.messages import RemoveMessage
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+def last_turns(messages):
+    return trim_messages(messages, strategy=&quot;last&quot;, max_tokens=4, token_counter=len,   # len: count messages
+                         start_on=&quot;human&quot;)
+
+sent_sizes = []                                    # how many messages the model received, call by call
+
+@before_model
+def trim_saved(state, runtime):                    # Option A: rewrite the thread itself
+    return {&quot;messages&quot;: [RemoveMessage(id=REMOVE_ALL_MESSAGES), *last_turns(state[&quot;messages&quot;])]}
+
+@wrap_model_call
+def trim_sent(request, handler):                   # Option B: change only this request
+    return handler(request.override(messages=last_turns(request.messages)))
+
+@wrap_model_call
+def spy(request, handler):
+    sent_sizes.append(len(request.messages))
+    return handler(request)
+
+for label, middleware in [(&quot;A · trim the saved thread&quot;, [trim_saved, spy]),
+                          (&quot;B · trim only what is sent&quot;, [trim_sent, spy])]:
+    sent_sizes.clear()
+    agent = create_agent(chat, tools=[], middleware=middleware, checkpointer=InMemorySaver())
+    cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: label}}
+    for i in range(5):                             # five short turns
+        agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;question {i}&quot;}]}, cfg)
+    print(f&quot;{label}: sent {sent_sizes}, saved {len(agent.get_state(cfg).values['messages'])}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">A · trim the saved thread: sent [1, 3, 3, 3, 3], saved 4
+B · trim only what is sent: sent [1, 3, 3, 3, 3], saved 10
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li><code>sent [...]</code> is the number of messages the model received on each of the five turns. Both options send the same, so cost and speed are the same.</li>
+<li><code>saved</code> is what the thread holds afterwards. Option A kept only the last few messages; the first turns are gone. Option B still holds all ten: five questions and five answers.</li>
+</ul></div></aside>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>Option A: <code>@before_model</code> with <code>RemoveMessage</code></th>
+<th>Option B: <code>@wrap_model_call</code> with <code>request.override</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>What changes</td>
+<td>The stored thread</td>
+<td>Only what the model receives</td>
+</tr>
+<tr>
+<td>Full history afterwards</td>
+<td>No</td>
+<td>Yes</td>
+</tr>
+<tr>
+<td>Audits and replays</td>
+<td>Weakened</td>
+<td>Intact</td>
+</tr>
+<tr>
+<td>Reversible</td>
+<td>No</td>
+<td>Yes: change the rule and the old turns are still there</td>
+</tr>
+<tr>
+<td>Storage</td>
+<td>Smaller</td>
+<td>Grows; needs a retention policy</td>
+</tr>
+</tbody>
+</table></div>
+<p><strong>In regulated work, prefer Option B.</strong> In pharma, finance or healthcare you may have to show later what the system saw, said and did; deleting messages from the thread destroys part of that record. Know which built-ins behave which way: <code>SummarizationMiddleware</code> (<a class="xref" href="#l0606">Lesson 14.56</a>) <strong>rewrites the saved thread</strong> with a summary, like Option A; context editing, next, changes only the request, like Option B.</p>
+<h3>Clear old tool results instead (context editing)</h3>
+<p>Trimming removes whole turns by <strong>age</strong>. Often the bulk is a few large tool results the model used once and keeps resending. <strong>Context editing</strong> replaces old tool results with a placeholder, by <strong>usefulness</strong>, and keeps the newest ones:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import ContextEditingMiddleware, ClearToolUsesEdit
+from langchain.tools import tool
+
+@tool
+def get_order_status(order_id: str) -&gt; str:
+    &quot;&quot;&quot;Return the full tracking log for a ShopKart order ID like 'A-1001'.&quot;&quot;&quot;
+    return f&quot;{order_id}: &quot; + &quot;scan event; &quot; * 200        # a bulky result, about 600 tokens
+
+last_request = []
+
+@wrap_model_call
+def capture(request, handler):
+    last_request[:] = request.messages
+    return handler(request)
+
+agent = create_agent(chat, tools=[get_order_status], checkpointer=InMemorySaver(), middleware=[
+    ContextEditingMiddleware(edits=[ClearToolUsesEdit(trigger=1000, keep=1)]),   # tiny trigger for the demo
+    capture,
+])
+cfg = {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;tracking&quot;}}
+for order in [&quot;A-1001&quot;, &quot;A-1002&quot;, &quot;A-1003&quot;]:
+    agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: f&quot;Track {order}&quot;}]}, cfg)
+
+def tool_results(messages):
+    return [m.content[:22] for m in messages if m.type == &quot;tool&quot;]
+
+print(&quot;sent to model:&quot;, tool_results(last_request))
+print(&quot;saved:        &quot;, tool_results(agent.get_state(cfg).values[&quot;messages&quot;]))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">sent to model: ['[cleared]', '[cleared]', 'A-1003: scan event; sc']
+saved:         ['A-1001: scan event; sc', 'A-1002: scan event; sc', 'A-1003: scan event; sc']
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li><strong>Sent to the model</strong>: the two older results became <code>[cleared]</code>; the newest (<code>keep=1</code>) went in full. The tool calls themselves stay, so the conversation is still valid for the provider.</li>
+<li><strong>Saved</strong>: all three results are untouched. Context editing changes the request, not the thread.</li>
+<li>Its settings: <code>trigger</code> is the request size in tokens at which clearing starts (default 100,000), <code>keep</code> how many recent results survive (default 3), <code>exclude_tools</code> results never to clear, and <code>placeholder</code> the replacement text (default <code>"[cleared]"</code>).</li>
+</ul></div></aside>
+<h3>Offload big results so they never enter the context</h3>
+<p>Context editing hides a result from later requests, so the model cannot look at it again without re-running the tool. <strong>Offloading</strong> stores the full result elsewhere and gives the model a short <strong>stub</strong> with an ID, plus a tool to read slices:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">RESULTS = {}                                      # stands in for a file, bucket or table
+
+@tool
+def orders_report(region: str) -&gt; str:
+    &quot;&quot;&quot;Run the daily orders report for a region. Returns a summary and a result ID.&quot;&quot;&quot;
+    rows = [{&quot;order&quot;: f&quot;A-{1000 + i}&quot;, &quot;region&quot;: region, &quot;amount&quot;: 100 + i} for i in range(5000)]
+    rid = f&quot;res_{len(RESULTS) + 1}&quot;
+    RESULTS[rid] = rows                           # 1. the full result goes to storage
+    return f&quot;{len(rows)} rows saved as {rid}. Columns: order, region, amount. First: {rows[0]}&quot;   # 2. a stub
+
+@tool
+def read_result(result_id: str, offset: int = 0, limit: int = 5) -&gt; str:
+    &quot;&quot;&quot;Read a slice of a saved result by its ID.&quot;&quot;&quot;
+    rows = RESULTS.get(result_id)
+    return str(rows[offset:offset + limit]) if rows else &quot;No such result.&quot;              # 3. only what is asked
+
+print(orders_report.invoke({&quot;region&quot;: &quot;North&quot;}))
+print(read_result.invoke({&quot;result_id&quot;: &quot;res_1&quot;, &quot;offset&quot;: 4998, &quot;limit&quot;: 2}))
+print(len(str(RESULTS[&quot;res_1&quot;])), &quot;characters never entered the context&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">5000 rows saved as res_1. Columns: order, region, amount. First: {'order': 'A-1000', 'region': 'North', 'amount': 100}
+[{'order': 'A-5998', 'region': 'North', 'amount': 5098}, {'order': 'A-5999', 'region': 'North', 'amount': 5099}]
+279100 characters never entered the context
+</code></pre></div></div></aside>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Technique</th>
+<th>Removes</th>
+<th>Changes the saved thread?</th>
+<th>The model can see it again?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trimming in <code>@before_model</code></td>
+<td>Old turns, by age</td>
+<td>Yes</td>
+<td>No</td>
+</tr>
+<tr>
+<td>Trimming in <code>@wrap_model_call</code></td>
+<td>Old turns, by age, per request</td>
+<td>No</td>
+<td>No (not sent), but it is still saved</td>
+</tr>
+<tr>
+<td>Summarization (<code>SummarizationMiddleware</code>)</td>
+<td>Old turns, replaced by a summary</td>
+<td>Yes</td>
+<td>Only the summary</td>
+</tr>
+<tr>
+<td>Context editing</td>
+<td>Old tool results, by usefulness</td>
+<td>No</td>
+<td>Only by re-running the tool</td>
+</tr>
+<tr>
+<td>Offloading</td>
+<td>Large results, before they enter the context</td>
+<td>No</td>
+<td>Yes, through a read tool</td>
+</tr>
+</tbody>
+</table></div>
+<p>Rule of thumb: <strong>trim what the model sees, not what you store</strong>, unless you have a reason to delete.</p>
+<h2>Idea 2 · The store: memory across threads</h2>
+<p>A thread's checkpoints belong to one conversation. The <strong>store</strong> is a separate place for facts that should outlive a conversation, such as a customer's language. Entries are filed under a <strong>namespace</strong> (a tuple, like a folder path) and a key. Save three facts for two customers and read one customer's facts back:</p>
+<figure class="diagram"><div class="dg-scroll"><svg class="dg" viewBox="0 0 880 280" role="img" aria-label="Two kinds of memory in LangGraph. The checkpointer holds the state of one conversation (a thread) and is what lets it continue. The store holds facts that should outlive any one conversation, filed by namespace, such as a customer&#x27;s preferences. A graph reads and writes both." style="min-width:560px"><defs><marker id="ah147" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah147a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="aha" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah147p" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahpp" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah147k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahk" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah147r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahr" d="M0 0 L10 5 L0 10 z"/></marker><marker id="ah147w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path class="ahw" d="M0 0 L10 5 L0 10 z"/></marker></defs><rect class="p" x="16" y="30" width="400" height="200" rx="12"/><text class="h" x="216" y="56" text-anchor="middle">Checkpointer: short-term, per thread</text><rect class="b" x="40" y="74" width="352" height="34" rx="6"/><text class="t" x="216" y="96" text-anchor="middle">thread &quot;chat-1&quot;: messages, step, pending</text><rect class="b" x="40" y="118" width="352" height="34" rx="6"/><text class="t" x="216" y="140" text-anchor="middle">thread &quot;chat-2&quot;: messages, step, pending</text><rect class="b" x="40" y="162" width="352" height="34" rx="6"/><text class="t" x="216" y="184" text-anchor="middle">thread &quot;chat-3&quot;: …</text><text class="s" x="216" y="216" text-anchor="middle">trim or summarise when a thread grows long</text><rect class="a" x="464" y="30" width="400" height="200" rx="12"/><text class="h" x="664" y="56" text-anchor="middle">Store: long-term, across threads</text><rect class="b" x="488" y="74" width="352" height="34" rx="6"/><text class="t" x="664" y="96" text-anchor="middle">(&quot;users&quot;, &quot;u-17&quot;) → prefers Hindi; vegetarian</text><rect class="b" x="488" y="118" width="352" height="34" rx="6"/><text class="t" x="664" y="140" text-anchor="middle">(&quot;users&quot;, &quot;u-17&quot;, &quot;orders&quot;) → last three orders</text><rect class="b" x="488" y="162" width="352" height="34" rx="6"/><text class="t" x="664" y="184" text-anchor="middle">(&quot;policies&quot;,) → refund rules v7</text><text class="s" x="664" y="216" text-anchor="middle">search by key or by meaning; decide what is worth keeping</text><text class="s" x="440" y="262" text-anchor="middle">a new conversation starts with an empty thread and whatever it loads from the store</text></svg></div><figcaption>Two kinds of memory in LangGraph. The checkpointer holds the state of one conversation (a thread) and is what lets it continue. The store holds facts that should outlive any one conversation, filed by namespace, such as a customer&#x27;s preferences. A graph reads and writes both.</figcaption></figure>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langgraph.store.memory import InMemoryStore
+
+store = InMemoryStore()
+store.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;profile&quot;), &quot;language&quot;, {&quot;value&quot;: &quot;Hindi&quot;})
+store.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;profile&quot;), &quot;refund_to&quot;, {&quot;value&quot;: &quot;UPI&quot;})
+store.put((&quot;customers&quot;, &quot;C-77&quot;, &quot;profile&quot;), &quot;language&quot;, {&quot;value&quot;: &quot;English&quot;})
+
+print(store.get((&quot;customers&quot;, &quot;C-42&quot;, &quot;profile&quot;), &quot;language&quot;).value)
+print({item.key: item.value[&quot;value&quot;] for item in store.search((&quot;customers&quot;, &quot;C-42&quot;))})
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'value': 'Hindi'}
+{'language': 'Hindi', 'refund_to': 'UPI'}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li><code>store.get</code> returns an <strong><code>Item</code></strong>, not just your dictionary: <code>.value</code> is the dictionary you saved, and the item also carries <code>.namespace</code>, <code>.key</code>, and <code>.created_at</code> / <code>.updated_at</code> timestamps the store adds.</li>
+<li><code>store.search(("customers", "C-42"))</code> with no query lists every item whose namespace <strong>starts with</strong> that tuple, up to <code>limit</code> (default 10). That prefix rule is what makes per-customer namespaces work, and what makes a too-short namespace dangerous (the debugging exercise).</li>
+<li><code>put</code> with an existing key <strong>replaces</strong> the value: that is how a memory is updated.</li>
+</ul></div></aside>
+<p>A store holds <span class="cx" data-c="311" tabindex="0">JSON</span> values under a <strong>namespace</strong> (a tuple, like a folder path) and a key. Namespaces are the design decision: here everything about a customer sits under <code>("customers", customer_id, ...)</code>, so one search returns a customer's profile and nothing else.</p>
+<h2>Idea 3 · Using the store from a graph</h2>
+<p>Compile the graph with a store, and every node can reach it through <code>runtime.store</code>. The customer ID comes from the run's context (<a class="xref" href="#l0611">Lesson 14.61</a>), which your application fills from the signed-in user:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from dataclasses import dataclass
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.runtime import Runtime
+
+@dataclass
+class Session:
+    customer_id: str                                      # from the signed-in user, never from the model
+
+class ChatState(TypedDict, total=False):
+    msg: str
+    reply: str
+
+def remember(state, runtime: Runtime[Session]):
+    if &quot;hindi&quot; in state[&quot;msg&quot;].lower():                   # a model would extract this in a real system
+        runtime.store.put((&quot;customers&quot;, runtime.context.customer_id, &quot;profile&quot;), &quot;language&quot;, {&quot;value&quot;: &quot;Hindi&quot;})
+    return {}
+
+def answer(state, runtime: Runtime[Session]):
+    pref = runtime.store.get((&quot;customers&quot;, runtime.context.customer_id, &quot;profile&quot;), &quot;language&quot;)
+    lang = pref.value[&quot;value&quot;] if pref else &quot;English&quot;
+    return {&quot;reply&quot;: f&quot;[replying in {lang}] How can I help?&quot;}
+
+b = StateGraph(ChatState, context_schema=Session)
+b.add_node(&quot;remember&quot;, remember); b.add_node(&quot;answer&quot;, answer)
+b.add_edge(START, &quot;remember&quot;); b.add_edge(&quot;remember&quot;, &quot;answer&quot;); b.add_edge(&quot;answer&quot;, END)
+memory_store = InMemoryStore()
+bot = b.compile(checkpointer=InMemorySaver(), store=memory_store)
+
+bot.invoke({&quot;msg&quot;: &quot;Please talk to me in Hindi&quot;}, {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;monday&quot;}}, context=Session(&quot;C-42&quot;))
+for thread, customer in [(&quot;tuesday&quot;, &quot;C-42&quot;), (&quot;other-customer&quot;, &quot;C-77&quot;)]:
+    out = bot.invoke({&quot;msg&quot;: &quot;hello&quot;}, {&quot;configurable&quot;: {&quot;thread_id&quot;: thread}}, context=Session(customer))
+    print(f&quot;{thread:15} {customer} -&gt; {out['reply']}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">tuesday         C-42 -&gt; [replying in Hindi] How can I help?
+other-customer  C-77 -&gt; [replying in English] How can I help?
+</code></pre></div></div></aside>
+<p>Monday's conversation saved a preference; Tuesday's conversation, a different thread, used it; another customer was not affected. <code>create_agent</code> accepts <code>store=</code> as well, and tools can read it, for example a <code>remember</code> tool the model calls when the customer states a preference.</p>
+<h2>Idea 4 · Search memories by meaning</h2>
+<p>With an embedding function, the store indexes values and searches them by similarity, so the right note can be found from a question that does not share its words:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">VOCAB = [&quot;hindi&quot;, &quot;language&quot;, &quot;address&quot;, &quot;deliver&quot;, &quot;gift&quot;, &quot;wrap&quot;, &quot;refund&quot;, &quot;upi&quot;, &quot;paid&quot;]
+
+def tiny_embed(texts):
+    &quot;&quot;&quot;A stand-in embedding: one number per vocabulary word. Use a real embedding model in practice.&quot;&quot;&quot;
+    return [[float(w in t.lower()) + 1e-3 for w in VOCAB] for t in texts]
+
+notes = InMemoryStore(index={&quot;embed&quot;: tiny_embed, &quot;dims&quot;: len(VOCAB), &quot;fields&quot;: [&quot;text&quot;]})
+notes.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;notes&quot;), &quot;n1&quot;, {&quot;text&quot;: &quot;Prefers replies in Hindi&quot;})
+notes.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;notes&quot;), &quot;n2&quot;, {&quot;text&quot;: &quot;Wants refunds paid to UPI, not the card&quot;})
+notes.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;notes&quot;), &quot;n3&quot;, {&quot;text&quot;: &quot;Always asks for gift wrap&quot;})
+
+for q in [&quot;how should my refund be paid?&quot;, &quot;can you wrap it as a present?&quot;]:
+    best = notes.search((&quot;customers&quot;, &quot;C-42&quot;, &quot;notes&quot;), query=q, limit=1)[0]
+    print(f&quot;{q:32} -&gt; {best.value['text']} ({best.score:.2f})&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">how should my refund be paid?    -&gt; Wants refunds paid to UPI, not the card (0.82)
+can you wrap it as a present?    -&gt; Always asks for gift wrap (0.71)
+</code></pre></div></div></aside>
+<p>This is how an agent pulls a few relevant memories into its prompt instead of all of them (<a class="xref" href="#l0310">Lesson 14.11</a>). The stand-in embedding only counts words from a fixed list; a real <span class="cx" data-c="204" tabindex="0">embedding model</span> is what makes "present" match "gift wrap" in general.</p>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><ul>
+<li>Each result is an <code>Item</code> with one extra field, <code>score</code>: how close its meaning is to the query (higher is closer; compare scores with each other, not with a fixed scale).</li>
+<li><code>index</code> has three settings: <code>embed</code> (the function or model that turns text into numbers), <code>dims</code> (how many numbers it returns) and <code>fields</code> (which keys of the value to embed).</li>
+<li>Search always returns the nearest items, relevant or not. With a dozen memories per customer, skip embeddings and load them all; with hundreds, search, and consider a score threshold.</li>
+</ul></div></aside>
+<h2>Idea 5 · Memory as tools the model calls</h2>
+<p>So far, your nodes read and wrote memory at fixed points. The alternative is to give the <strong>model</strong> two tools and let it decide.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">An assistant with a notebook on the desk</div><div class="co-body"><p>With <strong>automatic</strong> memory, a rule says "read the notebook before every meeting". With <strong>tool</strong> memory, the assistant decides: "this customer just told me something lasting, I'll write it down", or "they're asking about their preferences, let me check". You give the model a <code>remember</code> and a <code>recall</code> tool, and it calls them when it judges them useful, like any other tool.</p></div></aside>
+<p>The hard question is <strong>whose</strong> page a note goes on. If the model chose the customer ID, a message such as "save this under C-77" could write into another customer's memory. So the customer comes from your application, and the model supplies only <em>what</em> to save. LangChain's mechanism for that is a parameter typed <code>ToolRuntime</code>: LangChain fills it in when the tool runs, and <strong>leaves it out of the schema the model sees</strong>.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.tools import ToolRuntime
+from langchain_core.utils.uuid import uuid7
+
+@tool
+def remember(fact: str, runtime: ToolRuntime[Session]) -&gt; str:
+    &quot;&quot;&quot;Save a lasting fact the customer stated about themselves (preferences, needs).&quot;&quot;&quot;
+    ns = (&quot;customers&quot;, runtime.context.customer_id, &quot;notes&quot;)     # whose page: from the app, not the model
+    runtime.store.put(ns, str(uuid7()), {&quot;text&quot;: fact})         # a new key, so facts add up
+    return &quot;saved&quot;
+
+@tool
+def recall(query: str, runtime: ToolRuntime[Session]) -&gt; str:
+    &quot;&quot;&quot;Search what the customer told us before. Use before answering personal questions.&quot;&quot;&quot;
+    ns = (&quot;customers&quot;, runtime.context.customer_id, &quot;notes&quot;)
+    return &quot;\n&quot;.join(h.value[&quot;text&quot;] for h in runtime.store.search(ns, query=query, limit=3)) or &quot;nothing saved&quot;
+
+print(remember.args)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">{'fact': {'title': 'Fact', 'type': 'string'}}
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><code>.args</code> is everything the model is told it may send. <code>fact</code> is there (<code>'type': 'string'</code> from the hint; <code>'title'</code> is a label <span class="cx" data-c="477" tabindex="0">Pydantic</span> made from the name). <code>runtime</code> is not: LangChain saw the <code>ToolRuntime</code> type and removed it, so the model cannot set it. Inside the tool, <code>runtime</code> gives <code>context</code> (who is calling), <code>store</code>, <code>state</code>, <code>config</code> and <code>tool_call_id</code>.</p></div></aside>
+<p>To see the tools work without a model choosing them, play the model yourself: hand <code>ToolNode</code> (<a class="xref" href="#l0611">Lesson 14.61</a>) the tool calls a model would make, with a customer in the context:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain_core.messages import AIMessage
+from langgraph.graph import MessagesState
+from langgraph.prebuilt import ToolNode
+
+tools_only = (StateGraph(MessagesState, context_schema=Session)
+              .add_node(&quot;tools&quot;, ToolNode([remember, recall])).add_edge(START, &quot;tools&quot;)
+              .compile(store=notes))                            # the indexed store from Idea 4
+
+def as_model(name, args):                                       # a reply a model might write
+    return {&quot;messages&quot;: [AIMessage(&quot;&quot;, tool_calls=[{&quot;name&quot;: name, &quot;args&quot;: args, &quot;id&quot;: &quot;c1&quot;}])]}
+
+tools_only.invoke(as_model(&quot;remember&quot;, {&quot;fact&quot;: &quot;Ships gifts to Pune&quot;}), context=Session(&quot;C-42&quot;))
+for customer in [&quot;C-42&quot;, &quot;C-77&quot;]:
+    out = tools_only.invoke(as_model(&quot;recall&quot;, {&quot;query&quot;: &quot;where to deliver gifts&quot;}), context=Session(customer))
+    print(customer, &quot;-&gt;&quot;, out[&quot;messages&quot;][-1].content.splitlines()[0])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">C-42 -&gt; Ships gifts to Pune
+C-77 -&gt; nothing saved
+</code></pre></div></div></aside>
+<p>The same tool call gave C-42 their notes and C-77 nothing: the namespace came from the context, which your application sets from the signed-in user, so no wording in a message can redirect it.</p>
+<h2>Idea 6 · Load automatically, recall on demand</h2>
+<p>Tool memory is flexible, but the model can forget to look, or save trivia. Compare the three ways an agent can keep and reach memory:</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th>Checkpointer</th>
+<th>Store, loaded automatically</th>
+<th>Store, through tools</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Answers</td>
+<td>"Where were we in this conversation?"</td>
+<td>"What must I always know about this customer?"</td>
+<td>"Is there anything saved that might help now?"</td>
+</tr>
+<tr>
+<td>Scope</td>
+<td>One thread</td>
+<td>All threads</td>
+<td>All threads</td>
+</tr>
+<tr>
+<td>Triggered by</td>
+<td>The framework, every step</td>
+<td>Your code, every turn</td>
+<td>The model, when it chooses</td>
+</tr>
+<tr>
+<td>Reliable?</td>
+<td>Yes</td>
+<td>Yes</td>
+<td>The model may skip it</td>
+</tr>
+<tr>
+<td>Best for</td>
+<td>Continuity, crash recovery, approval pauses</td>
+<td>Language, refund method, tenant rules</td>
+<td>Long-tail facts and past episodes; "remember this" requests</td>
+</tr>
+<tr>
+<td>Risk</td>
+<td>The thread outgrows the context</td>
+<td>Loads memory even when irrelevant</td>
+<td>Missed memories, junk saved</td>
+</tr>
+</tbody>
+</table></div>
+<p>The checkpointer and the store are two <strong>places</strong> to keep memory; automatic loading and tools are two <strong>ways of reaching</strong> the store. Production systems use all three: a short profile loaded into every model call, and a <code>recall</code> tool for the rest. <code>@dynamic_prompt</code> (<a class="xref" href="#l0606">Lesson 14.56</a>) builds the <span class="cx" data-c="616" tabindex="0">system prompt</span> before each call, so it can read the store:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from langchain.agents.middleware import dynamic_prompt
+
+notes.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;profile&quot;), &quot;language&quot;, {&quot;text&quot;: &quot;Reply in Hindi&quot;})
+notes.put((&quot;customers&quot;, &quot;C-42&quot;, &quot;profile&quot;), &quot;refunds&quot;, {&quot;text&quot;: &quot;Refunds go to UPI&quot;})
+
+@dynamic_prompt
+def load_profile(request):                                       # layer 1: every model call
+    ns = (&quot;customers&quot;, request.runtime.context.customer_id, &quot;profile&quot;)
+    lines = &quot;\n&quot;.join(f&quot;- {i.value['text']}&quot; for i in request.runtime.store.search(ns, limit=5))
+    return f&quot;You are ShopKart support.\nKnown about this customer:\n{lines}&quot;
+
+seen = {}
+
+@wrap_model_call
+def show_prompt(request, handler):
+    seen[&quot;prompt&quot;] = request.system_message.content
+    return handler(request)
+
+agent = create_agent(chat, tools=[recall], middleware=[load_profile, show_prompt],   # layer 2: recall
+                     context_schema=Session, store=notes, checkpointer=InMemorySaver())
+agent.invoke({&quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Hi&quot;}]},
+             {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;t-profile&quot;}}, context=Session(&quot;C-42&quot;))
+print(seen[&quot;prompt&quot;])
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">You are ShopKart support.
+Known about this customer:
+- Reply in Hindi
+- Refunds go to UPI
+</code></pre></div></div></aside>
+<p>Why two layers: automatic loading carries what must never be missed, so a skipped <code>recall</code> costs little; the tool lets the model search for what the current message does not obviously ask for, and rephrase when the first search misses. Never put anything critical only behind the tool.</p>
+<h2>Idea 7 · When memories are written, and how they stay clean</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Hot path</strong>: during the conversation</th>
+<th><strong>Background</strong>: after it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>How</td>
+<td>The agent calls <code>remember</code> mid-conversation</td>
+<td>A job reads the finished thread and extracts memories</td>
+</tr>
+<tr>
+<td>Available</td>
+<td>At once</td>
+<td>After the job runs, usually by the next conversation</td>
+</tr>
+<tr>
+<td>Latency for the customer</td>
+<td>An extra tool call</td>
+<td>None</td>
+</tr>
+<tr>
+<td>Quality</td>
+<td>Depends on the model noticing</td>
+<td>Better: sees the whole conversation, can merge and resolve conflicts</td>
+</tr>
+</tbody>
+</table></div>
+<p>Production systems usually extract in the <strong>background</strong> and keep a <code>remember</code> tool only for explicit "remember this" requests, which the customer expects to work at once.</p>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">Extract, compare, decide, store</div><div class="co-body"><ol>
+<li><strong>Extract</strong>: give the transcript to a model with "list lasting facts, preferences, events and rules about this customer", and ask for <span class="cx" data-c="603" tabindex="0">structured output</span> (<a class="xref" href="#l0604">Lesson 14.54</a>).</li>
+<li><strong>Compare</strong>: for each new item, search the store for similar existing memories.</li>
+<li><strong>Decide</strong>: ask a model, with the new item and the similar old ones side by side, to <strong>add</strong> it, <strong>update</strong> an old one, <strong>delete</strong> one that is now false, or <strong>skip</strong>.</li>
+<li><strong>Store</strong>: plain code carries out the decisions with <code>put</code> and <code>delete</code>.</li>
+</ol>
+<p>The add/update/delete decision is not part of your agent's prompt. It is a separate model call inside the memory job. <a class="xref" href="#l0310">Lesson 14.11</a> builds the whole pipeline by hand.</p></div></aside>
+<p>Steps 1 to 3 are model calls with structured output. Step 4 is plain code you can test. Here it runs on the decisions a model would return after the customer said "Send refunds to my card from now on, and I no longer need gift wrap":</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from typing import Literal
+from pydantic import BaseModel
+
+class Op(BaseModel):                             # one decision, as the deciding model returns it
+    action: Literal[&quot;add&quot;, &quot;update&quot;, &quot;delete&quot;, &quot;skip&quot;]
+    key: str | None = None                       # which existing memory, for update or delete
+    text: str | None = None                      # the memory text, for add or update
+
+def apply_ops(store, ns, ops: list[Op]) -&gt; None:
+    for op in ops:
+        if op.action == &quot;add&quot;:
+            store.put(ns, str(uuid7()), {&quot;text&quot;: op.text})
+        elif op.action == &quot;update&quot;:
+            store.put(ns, op.key, {&quot;text&quot;: op.text})    # same key: replaces, never duplicates
+        elif op.action == &quot;delete&quot;:
+            store.delete(ns, op.key)
+
+ns = (&quot;customers&quot;, &quot;C-42&quot;, &quot;notes&quot;)
+apply_ops(notes, ns, [Op(action=&quot;update&quot;, key=&quot;n2&quot;, text=&quot;Wants refunds paid to the card&quot;),
+                      Op(action=&quot;delete&quot;, key=&quot;n3&quot;)])
+print(sorted(i.value[&quot;text&quot;] for i in notes.search(ns, limit=20)))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">['Prefers replies in Hindi', 'Ships gifts to Pune', 'Wants refunds paid to the card']
+</code></pre></div></div></aside>
+<p><code>update</code> kept one refund preference instead of two contradictory ones; <code>delete</code> removed a fact that is no longer true. Without the compare-and-decide steps, the store would now say both "UPI" and "card".</p>
+<p><strong>LangMem</strong>, LangChain's memory library, packages this: <code>create_manage_memory_tool</code> and <code>create_search_memory_tool</code> are ready-made <code>remember</code> and <code>recall</code> tools, and <code>create_memory_store_manager</code> is the background extract-compare-decide-store job. Their namespaces can contain <code>{langgraph_user_id}</code>, filled from the run's config, so identity again comes from your application. The manager does not delete unless you set <code>enable_deletes=True</code>.</p>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The store keeps the conversation."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The checkpointer keeps each thread's conversation. The store keeps short memories distilled from conversations.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The checkpointer only keeps the messages."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It saves the full state at every step, including tool outputs and pending work; that is what makes resuming possible.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "With a <code>recall</code> tool the agent always finds what it needs."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The model may not call it. Load anything critical automatically.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "The model decides whose memory it uses."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> The application does, through the context that tools receive in <code>runtime.context</code>. The model never sees it.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Summarization keeps my full history."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> <code>SummarizationMiddleware</code> rewrites the saved thread. A <code>wrap_model_call</code> trim and context editing change only the request.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "A new memory should always be added."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Compare it with similar ones first, then add, update, delete or skip; otherwise the store fills with duplicates and contradictions.</li>
+</ul></div></aside>
+<h2>Production notes</h2>
+<ul>
+<li><strong>Stores</strong>: <code>InMemoryStore</code> is for development; <code>PostgresStore</code> (with <span class="cx" data-c="441" tabindex="0">pgvector</span> for search) or the platform's built-in store (<a class="xref" href="#l0617">Lesson 14.67</a>) for production.</li>
+<li><strong>Who may write what</strong>: the namespace must come from your authentication, never from the model's arguments, or a crafted message can read or write another customer's memories (<a class="xref" href="#l1002">Lesson 15.22</a>).</li>
+<li><strong>What to remember</strong>: preferences and facts the customer stated, with when they said it. Not guesses about them, and not sensitive data you have no basis to keep.</li>
+<li><strong>Deletion</strong>: a customer can ask you to delete what you know. With per-customer namespaces, that is one loop, the modify exercise.</li>
+</ul>
+<h2>What the library replaces</h2>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>You wrote in Lessons <a class="xref" href="#l0309">14.10</a> and <a class="xref" href="#l0310">14.11</a></th>
+<th>LangGraph gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A window over the history</td>
+<td><code>trim_messages</code> with <code>include_system</code> and <code>start_on</code>, or <code>RemoveMessage</code></td>
+</tr>
+<tr>
+<td>A dictionary of facts per user</td>
+<td>A store with namespaces, <code>put</code>, <code>get</code>, <code>search</code>, <code>delete</code></td>
+</tr>
+<tr>
+<td>Embedding and ranking memories yourself</td>
+<td>A store <code>index</code> with an embedding function</td>
+</tr>
+<tr>
+<td>Passing the memory object to every function</td>
+<td><code>runtime.store</code> in every node, and <code>ToolRuntime</code> in tools</td>
+</tr>
+<tr>
+<td>A window applied before each model call</td>
+<td><code>@wrap_model_call</code> trimming, <code>ContextEditingMiddleware</code></td>
+</tr>
+<tr>
+<td><a class="xref" href="#l0310">Lesson 14.11</a>'s extraction and consolidation</td>
+<td>LangMem's memory tools and <code>create_memory_store_manager</code></td>
+</tr>
+</tbody>
+</table></div>
+<aside class="co co-checked"><div class="co-label">Checked against the docs</div><div class="co-title">Checked on 22 November 2026</div><div class="co-body"><ul>
+<li><strong>Sources</strong>: LangGraph docs: <em>Memory</em> (short-term and long-term), <em>Persistence</em> (memory store); LangChain docs: <em>Short-term memory</em> (<code>trim_messages</code>).</li>
+<li><strong>Versions</strong>: <code>langgraph</code> 1.2.24, <code>langchain-core</code> 1.8.4.</li>
+</ul>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status on the check date</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>trim_messages</code>, <code>count_tokens_approximately</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>BaseStore</code>, <code>InMemoryStore</code>, <code>PostgresStore</code>, semantic <code>index</code></td>
+<td>Stable</td>
+</tr>
+<tr>
+<td><code>runtime.store</code> in nodes, <code>store=</code> on <code>create_agent</code></td>
+<td>Stable</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Exercises</h2>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>With <code>max_tokens=80</code>, the trimmed history kept only the last turn. What would <code>max_tokens=120</code> keep, given that each turn is about 58 tokens and the system message about 14? (Solution P1.)</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Run the trimmer from Idea 1 without <code>start_on</code> and <code>include_system</code>, then send the result to a real model (or read <a class="xref" href="#l0301">Lesson 14.2</a>'s rules). What error do you expect, and why does the system message matter even when the provider accepts the request? (Solution B1.)</p></div></aside>
+<aside class="co co-debugx"><div class="co-label">Debugging exercise</div><div class="co-title">Debugging exercise: one customer&#x27;s preference shows up for everyone</div><div class="co-body"><p>After a customer asked for Hindi, every other customer started getting Hindi replies:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def remember_buggy(state, runtime: Runtime[Session]):
+    if &quot;hindi&quot; in state[&quot;msg&quot;].lower():
+        runtime.store.put((&quot;customers&quot;, &quot;profile&quot;), &quot;language&quot;, {&quot;value&quot;: &quot;Hindi&quot;})      # the bug is on this line
+    return {}
+
+def answer_buggy(state, runtime: Runtime[Session]):
+    pref = runtime.store.get((&quot;customers&quot;, &quot;profile&quot;), &quot;language&quot;)
+    return {&quot;reply&quot;: f&quot;[replying in {pref.value['value'] if pref else 'English'}] How can I help?&quot;}
+
+b = StateGraph(ChatState, context_schema=Session)
+b.add_node(&quot;remember&quot;, remember_buggy); b.add_node(&quot;answer&quot;, answer_buggy)
+b.add_edge(START, &quot;remember&quot;); b.add_edge(&quot;remember&quot;, &quot;answer&quot;); b.add_edge(&quot;answer&quot;, END)
+leaky = b.compile(checkpointer=InMemorySaver(), store=InMemoryStore())
+leaky.invoke({&quot;msg&quot;: &quot;Hindi please&quot;}, {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;a&quot;}}, context=Session(&quot;C-42&quot;))
+print(leaky.invoke({&quot;msg&quot;: &quot;hello&quot;}, {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;b&quot;}}, context=Session(&quot;C-77&quot;))[&quot;reply&quot;])
+</code></pre></div>
+<p>What it printed:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">[replying in Hindi] How can I help?
+</code></pre></div>
+<p>Find the bug. Why is it also a privacy incident, not just a wrong language? (Solution D1.)</p></div></aside>
+<aside class="co co-modify"><div class="co-label">Make it your own</div><div class="co-body"><p>Write <code>forget(customer_id)</code>, which deletes everything stored about a customer, and show that their next conversation no longer uses the old preference. (Solution M1.)</p></div></aside>
+<h2>Solutions</h2>
+<details class="qa" id="l0614-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Whole turns, from the end</span></summary><div class="qa-a"><p>Still the last turn only: two turns plus the system message are about 130 tokens, over the limit, and the trimmer never keeps half a turn when <code>start_on="human"</code>. At about 130 tokens or more it keeps the last two turns. The budget is spent in whole turns, which is why long tool results (<a class="xref" href="#l0606">Lesson 14.56</a>'s context editing) are often the better thing to cut.</p></div></details>
+<details class="qa" id="l0614-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Orphaned tool results</span></summary><div class="qa-a"><p>The history starts with a <code>ToolMessage</code> whose tool call is gone, so the provider rejects it: a tool result must follow the assistant turn that requested it. Even where a request is accepted, losing the system message removes the agent's instructions, so it silently stops following ShopKart's rules. Always keep the system message and start on a human turn.</p></div></details>
+<details class="qa" id="l0614-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">D1 · The namespace forgot the customer</span></summary><div class="qa-a"><p>The namespace <code>("customers", "profile")</code> has no customer ID, so every customer shares one profile, and the last preference saved wins for everyone. It is a privacy incident because the same mistake with an address or a phone number would show one customer's data to another. Put the customer ID, taken from your authentication context, in every namespace, as Idea 3 does, and add a test with two customers.</p></div></details>
+<details class="qa" id="l0614-qa4"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">M1 · Delete by namespace</span></summary><div class="qa-a"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def forget(customer_id):
+    &quot;&quot;&quot;Delete everything stored about a customer, for a deletion request.&quot;&quot;&quot;
+    for item in memory_store.search((&quot;customers&quot;, customer_id), limit=100):
+        memory_store.delete(item.namespace, item.key)
+
+print(len(memory_store.search((&quot;customers&quot;, &quot;C-42&quot;))), &quot;item(s) before&quot;)
+forget(&quot;C-42&quot;)
+print(len(memory_store.search((&quot;customers&quot;, &quot;C-42&quot;))), &quot;item(s) after&quot;)
+out = bot.invoke({&quot;msg&quot;: &quot;hello&quot;}, {&quot;configurable&quot;: {&quot;thread_id&quot;: &quot;wednesday&quot;}}, context=Session(&quot;C-42&quot;))
+print(out[&quot;reply&quot;])
+</code></pre></div>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">1 item(s) before
+0 item(s) after
+[replying in English] How can I help?
+</code></pre></div>
+<p>Also delete the customer's threads from the checkpointer, which hold their conversations, and anything copied into <span class="cx" data-c="649" tabindex="0">traces</span> or analytics; the store is only one of the places memories live.</p></div></details>
+<h2>Check your understanding</h2>
+<details class="qa" id="l0614-qa5"><summary><span class="qa-lvl qa-explain">Explain the mechanism</span><span class="qa-q">How does LangGraph handle short-term and long-term memory?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Short-term memory is the thread's state, usually its messages, saved by the checkpointer and loaded on each call with the same thread ID; it is kept within budget by trimming, deleting messages or summarizing. Long-term memory is a store, separate from threads, holding JSON documents under namespaces such as a user ID; nodes and tools read and write it through the runtime, and with an index it supports semantic search. Short-term is per conversation; long-term is per user or organization, across conversations.</p>
+<p><strong>A plausible wrong answer.</strong> "Long-term memory means keeping the whole chat history forever." Old histories are expensive to resend and hard to search; long-term memory keeps selected facts.</p>
+<p><strong>Follow-ups.</strong> How do you decide what to write to long-term memory?</p></div></details>
+<details class="qa" id="l0614-qa6"><summary><span class="qa-lvl qa-debug">Debug a failure</span><span class="qa-q">After trimming was added, the agent occasionally fails with a 400 error about tool results. Why?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> The trim boundary sometimes falls between an assistant message with tool calls and its tool results, leaving results without their calls, which providers reject. Set <code>start_on="human"</code> (and keep the system message), or trim by whole turns, and add a test with a long history ending in a tool call. If turns are large because of tool results, clear old tool results instead of whole turns.</p>
+<p><strong>A plausible wrong answer.</strong> "The model is producing bad tool calls." The calls were fine; the trimming removed them.</p>
+<p><strong>Follow-ups.</strong> How would you trim when a single tool result is larger than the budget?</p></div></details>
+<details class="qa" id="l0614-qa7"><summary><span class="qa-lvl qa-defend">Defend a design</span><span class="qa-q">Should an agent decide for itself what to remember?</span></summary><div class="qa-a"><p><strong>Worked answer.</strong> Partly. The model is good at spotting candidate facts, so I let it propose memories, through a tool or an extraction step, but the application decides the namespace from authentication, filters what categories may be stored, records when and where each fact came from, and lets the customer see and delete it. Memories the model infers rather than hears ("probably price-sensitive") should not be stored as facts. Without those controls, memory becomes a source of wrong personalization and privacy risk.</p>
+<p><strong>A plausible wrong answer.</strong> "Yes, let the agent save anything that seems useful." Then you have unreviewed personal data with no provenance.</p>
+<p><strong>Follow-ups.</strong> How would you evaluate whether memory improves answers (<a class="xref" href="#l0310">Lesson 14.11</a>)?</p></div></details>
+<h2>Check yourself</h2>
+<ul>
+<li>Trim a history with tool calls to a token budget without leaving an orphaned tool result.</li>
+<li>Save and read a customer preference in the store, under a namespace with the customer's ID.</li>
+<li>Use the store from a graph node, and show it working across two threads.</li>
+<li>Delete everything stored about one customer.</li>
+<li>Show, with a counter, the difference between trimming the saved thread and trimming only what is sent.</li>
+<li>Explain why a <code>remember</code> tool takes the customer from <code>ToolRuntime</code> and not from its arguments.</li>
+<li>Say which memories you would load automatically and which you would leave to a <code>recall</code> tool.</li>
+</ul>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="l0614-q1"><p class="q-text"><span class="q-num">Q1</span>Which trim_messages settings keep a trimmed history valid for a provider?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0614-q1-o0"><span class="opt-key">A</span><span>strategy="first" only</span></button><button type="button" class="opt" data-correct="true" id="l0614-q1-o1"><span class="opt-key">B</span><span>include_system=True and start_on="human"</span></button><button type="button" class="opt" data-correct="false" id="l0614-q1-o2"><span class="opt-key">C</span><span>max_tokens=0</span></button><button type="button" class="opt" data-correct="false" id="l0614-q1-o3"><span class="opt-key">D</span><span>allow_partial=True</span></button></div><p class="q-explain" hidden>The history must not start with a tool result whose call was trimmed away.</p></div><div class="q" id="l0614-q2"><p class="q-text"><span class="q-num">Q2</span>Where does a fact that should outlive one conversation belong?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0614-q2-o0"><span class="opt-key">A</span><span>In the thread's messages</span></button><button type="button" class="opt" data-correct="true" id="l0614-q2-o1"><span class="opt-key">B</span><span>In the store, under a namespace for that user</span></button><button type="button" class="opt" data-correct="false" id="l0614-q2-o2"><span class="opt-key">C</span><span>In the system prompt of every thread</span></button><button type="button" class="opt" data-correct="false" id="l0614-q2-o3"><span class="opt-key">D</span><span>In the recursion limit</span></button></div><p class="q-explain" hidden>Threads are per conversation; the store is shared across them.</p></div><div class="q" id="l0614-q3"><p class="q-text"><span class="q-num">Q3</span>Where should the user ID in a memory namespace come from?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="l0614-q3-o0"><span class="opt-key">A</span><span>The model's tool arguments</span></button><button type="button" class="opt" data-correct="true" id="l0614-q3-o1"><span class="opt-key">B</span><span>Your authentication, passed in the run's context</span></button><button type="button" class="opt" data-correct="false" id="l0614-q3-o2"><span class="opt-key">C</span><span>The thread ID</span></button><button type="button" class="opt" data-correct="false" id="l0614-q3-o3"><span class="opt-key">D</span><span>The first message</span></button></div><p class="q-explain" hidden>Otherwise a crafted message could read or write another user's memories.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="l0614" id="done-l0614">Mark complete and continue</button><button type="button" class="undo-btn" data-id="l0614" id="undo-l0614" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#l0613"><span class="pn-dir">Previous</span><span class="pn-t">14.63 · Human in the loop: interrupt and Command</span></a><a class="pn next" href="#l0615"><span class="pn-dir">Next</span><span class="pn-t">14.65 · Streaming modes and the Functional API</span></a></div></footer>

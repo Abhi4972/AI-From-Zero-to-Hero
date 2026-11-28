@@ -1,0 +1,506 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-19">Phase 19 · Capstone Builds</a></nav><h1>Capstone 14: an Inference Server with Speculative Decoding</h1><div class="m-meta"><span class="chip chip-num">Lesson 19.14</span><span class="chip">30 min</span><span class="chip chip-core">Capstone</span><span class="chip chip-done" data-done-chip="a1914" hidden>Completed</span></div></header><div class="prose"><aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Phase 3 (deep learning), Phase 7 (transformers), Phase 10 (LLMs from scratch), Phase 17 (infrastructure)</li>
+<li><strong>Type</strong>: Capstone. <strong>Time</strong>: about 30 minutes.</li>
+<li><strong>Code in</strong>: Python (serving), TypeScript, C++ / CUDA (kernel inspection), YAML (configs). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Speculative decoding — a cheap draft proposes tokens, the target model verifies them in one pass — is now a production-ready optimization, not a research trick. EAGLE-3 in vLLM 0.7 ships 2.5-3x throughput on real traffic. P-EAGLE (AWS 2026) pushed parallel speculation even further. SGLang's SpecForge trained draft heads at scale. Red Hat's Speculators hub published aligned drafts for common open models. TensorRT-LLM made speculative decoding first-class on NVIDIA. The 2026 production serving stack is vLLM or SGLang with EAGLE-family drafts, FP8 or INT4 quantization, and HPA on queue-wait. This capstone is to serve two open models at 2.5x+ baseline throughput with a full tail-latency report.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Draft model</td>
+<td>"Speculator"</td>
+<td>Small model that proposes N tokens for the target to verify</td>
+</tr>
+<tr>
+<td>EAGLE-3</td>
+<td>"2026 draft architecture"</td>
+<td>Draft head trained on target hidden states; ~75% acceptance</td>
+</tr>
+<tr>
+<td>P-EAGLE</td>
+<td>"Parallel speculation"</td>
+<td>Tree of draft branches verified in one target pass</td>
+</tr>
+<tr>
+<td>Acceptance rate</td>
+<td>"Hit rate"</td>
+<td>Fraction of drafted tokens accepted without resampling</td>
+</tr>
+<tr>
+<td>Quantization</td>
+<td>"FP8 / INT4"</td>
+<td>Lower-precision weights to fit more model in GPU memory</td>
+</tr>
+<tr>
+<td>Queue wait</td>
+<td>"HPA metric"</td>
+<td>Time a request waits in the pending queue before inference starts</td>
+</tr>
+<tr>
+<td>Speculators hub</td>
+<td>"Aligned drafts"</td>
+<td>Red Hat Neural Magic hub of EAGLE drafts for common open models</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>Problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p><strong>Speculative decoding</strong> makes a large model generate faster without changing what it outputs. A small, cheap <strong>draft</strong> model guesses the next few tokens; the large <strong>target</strong> model checks all of them in one forward pass and keeps the guesses up to the first one it disagrees with, then adds its own token. When the draft guesses well, each expensive pass yields several tokens instead of one. How well it guesses (the <strong>acceptance rate</strong>) depends on how closely the draft matches the target and on the kind of text: a draft tuned on chat may do worse on code. The serving work is in measuring this honestly: speed-up per batch size, tail latency when guesses are rejected, and cost per million tokens. Model and version names are a 2026 snapshot.</p></div></aside>
+<p>Speculative decoding became a commodity in 2026. EAGLE-3 draft heads train on the target model's hidden states and predict N tokens ahead; the target model verifies in a single pass. Acceptance rates of 60-80% translate to 2-3x end-to-end throughput. vLLM 0.7 integrates this natively. SGLang + SpecForge gives you the training pipeline. Red Hat's Speculators publishes aligned drafts for Llama 3.3 70B, Qwen3-Coder-30B MoE, GPT-OSS-120B.</p>
+<p>The craft is in the serving operations, not the model. Acceptance rate drifts with the traffic distribution (ShareGPT vs code vs domain data). Tail latency under rejection is worse than without speculation — you must report p99 at multiple batch sizes, not just steady-state tokens/sec. Cost per 1M tokens vs Anthropic / OpenAI API is the credibility lever.</p>
+<h2>Concept</h2>
+<p>Speculative decoding has two layers. A <strong>draft</strong> model (EAGLE-3 head, ngram, or smaller target-aligned model) proposes k candidate tokens per step. The <strong>target</strong> model verifies all k in one pass; any prefix accepted replaces the greedy path. Acceptance rate depends on draft-target alignment and the input distribution.</p>
+<figure class="diagram mmfig" data-mmd="a1914" data-h="02e6c8bbc2"><div class="dg-scroll"><svg class="dg mm" id="mm02e6c8bbc2" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 480.938px; background-color: transparent;" viewBox="0 0 480.9375 561" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm02e6c8bbc2{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm02e6c8bbc2 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm02e6c8bbc2 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm02e6c8bbc2 .error-icon{fill:#f4efe7;}#mm02e6c8bbc2 .error-text{fill:#0b1018;stroke:#0b1018;}#mm02e6c8bbc2 .edge-thickness-normal{stroke-width:1px;}#mm02e6c8bbc2 .edge-thickness-thick{stroke-width:3.5px;}#mm02e6c8bbc2 .edge-pattern-solid{stroke-dasharray:0;}#mm02e6c8bbc2 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm02e6c8bbc2 .edge-pattern-dashed{stroke-dasharray:3;}#mm02e6c8bbc2 .edge-pattern-dotted{stroke-dasharray:2;}#mm02e6c8bbc2 .marker{fill:#6c6357;stroke:#6c6357;}#mm02e6c8bbc2 .marker.cross{stroke:#6c6357;}#mm02e6c8bbc2 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm02e6c8bbc2 p{margin:0;}#mm02e6c8bbc2 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm02e6c8bbc2 .cluster-label text{fill:#0b1018;}#mm02e6c8bbc2 .cluster-label span{color:#0b1018;}#mm02e6c8bbc2 .cluster-label span p{background-color:transparent;}#mm02e6c8bbc2 .label text,#mm02e6c8bbc2 span{fill:#211c16;color:#211c16;}#mm02e6c8bbc2 .node rect,#mm02e6c8bbc2 .node circle,#mm02e6c8bbc2 .node ellipse,#mm02e6c8bbc2 .node polygon,#mm02e6c8bbc2 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm02e6c8bbc2 .rough-node .label text,#mm02e6c8bbc2 .node .label text,#mm02e6c8bbc2 .image-shape .label,#mm02e6c8bbc2 .icon-shape .label{text-anchor:middle;}#mm02e6c8bbc2 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm02e6c8bbc2 .rough-node .label,#mm02e6c8bbc2 .node .label,#mm02e6c8bbc2 .image-shape .label,#mm02e6c8bbc2 .icon-shape .label{text-align:center;}#mm02e6c8bbc2 .node.clickable{cursor:pointer;}#mm02e6c8bbc2 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm02e6c8bbc2 .arrowheadPath{fill:#0b0b0b;}#mm02e6c8bbc2 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm02e6c8bbc2 .flowchart-link{stroke:#6c6357;fill:none;}#mm02e6c8bbc2 .edgeLabel{background-color:#ffffff;text-align:center;}#mm02e6c8bbc2 .edgeLabel p{background-color:#ffffff;}#mm02e6c8bbc2 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm02e6c8bbc2 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm02e6c8bbc2 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm02e6c8bbc2 .cluster text{fill:#0b1018;}#mm02e6c8bbc2 .cluster span{color:#0b1018;}#mm02e6c8bbc2 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm02e6c8bbc2 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm02e6c8bbc2 rect.text{fill:none;stroke-width:0;}#mm02e6c8bbc2 .icon-shape,#mm02e6c8bbc2 .image-shape{background-color:#ffffff;text-align:center;}#mm02e6c8bbc2 .icon-shape p,#mm02e6c8bbc2 .image-shape p{background-color:#ffffff;padding:2px;}#mm02e6c8bbc2 .icon-shape .label rect,#mm02e6c8bbc2 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm02e6c8bbc2 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm02e6c8bbc2 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm02e6c8bbc2 .node .neo-node{stroke:#b5521b;}#mm02e6c8bbc2 [data-look="neo"].node rect,#mm02e6c8bbc2 [data-look="neo"].cluster rect,#mm02e6c8bbc2 [data-look="neo"].node polygon{stroke:url(#mm02e6c8bbc2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm02e6c8bbc2 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm02e6c8bbc2 [data-look="neo"].node path{stroke:url(#mm02e6c8bbc2-gradient);stroke-width:1px;}#mm02e6c8bbc2 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm02e6c8bbc2 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm02e6c8bbc2 [data-look="neo"].node circle{stroke:url(#mm02e6c8bbc2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm02e6c8bbc2 [data-look="neo"].node circle .state-start{fill:#000000;}#mm02e6c8bbc2 [data-look="neo"].icon-shape .icon{fill:url(#mm02e6c8bbc2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm02e6c8bbc2 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm02e6c8bbc2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm02e6c8bbc2 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm02e6c8bbc2_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm02e6c8bbc2_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M294.855,59L302.27,63.167C309.685,67.333,324.514,75.667,331.929,83.333C339.344,91,339.344,98,339.344,101.5L339.344,105" id="mm02e6c8bbc2-L_CTX_DR_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CTX_DR_0" data-points="W3sieCI6Mjk0Ljg1NTA0MzMxNjgzMTcsInkiOjU5fSx7IngiOjMzOS4zNDM3NSwieSI6ODR9LHsieCI6MzM5LjM0Mzc1LCJ5IjoxMDl9XQ==" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/><path d="M339.344,160L339.344,164.167C339.344,168.333,339.344,176.667,339.344,184.333C339.344,192,339.344,199,339.344,202.5L339.344,206" id="mm02e6c8bbc2-L_DR_TG_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DR_TG_0" data-points="W3sieCI6MzM5LjM0Mzc1LCJ5IjoxNjB9LHsieCI6MzM5LjM0Mzc1LCJ5IjoxODV9LHsieCI6MzM5LjM0Mzc1LCJ5IjoyMTB9XQ==" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/><path d="M339.344,282L339.344,286.167C339.344,290.333,339.344,298.667,339.414,306.417C339.484,314.167,339.625,321.334,339.695,324.917L339.765,328.501" id="mm02e6c8bbc2-L_TG_ACC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TG_ACC_0" data-points="W3sieCI6MzM5LjM0Mzc1LCJ5IjoyODJ9LHsieCI6MzM5LjM0Mzc1LCJ5IjozMDd9LHsieCI6MzM5Ljg0Mzc1LCJ5IjozMzIuNX1d" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/><path d="M290.596,389.5L277.265,397.083C263.934,404.667,237.272,419.833,216.031,434.634C194.79,449.435,178.97,463.869,171.061,471.087L163.151,478.304" id="mm02e6c8bbc2-L_ACC_ADD_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ACC_ADD_0" data-points="W3sieCI6MjkwLjU5NjM3MTY0NDI5NTMsInkiOjM4OS41fSx7IngiOjIxMC42MDkzNzUsInkiOjQzNX0seyJ4IjoxNjAuMTk2MDc0Njk1MTIxOTUsInkiOjQ4MX1d" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/><path d="M116.352,481L115.417,473.333C114.482,465.667,112.612,450.333,111.677,430.25C110.742,410.167,110.742,385.333,110.742,364C110.742,342.667,110.742,324.833,110.742,305.75C110.742,286.667,110.742,266.333,110.742,246C110.742,225.667,110.742,205.333,110.742,186.75C110.742,168.167,110.742,151.333,110.742,134.5C110.742,117.667,110.742,100.833,121.562,88.478C132.383,76.123,154.023,68.245,164.844,64.307L175.664,60.368" id="mm02e6c8bbc2-L_ADD_CTX_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ADD_CTX_0" data-points="W3sieCI6MTE2LjM1MTk0MzU5NzU2MDk4LCJ5Ijo0ODF9LHsieCI6MTEwLjc0MjE4NzUsInkiOjQzNX0seyJ4IjoxMTAuNzQyMTg3NSwieSI6MzYwLjV9LHsieCI6MTEwLjc0MjE4NzUsInkiOjMwN30seyJ4IjoxMTAuNzQyMTg3NSwieSI6MjQ2fSx7IngiOjExMC43NDIxODc1LCJ5IjoxODV9LHsieCI6MTEwLjc0MjE4NzUsInkiOjEzNC41fSx7IngiOjExMC43NDIxODc1LCJ5Ijo4NH0seyJ4IjoxNzkuNDIyNTcxMTYzMzY2MzQsInkiOjU5fV0=" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/><path d="M354.712,389.5L358.629,397.083C362.545,404.667,370.378,419.833,374.295,436.167C378.211,452.5,378.211,470,378.211,478.75L378.211,487.5" id="mm02e6c8bbc2-L_ACC_MON_0" class="edge-thickness-normal edge-pattern-dotted edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_ACC_MON_0" data-points="W3sieCI6MzU0LjcxMjQwNTYyMDgwNTQsInkiOjM4OS41fSx7IngiOjM3OC4yMTA5Mzc1LCJ5Ijo0MzV9LHsieCI6Mzc4LjIxMDkzNzUsInkiOjQ5MS41fV0=" data-look="classic" marker-end="url(#mm02e6c8bbc2_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_CTX_DR_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_DR_TG_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_TG_ACC_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_ACC_ADD_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_ADD_CTX_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(378.2109375, 435)"><g class="label" data-id="L_ACC_MON_0" transform="translate(-57.734375, -21)"><foreignObject width="115.46875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>acceptance drifts<br />with traffic</p></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm02e6c8bbc2-flowchart-CTX-0" data-look="classic" transform="translate(249.4765625, 33.5)"><rect class="basic label-container" style="" x="-76.71875" y="-25.5" width="153.4375" height="51"/><g class="label" style="" transform="translate(-46.71875, -10.5)"><rect/><foreignObject width="93.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Context so far</p></span></div></foreignObject></g></g><g class="node default" id="mm02e6c8bbc2-flowchart-DR-1" data-look="classic" transform="translate(339.34375, 134.5)"><rect class="basic label-container" style="" x="-108.984375" y="-25.5" width="217.96875" height="51"/><g class="label" style="" transform="translate(-78.984375, -10.5)"><rect/><foreignObject width="157.96875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Draft proposes k tokens</p></span></div></foreignObject></g></g><g class="node default" id="mm02e6c8bbc2-flowchart-TG-3" data-look="classic" transform="translate(339.34375, 246)"><rect class="basic label-container" style="" x="-91.9453125" y="-36" width="183.890625" height="72"/><g class="label" style="" transform="translate(-61.9453125, -21)"><rect/><foreignObject width="123.890625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Target checks all k<br />in one pass</p></span></div></foreignObject></g></g><g class="node default" id="mm02e6c8bbc2-flowchart-ACC-5" data-look="classic" transform="translate(339.34375, 360.5)"><polygon points="14.25,0 149.453125,0 163.703125,-28.5 149.453125,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-81.8515625,28.5)"/><g class="label" style="" transform="translate(-60.1015625, -21)"><rect/><foreignObject width="120.203125" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Accept up to the<br />first disagreement</p></span></div></foreignObject></g></g><g class="node default" id="mm02e6c8bbc2-flowchart-ADD-7" data-look="classic" transform="translate(120.7421875, 517)"><rect class="basic label-container" style="" x="-112.7421875" y="-36" width="225.484375" height="72"/><g class="label" style="" transform="translate(-82.7421875, -21)"><rect/><foreignObject width="165.484375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Append accepted tokens<br />+ one target token</p></span></div></foreignObject></g></g><g class="node default" id="mm02e6c8bbc2-flowchart-MON-11" data-look="classic" transform="translate(378.2109375, 517)"><rect class="basic label-container" style="" x="-94.7265625" y="-25.5" width="189.453125" height="51"/><g class="label" style="" transform="translate(-64.7265625, -10.5)"><rect/><foreignObject width="129.453125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Monitor per domain</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm02e6c8bbc2-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm02e6c8bbc2-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm02e6c8bbc2-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>EAGLE-3 beats ngram drafts on most traffic. P-EAGLE runs parallel speculation for deeper draft trees. The trade-off: P99 latency on rejection is higher because the verify pass is larger. The serving config must report batch-size-bucketed latency to surface this.</p>
+<p>Deployment is Kubernetes. vLLM 0.7 runs one replica per GPU or tensor-parallel shard. HPA autoscales on queue-wait rather than CPU. FP8 (Marlin) and INT4 (AWQ) quants keep GPU memory inside an H100 / H200 envelope. The end-to-end report is throughput, acceptance rate, p50/p99 at batch 1/8/32, and $/1M tokens.</p>
+<h2>Architecture</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">request ingress
+    |
+    v
+vLLM server (0.7) or SGLang (0.4)
+    |
+    +-- draft: EAGLE-3 heads | P-EAGLE parallel | ngram fallback
+    +-- target: Llama 3.3 70B | Qwen3-Coder-30B | GPT-OSS-120B
+    |     quantized FP8-Marlin or INT4-AWQ
+    |
+    v
+verify pass: batch k draft tokens through target
+    |
+    v (accept prefix; resample for rejected suffix)
+    v
+token stream back to client
+    |
+    v
+Prometheus metrics: throughput, acceptance rate, queue wait, latency p50/p99
+    |
+    v
+HPA on queue-wait metric
+</code></pre></div>
+<h2>Stack</h2>
+<ul>
+<li>Serving: vLLM 0.7 or SGLang 0.4</li>
+<li>Speculative methods: EAGLE-3 draft heads, P-EAGLE parallel speculation, ngram fallback</li>
+<li>Draft training: SpecForge (SGLang) or Red Hat Speculators</li>
+<li>Target models: Llama 3.3 70B, Qwen3-Coder-30B MoE, GPT-OSS-120B</li>
+<li>Quantization: FP8 (Marlin), INT4 AWQ</li>
+<li>Deployment: Kubernetes + NVIDIA device plugin; HPA on queue-wait metric</li>
+<li>Eval: ShareGPT, MT-Bench-v2, GSM8K, HumanEval for domain-spread acceptance measurement</li>
+<li>Reference: TensorRT-LLM speculative decoding for a vendor baseline</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cf-spec-decode"></div></figure></p>
+<h2>Build it</h2>
+<ol>
+<li>
+<p><strong>Target model prep.</strong> Pick Llama 3.3 70B. Quantize to FP8 via Marlin. Deploy under vLLM 0.7 on 1xH100 (or 2x tensor-parallel).</p>
+</li>
+<li>
+<p><strong>Draft source.</strong> Pull an aligned EAGLE-3 draft head from Red Hat Speculators (or train one via SpecForge). Load into vLLM's speculative-decoding config.</p>
+</li>
+<li>
+<p><strong>Baseline numbers.</strong> Before speculation: tokens/s at batch 1/8/32, p50/p99 latency, GPU utilization. Publish.</p>
+</li>
+<li>
+<p><strong>Enable EAGLE-3.</strong> Flip config; rerun the same benchmark. Report speedup, acceptance rate, p99 tail-latency delta.</p>
+</li>
+<li>
+<p><strong>P-EAGLE.</strong> Enable parallel speculation; measure deeper draft tree vs serial EAGLE-3. Report the inflection where P-EAGLE helps vs hurts.</p>
+</li>
+<li>
+<p><strong>Domain traffic.</strong> Run ShareGPT vs HumanEval vs domain-specific traffic through the same server. Measure acceptance rate per distribution. Identify when drafts drift.</p>
+</li>
+<li>
+<p><strong>Second target model.</strong> Run the same pipeline on Qwen3-Coder-30B MoE. Draft is trickier (MoE routing noise). Report.</p>
+</li>
+<li>
+<p><strong>K8s HPA.</strong> Deploy under K8s with HPA tracking <code>queue_wait_ms</code>. Demonstrate scale-out when load triples.</p>
+</li>
+<li>
+<p><strong>Cost comparison.</strong> Compute $/1M tokens vs Anthropic Claude Sonnet 4.7 and OpenAI GPT-5.4 on the same eval. Publish.</p>
+</li>
+</ol>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-title">Expected speed-up</div><div class="co-body"><p>With per-token acceptance probability <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span></span> and <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> draft tokens per step, the expected number of tokens produced per target pass is</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathbb">E</span><span class="mopen">[</span><span class="mord text"><span class="mord">tokens</span></span><span class="mclose">]</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.2954em;vertical-align:-0.7693em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5261em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.7693em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span></span></div></p>
+<p>If one draft token costs a fraction <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span></span></span></span> of a target pass, the wall-clock speed-up is about <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:2.4621em;vertical-align:-0.936em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.5261em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mclose">)</span><span class="mopen">(</span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord">1</span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8491em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mbin mtight">+</span><span class="mord mtight">1</span></span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.936em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span></span></span></span> (Leviathan et al., 2023).</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Picking k</div><div class="co-body"><p>Take <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.8</span></span></span></span> and a draft that costs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">c</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.05</span></span></span></span> of a target pass.</p>
+<ol>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>: tokens per pass <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">8</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">3</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/0.2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2.44</span></span></span></span>; cost factor <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.1</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.1</span></span></span></span>; speed-up ≈ 2.2×.</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4</span></span></span></span>: tokens <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">8</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">5</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/0.2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">3.36</span></span></span></span>; cost <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.2</span></span></span></span>; speed-up ≈ 2.8×.</li>
+<li><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">8</span></span></span></span>: tokens <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mopen">(</span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1.0641em;vertical-align:-0.25em;"></span><span class="mord">0.</span><span class="mord"><span class="mord">8</span><span class="msupsub"><span class="vlist-t"><span class="vlist-r"><span class="vlist" style="height:0.8141em;"><span style="top:-3.063em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight">9</span></span></span></span></span></span></span></span><span class="mclose">)</span><span class="mord">/0.2</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">4.33</span></span></span></span>; cost <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">1.4</span></span></span></span>; speed-up ≈ 3.1×.</li>
+<li>Gains flatten as <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> grows, because later guesses are rarely reached, while their cost keeps adding up; with a costlier draft the best <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> is smaller.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> The target model verifies all draft tokens in one pass.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Speculative decoding lowers output quality slightly.
+  With exact verification the output distribution is unchanged.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> Acceptance rate depends on the traffic, so it can drift.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Tokens per target call equals wall-clock speed-up.
+  Draft cost and larger verify passes eat into it, especially at large batch sizes.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal" style="margin-right:0.0037em;">α</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">0.75</span></span></span></span> and a draft costing 5% of a target pass, which <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal" style="margin-right:0.03148em;">k</span></span></span></span> between 1 and 10 gives the largest speed-up, and does it change if the draft costs 20%?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Speed-up against draft length</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def speedup(alpha, k, c):
+    return (1 - alpha ** (k + 1)) / ((1 - alpha) * (k * c + 1))
+
+for c in (0.05, 0.20):
+    row = {k: speedup(0.75, k, c) for k in range(1, 11)}
+    best = max(row, key=row.get)
+    print(f&quot;draft cost {c:.0%}: &quot; + &quot;  &quot;.join(f&quot;k={k}:{v:.2f}&quot; for k, v in row.items()))
+    print(f&quot;   best k = {best}, speed-up {row[best]:.2f}x&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">draft cost 5%: k=1:1.67  k=2:2.10  k=3:2.38  k=4:2.54  k=5:2.63  k=6:2.67  k=7:2.67  k=8:2.64  k=9:2.60  k=10:2.55
+   best k = 7, speed-up 2.67x
+draft cost 20%: k=1:1.46  k=2:1.65  k=3:1.71  k=4:1.69  k=5:1.64  k=6:1.58  k=7:1.50  k=8:1.42  k=9:1.35  k=10:1.28
+   best k = 3, speed-up 1.71x</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With a cheap draft (5% of a pass) the curve is flat from about k = 5 to 8, peaking near 2.7× at k = 7; with a costly one (20%) the best k drops to 3 and the speed-up to about 1.7×. This is the range real systems report (2–3×), and it shows why the toy's 6× figures below are optimistic: they count target calls but give the draft no cost at all.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">$ curl https://infer.example.com/v1/chat/completions -d '{&quot;messages&quot;:[...]}'
+[serve]     vLLM 0.7, Llama 3.3 70B FP8, EAGLE-3 active
+[decode]    bs=8, accepted_tokens_per_step=3.2, acceptance_rate=0.76
+[latency]   first-token 42ms, full-response 980ms (620 tokens)
+[cost]      $0.34 per 1M output tokens at sustained throughput
+</code></pre></div>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>softmax_from</code>, <code>sample</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Speculative decoding server — draft/verify scheduler scaffold.
+
+The hard architectural primitive is the draft/verify scheduler: a draft
+model proposes k candidate tokens; the target model verifies them in one
+batched pass; any accepted prefix is committed and the rejected suffix is
+resampled from the target. This scaffold implements the scheduler with
+synthetic token probabilities so the accept/reject logic and the throughput
+math are observable end to end.
+
+Run:  python main.py
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+
+
+# ---------------------------------------------------------------------------
+# synthetic models  --  probability distributions over a tiny vocabulary
+# ---------------------------------------------------------------------------
+
+VOCAB = list(&quot;abcdefghij&quot;)
+
+
+def softmax_from(seed: int) -&gt; list[float]:
+    rnd = random.Random(seed)
+    weights = [rnd.random() for _ in VOCAB]
+    total = sum(weights)
+    return [w / total for w in weights]
+
+
+def sample(dist: list[float], rng: random.Random) -&gt; int:
+    r = rng.random()
+    acc = 0.0
+    for i, p in enumerate(dist):
+        acc += p
+        if r &lt;= acc:
+            return i
+    return len(dist) - 1
+
+
+# ---------------------------------------------------------------------------
+# target  --  the expensive model we are trying to save calls to
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>TargetModel</code>, <code>DraftModel</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class TargetModel:
+    calls: int = 0
+    tokens_verified: int = 0
+
+    def distribution(self, ctx_seed: int) -&gt; list[float]:
+        return softmax_from(ctx_seed * 7 + 13)
+
+    def verify(self, draft_tokens: list[int], ctx_seed: int,
+               rng: random.Random) -&gt; tuple[list[int], int]:
+        &quot;&quot;&quot;Return (accepted_tokens, resampled_next). In one target call we can
+        verify draft_tokens in a batched pass: the target produces a prob per
+        position; we accept up to the first rejection.&quot;&quot;&quot;
+        self.calls += 1
+        self.tokens_verified += len(draft_tokens) + 1
+        accepted: list[int] = []
+        for pos, tok in enumerate(draft_tokens):
+            dist = self.distribution(ctx_seed + pos)
+            # simple accept criterion: target prob on this token &gt;= 0.5 * max prob
+            if dist[tok] &gt;= 0.5 * max(dist):
+                accepted.append(tok)
+            else:
+                break
+        # resample a next token from the target at the position after the accept
+        ctx = ctx_seed + len(accepted)
+        dist = self.distribution(ctx)
+        next_tok = sample(dist, rng)
+        return accepted, next_tok
+
+
+# ---------------------------------------------------------------------------
+# draft  --  a cheaper model that is mostly aligned with target
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DraftModel:
+    calls: int = 0
+    alignment: float = 0.80     # probability that draft picks what target would
+
+    def propose(self, ctx_seed: int, k: int, rng: random.Random,
+                target: TargetModel) -&gt; list[int]:
+        self.calls += 1
+        draft_tokens: list[int] = []
+        for pos in range(k):
+            dist = target.distribution(ctx_seed + pos)
+            # with prob alignment, emit target's best; otherwise sample a neighbour
+            if rng.random() &lt; self.alignment:
+                draft_tokens.append(max(range(len(dist)), key=lambda i: dist[i]))
+            else:
+                draft_tokens.append(sample(dist, rng))
+        return draft_tokens
+
+
+# ---------------------------------------------------------------------------
+# decode scheduler  --  speculative loop + baseline greedy for comparison
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>Metrics</code>, <code>speculative_decode</code>, <code>baseline_decode</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class Metrics:
+    generated: int = 0
+    target_calls: int = 0
+    draft_calls: int = 0
+    accepted_sum: int = 0
+
+    def acceptance_rate(self, k: int) -&gt; float:
+        if self.target_calls == 0:
+            return 0.0
+        return self.accepted_sum / (self.target_calls * k)
+
+    def tokens_per_target_call(self) -&gt; float:
+        return self.generated / max(1, self.target_calls)
+
+
+def speculative_decode(n_tokens: int, k: int, rng: random.Random,
+                       target: TargetModel, draft: DraftModel) -&gt; Metrics:
+    m = Metrics()
+    ctx_seed = 1
+    while m.generated &lt; n_tokens:
+        draft_tokens = draft.propose(ctx_seed, k, rng, target)
+        m.draft_calls += 1
+        accepted, next_tok = target.verify(draft_tokens, ctx_seed, rng)
+        m.target_calls += 1
+        m.accepted_sum += len(accepted)
+        for tok in accepted:
+            m.generated += 1
+            ctx_seed += 1
+            if m.generated &gt;= n_tokens:
+                break
+        if m.generated &lt; n_tokens:
+            m.generated += 1     # resampled next_tok
+            ctx_seed += 1
+    return m
+
+
+def baseline_decode(n_tokens: int, rng: random.Random,
+                    target: TargetModel) -&gt; Metrics:
+    m = Metrics()
+    ctx_seed = 1
+    while m.generated &lt; n_tokens:
+        target.calls += 1
+        m.target_calls += 1
+        dist = target.distribution(ctx_seed)
+        _ = sample(dist, rng)
+        m.generated += 1
+        ctx_seed += 1
+    return m
+
+
+# ---------------------------------------------------------------------------
+# sweep  --  compare speedup across k and draft alignment
+# ---------------------------------------------------------------------------
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    n_tokens = 500
+    print(f&quot;=== decode {n_tokens} tokens, compare baseline vs speculative ===&quot;)
+
+    target = TargetModel()
+    rng = random.Random(7)
+    base = baseline_decode(n_tokens, rng, target)
+    print(f&quot;baseline: {base.target_calls} target calls, &quot;
+          f&quot;{base.tokens_per_target_call():.2f} tok/call&quot;)
+
+    for alignment in (0.60, 0.75, 0.90):
+        for k in (2, 4, 6):
+            target = TargetModel()
+            draft = DraftModel(alignment=alignment)
+            rng = random.Random(7)
+            m = speculative_decode(n_tokens, k, rng, target, draft)
+            speedup = base.target_calls / max(1, m.target_calls)
+            print(f&quot;  align={alignment:.2f} k={k}  &quot;
+                  f&quot;target_calls={m.target_calls:3d}  &quot;
+                  f&quot;acceptance={m.acceptance_rate(k):.2f}  &quot;
+                  f&quot;tok/call={m.tokens_per_target_call():.2f}  &quot;
+                  f&quot;speedup={speedup:.2f}x&quot;)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">=== decode 500 tokens, compare baseline vs speculative ===
+baseline: 500 target calls, 1.00 tok/call
+  align=0.60 k=2  target_calls=181  acceptance=0.88  tok/call=2.76  speedup=2.76x
+  align=0.60 k=4  target_calls=117  acceptance=0.82  tok/call=4.27  speedup=4.27x
+  align=0.60 k=6  target_calls= 99  acceptance=0.69  tok/call=5.05  speedup=5.05x
+  align=0.75 k=2  target_calls=177  acceptance=0.92  tok/call=2.82  speedup=2.82x
+  align=0.75 k=4  target_calls=111  acceptance=0.88  tok/call=4.50  speedup=4.50x
+  align=0.75 k=6  target_calls= 82  acceptance=0.85  tok/call=6.10  speedup=6.10x
+  align=0.90 k=2  target_calls=171  acceptance=0.96  tok/call=2.92  speedup=2.92x
+  align=0.90 k=4  target_calls=103  acceptance=0.96  tok/call=4.85  speedup=4.85x
+  align=0.90 k=6  target_calls= 78  acceptance=0.91  tok/call=6.41  speedup=6.41x</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The simulation decodes 500 tokens and shows the two levers clearly: better draft–target alignment raises acceptance, and longer drafts produce more tokens per target call, up to 6.4 at alignment 0.9 and k = 6. Notice that acceptance <em>falls</em> as k grows (from 0.88 to 0.69 at alignment 0.6), since later guesses are harder. And remember what "speedup" means here: target calls saved, with draft cost and verification overhead left out, so real wall-clock gains are much smaller, as the visual shows.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>A team reports "3× throughput with speculative decoding" measured at batch size 1 on chat prompts, then deploys it for a code-completion service running at batch size 32. Throughput barely improves and p99 latency gets worse. Name two reasons. (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>A cheap draft guesses; the target verifies all guesses in one pass.</li>
+<li>Output is unchanged; speed depends on acceptance rate.</li>
+<li>Expected tokens per pass: (1 − α^(k+1)) / (1 − α); draft cost limits useful k.</li>
+<li>Acceptance drifts with traffic: measure per domain.</li>
+<li>Report speed-up and p99 at several batch sizes, plus cost per million tokens.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-speculative-decoding"><span class="t" style="--cs-hue:252">SD</span>Cheat sheet · Speculative Decoding with Drafts, EAGLE and MTP</a></div>
+<h2>Ship it</h2>
+<p><code>outputs/skill-inference-server.md</code> describes the deliverable. A measured serving stack with speculative decoding, a full benchmark report, and a K8s deployment.</p>
+<div class="tbl"><table>
+<thead>
+<tr>
+<th style="text-align: center;">Weight</th>
+<th>Criterion</th>
+<th>How it is measured</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: center;">25</td>
+<td>Measured speedup vs baseline</td>
+<td>2.5x+ throughput at matched quality on two models</td>
+</tr>
+<tr>
+<td style="text-align: center;">20</td>
+<td>Acceptance rate on realistic traffic</td>
+<td>Per-distribution acceptance-rate report</td>
+</tr>
+<tr>
+<td style="text-align: center;">20</td>
+<td>P99 tail-latency discipline</td>
+<td>p99 at batch 1/8/32 with and without speculation</td>
+</tr>
+<tr>
+<td style="text-align: center;">20</td>
+<td>Ops</td>
+<td>K8s deploy, HPA on queue-wait, rollout smooth</td>
+</tr>
+<tr>
+<td style="text-align: center;">15</td>
+<td>Write-up and methodology</td>
+<td>Clear explanation of what changed and why</td>
+</tr>
+<tr>
+<td style="text-align: center;"><strong>100</strong></td>
+<td></td>
+<td></td>
+</tr>
+</tbody>
+</table></div>
+<p><strong><code>outputs/skill-inference-server.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: inference-server
+description: Ship a speculative-decoding inference server with EAGLE-3 or P-EAGLE drafts, K8s autoscaling, and a full throughput/latency/cost report.
+version: 1.0.0
+phase: 19
+lesson: 14
+tags: [capstone, inference, vllm, sglang, eagle-3, p-eagle, speculative-decoding, quantization, hpa]
+---
+
+Given two open target models (Llama 3.3 70B and Qwen3-Coder-30B MoE or GPT-OSS-120B), ship a production serving stack with speculative decoding, quantization, and Kubernetes autoscaling. Publish measured speedups and tail-latency numbers.
+
+Build plan:
+
+1. Deploy target models under vLLM 0.7 (or SGLang 0.4) with FP8 Marlin quantization.
+2. Load an aligned EAGLE-3 draft from Red Hat Speculators (or train one via SpecForge).
+3. Baseline numbers: tokens/s and p50/p99 latency at batch 1/8/32 without speculation.
+4. Enable EAGLE-3. Rerun the same benchmark. Report speedup, acceptance rate, p99 tail-latency delta.
+5. Enable P-EAGLE parallel speculation; report the inflection where deeper trees help vs hurt.
+6. Run the benchmarks across distributions: ShareGPT, HumanEval, domain data. Publish acceptance-rate drift.
+7. Repeat on the second target model (MoE); identify routing-noise sensitivity in draft acceptance.
+8. Deploy on Kubernetes with HPA tracking `queue_wait_ms`. Demonstrate scale-out when load triples.
+9. Compare $/1M tokens vs Anthropic Claude Sonnet 4.7 and OpenAI GPT-5.4 on matched evals.
+
+Assessment rubric:
+
+| Weight | Criterion | Measurement |
+|:-:|---|---|
+| 25 | Measured speedup vs baseline | 2.5x+ throughput at matched quality on both models |
+| 20 | Acceptance rate on realistic traffic | Per-distribution acceptance-rate report |
+| 20 | P99 tail-latency discipline | p99 at batch 1/8/32 with and without speculation |
+| 20 | Ops | K8s deploy, HPA on queue-wait, smooth rollout, drain-first upgrade |
+| 15 | Write-up and methodology | Clear derivation of metrics, matched baselines |
+
+Hard rejects:
+
+- Reporting steady-state throughput without tail latency.
+- HPA on CPU instead of queue-wait. Will thrash under GPU saturation.
+- Ignoring draft-target version alignment. Drifted drafts cost more than no speculation.
+- Cost comparisons that omit the hosted APIs' prompt-caching discounts.
+
+Refusal rules:
+
+- Refuse to serve without a rollout drain. Upgrading in-place while requests are in flight is disqualifying.
+- Refuse to report acceptance rate aggregated across distributions. Per-distribution is mandatory.
+- Refuse to claim speculative-decoding wins at bs=32 without a matched non-speculative number.
+
+Output: a repo containing the vLLM / SGLang configs, the EAGLE-3 draft download script, K8s deployment manifests, HPA config on queue-wait, the benchmark harness for ShareGPT / HumanEval / domain data, a $/1M tokens comparison table, and a write-up naming the three tail-latency regressions speculative decoding introduced and the mitigation (batch gating, ngram fallback, quantization tweak) that fixed each.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Measure acceptance-rate degradation when the draft is one version behind the target (e.g., Llama 3.3 -&gt; 3.4 drift). Build a monitoring alert.</p>
+</li>
+<li>
+<p>Implement ngram-fallback: if EAGLE-3 acceptance drops below a threshold, switch to ngram drafts. Report reliability improvement.</p>
+</li>
+<li>
+<p>Run a controlled MoE experiment: same Qwen3-Coder-30B with routing noise injected vs without. Measure draft acceptance sensitivity.</p>
+</li>
+<li>
+<p>Extend to H200 (141 GB). Report the model-size-per-replica headroom gained and whether you can serve an unquantized Llama 3.3 70B.</p>
+</li>
+<li>
+<p>Benchmark TensorRT-LLM speculative decoding on the same H100 hardware. Report where it wins vs vLLM.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1914-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · Fallback on low acceptance</span></summary><div class="qa-a"><p>Track acceptance over a sliding window per traffic class. When it falls below the level where speculation pays off (from the speed-up formula with your draft's cost, often around 0.5), switch that class to an n-gram draft or to plain decoding, and switch back when a probe shows recovery. Report how often the fallback triggers and the latency it saved.</p></div></details>
+<details class="qa" id="a1914-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Wrong batch size, wrong traffic</span></summary><div class="qa-a"><p>At batch size 32 the GPU is already busy, so the spare compute speculation relies on is gone and larger verify passes add latency. And a draft tuned on chat accepts fewer guesses on code, lowering the gain further; rejected guesses also create the tail-latency spikes. Benchmark at the production batch size on production-like traffic before enabling it.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.vllm.ai">vLLM EAGLE and P-EAGLE documentation</a> — the reference serving stack</li>
+<li><a href="https://aws.amazon.com/blogs/machine-learning/p-eagle-faster-llm-inference-with-parallel-speculative-decoding-in-vllm/">P-EAGLE (AWS 2026)</a> — parallel speculative decoding paper + integration</li>
+<li><a href="https://github.com/sgl-project/SpecForge">SGLang SpecForge</a> — draft-head training pipeline</li>
+<li><a href="https://github.com/neuralmagic/speculators">Red Hat Speculators</a> — aligned draft hub</li>
+<li><a href="https://nvidia.github.io/TensorRT-LLM/">TensorRT-LLM speculative decoding</a> — vendor alternative</li>
+<li><a href="https://fireworks.ai/blog">Fireworks.ai serving architecture</a> — commercial reference</li>
+<li><a href="https://arxiv.org/abs/2503.01840">EAGLE-3 paper (arXiv:2503.01840)</a> — the method paper</li>
+<li><a href="https://github.com/vllm-project/vllm">vLLM repository</a> — code and benchmarks</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1914" id="done-a1914">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1914" id="undo-a1914" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1913"><span class="pn-dir">Previous</span><span class="pn-t">19.13 · Capstone 13: a Governed MCP Server with a Registry</span></a><a class="pn next" href="#a1915"><span class="pn-dir">Next</span><span class="pn-t">19.15 · Capstone 15: a Constitutional Safety Harness and Red-Team Range</span></a></div></footer>

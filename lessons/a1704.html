@@ -1,0 +1,455 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · LLM Inference, Infrastructure and LLMOps</a></nav><h1>Inside LLM Serving Engines: PagedAttention, Continuous Batching and Chunked Prefill</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.4</span><span class="chip">75 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1704" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain PagedAttention as a KV cache allocator: blocks, block tables, and why fragmentation stays under 4% at production load.</li>
+<li>Diagram continuous batching at the iteration level: how finished sequences leave the batch and new ones join without draining.</li>
+<li>Describe chunked prefill in one sentence and name which latency metric it protects (hint: it is the ITL tail of concurrent decodes, not mean throughput).</li>
+<li>Check a vLLM feature combination against the compatibility matrix for your version before enabling every optimization at once.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 17.1 (Model Serving), Phase 11 (LLM Engineering and Applications)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 75 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy continuous batching scheduler). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Modern serving-engine throughput rests on three compounding defaults, not a single trick. PagedAttention is always on. Continuous batching injects new requests into the active batch between decode iterations. Chunked prefill slices long prompts so decode tokens never starve. Turn all three on and a Llama 3.3 70B FP8 on one H100 SXM5 pushes 2,200-2,400 tok/s at 128 concurrent — roughly 25% above vLLM's own default and 3-4x a naive PyTorch loop. This lesson reads the scheduler and attention kernel of vLLM — the reference engine for all three techniques — at a level you can diagram, and ends with a toy continuous batcher in <code>code/main.py</code> that schedules prefill and decode the way vLLM does.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PagedAttention</td>
+<td>"the KV trick"</td>
+<td>Fixed-size block allocator for KV cache; fragmentation &lt;4%</td>
+</tr>
+<tr>
+<td>Block table</td>
+<td>"the page table"</td>
+<td>Per-sequence map from logical token position to physical KV block</td>
+</tr>
+<tr>
+<td>Continuous batching</td>
+<td>"dynamic batching, but right"</td>
+<td>Admit/release decisions made every decode iteration</td>
+</tr>
+<tr>
+<td>Chunked prefill</td>
+<td>"prefill splitting"</td>
+<td>Break long prefill into 512-token slices interleaved with decode</td>
+</tr>
+<tr>
+<td>TTFT</td>
+<td>"first token time"</td>
+<td>Prefill + queue + network; dominated by prefill at long prompts</td>
+</tr>
+<tr>
+<td>ITL</td>
+<td>"inter-token latency"</td>
+<td>Time between consecutive decode tokens; dominated by batch size</td>
+</tr>
+<tr>
+<td>Goodput</td>
+<td>"throughput that meets SLO"</td>
+<td>Requests/sec that still hit TTFT and ITL targets (Phase 17 · 08 reports it as the share of requests)</td>
+</tr>
+<tr>
+<td>V1 scheduler</td>
+<td>"the new scheduler"</td>
+<td>vLLM's 2026 scheduler; runs continuous batching with chunked prefill</td>
+</tr>
+<tr>
+<td><code>--gpu-memory-utilization</code></td>
+<td>"the memory knob"</td>
+<td>Fraction of HBM reserved for KV blocks after weights and activations</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>A model server answers many users at once by putting their requests into one <strong>batch</strong> and running them through the model together. The hard part is that requests have different lengths and arrive at different times. vLLM, the most used open-source server, does three things to keep the GPU full of useful work. <strong>PagedAttention</strong> stores each request's KV cache (the keys and values the model remembers for earlier tokens) in small fixed-size blocks, the way an operating system pages memory, so little is wasted. <strong>Continuous batching</strong> lets requests join and leave the batch after every generated token instead of waiting for the slowest one. <strong>Chunked prefill</strong> cuts a long prompt into slices so it does not freeze everyone else's output while it is read.</p></div></aside>
+<p>A naive PyTorch serve loop runs one request at a time: tokenize, prefill, decode until EOS, return. At one user this works. At one hundred, it is a queue of patient people. The obvious fix — static batching — pads every request to the longest prompt in the window, pads every decode to the longest expected output, and stalls the whole batch on the slowest sequence. You pay for padding you never use, and fast requests wait for slow ones.</p>
+<p>vLLM solves three problems at once. PagedAttention stops KV cache fragmentation from eating 60-80% of GPU memory the way classic contiguous allocation does. Continuous batching lets requests join and leave the batch between each decode iteration, so the batch is always full of real work. Chunked prefill breaks a 32k-token prompt into ~512-token slices that interleave with decode, so a long prompt does not freeze every decode token on the GPU.</p>
+<p>The 2026 production default is all three on. You need to understand what each one does because the failure modes are all on the scheduler, not the model.</p>
+<h2>Idea 1 · PagedAttention as a virtual memory system</h2>
+<p>A KV cache is <code>num_layers × 2 × num_heads × head_dim × seq_len × bytes_per_element</code> per sequence. For Llama 3.3 70B at 8192 tokens, that is roughly 1.25 GB per sequence in BF16. If you pre-reserve 8192 slots for every request but the average request only uses 1500 tokens, you waste roughly 82% of the HBM you reserved. Classic batching pays this waste.</p>
+<figure class="diagram mmfig" data-mmd="a1704" data-h="18d3956b75"><div class="dg-scroll"><svg class="dg mm" id="mm18d3956b75" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 289.09px; background-color: transparent;" viewBox="0 0 289.08984375 811" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm18d3956b75{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm18d3956b75 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm18d3956b75 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm18d3956b75 .error-icon{fill:#f4efe7;}#mm18d3956b75 .error-text{fill:#0b1018;stroke:#0b1018;}#mm18d3956b75 .edge-thickness-normal{stroke-width:1px;}#mm18d3956b75 .edge-thickness-thick{stroke-width:3.5px;}#mm18d3956b75 .edge-pattern-solid{stroke-dasharray:0;}#mm18d3956b75 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm18d3956b75 .edge-pattern-dashed{stroke-dasharray:3;}#mm18d3956b75 .edge-pattern-dotted{stroke-dasharray:2;}#mm18d3956b75 .marker{fill:#6c6357;stroke:#6c6357;}#mm18d3956b75 .marker.cross{stroke:#6c6357;}#mm18d3956b75 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm18d3956b75 p{margin:0;}#mm18d3956b75 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm18d3956b75 .cluster-label text{fill:#0b1018;}#mm18d3956b75 .cluster-label span{color:#0b1018;}#mm18d3956b75 .cluster-label span p{background-color:transparent;}#mm18d3956b75 .label text,#mm18d3956b75 span{fill:#211c16;color:#211c16;}#mm18d3956b75 .node rect,#mm18d3956b75 .node circle,#mm18d3956b75 .node ellipse,#mm18d3956b75 .node polygon,#mm18d3956b75 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm18d3956b75 .rough-node .label text,#mm18d3956b75 .node .label text,#mm18d3956b75 .image-shape .label,#mm18d3956b75 .icon-shape .label{text-anchor:middle;}#mm18d3956b75 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm18d3956b75 .rough-node .label,#mm18d3956b75 .node .label,#mm18d3956b75 .image-shape .label,#mm18d3956b75 .icon-shape .label{text-align:center;}#mm18d3956b75 .node.clickable{cursor:pointer;}#mm18d3956b75 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm18d3956b75 .arrowheadPath{fill:#0b0b0b;}#mm18d3956b75 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm18d3956b75 .flowchart-link{stroke:#6c6357;fill:none;}#mm18d3956b75 .edgeLabel{background-color:#ffffff;text-align:center;}#mm18d3956b75 .edgeLabel p{background-color:#ffffff;}#mm18d3956b75 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm18d3956b75 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm18d3956b75 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm18d3956b75 .cluster text{fill:#0b1018;}#mm18d3956b75 .cluster span{color:#0b1018;}#mm18d3956b75 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm18d3956b75 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm18d3956b75 rect.text{fill:none;stroke-width:0;}#mm18d3956b75 .icon-shape,#mm18d3956b75 .image-shape{background-color:#ffffff;text-align:center;}#mm18d3956b75 .icon-shape p,#mm18d3956b75 .image-shape p{background-color:#ffffff;padding:2px;}#mm18d3956b75 .icon-shape .label rect,#mm18d3956b75 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm18d3956b75 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm18d3956b75 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm18d3956b75 .node .neo-node{stroke:#b5521b;}#mm18d3956b75 [data-look="neo"].node rect,#mm18d3956b75 [data-look="neo"].cluster rect,#mm18d3956b75 [data-look="neo"].node polygon{stroke:url(#mm18d3956b75-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm18d3956b75 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm18d3956b75 [data-look="neo"].node path{stroke:url(#mm18d3956b75-gradient);stroke-width:1px;}#mm18d3956b75 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm18d3956b75 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm18d3956b75 [data-look="neo"].node circle{stroke:url(#mm18d3956b75-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm18d3956b75 [data-look="neo"].node circle .state-start{fill:#000000;}#mm18d3956b75 [data-look="neo"].icon-shape .icon{fill:url(#mm18d3956b75-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm18d3956b75 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm18d3956b75-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm18d3956b75 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm18d3956b75_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm18d3956b75_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm18d3956b75_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M184.8,59L183.426,64.917C182.052,70.833,179.303,82.667,179.171,93.934C179.039,105.201,181.524,115.902,182.766,121.253L184.009,126.604" id="mm18d3956b75-L_W_AD_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_W_AD_0" data-points="W3sieCI6MTg0Ljc5OTk4MDc4ODkzNDQyLCJ5Ijo1OX0seyJ4IjoxNzYuNTU0Njg3NSwieSI6OTQuNX0seyJ4IjoxODQuOTEzNDgyNjY2MDE1NjIsInkiOjEzMC41fV0=" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M158.904,187.5L152.112,193.333C145.319,199.167,131.734,210.833,124.941,221.917C118.148,233,118.148,243.5,118.148,248.75L118.148,254" id="mm18d3956b75-L_AD_RUN_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AD_RUN_0" data-points="W3sieCI6MTU4LjkwNDQ0OTQ2Mjg5MDYyLCJ5IjoxODcuNX0seyJ4IjoxMTguMTQ4NDM3NSwieSI6MjIyLjV9LHsieCI6MTE4LjE0ODQzNzUsInkiOjI1OH1d" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M197.532,130.5L198.758,124.5C199.985,118.5,202.438,106.5,202.441,95.233C202.444,83.965,199.997,73.431,198.774,68.164L197.55,62.896" id="mm18d3956b75-L_AD_W_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_AD_W_0" data-points="W3sieCI6MTk3LjUzMTgyOTgzMzk4NDM4LCJ5IjoxMzAuNX0seyJ4IjoyMDQuODkwNjI1LCJ5Ijo5NC41fSx7IngiOjE5Ni42NDUzMzE3MTEwNjU1OCwieSI6NTl9XQ==" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M118.148,330L118.148,334.167C118.148,338.333,118.148,346.667,118.148,354.333C118.148,362,118.148,369,118.148,372.5L118.148,376" id="mm18d3956b75-L_RUN_CH_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RUN_CH_0" data-points="W3sieCI6MTE4LjE0ODQzNzUsInkiOjMzMH0seyJ4IjoxMTguMTQ4NDM3NSwieSI6MzU1fSx7IngiOjExOC4xNDg0Mzc1LCJ5IjozODB9XQ==" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M118.148,452L118.148,456.167C118.148,460.333,118.148,468.667,118.148,476.333C118.148,484,118.148,491,118.148,494.5L118.148,498" id="mm18d3956b75-L_CH_STEP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_CH_STEP_0" data-points="W3sieCI6MTE4LjE0ODQzNzUsInkiOjQ1Mn0seyJ4IjoxMTguMTQ4NDM3NSwieSI6NDc3fSx7IngiOjExOC4xNDg0Mzc1LCJ5Ijo1MDJ9XQ==" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M111.015,574L109.843,579.917C108.67,585.833,106.325,597.667,106.626,608.941C106.927,620.214,109.874,630.929,111.347,636.286L112.821,641.643" id="mm18d3956b75-L_STEP_DONE_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_STEP_DONE_0" data-points="W3sieCI6MTExLjAxNDkxNDc3MjcyNzI3LCJ5Ijo1NzR9LHsieCI6MTAzLjk4MDQ2ODc1LCJ5Ijo2MDkuNX0seyJ4IjoxMTMuODgxNjQ0Mjc1NzAwOTQsInkiOjY0NS41fV0=" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M118.648,681.5L118.565,687.333C118.482,693.167,118.315,704.833,124.761,716.154C131.206,727.475,144.264,738.451,150.793,743.939L157.322,749.426" id="mm18d3956b75-L_DONE_REL_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DONE_REL_0" data-points="W3sieCI6MTE4LjY0ODQzNzUsInkiOjY4MS41fSx7IngiOjExOC4xNDg0Mzc1LCJ5Ijo3MTYuNX0seyJ4IjoxNjAuMzg0MjUzMzI5OTE4MDQsInkiOjc1Mn1d" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M138.299,645.5L144.675,639.5C151.051,633.5,163.803,621.5,165.767,610.1C167.732,598.699,158.909,587.899,154.498,582.498L150.086,577.098" id="mm18d3956b75-L_DONE_STEP_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_DONE_STEP_0" data-points="W3sieCI6MTM4LjI5OTEzODQzNDU3OTQ1LCJ5Ijo2NDUuNX0seyJ4IjoxNzYuNTU0Njg3NSwieSI6NjA5LjV9LHsieCI6MTQ3LjU1NTc4MDE1NzM0MjY3LCJ5Ijo1NzR9XQ==" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/><path d="M221.061,752L228.1,746.083C235.14,740.167,249.218,728.333,256.258,713.5C263.297,698.667,263.297,680.833,263.297,663C263.297,645.167,263.297,627.333,263.297,606.5C263.297,585.667,263.297,561.833,263.297,539.75C263.297,517.667,263.297,497.333,263.297,477C263.297,456.667,263.297,436.333,263.297,416C263.297,395.667,263.297,375.333,263.297,355C263.297,334.667,263.297,314.333,263.297,292.25C263.297,270.167,263.297,246.333,257.171,229.024C251.046,211.714,238.794,200.929,232.669,195.536L226.543,190.143" id="mm18d3956b75-L_REL_AD_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_REL_AD_0" data-points="W3sieCI6MjIxLjA2MTA1OTE3MDA4MTk2LCJ5Ijo3NTJ9LHsieCI6MjYzLjI5Njg3NSwieSI6NzE2LjV9LHsieCI6MjYzLjI5Njg3NSwieSI6NjYzfSx7IngiOjI2My4yOTY4NzUsInkiOjYwOS41fSx7IngiOjI2My4yOTY4NzUsInkiOjUzOH0seyJ4IjoyNjMuMjk2ODc1LCJ5Ijo0Nzd9LHsieCI6MjYzLjI5Njg3NSwieSI6NDE2fSx7IngiOjI2My4yOTY4NzUsInkiOjM1NX0seyJ4IjoyNjMuMjk2ODc1LCJ5IjoyOTR9LHsieCI6MjYzLjI5Njg3NSwieSI6MjIyLjV9LHsieCI6MjIzLjU0MDg2MzAzNzEwOTM4LCJ5IjoxODcuNX1d" data-look="classic" marker-end="url(#mm18d3956b75_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_W_AD_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(118.1484375, 222.5)"><g class="label" data-id="L_AD_RUN_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(204.890625, 94.5)"><g class="label" data-id="L_AD_W_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_RUN_CH_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_CH_STEP_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_STEP_DONE_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(118.1484375, 716.5)"><g class="label" data-id="L_DONE_REL_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(176.5546875, 609.5)"><g class="label" data-id="L_DONE_STEP_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_REL_AD_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm18d3956b75-flowchart-W-0" data-look="classic" transform="translate(190.72265625, 33.5)"><rect class="basic label-container" style="" x="-77.28125" y="-25.5" width="154.5625" height="51"/><g class="label" style="" transform="translate(-47.28125, -10.5)"><rect/><foreignObject width="94.5625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Waiting queue</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-AD-1" data-look="classic" transform="translate(190.72265625, 158.5)"><polygon points="14.25,0 166.484375,0 180.734375,-28.5 166.484375,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-90.3671875,28.5)"/><g class="label" style="" transform="translate(-68.6171875, -21)"><rect/><foreignObject width="137.234375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Free KV blocks<br />for the next request?</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-RUN-3" data-look="classic" transform="translate(118.1484375, 294)"><rect class="basic label-container" style="" x="-98.71875" y="-36" width="197.4375" height="72"/><g class="label" style="" transform="translate(-68.71875, -21)"><rect/><foreignObject width="137.4375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Add to RUNNING<br />(blocks of 16 tokens)</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-CH-7" data-look="classic" transform="translate(118.1484375, 416)"><rect class="basic label-container" style="" x="-96.6328125" y="-36" width="193.265625" height="72"/><g class="label" style="" transform="translate(-66.6328125, -21)"><rect/><foreignObject width="133.265625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Long prompt? prefill<br />in 512-token chunks</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-STEP-9" data-look="classic" transform="translate(118.1484375, 538)"><rect class="basic label-container" style="" x="-110.1484375" y="-36" width="220.296875" height="72"/><g class="label" style="" transform="translate(-80.1484375, -21)"><rect/><foreignObject width="160.296875" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>One forward step:<br />one token per sequence</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-DONE-11" data-look="classic" transform="translate(118.1484375, 663)"><polygon points="9,0 154.328125,0 163.328125,-18 154.328125,-36 9,-36 0,-18" class="label-container" transform="translate(-81.6640625,18)"/><g class="label" style="" transform="translate(-65.1640625, -10.5)"><rect/><foreignObject width="130.328125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Sequence finished?</p></span></div></foreignObject></g></g><g class="node default" id="mm18d3956b75-flowchart-REL-13" data-look="classic" transform="translate(190.72265625, 777.5)"><rect class="basic label-container" style="" x="-89.3046875" y="-25.5" width="178.609375" height="51"/><g class="label" style="" transform="translate(-59.3046875, -10.5)"><rect/><foreignObject width="118.609375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Release its blocks</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm18d3956b75-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm18d3956b75-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm18d3956b75-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p>PagedAttention borrows the idea from OS virtual memory. KV cache is not contiguous per sequence. It is allocated in fixed-size blocks (default 16 tokens). Each sequence has a block table that maps its logical token positions to physical block IDs. When a sequence grows past its allocated blocks, one more block is added. When it finishes, its blocks return to the pool.</p>
+<p>Fragmentation drops from 60-80% (classic) to under 4% (PagedAttention). You do not enable PagedAttention with a flag — it is the only allocator vLLM ships. The knob is <code>--gpu-memory-utilization</code> (default 0.9), which tells vLLM how much HBM to reserve for KV blocks after loading weights and activations.</p>
+<h2>Idea 2 · Continuous batching at the iteration level</h2>
+<p>The old "dynamic batching" waited for a window (say 10 ms) to fill a batch, then ran prefill + decode + decode + decode until every sequence finished. Fast sequences left early and sat idle while the GPU finished the slow ones.</p>
+<p>Continuous batching operates between each decode step. Call the set of running sequences the <code>RUNNING</code> list. At each iteration:</p>
+<ol>
+<li>Any sequence in <code>RUNNING</code> that just hit EOS or max_tokens is removed.</li>
+<li>The scheduler looks at the waiting queue. If there are free KV blocks, it admits new sequences (prefill or resumed).</li>
+<li>The forward pass runs on whatever is now in <code>RUNNING</code>, emitting one new token per sequence.</li>
+</ol>
+<p>The batch size is never padded to a fixed number. Sequences at different positions in their output share one fused forward. In 2026 vLLM this is called the <code>V1 scheduler</code>. The key invariant: the scheduler runs once per decode iteration, not once per request.</p>
+<h2>Idea 3 · Chunked prefill protects the ITL tail</h2>
+<p>Prefill is compute-bound. A 32k-token prompt on Llama 3.3 70B takes ~800 ms of pure prefill on one H100. While prefill runs, decode tokens for every other sequence in the batch wait. In a serving loop, the first-token latency (TTFT) of one long prompt becomes the inter-token latency (ITL) blip for dozens of other users.</p>
+<p>Chunked prefill splits prefill into fixed-size chunks (default 512 tokens) and schedules each chunk as a unit. Between chunks the scheduler can advance decode sequences by one token. You trade a small absolute prefill latency hit (a few ms per chunk) for much lower decode-time jitter. P99 ITL under mixed load drops from ~50 ms to ~15 ms in published benchmarks.</p>
+<h2>Idea 4 · The three defaults interact</h2>
+<p>All three features assume each other. PagedAttention gives the scheduler a fine-grained KV resource to trade against. Continuous batching needs that fine-grained resource so admitting a new sequence does not force a global reshuffle. Chunked prefill is a decision the scheduler makes on the same <code>RUNNING</code> list — it is one more scheduler policy, not a separate system.</p>
+<p>You do not need to know every flag. You need to know what the scheduler optimizes: goodput under KV-block budget, subject to chunked prefill slicing.</p>
+<h2>Idea 5 · Check the compatibility matrix</h2>
+<p>Check every feature combination against the compatibility matrix for your exact vLLM version before enabling all of them at once, because what composes changes between releases. In v0.18.0 the feature matrix marks speculative decoding as compatible with chunked prefill and prefix caching, and the speculative-decoding page lists two known incompatibilities: pipeline parallelism through v0.15.0, and draft-model speculation through v0.10.0. For the draft method itself, the 2026 default is often EAGLE-3 (<code>"method": "eagle3"</code>), covered in Phase 17 · 05.</p>
+<h2>Idea 6 · Numbers you should remember</h2>
+<ul>
+<li>Llama 3.3 70B FP8, H100 SXM5, 128 concurrent, all three on: 2,200-2,400 tok/s.</li>
+<li>Same model, default vLLM (no chunked prefill): ~1,800 tok/s.</li>
+<li>Same model, naive PyTorch forward loop: ~600 tok/s.</li>
+<li>KV fragmentation waste under PagedAttention at production load: &lt;4%.</li>
+<li>P99 ITL under mixed load: ~15 ms with chunked prefill, ~50 ms without.</li>
+</ul>
+<h2>Idea 7 · What the scheduler looks like</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">while True:
+    finished = [s for s in RUNNING if s.is_done()]
+    for s in finished: release_blocks(s); RUNNING.remove(s)
+
+    while WAITING and have_free_blocks_for(WAITING[0]):
+        s = WAITING.pop(0)
+        allocate_initial_blocks(s)
+        RUNNING.append(s)
+
+    # schedule prefill chunks + decode in one batch
+    batch = []
+    for s in RUNNING:
+        if s.in_prefill:
+            batch.append(next_prefill_chunk(s))   # e.g. 512 tokens
+        else:
+            batch.append(decode_one_token(s))     # 1 token
+
+    run_forward(batch)                            # one fused GPU call
+</code></pre></div>
+<p><code>code/main.py</code> is exactly this loop in stdlib Python with fake token counts and fake forward latency. Running it shows how chunked prefill keeps decode sequences alive during a long prefill.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="tensor-parallel"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>KV cache per sequence.</strong> For a model with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span></span></span></span> layers, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> key-value heads of size <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span></span></span></span>, stored in <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span> bytes per number, a sequence of <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> tokens needs</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8889em;vertical-align:-0.1944em;"></span><span class="mord text"><span class="mord">KV bytes</span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathnormal">L</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.08125em;">H</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:-0.0813em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight" style="margin-right:0.03148em;">k</span><span class="mord mathnormal mtight" style="margin-right:0.03588em;">v</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">d</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.4445em;"></span><span class="mord mathnormal">n</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">⋅</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span></span></span></span></span></div></p>
+<p>The 2 counts keys and values. Reserving <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.5806em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> tokens per request when it uses only <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.4306em;"></span><span class="mord mathnormal">n</span></span></span></span> wastes the fraction <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7278em;vertical-align:-0.0833em;"></span><span class="mord">1</span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">−</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">n</span><span class="mord">/</span><span class="mord"><span class="mord mathnormal">n</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1514em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mop mtight"><span class="mtight">m</span><span class="mtight">a</span><span class="mtight">x</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span> of that reservation.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Waste from reserving the maximum</div><div class="co-body"><p>Llama 3.3 70B has 80 layers and 8 KV heads of size 128. In BF16 (<span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6944em;"></span><span class="mord mathnormal">b</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6444em;"></span><span class="mord">2</span></span></span></span>), one token needs 2 × 80 × 8 × 128 × 2 = 327,680 bytes, about 0.33 MB.</p>
+<ol>
+<li>Reserving 8,192 tokens per request: 8,192 × 0.33 MB ≈ 2.7 GB per request.</li>
+<li>A request that really uses 1,500 tokens fills 1,500 / 8,192 ≈ 18% of it; 82% is wasted.</li>
+<li>With 16-token blocks, the same request takes ⌈1500 / 16⌉ = 94 blocks = 1,504 slots: 4 slots of waste, about 0.3%.</li>
+</ol>
+<p>That difference in waste is the room continuous batching uses to fit more requests on one GPU.</p></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Continuous batching runs the scheduler once per generated token, not once per request.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Chunked prefill makes each long prompt finish faster.
+  It makes the long prompt slightly slower; what it protects is everybody else's inter-token latency.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> <code>--gpu-memory-utilization</code> sets how much GPU memory vLLM reserves for KV blocks.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Every vLLM feature can be switched on together in every version.
+  Check the compatibility matrix for your version first.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>On a GPU, one decode step for 64 sequences takes barely longer than for 1, because reading the model's weights from memory dominates. Before you run the code below, guess how much more throughput a batch of 64 gives than a batch of 1.</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Why batching works on a GPU</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">WEIGHTS_MS = 20.0          # read all weights once per decode step (memory-bound)
+PER_SEQ_MS = 0.15          # extra compute per sequence in the batch
+
+for batch in (1, 4, 16, 64, 128):
+    step_ms = WEIGHTS_MS + PER_SEQ_MS * batch
+    tok_per_s = batch / (step_ms / 1000)
+    print(f&quot;batch {batch:4d}: step {step_ms:5.1f} ms  -&gt;  {tok_per_s:7.0f} tokens/s&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">batch    1: step  20.1 ms  -&gt;       50 tokens/s
+batch    4: step  20.6 ms  -&gt;      194 tokens/s
+batch   16: step  22.4 ms  -&gt;      714 tokens/s
+batch   64: step  29.6 ms  -&gt;     2162 tokens/s
+batch  128: step  39.2 ms  -&gt;     3265 tokens/s</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Going from 1 to 64 sequences makes each step about 50% slower but produces 64 tokens instead of 1, so throughput rises about 40 times. Batching pays because the dominant cost, reading the weights, is shared. Keep this in mind when you read the toy scheduler below: it charges a fixed 0.5 ms for every token in the batch, so batching cannot pay there the way it does on a GPU.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates a vLLM-style scheduler with toggleable features. Run it to see:</p>
+<ul>
+<li><code>NAIVE</code> mode: one request at a time, no batching.</li>
+<li><code>STATIC</code> mode: pad and wait, classic batching.</li>
+<li><code>CONTINUOUS</code> mode: iteration-level admission and release.</li>
+<li><code>CONTINUOUS + CHUNKED</code> mode: prefill slices interleaved with decode.</li>
+</ul>
+<p>The output shows total throughput (tokens per virtual second), TTFT mean, and P99 ITL. The <code>CONTINUOUS + CHUNKED</code> row should dominate on mixed traffic.</p>
+<p>Here is <code>code/main.py</code>, in 5 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 5 · <code>Request</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Toy continuous-batching scheduler — stdlib Python.
+
+Simulates four serving modes on the same workload:
+  NAIVE            : one request at a time, no batching
+  STATIC           : pad to batch boundary, wait for slowest
+  CONTINUOUS       : iteration-level admit/release
+  CONTINUOUS+CHUNK : continuous + chunked prefill (512-token slices)
+
+Reports throughput (tok / virt-sec), mean TTFT, and P99 ITL so you can
+reproduce the shape of the vLLM benchmarks without a GPU. Pedagogical:
+the latency constants are illustrative, not measured.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from collections import deque
+import random
+import statistics
+
+
+FORWARD_LATENCY_PER_TOKEN = 0.0005   # 0.5 ms per decode token in the batch
+PREFILL_LATENCY_PER_TOKEN = 0.00004  # prefill ~12x cheaper per token than decode
+BATCH_OVERHEAD = 0.0002              # fixed overhead per forward call
+CHUNK_SIZE = 512
+KV_BLOCK_SIZE = 16
+KV_BLOCKS_AVAILABLE = 1800           # toy KV block budget
+
+
+@dataclass
+class Request:
+    req_id: int
+    prompt_len: int
+    output_len: int
+    arrived_at: float
+    prefilled: int = 0
+    generated: int = 0
+    ttft: float | None = None
+    last_token_at: float | None = None
+    itl_samples: list[float] = field(default_factory=list)
+
+    @property
+    def in_prefill(self) -&gt; bool:
+        return self.prefilled &lt; self.prompt_len
+
+    @property
+    def done(self) -&gt; bool:
+        return self.generated &gt;= self.output_len
+
+    def blocks_needed(self) -&gt; int:
+        total = self.prompt_len + self.output_len
+        return (total + KV_BLOCK_SIZE - 1) // KV_BLOCK_SIZE
+</code></pre></div>
+
+<p><strong>Part 2 of 5 · <code>make_workload</code>, <code>report</code>, <code>simulate_naive</code>, <code>simulate_static</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def make_workload(n: int = 60, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    now = 0.0
+    for i in range(n):
+        now += rng.expovariate(40.0)   # ~40 req/s arrival
+        prompt_len = rng.choice([128, 256, 512, 2048, 8192])
+        out_len = rng.randint(50, 300)
+        reqs.append(Request(i, prompt_len, out_len, now))
+    return reqs
+
+
+def report(label: str, reqs: list[Request], sim_end: float) -&gt; None:
+    ttfts = [r.ttft - r.arrived_at for r in reqs if r.ttft is not None]
+    itls = [dt for r in reqs for dt in r.itl_samples]
+    total_out = sum(r.generated for r in reqs)
+    throughput = total_out / sim_end if sim_end else 0
+    mean_ttft = statistics.mean(ttfts) * 1000 if ttfts else 0
+    p99_itl = sorted(itls)[int(0.99 * len(itls)) - 1] * 1000 if itls else 0
+    print(f&quot;{label:28}  throughput={throughput:6.0f} tok/s   &quot;
+          f&quot;mean_TTFT={mean_ttft:6.1f} ms   &quot;
+          f&quot;P99_ITL={p99_itl:5.1f} ms   finished={sum(r.done for r in reqs)}/{len(reqs)}&quot;)
+
+
+def simulate_naive(reqs: list[Request]) -&gt; float:
+    &quot;&quot;&quot;One at a time. Prefill the whole prompt, then decode until done.&quot;&quot;&quot;
+    now = 0.0
+    for r in reqs:
+        if now &lt; r.arrived_at:
+            now = r.arrived_at
+        now += r.prompt_len * PREFILL_LATENCY_PER_TOKEN + BATCH_OVERHEAD
+        r.prefilled = r.prompt_len
+        r.ttft = now
+        r.last_token_at = now
+        for _ in range(r.output_len):
+            prev = r.last_token_at
+            now += FORWARD_LATENCY_PER_TOKEN + BATCH_OVERHEAD
+            r.generated += 1
+            r.itl_samples.append(now - prev)
+            r.last_token_at = now
+    return now
+
+
+def simulate_static(reqs: list[Request], batch: int = 16) -&gt; float:
+    &quot;&quot;&quot;Group into fixed batches; wait for the slowest to finish.&quot;&quot;&quot;
+    now = 0.0
+    i = 0
+    while i &lt; len(reqs):
+        window = reqs[i:i + batch]
+        i += batch
+        now = max(now, max(r.arrived_at for r in window))
+        pad_prompt = max(r.prompt_len for r in window)
+        pad_output = max(r.output_len for r in window)
+        now += pad_prompt * PREFILL_LATENCY_PER_TOKEN + BATCH_OVERHEAD
+        for r in window:
+            r.prefilled = r.prompt_len
+            r.ttft = now
+            r.last_token_at = now
+        for _ in range(pad_output):
+            prev_now = now
+            now += FORWARD_LATENCY_PER_TOKEN * len(window) / 16 + BATCH_OVERHEAD
+            for r in window:
+                if r.generated &lt; r.output_len:
+                    r.generated += 1
+                    r.itl_samples.append(now - prev_now)
+                    r.last_token_at = now
+    return now
+</code></pre></div>
+
+<p><strong>Part 3 of 5 · <code>simulate_continuous</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simulate_continuous(reqs: list[Request], chunked: bool) -&gt; float:
+    waiting = deque(sorted(reqs, key=lambda r: r.arrived_at))
+    running: list[Request] = []
+    blocks_used = 0
+    now = 0.0
+    while waiting or running:
+        if waiting and running and now &lt; waiting[0].arrived_at and not running:
+            now = waiting[0].arrived_at
+        while waiting and waiting[0].arrived_at &lt;= now:
+            r = waiting[0]
+            if blocks_used + r.blocks_needed() &gt; KV_BLOCKS_AVAILABLE:
+                break
+            blocks_used += r.blocks_needed()
+            running.append(waiting.popleft())
+        if not running:
+            if not waiting:
+                break
+            now = waiting[0].arrived_at
+            continue
+
+        batch_tokens = 0
+        prefill_work = 0
+        decoded: list[Request] = []
+        for r in running:
+            if r.in_prefill:
+                remaining = r.prompt_len - r.prefilled
+                take = min(CHUNK_SIZE if chunked else remaining, remaining)
+                r.prefilled += take
+                prefill_work += take
+                if r.prefilled &gt;= r.prompt_len:
+                    r.ttft = now + prefill_work * PREFILL_LATENCY_PER_TOKEN
+            else:
+                decoded.append(r)
+                batch_tokens += 1
+
+        dt = (prefill_work * PREFILL_LATENCY_PER_TOKEN
+              + batch_tokens * FORWARD_LATENCY_PER_TOKEN
+              + BATCH_OVERHEAD)
+        now += dt
+        for r in decoded:
+            prev = r.last_token_at or r.ttft or now
+            r.generated += 1
+            r.itl_samples.append(now - prev)
+            r.last_token_at = now
+            if r.ttft is None:
+                r.ttft = now
+
+        finished = [r for r in running if r.done]
+        for r in finished:
+            blocks_used -= r.blocks_needed()
+            running.remove(r)
+    return now
+</code></pre></div>
+
+<p><strong>Part 4 of 5 · <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def main() -&gt; None:
+    print(&quot;=&quot; * 80)
+    print(&quot;TOY vLLM SCHEDULER: four modes on the same 60-request workload&quot;)
+    print(&quot;=&quot; * 80)
+
+    base = make_workload()
+    w1 = [Request(r.req_id, r.prompt_len, r.output_len, r.arrived_at) for r in base]
+    end = simulate_naive(w1)
+    report(&quot;NAIVE&quot;, w1, end)
+
+    w2 = [Request(r.req_id, r.prompt_len, r.output_len, r.arrived_at) for r in base]
+    end = simulate_static(w2)
+    report(&quot;STATIC (batch=16, padded)&quot;, w2, end)
+
+    w3 = [Request(r.req_id, r.prompt_len, r.output_len, r.arrived_at) for r in base]
+    end = simulate_continuous(w3, chunked=False)
+    report(&quot;CONTINUOUS (no chunk)&quot;, w3, end)
+
+    w4 = [Request(r.req_id, r.prompt_len, r.output_len, r.arrived_at) for r in base]
+    end = simulate_continuous(w4, chunked=True)
+    report(&quot;CONTINUOUS + CHUNKED&quot;, w4, end)
+
+    print()
+    print(&quot;Read the CONTINUOUS+CHUNKED row. That is what vLLM ships as default.&quot;)
+    print(&quot;The gap between STATIC and CONTINUOUS is the whole reason vLLM exists.&quot;)
+</code></pre></div>
+
+<p><strong>Part 5 of 5 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">================================================================================
+TOY vLLM SCHEDULER: four modes on the same 60-request workload
+================================================================================
+NAIVE                         throughput=   768 tok/s   mean_TTFT=5870.5 ms   P99_ITL=  0.7 ms   finished=60/60
+STATIC (batch=16, padded)     throughput=  4055 tok/s   mean_TTFT= 691.3 ms   P99_ITL=  0.7 ms   finished=60/60
+CONTINUOUS (no chunk)         throughput=   886 tok/s   mean_TTFT=4671.6 ms   P99_ITL=219.3 ms   finished=60/60
+CONTINUOUS + CHUNKED          throughput=   885 tok/s   mean_TTFT=4591.5 ms   P99_ITL= 66.1 ms   finished=60/60
+
+Read the CONTINUOUS+CHUNKED row. That is what vLLM ships as default.
+The gap between STATIC and CONTINUOUS is the whole reason vLLM exists.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>The script's STATIC row beats CONTINUOUS on throughput, the opposite of real vLLM. Its cost model is why: <code>FORWARD_LATENCY_PER_TOKEN</code> charges 0.5 ms for each sequence in a decode step, so a step for 64 sequences costs 64 times a step for one, and the main advantage of batching disappears. What the toy does show correctly is the last column: chunked prefill cuts P99 inter-token latency from about 219 ms to 66 ms, because long prompts no longer block decode steps.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>An engineer turns off chunked prefill because "it makes TTFT worse for our long prompts". Throughput is unchanged, but users on short chats complain that answers now stall mid-sentence. What happened? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>PagedAttention allocates KV cache in 16-token blocks, cutting waste from most of the reservation to a few per cent.</li>
+<li>Continuous batching admits and releases requests after every token.</li>
+<li>Chunked prefill slices long prompts so decode keeps moving: better P99 ITL, not better throughput by itself.</li>
+<li>Batching pays because a decode step's cost is dominated by reading weights, shared by the whole batch.</li>
+<li>KV bytes per token = 2 · layers · KV heads · head size · bytes per number.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-inference-optimization"><span class="t" style="--cs-hue:200">IO</span>Cheat sheet · KV Cache, Quantization and Batching: Inference Optimization</a><a href="#cs-serving-engines-compared"><span class="t" style="--cs-hue:262">SN</span>Cheat sheet · Comparing LLM Serving Engines</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-vllm-scheduler-reader.md</code>. Given a serving config (batch size, KV memory utilization, chunked prefill size, speculative config), it produces a scheduler diagnosis that names which of the three defaults is bottlenecking and what to tune.</p>
+<p><strong><code>outputs/skill-vllm-scheduler-reader.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: vllm-scheduler-reader
+description: Diagnose a vLLM serving config by reading the scheduler-level knobs and identifying which of PagedAttention, continuous batching, and chunked prefill is the bottleneck.
+version: 1.0.0
+phase: 17
+lesson: 04
+tags: [vllm, paged-attention, continuous-batching, chunked-prefill, serving, scheduler]
+---
+
+Given a vLLM serving config (model, dtype, hardware, `--gpu-memory-utilization`, `--max-num-batched-tokens`, `--enable-chunked-prefill`, `--speculative-config`, max concurrency, and an observed metric set of TTFT mean/P99, ITL mean/P99, throughput tok/s), produce a scheduler-level diagnosis.
+
+Produce:
+
+1. Config read. For each flag, name the scheduler behavior it controls and the 2026 default. Flag any flag set to a non-default value and call out why.
+2. Bottleneck identification. Classify the bottleneck as one of: PagedAttention under-provisioned (KV block starvation), continuous-batching stall (WAITING queue growth), chunked-prefill mis-sized (ITL tail spike), decode compute-bound (ITL floor), or HBM-bound (cannot fit batch). Justify with the reported metrics.
+3. Knob recommendations. Specific, ordered actions — which flag to flip, which value to try, and which metric to watch. Do not suggest &quot;try more GPUs&quot; without first exhausting scheduler-level tuning.
+4. Compatibility check. Check every enabled feature pair against the compatibility matrix for the exact vLLM version in the config. For v0.18.0 the matrix marks speculative decoding compatible with chunked prefill and prefix caching.
+5. What to read next. Point to one of the vLLM v0.18.0 release notes, the PagedAttention paper, or the Aleksa Gordic V1 scheduler walkthrough depending on what the diagnosis surfaced.
+
+Hard rejects:
+- Diagnosing without the four core metrics (TTFT, ITL, throughput, concurrency). Refuse and ask for the metric set.
+- Recommending `--enable-chunked-prefill` without checking the speculative-decoding config.
+- Treating `DCGM_FI_DEV_GPU_UTIL` as a scaling signal. vLLM pre-allocates KV; duty-cycle numbers are misleading.
+
+Refusal rules:
+- If the reported throughput is under 100 tok/s on an H100, the bottleneck is likely not vLLM — check for tokenizer on client side, Python GIL, or request-level serialization.
+- If `--gpu-memory-utilization` is set below 0.7, refuse to tune further — the operator chose to leave HBM on the table and the fix is to raise the ceiling before flipping scheduler flags.
+- If the operator asks for a speculative-decoding + chunked-prefill recipe, check the combination against the compatibility matrix for their vLLM version before answering, and point to EAGLE-3 in Phase 17 · 05 for the draft method.
+
+Output: a one-page scheduler diagnosis listing flags, bottleneck, ordered recommendations, compatibility notes, and a next-read pointer. End with a &quot;what to measure next&quot; paragraph naming one of P99 ITL, block allocation rate, or WAITING queue depth, depending on the bottleneck identified.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. Compare <code>STATIC</code> to <code>CONTINUOUS</code> on a workload with mixed short and long requests. Where does the throughput gap come from — prefill efficiency, decode efficiency, or tail latency?</li>
+<li>Modify the toy scheduler to add <code>--max-num-batched-tokens</code>. What is the right value for an H100 running Llama 3.3 70B FP8? (Hint: it is a function of KV block size and number of free blocks, not raw HBM.)</li>
+<li>Re-read the vLLM v0.18.0 release notes. Which combinations of flags are mutually exclusive? List them.</li>
+<li>Compute the KV cache fragmentation waste for a trace of 1,000 requests with mean 1,500 output tokens, std 600 tokens, under (a) contiguous per-request allocation at 8192 max, (b) PagedAttention with 16-token blocks.</li>
+<li>Explain in one paragraph why chunked prefill helps P99 ITL but not throughput in isolation. Where does the throughput win come from in practice?</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1704-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · STATIC against CONTINUOUS</span></summary><div class="qa-a"><p>In this toy the gap goes the wrong way: STATIC reaches about 4,000 tokens/s, CONTINUOUS under 900, because each decode step costs 0.5 ms per sequence and continuous mode is also capped by the KV block budget. On a real GPU, with near-constant step cost, continuous batching wins on decode efficiency: finished sequences leave immediately and new ones take their place instead of padding.</p></div></details>
+<details class="qa" id="a1704-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P4 · Fragmentation waste</span></summary><div class="qa-a"><p>(a) Contiguous allocation at 8,192 tokens with a mean use of 1,500 wastes about 1 − 1,500 / 8,192 ≈ 82% of reserved KV memory. (b) With 16-token blocks, each request wastes on average half a block, 8 tokens of about 1,500, roughly 0.5%.</p></div></details>
+<details class="qa" id="a1704-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Stalls mid-sentence</span></summary><div class="qa-a"><p>Without chunked prefill, each long prompt's prefill runs as one large step, and every decode sequence waits for it. Short chats see their tokens stop for hundreds of milliseconds whenever a long prompt arrives: the P99 inter-token latency jumps. Turn chunked prefill back on and, if long-prompt TTFT matters, raise the chunk size a little.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://docs.vllm.ai/en/latest/features/spec_decode/">vLLM documentation — Speculative Decoding</a> — official source on chunked-prefill and speculative-decoding compatibility.</li>
+<li><a href="https://docs.nvidia.com/deeplearning/frameworks/vllm-release-notes/index.html">vLLM Release Notes (NVIDIA)</a> — 2026 release cadence and version-specific behavior.</li>
+<li><a href="https://blog.vllm.ai/2023/06/20/vllm.html">vLLM Blog — PagedAttention</a> — the original write-up that still defines how to think about the allocator.</li>
+<li><a href="https://arxiv.org/abs/2309.06180">PagedAttention paper (arXiv:2309.06180)</a> — fragmentation analysis and scheduler design.</li>
+<li><a href="https://www.aleksagordic.com/blog/vllm">Aleksa Gordic — Inside vLLM</a> — detailed V1 scheduler walkthrough with flame graphs.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1704" id="done-a1704">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1704" id="undo-a1704" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1703"><span class="pn-dir">Previous</span><span class="pn-t">17.3 · Kubernetes GPU Autoscaling: Karpenter, KAI Scheduler and Gang Scheduling</span></a><a class="pn next" href="#a1705"><span class="pn-dir">Next</span><span class="pn-t">17.5 · Speculative Decoding with EAGLE-3 in Production</span></a></div></footer>

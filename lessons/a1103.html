@@ -1,0 +1,892 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-11">Phase 11 · LLM Engineering and Applications</a></nav><h1>Structured Outputs with JSON Schema Validation and Constrained Decoding</h1><div class="m-meta"><span class="chip chip-num">Lesson 11.12</span><span class="chip">90 min</span><span class="chip chip-core">Build</span><span class="chip chip-done" data-done-chip="a1103" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Implement JSON-mode and schema-constrained outputs using OpenAI and Anthropic API parameters</li>
+<li>Build a Pydantic validation layer that rejects malformed LLM outputs and retries with error feedback</li>
+<li>Explain how constrained decoding forces valid JSON at the token level without post-processing</li>
+<li>Design robust extraction prompts that reliably convert unstructured text into typed data structures</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lessons 10.2 to 10.8 (Build an LLM from Scratch)</li>
+<li><strong>Type</strong>: Build. <strong>Time</strong>: about 90 minutes.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Your LLM returns a string. Your application needs JSON. That gap has crashed more production systems than any model hallucination. Structured output is the bridge between natural language and typed data. Get it right and your LLM becomes a reliable API. Get it wrong and you're parsing free-text with regex at 3am.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JSON mode</td>
+<td>"Returns JSON"</td>
+<td>API flag that guarantees syntactically valid JSON output, but does not enforce any particular schema</td>
+</tr>
+<tr>
+<td>Structured output</td>
+<td>"Typed JSON"</td>
+<td>Output that matches a specific JSON Schema with correct keys, types, and constraints</td>
+</tr>
+<tr>
+<td>Constrained decoding</td>
+<td>"Guided generation"</td>
+<td>At each token position, mask out tokens that would produce invalid output -- guarantees 100% schema compliance</td>
+</tr>
+<tr>
+<td>JSON Schema</td>
+<td>"A JSON template"</td>
+<td>A declarative language for describing the structure, types, and constraints of JSON data (used by OpenAPI, JSON Forms, etc.)</td>
+</tr>
+<tr>
+<td>Pydantic</td>
+<td>"Python dataclasses+"</td>
+<td>Python library that defines data models with type validation, used by FastAPI and Instructor to generate JSON Schemas</td>
+</tr>
+<tr>
+<td>Function calling</td>
+<td>"Tool use"</td>
+<td>LLM outputs a structured function invocation (name + typed arguments) instead of free text -- OpenAI and Anthropic both support this</td>
+</tr>
+<tr>
+<td>Instructor</td>
+<td>"Pydantic for LLMs"</td>
+<td>Python library that wraps LLM clients to return validated Pydantic instances, with automatic retry on validation failure</td>
+</tr>
+<tr>
+<td>Token masking</td>
+<td>"Filtering the vocabulary"</td>
+<td>Setting specific token probabilities to zero during generation so the model cannot produce them</td>
+</tr>
+<tr>
+<td>Schema compliance</td>
+<td>"Matches the shape"</td>
+<td>The output has every required field, correct types, values within constraints, and no extra disallowed fields</td>
+</tr>
+<tr>
+<td>Retry loop</td>
+<td>"Try again until it works"</td>
+<td>Send validation errors back to the model and ask it to fix the output -- Instructor does this automatically, up to a configurable max</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>Programs need data with a fixed shape: these keys, these types, these allowed values. A language model writes text one token at a time, and nothing forces that text to be valid JSON, let alone the right JSON. There are three ways to close the gap: ask nicely in the prompt and check afterwards; let the API enforce a schema; or, underneath both, constrained decoding, which at every step blocks the tokens that would break the schema, so the model can only write valid output. This lesson builds a schema validator and a constrained-decoding simulator, then builds real constrained decoding from scratch on a 0.5B model and runs XGrammar, the engine inside vLLM and SGLang, on the same task. Valid shape is not correct content, and the runs show that too. No model is trained.</p></div></aside>
+<p>You ask an LLM: "Extract the product name, price, and availability from this text." It responds:</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">The product is the Sony WH-1000XM5 headphones, which cost $348.00 and are currently in stock.
+</code></pre></div>
+<p>That is a perfectly correct answer. It is also completely useless to your application. Your inventory system needs <code>{"product": "Sony WH-1000XM5", "price": 348.00, "in_stock": true}</code>. You need a JSON object with specific keys, specific types, and specific value constraints. You do not need a sentence.</p>
+<p>The naive solution: add "Respond in JSON" to your prompt. This works 90% of the time. The other 10% the model wraps the JSON in markdown code fences, or adds a preamble like "Here's the JSON:", or produces syntactically invalid JSON because it closed a bracket early. Your JSON parser crashes. Your pipeline breaks. You add try/except and a retry loop. The retry sometimes produces different data. Now you have a consistency problem on top of a parsing problem.</p>
+<p>This is not a prompt engineering problem. It is a decoding problem. The model generates tokens left to right. At each position, it picks the most likely next token from a vocabulary of 100K+ options. Most of those options would produce invalid JSON at any given position. If the model just emitted <code>{"price":</code>, the next token must be a digit, a quote (for string), <code>null</code>, <code>true</code>, <code>false</code>, or a negative sign. Anything else produces invalid JSON. Without constraints, the model might pick a perfectly reasonable English word that is catastrophically wrong syntactically.</p>
+<h2>Idea 1 · The Structured Output Spectrum</h2>
+<p>There are four levels of structured output control, each more reliable than the last.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mmc16ef58477" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1137.8px; background-color: transparent;" viewBox="0 0 1137.796875 179" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mmc16ef58477{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mmc16ef58477 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mmc16ef58477 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mmc16ef58477 .error-icon{fill:#f4efe7;}#mmc16ef58477 .error-text{fill:#0b1018;stroke:#0b1018;}#mmc16ef58477 .edge-thickness-normal{stroke-width:1px;}#mmc16ef58477 .edge-thickness-thick{stroke-width:3.5px;}#mmc16ef58477 .edge-pattern-solid{stroke-dasharray:0;}#mmc16ef58477 .edge-thickness-invisible{stroke-width:0;fill:none;}#mmc16ef58477 .edge-pattern-dashed{stroke-dasharray:3;}#mmc16ef58477 .edge-pattern-dotted{stroke-dasharray:2;}#mmc16ef58477 .marker{fill:#6c6357;stroke:#6c6357;}#mmc16ef58477 .marker.cross{stroke:#6c6357;}#mmc16ef58477 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mmc16ef58477 p{margin:0;}#mmc16ef58477 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mmc16ef58477 .cluster-label text{fill:#0b1018;}#mmc16ef58477 .cluster-label span{color:#0b1018;}#mmc16ef58477 .cluster-label span p{background-color:transparent;}#mmc16ef58477 .label text,#mmc16ef58477 span{fill:#211c16;color:#211c16;}#mmc16ef58477 .node rect,#mmc16ef58477 .node circle,#mmc16ef58477 .node ellipse,#mmc16ef58477 .node polygon,#mmc16ef58477 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mmc16ef58477 .rough-node .label text,#mmc16ef58477 .node .label text,#mmc16ef58477 .image-shape .label,#mmc16ef58477 .icon-shape .label{text-anchor:middle;}#mmc16ef58477 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mmc16ef58477 .rough-node .label,#mmc16ef58477 .node .label,#mmc16ef58477 .image-shape .label,#mmc16ef58477 .icon-shape .label{text-align:center;}#mmc16ef58477 .node.clickable{cursor:pointer;}#mmc16ef58477 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mmc16ef58477 .arrowheadPath{fill:#0b0b0b;}#mmc16ef58477 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mmc16ef58477 .flowchart-link{stroke:#6c6357;fill:none;}#mmc16ef58477 .edgeLabel{background-color:#ffffff;text-align:center;}#mmc16ef58477 .edgeLabel p{background-color:#ffffff;}#mmc16ef58477 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmc16ef58477 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mmc16ef58477 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mmc16ef58477 .cluster text{fill:#0b1018;}#mmc16ef58477 .cluster span{color:#0b1018;}#mmc16ef58477 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mmc16ef58477 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mmc16ef58477 rect.text{fill:none;stroke-width:0;}#mmc16ef58477 .icon-shape,#mmc16ef58477 .image-shape{background-color:#ffffff;text-align:center;}#mmc16ef58477 .icon-shape p,#mmc16ef58477 .image-shape p{background-color:#ffffff;padding:2px;}#mmc16ef58477 .icon-shape .label rect,#mmc16ef58477 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mmc16ef58477 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mmc16ef58477 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mmc16ef58477 .node .neo-node{stroke:#b5521b;}#mmc16ef58477 [data-look="neo"].node rect,#mmc16ef58477 [data-look="neo"].cluster rect,#mmc16ef58477 [data-look="neo"].node polygon{stroke:url(#mmc16ef58477-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc16ef58477 [data-look="neo"].swimlane.cluster rect{filter:none;}#mmc16ef58477 [data-look="neo"].node path{stroke:url(#mmc16ef58477-gradient);stroke-width:1px;}#mmc16ef58477 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc16ef58477 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mmc16ef58477 [data-look="neo"].node circle{stroke:url(#mmc16ef58477-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc16ef58477 [data-look="neo"].node circle .state-start{fill:#000000;}#mmc16ef58477 [data-look="neo"].icon-shape .icon{fill:url(#mmc16ef58477-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc16ef58477 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mmc16ef58477-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mmc16ef58477 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mmc16ef58477_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mmc16ef58477_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mmc16ef58477_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mmc16ef58477-Spectrum" data-look="classic"><rect style="" x="8" y="8" width="1121.796875" height="163"/><g class="cluster-label" transform="translate(475.53125, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Structured</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Output</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Spectrum</tspan></tspan></text></g></g></g></g><g class="edgePaths"><path d="M200.156,89.5L206.406,89.5C212.656,89.5,225.156,89.5,236.99,89.5C248.823,89.5,259.99,89.5,265.573,89.5L271.156,89.5" id="mmc16ef58477-L_A_B_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_A_B_0" data-points="W3sieCI6MjAwLjE1NjI1LCJ5Ijo4OS41fSx7IngiOjIzNy42NTYyNSwieSI6ODkuNX0seyJ4IjoyNzUuMTU2MjUsInkiOjg5LjV9XQ==" data-look="classic" marker-end="url(#mmc16ef58477_flowchart-v2-pointEnd)"/><path d="M489.609,89.5L495.859,89.5C502.109,89.5,514.609,89.5,526.443,89.5C538.276,89.5,549.443,89.5,555.026,89.5L560.609,89.5" id="mmc16ef58477-L_B_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_B_C_0" data-points="W3sieCI6NDg5LjYwOTM3NSwieSI6ODkuNX0seyJ4Ijo1MjcuMTA5Mzc1LCJ5Ijo4OS41fSx7IngiOjU2NC42MDkzNzUsInkiOjg5LjV9XQ==" data-look="classic" marker-end="url(#mmc16ef58477_flowchart-v2-pointEnd)"/><path d="M792.266,89.5L798.516,89.5C804.766,89.5,817.266,89.5,829.099,89.5C840.932,89.5,852.099,89.5,857.682,89.5L863.266,89.5" id="mmc16ef58477-L_C_D_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_D_0" data-points="W3sieCI6NzkyLjI2NTYyNSwieSI6ODkuNX0seyJ4Ijo4MjkuNzY1NjI1LCJ5Ijo4OS41fSx7IngiOjg2Ny4yNjU2MjUsInkiOjg5LjV9XQ==" data-look="classic" marker-end="url(#mmc16ef58477_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_A_B_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_B_C_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_C_D_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mmc16ef58477-flowchart-A-0" data-look="classic" transform="translate(122.828125, 89.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#ff6b6b !important" x="-77.328125" y="-46.5" width="154.65625" height="93"/><g class="label" style="color:#fff !important" transform="translate(-47.328125, -31.5)"><rect/><foreignObject width="94.65625" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Prompt-based<br />'Return JSON'<br />~90% valid</p></span></div></foreignObject></g></g><g class="node default" id="mmc16ef58477-flowchart-B-1" data-look="classic" transform="translate(382.3828125, 89.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#ffa500 !important" x="-107.2265625" y="-46.5" width="214.453125" height="93"/><g class="label" style="color:#fff !important" transform="translate(-77.2265625, -31.5)"><rect/><foreignObject width="154.453125" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>JSON Mode<br />Guaranteed valid JSON<br />No schema guarantee</p></span></div></foreignObject></g></g><g class="node default" id="mmc16ef58477-flowchart-C-3" data-look="classic" transform="translate(678.4375, 89.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-113.828125" y="-46.5" width="227.65625" height="93"/><g class="label" style="color:#fff !important" transform="translate(-83.828125, -31.5)"><rect/><foreignObject width="167.65625" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Schema Mode<br />JSON + matches schema<br />Guaranteed compliance</p></span></div></foreignObject></g></g><g class="node default" id="mmc16ef58477-flowchart-D-5" data-look="classic" transform="translate(979.78125, 89.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#0f3460 !important" x="-112.515625" y="-46.5" width="225.03125" height="93"/><g class="label" style="color:#fff !important" transform="translate(-82.515625, -31.5)"><rect/><foreignObject width="165.03125" height="63"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Constrained Decoding<br />Token-level enforcement<br />100% compliance</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mmc16ef58477-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mmc16ef58477-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mmc16ef58477-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p><strong>Prompt-based</strong> ("Respond in valid JSON"): no enforcement. The model usually complies but sometimes does not. Reliability: ~90%. Failure mode: markdown fences, preamble text, truncated output, wrong structure.</p>
+<p><strong>JSON mode</strong>: the API guarantees the output is valid JSON. OpenAI's <code>response_format: { type: "json_object" }</code> enables this. The output will parse without errors. But it may not match your expected schema -- extra keys, wrong types, missing fields.</p>
+<p><strong>Schema mode</strong>: the API takes a JSON Schema and guarantees the output matches it. Every major provider supports this natively: OpenAI's structured outputs (<code>response_format</code> with <code>type: "json_schema"</code> and <code>strict: true</code>, or <code>text.format</code> in the Responses API, and <code>strict: true</code> on function definitions), Anthropic's structured outputs (<code>output_config.format</code> with <code>type: "json_schema"</code>, and strict tool use), and Gemini's <code>response_schema</code> with <code>response_mime_type: "application/json"</code>. The output has the exact keys and types you specified; each provider supports a documented subset of JSON Schema keywords, so check which constraints (string formats, <code>minimum</code>, <code>maxItems</code>) are enforced and which are only described.</p>
+<p><strong>Constrained decoding</strong>: at each token position during generation, the decoder masks out all tokens that would produce invalid output. If the schema requires a number and the model is about to emit a letter, that token is set to probability zero. The model can only produce tokens that lead to valid output. This is what hosted structured-output modes do under the hood, and what open engines implement: XGrammar (the default in vLLM and SGLang), llguidance (behind Guidance), and Outlines.</p>
+<h2>Idea 2 · JSON Schema: The Contract Language</h2>
+<p>JSON Schema is how you tell the model (or validation layer) what shape the output must have. Every major structured output system uses it.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-json">{
+  &quot;type&quot;: &quot;object&quot;,
+  &quot;properties&quot;: {
+    &quot;product&quot;: { &quot;type&quot;: &quot;string&quot; },
+    &quot;price&quot;: { &quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0 },
+    &quot;in_stock&quot;: { &quot;type&quot;: &quot;boolean&quot; },
+    &quot;categories&quot;: {
+      &quot;type&quot;: &quot;array&quot;,
+      &quot;items&quot;: { &quot;type&quot;: &quot;string&quot; }
+    }
+  },
+  &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;]
+}
+</code></pre></div>
+<p>This schema says: the output must be an object with a string <code>product</code>, a non-negative number <code>price</code>, a boolean <code>in_stock</code>, and an optional array of string <code>categories</code>. Any output that does not match gets rejected.</p>
+<p>Schemas handle the hard cases: nested objects, arrays with typed items, enums (constrain a string to specific values), pattern matching (regex on strings), and combinators (oneOf, anyOf, allOf for polymorphic outputs).</p>
+<h2>Idea 3 · The Pydantic Pattern</h2>
+<p>In Python, you do not write JSON Schema by hand. You define a Pydantic model and it generates the schema for you.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">from pydantic import BaseModel
+
+class Product(BaseModel):
+    product: str
+    price: float
+    in_stock: bool
+    categories: list[str] = []
+</code></pre></div>
+
+<p>This produces the same JSON Schema as above. The Instructor library (and OpenAI's SDK) accept Pydantic models directly: pass the model class, get back a validated instance. If the LLM output does not match, Instructor retries automatically.</p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p>At each step the model gives a distribution <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span></span> over the vocabulary <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.08222em;">V</span></span></span></span>. A grammar (here, a JSON Schema compiled to an automaton) defines the set <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.8333em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">⊆</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.6833em;"></span><span class="mord mathcal" style="margin-right:0.08222em;">V</span></span></span></span> of tokens that keep the output a valid prefix. Constrained decoding samples from the renormalised, masked distribution
+<div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord accent"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.6679em;"><span style="top:-3em;"><span class="pstrut" style="height:3em;"></span><span class="mord mathnormal">p</span></span><span style="top:-3.35em;"><span class="pstrut" style="height:3em;"></span><span class="accent-body" style="left:-0.1667em;"><span class="mord">~</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1944em;"><span></span></span></span></span></span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">=</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:2.5128em;vertical-align:-1.0858em;"></span><span class="mord"><span class="mopen nulldelimiter"></span><span class="mfrac"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:1.427em;"><span style="top:-2.314em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mop"><span class="mop op-symbol small-op" style="position:relative;top:0em;">∑</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.1786em;"><span style="top:-2.4003em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord mathnormal mtight">u</span><span class="mrel mtight">∈</span><span class="mord mtight"><span class="mord mathnormal mtight">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3281em;"><span style="top:-2.357em;margin-left:0em;margin-right:0.0714em;"><span class="pstrut" style="height:2.5em;"></span><span class="sizing reset-size3 size1 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.143em;"><span></span></span></span></span></span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.3998em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">u</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span></span></span><span style="top:-3.23em;"><span class="pstrut" style="height:3em;"></span><span class="frac-line" style="border-bottom-width:0.04em;"></span></span><span style="top:-3.677em;"><span class="pstrut" style="height:3em;"></span><span class="mord"><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∣</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord mathnormal">x</span><span class="mpunct">,</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord"><span class="mord mathnormal" style="margin-right:0.03588em;">y</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:-0.0359em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mrel mtight">&lt;</span><span class="mord mathnormal mtight">i</span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.1774em;"><span></span></span></span></span></span></span><span class="mclose">)</span><span class="mspace" style="margin-right:0.1667em;"></span><span class="mord mathbf">1</span><span class="mopen">[</span><span class="mord mathnormal">t</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">∈</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mord"><span class="mord mathnormal">A</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3117em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mathnormal mtight">i</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mclose">]</span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:1.0858em;"><span></span></span></span></span></span><span class="mclose nulldelimiter"></span></span><span class="mord">.</span></span></span></span></span></div>
+In practice the logits of disallowed tokens are set to <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.6667em;vertical-align:-0.0833em;"></span><span class="mord">−</span><span class="mord">∞</span></span></span></span> before the softmax. Every finished output is in the language of the grammar; nothing guarantees the values are right.</p>
+<p><strong>Cost.</strong> The mask is a bitmask over <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathcal" style="margin-right:0.08222em;">V</span><span class="mord">∣</span></span></span></span> tokens, <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">∣</span><span class="mord mathcal" style="margin-right:0.08222em;">V</span><span class="mord">∣/8</span></span></span></span> bytes per step (19 KB for a 151,643-token vocabulary). Engines like XGrammar precompute which tokens are allowed in which grammar state, so only a few context-dependent tokens are checked at run time.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">A price field with a 151,936-entry vocabulary</div><div class="co-body"><ul>
+<li>After <code>"price":</code> the schema allows only tokens that can start a JSON number (digits, a minus sign), plus whitespace. In the run below that is 25 tokens of 151,936 (0.02%).</li>
+<li>Suppose the model, reading "2,499 dollars", puts its highest score on the token <code>"$"</code>: it is masked, so the best digit token wins instead.</li>
+<li>After <code>2</code> the model wants <code>,</code> (as in 2,499). With a digits-only mask, as in the from-scratch run, the comma is masked and the next best digits <code>499</code> win: 2499, the right value.</li>
+<li>A full JSON grammar is more permissive: a comma after a number is legal (it ends the number), so the value could become 2: valid, and wrong. In this lesson's runs both decoders wrote 2499, but "valid" never means "right"; say "no thousands separators" in the prompt, give an example, and check values with code.</li>
+</ul></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><ul>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Schema-valid output is correct output."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> It has the right shape. The model can still pick the wrong number or the wrong enum value; check values against the source.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "Constrained decoding makes the model slower by checking 150,000 tokens per step."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> Modern engines precompute most of the mask per grammar state; the run below measures the overhead.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> "JSON mode and schema mode are the same."<br />
+  <span class="ck-yes" aria-label="Right">✓</span> JSON mode only promises parseable JSON; schema mode promises your keys, types and enum values.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>For "Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out", constrained decoding must write the price as a JSON number. What will it write? (Solution P1.)</p></div></aside>
+<h2>Idea 4 · Function Calling / Tool Use</h2>
+<p>An alternative interface for the same problem. Instead of asking the model to produce JSON directly, you define "tools" (functions) with typed parameters. The model outputs a function call with structured arguments. OpenAI calls this "function calling." Anthropic calls it "tool use." The result is the same: structured data.</p>
+<p><figure class="diagram mmfig"><div class="dg-scroll"><svg class="dg mm" id="mm6a9e3b48b2" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 1488.77px; background-color: transparent;" viewBox="0 0 1488.765625 263" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm6a9e3b48b2{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm6a9e3b48b2 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm6a9e3b48b2 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm6a9e3b48b2 .error-icon{fill:#f4efe7;}#mm6a9e3b48b2 .error-text{fill:#0b1018;stroke:#0b1018;}#mm6a9e3b48b2 .edge-thickness-normal{stroke-width:1px;}#mm6a9e3b48b2 .edge-thickness-thick{stroke-width:3.5px;}#mm6a9e3b48b2 .edge-pattern-solid{stroke-dasharray:0;}#mm6a9e3b48b2 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm6a9e3b48b2 .edge-pattern-dashed{stroke-dasharray:3;}#mm6a9e3b48b2 .edge-pattern-dotted{stroke-dasharray:2;}#mm6a9e3b48b2 .marker{fill:#6c6357;stroke:#6c6357;}#mm6a9e3b48b2 .marker.cross{stroke:#6c6357;}#mm6a9e3b48b2 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm6a9e3b48b2 p{margin:0;}#mm6a9e3b48b2 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm6a9e3b48b2 .cluster-label text{fill:#0b1018;}#mm6a9e3b48b2 .cluster-label span{color:#0b1018;}#mm6a9e3b48b2 .cluster-label span p{background-color:transparent;}#mm6a9e3b48b2 .label text,#mm6a9e3b48b2 span{fill:#211c16;color:#211c16;}#mm6a9e3b48b2 .node rect,#mm6a9e3b48b2 .node circle,#mm6a9e3b48b2 .node ellipse,#mm6a9e3b48b2 .node polygon,#mm6a9e3b48b2 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm6a9e3b48b2 .rough-node .label text,#mm6a9e3b48b2 .node .label text,#mm6a9e3b48b2 .image-shape .label,#mm6a9e3b48b2 .icon-shape .label{text-anchor:middle;}#mm6a9e3b48b2 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm6a9e3b48b2 .rough-node .label,#mm6a9e3b48b2 .node .label,#mm6a9e3b48b2 .image-shape .label,#mm6a9e3b48b2 .icon-shape .label{text-align:center;}#mm6a9e3b48b2 .node.clickable{cursor:pointer;}#mm6a9e3b48b2 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm6a9e3b48b2 .arrowheadPath{fill:#0b0b0b;}#mm6a9e3b48b2 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm6a9e3b48b2 .flowchart-link{stroke:#6c6357;fill:none;}#mm6a9e3b48b2 .edgeLabel{background-color:#ffffff;text-align:center;}#mm6a9e3b48b2 .edgeLabel p{background-color:#ffffff;}#mm6a9e3b48b2 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm6a9e3b48b2 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm6a9e3b48b2 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm6a9e3b48b2 .cluster text{fill:#0b1018;}#mm6a9e3b48b2 .cluster span{color:#0b1018;}#mm6a9e3b48b2 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm6a9e3b48b2 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm6a9e3b48b2 rect.text{fill:none;stroke-width:0;}#mm6a9e3b48b2 .icon-shape,#mm6a9e3b48b2 .image-shape{background-color:#ffffff;text-align:center;}#mm6a9e3b48b2 .icon-shape p,#mm6a9e3b48b2 .image-shape p{background-color:#ffffff;padding:2px;}#mm6a9e3b48b2 .icon-shape .label rect,#mm6a9e3b48b2 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm6a9e3b48b2 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm6a9e3b48b2 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm6a9e3b48b2 .node .neo-node{stroke:#b5521b;}#mm6a9e3b48b2 [data-look="neo"].node rect,#mm6a9e3b48b2 [data-look="neo"].cluster rect,#mm6a9e3b48b2 [data-look="neo"].node polygon{stroke:url(#mm6a9e3b48b2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm6a9e3b48b2 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm6a9e3b48b2 [data-look="neo"].node path{stroke:url(#mm6a9e3b48b2-gradient);stroke-width:1px;}#mm6a9e3b48b2 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm6a9e3b48b2 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm6a9e3b48b2 [data-look="neo"].node circle{stroke:url(#mm6a9e3b48b2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm6a9e3b48b2 [data-look="neo"].node circle .state-start{fill:#000000;}#mm6a9e3b48b2 [data-look="neo"].icon-shape .icon{fill:url(#mm6a9e3b48b2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm6a9e3b48b2 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm6a9e3b48b2-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm6a9e3b48b2 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm6a9e3b48b2_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm6a9e3b48b2_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"/><g class="edgeLabels"/><g class="nodes"><g class="root" transform="translate(0, 0)"><g class="clusters"><g class="cluster" id="mm6a9e3b48b2-ToolUse" data-look="classic"><rect style="" x="8" y="8" width="1472.765625" height="247"/><g class="cluster-label" transform="translate(697.7578125, 8)"><g><rect class="background" style="stroke: none"/><text y="-10.1" style=""><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em"><tspan font-style="normal" class="text-inner-tspan" font-weight="normal">Tool</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Use</tspan><tspan font-style="normal" class="text-inner-tspan" font-weight="normal"> Flow</tspan></tspan></text></g></g></g></g><g class="edgePaths"><path d="M275.469,131.5L281.719,131.5C287.969,131.5,300.469,131.5,312.302,131.5C324.135,131.5,335.302,131.5,340.885,131.5L346.469,131.5" id="mm6a9e3b48b2-L_U_M_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_U_M_0" data-points="W3sieCI6Mjc1LjQ2ODc1LCJ5IjoxMzEuNX0seyJ4IjozMTIuOTY4NzUsInkiOjEzMS41fSx7IngiOjM1MC40Njg3NSwieSI6MTMxLjV9XQ==" data-look="classic" marker-end="url(#mm6a9e3b48b2_flowchart-v2-pointEnd)"/><path d="M561.109,131.5L567.359,131.5C573.609,131.5,586.109,131.5,597.943,131.5C609.776,131.5,620.943,131.5,626.526,131.5L632.109,131.5" id="mm6a9e3b48b2-L_M_TC_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_M_TC_0" data-points="W3sieCI6NTYxLjEwOTM3NSwieSI6MTMxLjV9LHsieCI6NTk4LjYwOTM3NSwieSI6MTMxLjV9LHsieCI6NjM2LjEwOTM3NSwieSI6MTMxLjV9XQ==" data-look="classic" marker-end="url(#mm6a9e3b48b2_flowchart-v2-pointEnd)"/><path d="M896.109,131.5L902.359,131.5C908.609,131.5,921.109,131.5,932.943,131.5C944.776,131.5,955.943,131.5,961.526,131.5L967.109,131.5" id="mm6a9e3b48b2-L_TC_V_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_TC_V_0" data-points="W3sieCI6ODk2LjEwOTM3NSwieSI6MTMxLjV9LHsieCI6OTMzLjYwOTM3NSwieSI6MTMxLjV9LHsieCI6OTcxLjEwOTM3NSwieSI6MTMxLjV9XQ==" data-look="classic" marker-end="url(#mm6a9e3b48b2_flowchart-v2-pointEnd)"/><path d="M1141.375,131.5L1147.625,131.5C1153.875,131.5,1166.375,131.5,1178.208,131.5C1190.042,131.5,1201.208,131.5,1206.792,131.5L1212.375,131.5" id="mm6a9e3b48b2-L_V_R_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_V_R_0" data-points="W3sieCI6MTE0MS4zNzUsInkiOjEzMS41fSx7IngiOjExNzguODc1LCJ5IjoxMzEuNX0seyJ4IjoxMjE2LjM3NSwieSI6MTMxLjV9XQ==" data-look="classic" marker-end="url(#mm6a9e3b48b2_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_U_M_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_M_TC_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_TC_V_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g><g class="edgeLabel"><g class="label" data-id="L_V_R_0" transform="translate(0, 0)"><text y="-10.1" text-anchor="middle"><tspan class="text-outer-tspan row" x="0" y="-0.1em" dy="1.1em" text-anchor="middle"/></text></g></g><g><rect class="background" style="stroke: none"/></g></g><g class="nodes"><g class="node default" id="mm6a9e3b48b2-flowchart-U-0" data-look="classic" transform="translate(160.484375, 131.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#0f3460 !important" x="-114.984375" y="-36" width="229.96875" height="72"/><g class="label" style="color:#fff !important" transform="translate(-84.984375, -21)"><rect/><foreignObject width="169.96875" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>User: Extract product info<br />from this review text</p></span></div></foreignObject></g></g><g class="node default" id="mm6a9e3b48b2-flowchart-M-1" data-look="classic" transform="translate(455.7890625, 131.5)"><rect class="basic label-container" style="" x="-105.3203125" y="-25.5" width="210.640625" height="51"/><g class="label" style="" transform="translate(-75.3203125, -10.5)"><rect/><foreignObject width="150.640625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Model processes input</p></span></div></foreignObject></g></g><g class="node default" id="mm6a9e3b48b2-flowchart-TC-3" data-look="classic" transform="translate(766.109375, 131.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#e94560 !important" x="-130" y="-88.5" width="260" height="177"/><g class="label" style="color:#fff !important" transform="translate(-100, -73.5)"><rect/><foreignObject width="200" height="147"><div style="color: rgb(255, 255, 255) !important; display: table; white-space: break-spaces; line-height: 1.5; max-width: 200px; text-align: center; width: 200px;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Tool Call:<br />extract_product(<br />  product='Sony WH-1000XM5',<br />  price=348.00,<br />  in_stock=true<br />)</p></span></div></foreignObject></g></g><g class="node default" id="mm6a9e3b48b2-flowchart-V-5" data-look="classic" transform="translate(1056.2421875, 131.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#ffa500 !important" x="-85.1328125" y="-36" width="170.265625" height="72"/><g class="label" style="color:#fff !important" transform="translate(-55.1328125, -21)"><rect/><foreignObject width="110.265625" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Validate against<br />function schema</p></span></div></foreignObject></g></g><g class="node default" id="mm6a9e3b48b2-flowchart-R-7" data-look="classic" transform="translate(1329.8203125, 131.5)"><rect class="basic label-container" style="fill:#1a1a2e !important;stroke:#51cf66 !important" x="-113.4453125" y="-36" width="226.890625" height="72"/><g class="label" style="color:#fff !important" transform="translate(-83.4453125, -21)"><rect/><foreignObject width="166.890625" height="42"><div style="color: rgb(255, 255, 255) !important; display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;" xmlns="http://www.w3.org/1999/xhtml"><span style="color:#fff !important" class="nodeLabel"><p>Structured Result:<br />{product, price, in_stock}</p></span></div></foreignObject></g></g></g></g></g></g></g><defs><filter id="mm6a9e3b48b2-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm6a9e3b48b2-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm6a9e3b48b2-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(236.25, 10%, 83.7254901961%)" stop-opacity="1"/></linearGradient></svg></div></figure></p>
+<p>Tool use is preferred when the model needs to choose which function to call, not just fill in parameters. If you have 10 different extraction schemas and the model must pick the right one based on the input, tool use gives you both the schema selection and the structured output.</p>
+<h2>Idea 5 · Common Failure Modes</h2>
+<p>Even with schema enforcement, structured outputs can fail in subtle ways.</p>
+<p><strong>Hallucinated values</strong>: the output matches the schema but contains invented data. The model produces <code>{"price": 299.99}</code> when the text says $348. Schema validation cannot catch this -- the type is correct, the value is wrong.</p>
+<p><strong>Enum confusion</strong>: you constrain a field to <code>["in_stock", "out_of_stock", "preorder"]</code>. The model outputs <code>"available"</code> -- semantically correct, but not in the allowed set. Good constrained decoding prevents this. Prompt-based approaches do not.</p>
+<p><strong>Nested object depth</strong>: deeply nested schemas (4+ levels) produce more errors. Each level of nesting is another place where the model can lose track of structure.</p>
+<p><strong>Array length</strong>: the model may produce too many or too few items in an array. Schemas support <code>minItems</code> and <code>maxItems</code> but not all providers enforce them at the decoding level.</p>
+<p><strong>Optional field omission</strong>: the model omits fields that are technically optional but semantically important for your use case. Set them as required in the schema even if the data is sometimes missing -- force the model to produce <code>null</code> explicitly.</p>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="mx-schema-funnel"></div></figure></p>
+<h2>Step 1 · JSON Schema Validator</h2>
+<p>Build a validator from scratch that checks whether a Python object matches a JSON Schema. This is what runs on the output side to verify compliance.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json
+
+def validate_schema(data, schema):
+    errors = []
+    _validate(data, schema, &quot;&quot;, errors)
+    return errors
+
+def _validate(data, schema, path, errors):
+    schema_type = schema.get(&quot;type&quot;)
+
+    if schema_type == &quot;object&quot;:
+        if not isinstance(data, dict):
+            errors.append(f&quot;{path}: expected object, got {type(data).__name__}&quot;)
+            return
+        for key in schema.get(&quot;required&quot;, []):
+            if key not in data:
+                errors.append(f&quot;{path}.{key}: required field missing&quot;)
+        properties = schema.get(&quot;properties&quot;, {})
+        for key, value in data.items():
+            if key in properties:
+                _validate(value, properties[key], f&quot;{path}.{key}&quot;, errors)
+
+    elif schema_type == &quot;array&quot;:
+        if not isinstance(data, list):
+            errors.append(f&quot;{path}: expected array, got {type(data).__name__}&quot;)
+            return
+        min_items = schema.get(&quot;minItems&quot;, 0)
+        max_items = schema.get(&quot;maxItems&quot;, float(&quot;inf&quot;))
+        if len(data) &lt; min_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, minimum is {min_items}&quot;)
+        if len(data) &gt; max_items:
+            errors.append(f&quot;{path}: array has {len(data)} items, maximum is {max_items}&quot;)
+        items_schema = schema.get(&quot;items&quot;, {})
+        for i, item in enumerate(data):
+            _validate(item, items_schema, f&quot;{path}[{i}]&quot;, errors)
+
+    elif schema_type == &quot;string&quot;:
+        if not isinstance(data, str):
+            errors.append(f&quot;{path}: expected string, got {type(data).__name__}&quot;)
+            return
+        enum_values = schema.get(&quot;enum&quot;)
+        if enum_values and data not in enum_values:
+            errors.append(f&quot;{path}: '{data}' not in allowed values {enum_values}&quot;)
+
+    elif schema_type == &quot;number&quot;:
+        if not isinstance(data, (int, float)):
+            errors.append(f&quot;{path}: expected number, got {type(data).__name__}&quot;)
+            return
+        minimum = schema.get(&quot;minimum&quot;)
+        maximum = schema.get(&quot;maximum&quot;)
+        if minimum is not None and data &lt; minimum:
+            errors.append(f&quot;{path}: {data} is less than minimum {minimum}&quot;)
+        if maximum is not None and data &gt; maximum:
+            errors.append(f&quot;{path}: {data} is greater than maximum {maximum}&quot;)
+
+    elif schema_type == &quot;boolean&quot;:
+        if not isinstance(data, bool):
+            errors.append(f&quot;{path}: expected boolean, got {type(data).__name__}&quot;)
+
+    elif schema_type == &quot;integer&quot;:
+        if not isinstance(data, int) or isinstance(data, bool):
+            errors.append(f&quot;{path}: expected integer, got {type(data).__name__}&quot;)
+</code></pre></div>
+
+<h2>Step 2 · Pydantic-Style Model to Schema</h2>
+<p>Build a minimal class-to-schema converter. Define a Python class and generate its JSON Schema automatically.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">class SchemaField:
+    def __init__(self, field_type, required=True, default=None, enum=None, minimum=None, maximum=None):
+        self.field_type = field_type
+        self.required = required
+        self.default = default
+        self.enum = enum
+        self.minimum = minimum
+        self.maximum = maximum
+
+def python_type_to_schema(field):
+    type_map = {
+        str: &quot;string&quot;,
+        int: &quot;integer&quot;,
+        float: &quot;number&quot;,
+        bool: &quot;boolean&quot;,
+    }
+
+    schema = {}
+
+    if field.field_type in type_map:
+        schema[&quot;type&quot;] = type_map[field.field_type]
+    elif field.field_type == list:
+        schema[&quot;type&quot;] = &quot;array&quot;
+        schema[&quot;items&quot;] = {&quot;type&quot;: &quot;string&quot;}
+    elif isinstance(field.field_type, dict):
+        schema = field.field_type
+
+    if field.enum:
+        schema[&quot;enum&quot;] = field.enum
+    if field.minimum is not None:
+        schema[&quot;minimum&quot;] = field.minimum
+    if field.maximum is not None:
+        schema[&quot;maximum&quot;] = field.maximum
+
+    return schema
+
+def model_to_schema(name, fields):
+    properties = {}
+    required = []
+
+    for field_name, field in fields.items():
+        properties[field_name] = python_type_to_schema(field)
+        if field.required:
+            required.append(field_name)
+
+    return {
+        &quot;type&quot;: &quot;object&quot;,
+        &quot;properties&quot;: properties,
+        &quot;required&quot;: required,
+    }
+</code></pre></div>
+
+<h2>Step 3 · Constrained Token Filter</h2>
+<p>Simulate constrained decoding. Given a partial JSON string and a schema, determine which token categories are valid at the current position.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def next_valid_tokens(partial_json, schema):
+    stripped = partial_json.strip()
+
+    if not stripped:
+        return [&quot;{&quot;]
+
+    try:
+        json.loads(stripped)
+        return [&quot;&lt;EOS&gt;&quot;]
+    except json.JSONDecodeError:
+        pass
+
+    last_char = stripped[-1] if stripped else &quot;&quot;
+
+    if last_char == &quot;{&quot;:
+        return ['&quot;', &quot;}&quot;]
+    elif last_char == '&quot;':
+        if stripped.endswith('&quot;:'):
+            return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+        return [&quot;a-z&quot;, '&quot;']
+    elif last_char == &quot;:&quot;:
+        return [&quot; &quot;, '&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;[&quot;, &quot;{&quot;]
+    elif last_char == &quot;,&quot;:
+        return [&quot; &quot;, '&quot;', &quot;{&quot;, &quot;[&quot;]
+    elif last_char in &quot;0123456789&quot;:
+        return [&quot;0-9&quot;, &quot;.&quot;, &quot;,&quot;, &quot;}&quot;, &quot;]&quot;]
+    elif last_char == &quot;}&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;]&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;]&quot;:
+        return [&quot;,&quot;, &quot;}&quot;, &quot;&lt;EOS&gt;&quot;]
+    elif last_char == &quot;[&quot;:
+        return ['&quot;', &quot;0-9&quot;, &quot;true&quot;, &quot;false&quot;, &quot;null&quot;, &quot;{&quot;, &quot;[&quot;, &quot;]&quot;]
+    else:
+        return [&quot;any&quot;]
+
+def demonstrate_constrained_decoding():
+    partial_states = [
+        '',
+        '{',
+        '{&quot;product&quot;',
+        '{&quot;product&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;',
+        '{&quot;product&quot;: &quot;Sony&quot;,',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;:',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348',
+        '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348}',
+    ]
+
+    print(f&quot;{'Partial JSON':&lt;45} {'Valid Next Tokens'}&quot;)
+    print(&quot;-&quot; * 80)
+    for state in partial_states:
+        valid = next_valid_tokens(state, {})
+        display = state if state else &quot;(empty)&quot;
+        print(f&quot;{display:&lt;45} {valid}&quot;)
+</code></pre></div>
+
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Constrained decoding from scratch, on a real model</div><div class="co-body"><p>The lesson's simulator, made real: Qwen2.5-0.5B-Instruct writes the JSON for six product texts, once freely with the schema in the prompt, and once with masks built from its own vocabulary (string tokens without quotes, digit-only tokens for the price, and whole-sequence scoring for the boolean and the enum). Both results are checked against the schema by code. About three minutes on CPU (the masks are rebuilt in Python at every step), so the output below was recorded.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, re, torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+name = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+V = model.config.vocab_size                    # logits cover 151,936 ids; the tokenizer defines 151,665
+SCHEMA = {&quot;product&quot;: &quot;string&quot;, &quot;price&quot;: &quot;number&quot;, &quot;in_stock&quot;: &quot;boolean&quot;, &quot;condition&quot;: [&quot;new&quot;, &quot;used&quot;, &quot;refurbished&quot;]}
+SYSTEM = (&quot;Extract the product as JSON with exactly these keys: product (string), price (number, no currency sign), &quot;
+          &quot;in_stock (true or false), condition (one of new, used, refurbished). Output the JSON only.&quot;)
+TEXTS = [&quot;Sony WH-1000XM5 headphones, $348, in stock, brand new.&quot;,
+         &quot;Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out.&quot;,
+         &quot;Selling my used Kindle Paperwhite, 60 bucks, still have it.&quot;,
+         &quot;Open-box Dyson V15 vacuum (like new), $549.99, available now.&quot;,
+         &quot;Nintendo Switch OLED, three hundred and forty-nine dollars, back-ordered, new.&quot;,
+         &quot;Canon EOS R8 body, second-hand, priced at 1199 USD, ready to ship.&quot;]
+
+def check(d):                                   # the schema, checked by hand: keys, types, enum
+    if not isinstance(d, dict) or sorted(d) != sorted(SCHEMA): return &quot;wrong keys&quot;
+    if not isinstance(d[&quot;product&quot;], str): return &quot;product not a string&quot;
+    if not isinstance(d[&quot;price&quot;], (int, float)) or isinstance(d[&quot;price&quot;], bool): return f&quot;price {d['price']!r} not a number&quot;
+    if not isinstance(d[&quot;in_stock&quot;], bool): return f&quot;in_stock {d['in_stock']!r} not a boolean&quot;
+    if d[&quot;condition&quot;] not in SCHEMA[&quot;condition&quot;]: return f&quot;condition {d['condition']!r} not allowed&quot;
+    return &quot;valid&quot;
+
+def prompt_ids(text):
+    msgs = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: text}]
+    return tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True), return_tensors=&quot;pt&quot;).input_ids
+
+# token classes for the masks: decode every vocabulary entry once
+pieces = [tok.decode([i]) if i &lt; len(tok) else &quot;&quot; for i in range(V)]
+DIGITS = torch.tensor([bool(re.fullmatch(r&quot;[0-9.]+&quot;, p)) for p in pieces])
+STRING = torch.tensor([('&quot;' not in p and &quot;\n&quot; not in p and &quot;\\&quot; not in p and len(p) &gt; 0) for p in pieces])
+QUOTE = tok.encode('&quot;')[0]
+COMMA = tok.encode(&quot;,&quot;)[0]
+
+def logits_after(text_ids):
+    with torch.no_grad():
+        return model(text_ids).logits[0, -1]
+def push(ids, s):
+    return torch.cat([ids, torch.tensor([tok.encode(s)])], 1)
+
+def constrained(text):
+    ids, out = push(prompt_ids(text), '{&quot;product&quot;: &quot;'), {}
+    # string: any token without a quote, newline or backslash, or the closing quote
+    s = &quot;&quot;
+    for _ in range(24):
+        lg = logits_after(ids); mask = STRING.clone(); mask[QUOTE] = True
+        t = int(torch.where(mask, lg, torch.tensor(-1e9)).argmax())
+        ids = torch.cat([ids, torch.tensor([[t]])], 1)
+        if t == QUOTE: break
+        s += pieces[t]
+    out[&quot;product&quot;] = s
+    ids = push(ids, ', &quot;price&quot;: ')
+    # number: digit tokens only, or a comma that ends the number
+    s = &quot;&quot;
+    for _ in range(8):
+        lg = logits_after(ids); mask = DIGITS.clone(); mask[COMMA] = len(s) &gt; 0
+        t = int(torch.where(mask, lg, torch.tensor(-1e9)).argmax())
+        if t == COMMA: break
+        ids = torch.cat([ids, torch.tensor([[t]])], 1); s += pieces[t]
+    out[&quot;price&quot;] = float(s)
+    ids = push(ids, ', &quot;in_stock&quot;: ')
+    # boolean and enum: score each allowed continuation by its total log-probability
+    def pick(options):
+        best = None
+        for o in options:
+            o_ids = torch.tensor([tok.encode(o)]); full = torch.cat([ids, o_ids], 1)
+            with torch.no_grad(): lp = torch.log_softmax(model(full).logits[0, ids.shape[1] - 1:-1], -1)
+            score = float(lp.gather(1, o_ids[0][:, None]).sum())
+            if best is None or score &gt; best[0]: best = (score, o)
+        return best[1]
+    out[&quot;in_stock&quot;] = pick([&quot;true&quot;, &quot;false&quot;]) == &quot;true&quot;
+    ids = push(ids, (&quot;true&quot; if out[&quot;in_stock&quot;] else &quot;false&quot;) + ', &quot;condition&quot;: ')
+    out[&quot;condition&quot;] = pick([f'&quot;{c}&quot;' for c in SCHEMA[&quot;condition&quot;]]).strip('&quot;')
+    return out
+
+def free(text):
+    ids = prompt_ids(text)
+    with torch.no_grad():
+        g = model.generate(ids, max_new_tokens=60, do_sample=False)
+    return tok.decode(g[0, ids.shape[1]:], skip_special_tokens=True).strip()
+
+print(f&quot;Vocabulary {V:,} tokens. Allowed inside a string: {int(STRING.sum()):,}; inside a number: {int(DIGITS.sum()):,} &quot;
+      f&quot;({DIGITS.float().mean():.2%}); for a boolean or an enum: 2 or 3 whole continuations.\n&quot;)
+ok_free = ok_con = 0
+for t in TEXTS:
+    raw = free(t)
+    try: verdict = check(json.loads(raw))
+    except json.JSONDecodeError: verdict = &quot;not JSON&quot;
+    ok_free += verdict == &quot;valid&quot;
+    c = constrained(t); vc = check(json.loads(json.dumps(c))); ok_con += vc == &quot;valid&quot;
+    print(t)
+    print(f&quot;  free:        {raw.replace(chr(10), ' ')[:110]}  -&gt; {verdict}&quot;)
+    print(f&quot;  constrained: {json.dumps(c)}  -&gt; {vc}&quot;)
+print(f&quot;\nschema-valid: free {ok_free}/{len(TEXTS)}, constrained {ok_con}/{len(TEXTS)}&quot;)
+</code></pre></div>
+<p><strong>Recorded output</strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Vocabulary 151,936 tokens. Allowed inside a string: 148,261; inside a number: 25 (0.02%); for a boolean or an enum: 2 or 3 whole continuations.
+
+Sony WH-1000XM5 headphones, $348, in stock, brand new.
+  free:        {   &quot;product&quot;: &quot;Sony WH-1000XM5 headphones&quot;,   &quot;price&quot;: 348,   &quot;in_stock&quot;: true,   &quot;condition&quot;: &quot;new&quot; }  -&gt; valid
+  constrained: {&quot;product&quot;: &quot;Sony WH-1000XM5 headphones, $348, in stock, brand new. price:&quot;, &quot;price&quot;: 348.0, &quot;in_stock&quot;: true, &quot;condition&quot;: &quot;new&quot;}  -&gt; valid
+Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out.
+  free:        {&quot;product&quot;: &quot;Refurbished MacBook Pro 16&quot;, &quot;price&quot;: 2499, &quot;in_stock&quot;: true, &quot;condition&quot;: &quot;refurbished&quot;}  -&gt; valid
+  constrained: {&quot;product&quot;: &quot;Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out. Condition: refurbished&quot;, &quot;price&quot;: 2499.0, &quot;in_stock&quot;: false, &quot;condition&quot;: &quot;refurbished&quot;}  -&gt; valid
+Selling my used Kindle Paperwhite, 60 bucks, still have it.
+  free:        {   &quot;product&quot;: &quot;Kindle Paperwhite&quot;,   &quot;price&quot;: 60,   &quot;in_stock&quot;: true,   &quot;condition&quot;: &quot;used&quot; }  -&gt; valid
+  constrained: {&quot;product&quot;: &quot;Kindle Paperwhite (used), $60, in_stock: true, condition: used}&lt;|im_end|&gt;&lt;|endoftext|&gt;Human:&quot;, &quot;price&quot;: 100.0, &quot;in_stock&quot;: true, &quot;condition&quot;: &quot;new&quot;}  -&gt; valid
+Open-box Dyson V15 vacuum (like new), $549.99, available now.
+  free:        {   &quot;product&quot;: &quot;Open-box Dyson V15 vacuum&quot;,   &quot;price&quot;: 549.99,   &quot;in_stock&quot;: true,   &quot;condition&quot;: &quot;new&quot; }  -&gt; valid
+  constrained: {&quot;product&quot;: &quot;Open-box Dyson V15 vacuum (like new), $549.99, available now.},&quot;, &quot;price&quot;: 549.99, &quot;in_stock&quot;: true, &quot;condition&quot;: &quot;new&quot;}  -&gt; valid
+Nintendo Switch OLED, three hundred and forty-nine dollars, back-ordered, new.
+  free:        {   &quot;product&quot;: &quot;Nintendo Switch OLED&quot;,   &quot;price&quot;: 349,   &quot;in_stock&quot;: true,   &quot;condition&quot;: &quot;new&quot; }  -&gt; valid
+  constrained: {&quot;product&quot;: &quot;Nintendo Switch OLED, three hundred and forty-nine dollars, back-ordered, new.}, {condition: 'new'}&quot;, &quot;price&quot;: 349.0, &quot;in_stock&quot;: false, &quot;condition&quot;: &quot;new&quot;}  -&gt; valid
+Canon EOS R8 body, second-hand, priced at 1199 USD, ready to ship.
+  free:        {   &quot;product&quot;: &quot;Canon EOS R8 body&quot;,   &quot;price&quot;: 1199,   &quot;in_stock&quot;: true,   &quot;condition&quot;: &quot;second-hand&quot; }  -&gt; condition 'second-hand' not allowed
+  constrained: {&quot;product&quot;: &quot;Canon EOS R8 body, second-hand, priced at 1199 USD, ready to ship. Condition:&quot;, &quot;price&quot;: 1199.0, &quot;in_stock&quot;: true, &quot;condition&quot;: &quot;used&quot;}  -&gt; valid
+
+schema-valid: free 5/6, constrained 6/6
+</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>The masks are drastic.</strong> Inside a string almost anything is allowed: 148,261 of 151,936 vocabulary entries (everything except tokens containing a quote and a few control tokens). Inside a number, only 25 entries are allowed, 0.02% of the vocabulary. For the boolean and the enum the decoder scores the 2 or 3 complete continuations and picks the most likely, so an invalid value is impossible.</p>
+<p><strong>Free generation was nearly valid already.</strong> With the schema in the prompt, 5 of 6 answers passed the schema check. The failure is typical: "second-hand" for a field that allows only new, used or refurbished. The constrained run mapped the same text to "used", which is valid and right. That is the guarantee constrained decoding gives: 6 of 6 valid.</p>
+<p><strong>Valid is not the same as right, in both directions.</strong> Free generation said <code>in_stock: true</code> for the MacBook that is "currently sold out", and for the back-ordered Nintendo. The constrained run, forced to compare <code>true</code> against <code>false</code> as whole options, got both right. But the constrained run also produced the worst answers in the table. Its <code>product</code> strings swallow the rest of the sentence ("…, $348, in stock, brand new. price:") because nothing in a string mask says where a product name ends. The Kindle came out at <code>price: 100.0, condition: "new"</code>, when the text says 60 and used. The mask removed every invalid token, and with them the model's usual way of closing the string. What remained was a valid object with wrong content.</p>
+<p><strong>This is why production libraries do more than mask.</strong> They compile the whole schema into a grammar, so the end of a string is a legal, likely continuation, and they rely on models trained to produce structured output. The next run uses one.</p></div></aside>
+<h2>Step 4 · Extraction Pipeline</h2>
+<p>Combine everything into an extraction pipeline: define a schema, simulate an LLM producing structured output, validate the output, and handle retries.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def simulate_llm_extraction(text, schema, attempt=0):
+    if &quot;headphones&quot; in text.lower() or &quot;sony&quot; in text.lower():
+        if attempt == 0:
+            return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true, &quot;categories&quot;: [&quot;audio&quot;, &quot;headphones&quot;]}'
+        return '{&quot;product&quot;: &quot;Sony WH-1000XM5&quot;, &quot;price&quot;: 348.00, &quot;in_stock&quot;: true}'
+
+    if &quot;laptop&quot; in text.lower():
+        return '{&quot;product&quot;: &quot;MacBook Pro 16&quot;, &quot;price&quot;: 2499.00, &quot;in_stock&quot;: false, &quot;categories&quot;: [&quot;computers&quot;]}'
+
+    return '{&quot;product&quot;: &quot;Unknown&quot;, &quot;price&quot;: 0, &quot;in_stock&quot;: false}'
+
+def extract_with_retry(text, schema, max_retries=3):
+    for attempt in range(max_retries):
+        raw = simulate_llm_extraction(text, schema, attempt)
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f&quot;  Attempt {attempt + 1}: JSON parse error -- {e}&quot;)
+            continue
+
+        errors = validate_schema(data, schema)
+        if not errors:
+            return data
+
+        print(f&quot;  Attempt {attempt + 1}: Schema validation errors -- {errors}&quot;)
+
+    return None
+
+product_schema = {
+    &quot;type&quot;: &quot;object&quot;,
+    &quot;properties&quot;: {
+        &quot;product&quot;: {&quot;type&quot;: &quot;string&quot;},
+        &quot;price&quot;: {&quot;type&quot;: &quot;number&quot;, &quot;minimum&quot;: 0},
+        &quot;in_stock&quot;: {&quot;type&quot;: &quot;boolean&quot;},
+        &quot;categories&quot;: {&quot;type&quot;: &quot;array&quot;, &quot;items&quot;: {&quot;type&quot;: &quot;string&quot;}},
+    },
+    &quot;required&quot;: [&quot;product&quot;, &quot;price&quot;, &quot;in_stock&quot;],
+}
+</code></pre></div>
+
+<h2>Step 5 · Run the Full Pipeline</h2>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def run_demo():
+    print(&quot;=&quot; * 60)
+    print(&quot;  Structured Output Pipeline Demo&quot;)
+    print(&quot;=&quot; * 60)
+
+    print(&quot;\n--- Schema Definition ---&quot;)
+    product_fields = {
+        &quot;product&quot;: SchemaField(str),
+        &quot;price&quot;: SchemaField(float, minimum=0),
+        &quot;in_stock&quot;: SchemaField(bool),
+        &quot;categories&quot;: SchemaField(list, required=False),
+    }
+    generated_schema = model_to_schema(&quot;Product&quot;, product_fields)
+    print(json.dumps(generated_schema, indent=2))
+
+    print(&quot;\n--- Schema Validation ---&quot;)
+    test_cases = [
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: 10.0, &quot;in_stock&quot;: True}, &quot;Valid object&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: -5.0, &quot;in_stock&quot;: True}, &quot;Negative price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;in_stock&quot;: True}, &quot;Missing price&quot;),
+        ({&quot;product&quot;: &quot;Test&quot;, &quot;price&quot;: &quot;ten&quot;, &quot;in_stock&quot;: True}, &quot;String as price&quot;),
+        (&quot;not an object&quot;, &quot;String instead of object&quot;),
+    ]
+
+    for data, label in test_cases:
+        errors = validate_schema(data, product_schema)
+        status = &quot;PASS&quot; if not errors else f&quot;FAIL: {errors}&quot;
+        print(f&quot;  {label}: {status}&quot;)
+
+    print(&quot;\n--- Constrained Decoding Simulation ---&quot;)
+    demonstrate_constrained_decoding()
+
+    print(&quot;\n--- Extraction Pipeline ---&quot;)
+    texts = [
+        &quot;The Sony WH-1000XM5 headphones are priced at $348 and currently available.&quot;,
+        &quot;The new MacBook Pro 16-inch laptop costs $2499 but is sold out.&quot;,
+        &quot;This is a random sentence with no product info.&quot;,
+    ]
+
+    for text in texts:
+        print(f&quot;\n  Input: {text[:60]}...&quot;)
+        result = extract_with_retry(text, product_schema)
+        if result:
+            print(f&quot;  Output: {json.dumps(result)}&quot;)
+        else:
+            print(f&quot;  Output: FAILED after retries&quot;)
+</code></pre></div>
+
+<h2>Use it: the same idea with real libraries</h2>
+<h3>OpenAI Structured Outputs</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># from openai import OpenAI
+# from pydantic import BaseModel
+#
+# client = OpenAI()
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# # Responses API; the SDK turns the Pydantic model into a strict JSON schema
+# response = client.responses.parse(
+#     model=&quot;gpt-6-luna&quot;,
+#     instructions=&quot;Extract product information.&quot;,
+#     input=&quot;Sony WH-1000XM5, $348, in stock&quot;,
+#     text_format=Product,
+# )
+#
+# product = response.output_parsed          # None if the model refused
+# print(product.product, product.price, product.in_stock)
+</code></pre></div>
+
+<p>OpenAI's structured output mode uses constrained decoding internally, so the output matches the Pydantic schema. You still handle three cases: a refusal (the model declines, and <code>parsed</code> is empty), a response cut off by the token limit (invalid JSON), and values that are well-formed but wrong, which no schema can catch. Keep the validation step; drop the retry-on-parse-error loop.</p>
+<h3>Anthropic Tool Use</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># import anthropic
+# from pydantic import BaseModel
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# client = anthropic.Anthropic()
+#
+# # Native structured outputs: the SDK sends the schema as output_config.format
+# response = client.messages.parse(
+#     model=&quot;claude-opus-5-5&quot;,
+#     max_tokens=1024,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Extract: Sony WH-1000XM5, $348, in stock&quot;}],
+#     output_format=Product,
+# )
+# print(response.parsed_output)
+#
+# # The tool-use route: a strict tool whose input_schema is enforced
+# # tools=[{&quot;name&quot;: &quot;extract_product&quot;, &quot;description&quot;: &quot;Extract product information from text&quot;,
+# #         &quot;strict&quot;: True, &quot;input_schema&quot;: Product.model_json_schema()}]
+</code></pre></div>
+
+<p>Anthropic offers both surfaces: native structured outputs (<code>output_config.format</code>, or <code>messages.parse</code> with a Pydantic model), and tool use, where the model emits a tool call whose arguments match <code>input_schema</code> (add <code>"strict": true</code> to the tool to have them enforced). Use structured outputs when you just want the data, tools when the model must choose what to call.</p>
+<h3>Instructor Library</h3>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python"># pip install instructor
+# import instructor
+# from pydantic import BaseModel
+#
+# client = instructor.from_provider(&quot;openai/gpt-6-luna&quot;)   # also &quot;anthropic/...&quot;, &quot;google/...&quot;, local models
+#
+# class Product(BaseModel):
+#     product: str
+#     price: float
+#     in_stock: bool
+#
+# product = client.chat.completions.create(
+#     response_model=Product,
+#     max_retries=2,
+#     messages=[{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Sony WH-1000XM5, $348, in stock&quot;}],
+# )
+</code></pre></div>
+
+<p>Instructor wraps any LLM client and adds automatic retries with validation. If the first attempt fails validation, it sends the errors back to the model as context and asks it to fix the output. This works with any provider, not just OpenAI.</p>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">XGrammar with a Pydantic schema</div><div class="co-body"><p>The production route on the same model: a Pydantic model (with an enum, a minimum and a list of at most three categories) becomes a JSON schema, XGrammar compiles it into a token-level grammar, and Hugging Face <code>generate</code> uses it as a logits processor. Four texts with and without the grammar, validated by Pydantic, then the number of allowed tokens at points inside one answer. About a minute.</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">import json, time, torch, xgrammar as xgr
+from typing import Literal
+from pydantic import BaseModel, Field, ValidationError
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+name = &quot;Qwen/Qwen2.5-0.5B-Instruct&quot;
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
+
+class Product(BaseModel):                     # the contract, written once as a Pydantic model
+    product: str
+    price: float = Field(ge=0)
+    in_stock: bool
+    condition: Literal[&quot;new&quot;, &quot;used&quot;, &quot;refurbished&quot;]
+    categories: list[str] = Field(max_length=3)
+
+schema = json.dumps(Product.model_json_schema())
+info = xgr.TokenizerInfo.from_huggingface(tok, vocab_size=AutoConfig.from_pretrained(name).vocab_size)
+t0 = time.time()
+compiled = xgr.GrammarCompiler(info).compile_json_schema(schema)
+print(f&quot;Pydantic schema -&gt; grammar compiled in {time.time() - t0:.2f} s; vocabulary {info.vocab_size:,} tokens&quot;)
+
+TEXTS = [&quot;Sony WH-1000XM5 headphones, $348, in stock, brand new.&quot;,
+         &quot;Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out.&quot;,
+         &quot;Open-box Dyson V15 vacuum (like new), $549.99, available now.&quot;,
+         &quot;Canon EOS R8 body, second-hand, priced at 1199 USD, ready to ship.&quot;]
+SYSTEM = &quot;Extract the product from the text as JSON matching this schema: &quot; + schema
+
+def run(text, constrained):
+    msgs = [{&quot;role&quot;: &quot;system&quot;, &quot;content&quot;: SYSTEM}, {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: text}]
+    ids = tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True), return_tensors=&quot;pt&quot;).input_ids
+    kw = {}
+    if constrained:
+        kw[&quot;logits_processor&quot;] = [xgr.contrib.hf.LogitsProcessor(compiled)]
+    t = time.time()
+    with torch.no_grad():
+        g = model.generate(ids, max_new_tokens=120, do_sample=False, **kw)
+    n = g.shape[1] - ids.shape[1]
+    return tok.decode(g[0, ids.shape[1]:], skip_special_tokens=True).strip(), n, time.time() - t
+
+for constrained in (False, True):
+    valid, tps = 0, []
+    print(&quot;\nwith the grammar&quot; if constrained else &quot;\nwithout the grammar (schema in the prompt only)&quot;)
+    for text in TEXTS:
+        out, n, dt = run(text, constrained); tps.append(n / dt)
+        try:
+            p = Product.model_validate_json(out); valid += 1; verdict = &quot;valid: &quot; + p.model_dump_json()
+        except ValidationError as e:
+            err = e.errors()[0]
+            verdict = f&quot;invalid: {'.'.join(map(str, err['loc'])) or 'json'}: {err['type']} ({e.error_count()} error(s))&quot;
+        print(&quot;  &quot; + verdict)
+    print(f&quot;  -&gt; {valid}/{len(TEXTS)} pass Pydantic validation | {sum(tps) / len(tps):.1f} tokens/s&quot;)
+
+# what the grammar allows at a few points of one valid answer
+m = xgr.GrammarMatcher(compiled)
+bitmask = xgr.allocate_token_bitmask(1, info.vocab_size)
+points = ['', '{&quot;product&quot;: &quot;', '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: ', '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348',
+          '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348, &quot;in_stock&quot;: ', '{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348, &quot;in_stock&quot;: true, &quot;condition&quot;: ']
+print(&quot;\nhow many tokens the grammar allows next:&quot;)
+for p in points:
+    m.reset()
+    accepted = all(m.accept_token(t) for t in tok.encode(p))
+    m.fill_next_token_bitmask(bitmask)
+    logits = torch.zeros(1, info.vocab_size)
+    xgr.apply_token_bitmask_inplace(logits, bitmask)
+    n = int(torch.isfinite(logits).sum())
+    print(f&quot;  after {p[-34:]!r:38} {n:&gt;7,} of {info.vocab_size:,}&quot; + (&quot;&quot; if accepted else &quot;  (prefix rejected)&quot;))
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">Pydantic schema -&gt; grammar compiled in 0.02 s; vocabulary 151,936 tokens
+
+without the grammar (schema in the prompt only)
+  invalid: categories: list_type (1 error(s))
+  invalid: categories: list_type (1 error(s))
+  invalid: categories: list_type (1 error(s))
+  invalid: condition: literal_error (2 error(s))
+  -&gt; 0/4 pass Pydantic validation | 2.3 tokens/s
+
+with the grammar
+  valid: {&quot;product&quot;:&quot;Sony WH-1000XM5 headphones&quot;,&quot;price&quot;:348.0,&quot;in_stock&quot;:true,&quot;condition&quot;:&quot;new&quot;,&quot;categories&quot;:[&quot;Headphones&quot;]}
+  valid: {&quot;product&quot;:&quot;MacBook Pro&quot;,&quot;price&quot;:2499.0,&quot;in_stock&quot;:true,&quot;condition&quot;:&quot;refurbished&quot;,&quot;categories&quot;:[&quot;Electronics&quot;]}
+  valid: {&quot;product&quot;:&quot;Dyson V15 vacuum&quot;,&quot;price&quot;:549.99,&quot;in_stock&quot;:true,&quot;condition&quot;:&quot;new&quot;,&quot;categories&quot;:[&quot;vacuum cleaners&quot;]}
+  valid: {&quot;product&quot;:&quot;Canon EOS R8 body&quot;,&quot;price&quot;:1199.0,&quot;in_stock&quot;:true,&quot;condition&quot;:&quot;used&quot;,&quot;categories&quot;:[&quot;Camera Accessories&quot;]}
+  -&gt; 4/4 pass Pydantic validation | 1.9 tokens/s
+
+how many tokens the grammar allows next:
+  after &#x27;&#x27;                                           7 of 151,936
+  after &#x27;{&quot;product&quot;: &quot;&#x27;                        147,137 of 151,936
+  after &#x27;{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: &#x27;            432 of 151,936
+  after &#x27;{&quot;product&quot;: &quot;Sony&quot;, &quot;price&quot;: 348&#x27;         446 of 151,936
+  after &#x27;&quot;Sony&quot;, &quot;price&quot;: 348, &quot;in_stock&quot;: &#x27;       443 of 151,936
+  after &#x27;8, &quot;in_stock&quot;: true, &quot;condition&quot;: &#x27;       425 of 151,936</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p><strong>Without the grammar, 0 of 4 pass.</strong> The schema was in the prompt, and the model still wrote <code>categories</code> as a string instead of a list three times, and an invalid <code>condition</code> once. Pydantic catches each one, so in production these would mean retries.</p>
+<p><strong>With the grammar, 4 of 4 pass, and the content is cleaner than the from-scratch run.</strong> Product names end where they should ("MacBook Pro", "Canon EOS R8 body"), because the grammar knows a string can close after any character and the model's normal closing quote stays available. Prices are numbers, <code>condition</code> is one of the three values, and <code>categories</code> is a short list.</p>
+<p><strong>Still valid, still wrong.</strong> The MacBook comes out <code>"in_stock": true</code> although the text says sold out. No grammar can check meaning. Validate values against the source where you can, and evaluate extraction accuracy separately from schema validity.</p>
+<p><strong>Speed and the size of the mask.</strong> At the start only 7 tokens are allowed (an opening brace with optional whitespace). Inside the product string, 147,137 are allowed. In the number and the boolean, a few hundred: the grammar also allows whitespace and the tokens that continue or close the value. On this CPU the grammar run was slower (5.5 against 8.6 tokens per second) because the mask is applied in Python at every step. Inference servers such as vLLM and SGLang compute the mask in optimised native code while the GPU runs the forward pass, so the overhead there is small.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>Make <code>condition</code> required but leave the text silent about it ("Kindle Paperwhite, $60, in stock"). With constrained decoding the model must still pick one of the three values. What should the schema look like so that "the text does not say" is possible? (Solution B1.)</p></div></aside>
+<aside class="co co-practice"><div class="co-label">Industry practice</div><div class="co-title">What&#x27;s current (2024–2026)</div><div class="co-body"><ul>
+<li><strong>Native strict schemas everywhere</strong>: OpenAI structured outputs and strict function calling, Anthropic structured outputs and strict tool use, Gemini <code>response_schema</code>. Each enforces a documented subset of JSON Schema.</li>
+<li><strong>Grammar engines in open serving</strong>: vLLM and SGLang use XGrammar by default, with llguidance and Outlines as alternatives; the mask costs little enough to leave on for every request.</li>
+<li><strong>Pydantic as the contract</strong>: SDK helpers (<code>responses.parse</code>, <code>messages.parse</code>) and Instructor turn Pydantic models into schemas and parse the result back.</li>
+<li><strong>Validation stays</strong>: refusals, truncation and wrong values still happen; teams log schema-valid but semantically wrong outputs as their own error class.</li>
+</ul>
+<p>Sources: <a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs">Claude structured outputs</a>, <a href="https://platform.openai.com/docs/guides/structured-outputs">OpenAI structured outputs guide</a>, <a href="https://arxiv.org/abs/2411.15100">XGrammar paper</a>, <a href="https://github.com/mlc-ai/xgrammar">XGrammar on GitHub</a>, <a href="https://arxiv.org/abs/2307.09702">Willard and Louf 2023 (Outlines)</a>, <a href="https://python.useinstructor.com/">Instructor</a>.</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Prompting for JSON gives mostly-valid JSON; production needs a guarantee and a check.</li>
+<li>Schema mode enforces keys, types and enums; JSON mode only parseability.</li>
+<li>Constrained decoding masks disallowed tokens at every step; engines precompute the masks.</li>
+<li>Valid shape is not correct content: validate values, handle refusals and truncation.</li>
+<li>Design schemas for missing data: nullable fields or an explicit "unknown".</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-structured-outputs-v4"><span class="t" style="--cs-hue:215">SO</span>Cheat sheet · Constrained Decoding and Structured Outputs: Quick Reference</a><a href="#cs-tool-calling"><span class="t" style="--cs-hue:30">TC</span>Cheat sheet · Function Calling and Structured Outputs</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/prompt-structured-extractor.md</code> -- a reusable prompt template that extracts structured data from any text given a schema definition. Feed it a JSON Schema and unstructured text, and it returns validated JSON.</p>
+<p>It also produces <code>outputs/skill-structured-outputs.md</code> -- a decision framework for choosing the right structured output strategy based on your provider, reliability requirements, and schema complexity.</p>
+<p><strong><code>outputs/prompt-structured-extractor.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: prompt-structured-extractor
+description: Extract structured data from unstructured text given a JSON Schema definition
+phase: 11
+lesson: 03
+---
+
+You are a structured data extraction engine. I will provide a JSON Schema and unstructured text. You will extract data that conforms exactly to the schema.
+
+## Extraction Protocol
+
+### 1. Schema Analysis
+
+Before extracting, analyze the schema:
+
+- Identify all required fields and their types
+- Note enum constraints, minimum/maximum values, and format requirements
+- Identify nested objects and array structures
+- Flag fields that may be ambiguous or hard to extract from natural text
+
+### 2. Extraction Rules
+
+**Required fields**: must always be present in the output. If the information is not in the text, use the most reasonable default:
+- Strings: use &quot;unknown&quot; or &quot;not specified&quot;
+- Numbers: use 0 or null (if the schema allows nullable)
+- Booleans: use false as the conservative default
+- Arrays: use an empty array []
+
+**Type enforcement**: every value must match the schema type exactly:
+- &quot;price&quot; with type &quot;number&quot;: extract 348.00, not &quot;$348&quot; or &quot;three hundred&quot;
+- &quot;in_stock&quot; with type &quot;boolean&quot;: extract true/false, not &quot;yes&quot;/&quot;available&quot;
+- &quot;categories&quot; with type &quot;array&quot;: extract [&quot;audio&quot;, &quot;headphones&quot;], not &quot;audio, headphones&quot;
+
+**Enum fields**: the value must be one of the allowed values. If the text uses a synonym, map it to the closest allowed value.
+
+**Nested objects**: extract each level of nesting separately. Validate inner objects against their sub-schemas.
+
+### 3. Confidence Annotation
+
+For each extracted field, internally assess confidence:
+- **High**: the information is explicitly stated in the text
+- **Medium**: the information is implied or requires minor inference
+- **Low**: the information is guessed based on context or defaults
+
+If more than 2 fields are low confidence, note this in a separate `_extraction_notes` field (only if the schema does not prohibit additional properties).
+
+### 4. Output Format
+
+Return ONLY the JSON object. No markdown fences. No preamble. No explanation. The output must be directly parseable by `JSON.parse()` or `json.loads()`.
+
+## Input Format
+
+**Schema:**
+```json
+{schema}
+```
+
+**Text to extract from:**
+```
+{text}
+```
+
+## Output
+
+A single JSON object matching the schema exactly.
+</code></pre></div>
+<p><strong><code>outputs/skill-structured-outputs.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: skill-structured-outputs
+description: Decision framework for choosing the right structured output strategy based on provider, reliability, and complexity
+version: 1.0.0
+phase: 11
+lesson: 03
+tags: [structured-output, json, schema, constrained-decoding, pydantic, function-calling]
+---
+
+# Structured Output Strategy
+
+When building an LLM application that requires structured data, apply this decision framework.
+
+## When to use each approach
+
+**Prompt-based (&quot;Return JSON&quot;):** Prototyping only. Acceptable for internal tools where occasional parse failures are tolerable. Add a try/except with retry. Never use in production pipelines.
+
+**JSON mode (API flag):** You need guaranteed valid JSON but the schema is simple or flexible. Works when you validate the shape on the application side. Available: OpenAI, Anthropic (via tool use), Google.
+
+**Schema mode (constrained decoding):** Production systems where every output must match a specific schema. Zero parse failures. Zero schema violations. Use this by default for any production extraction or classification task. Available: OpenAI structured outputs, Outlines, Guidance.
+
+**Function calling / tool use:** The model needs to choose which function to call, not just fill parameters. You have multiple schemas and the model selects the appropriate one. Also use when integrating with existing tool/function infrastructure.
+
+**Instructor library:** You want Pydantic validation with automatic retry across any provider. Best DX for Python projects. Wraps OpenAI, Anthropic, Google, and open-source models.
+
+## Provider-specific guidance
+
+**OpenAI:** Use `response_format` with `json_schema` type. Constrained decoding is built in. Pydantic models work directly. Most reliable structured output implementation.
+
+**Anthropic:** Use tool use for structured output. Define a single tool with the desired schema. The model returns tool call arguments matching the schema. Reliable but requires the tool use API pattern.
+
+**Open-source models (vLLM, Ollama):** Use Outlines or Guidance for constrained decoding. These libraries compile JSON Schemas into finite state machines that mask invalid tokens during generation. Requires running inference locally.
+
+## Schema design guidelines
+
+1. Keep schemas flat when possible. Nested objects beyond 2 levels increase extraction errors.
+2. Use enums for categorical fields. Do not rely on the model inventing the right string.
+3. Make ambiguous fields required with explicit null support rather than optional. Forces the model to make a decision.
+4. Add descriptions to schema properties. The model reads these as instructions.
+5. Avoid union types (oneOf/anyOf) unless necessary. They increase decoding complexity.
+6. Set minimum/maximum on numbers. Catches hallucinated extreme values.
+7. Use minItems/maxItems on arrays to prevent empty or unbounded outputs.
+
+## Common failure patterns and fixes
+
+- **Model wraps JSON in markdown fences**: switch from prompt-based to JSON mode or schema mode
+- **Schema-valid but factually wrong**: add an LLM-as-judge validation step after extraction
+- **Inconsistent enum values**: switch to constrained decoding or add post-processing normalization
+- **Missing optional fields**: make them required or add default values in application code
+- **Very slow extraction**: constrained decoding adds 5-15% latency, reduce schema complexity if latency-sensitive
+- **Large arrays with varied items**: chunk the input and extract per-chunk, then merge results
+
+## Reliability ladder
+
+| Approach | Parse Success | Schema Match | Setup Effort |
+|----------|-------------|-------------|-------------|
+| Prompt-based | ~90% | ~80% | 1 minute |
+| JSON mode | 100% | ~90% | 5 minutes |
+| Schema mode | 100% | ~99% | 15 minutes |
+| Constrained decoding | 100% | 100% | 30 minutes |
+| Instructor + retry | 100% | ~99.5% | 10 minutes |
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>
+<p>Extend the schema validator to support <code>oneOf</code> (the data must match exactly one of several schemas). This handles polymorphic outputs -- for example, a field that can be either a <code>Product</code> or a <code>Service</code> object with different shapes.</p>
+</li>
+<li>
+<p>Build a "schema diff" tool that compares two schemas and identifies breaking changes (removed required fields, changed types) versus non-breaking changes (added optional fields, relaxed constraints). This is essential for versioning your extraction schemas in production.</p>
+</li>
+<li>
+<p>Implement a more realistic constrained decoding simulator. Given a JSON Schema and a vocabulary of 100 tokens (letters, digits, punctuation, keywords), walk through generation step by step, masking invalid tokens at each position. Measure what percentage of the vocabulary is valid at each step.</p>
+</li>
+<li>
+<p>Build an extraction eval suite. Create 50 product descriptions with hand-labeled JSON outputs. Run your extraction pipeline on all 50 and measure exact match, field-level accuracy, and type compliance. Identify which fields are hardest to extract correctly.</p>
+</li>
+<li>
+<p>Add "confidence scores" to your extraction pipeline. For each extracted field, estimate how confident the model is (based on token probabilities, or by running extraction 3 times and measuring consistency). Flag low-confidence fields for human review.</p>
+</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1103-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · 2499, but read the product field</span></summary><div class="qa-a"><p>2499.0, the right number. The digits-only mask removed the comma the model wanted after "2", and the next best digits were "499". The same field shows what a mask cannot do, though. The constrained <code>product</code> value for that text is "Refurbished MacBook Pro 16 for 2,499 dollars, currently sold out. Condition: refurbished": the whole sentence. Nothing in a string mask marks the end of a product name. And in the XGrammar run on the same model, the MacBook is valid but <code>"in_stock": true</code> although it is sold out. Constrained decoding guarantees the shape of the answer, not its truth.</p></div></details>
+<details class="qa" id="a1103-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Give the model a way to say "unknown"</span></summary><div class="qa-a"><p>If <code>condition</code> is required and must be one of new, used or refurbished, constrained decoding forces a choice even when the text never says. The model picks the likeliest option, usually "new", and the answer is valid, confident and invented. The from-scratch run shows how readily the forced choice goes wrong: for a Kindle the text calls "used", the constrained decoder wrote "new". Make "not stated" representable. Either make the field optional and nullable (<code>condition: Literal["new", "used", "refurbished"] | None = None</code>), or add an explicit value such as <code>"unknown"</code>. Then tell the model in the prompt to use it when the text is silent, and test that path with examples like this one.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://platform.openai.com/docs/guides/structured-outputs">OpenAI Structured Outputs Guide</a> -- official documentation for JSON Schema-based constrained decoding in the OpenAI API</li>
+<li><a href="https://arxiv.org/abs/2307.09702">Willard &amp; Louf, 2023 -- "Efficient Guided Generation for Large Language Models"</a> -- the Outlines paper, describing how to compile JSON Schemas into finite state machines for token-level constraints</li>
+<li><a href="https://python.useinstructor.com/">Instructor documentation</a> -- the standard library for getting structured outputs from any LLM with Pydantic validation and retries</li>
+<li><a href="https://docs.anthropic.com/en/docs/tool-use">Anthropic Tool Use Guide</a> -- how Claude implements structured output via tool use with JSON Schema input_schema</li>
+<li><a href="https://json-schema.org/">JSON Schema specification</a> -- the full spec for the schema language used by every major structured output system</li>
+<li><a href="https://github.com/outlines-dev/outlines">Outlines library</a> -- open-source constrained generation using regex and JSON Schema compiled to finite state machines</li>
+<li><a href="https://arxiv.org/abs/2411.15100">Dong et al., "XGrammar: Flexible and Efficient Structured Generation Engine for Large Language Models" (MLSys 2025)</a> -- the current state-of-the-art grammar engine; pushdown-automaton compilation that masks tokens at ~100 ns / token.</li>
+<li><a href="https://arxiv.org/abs/2212.06094">Beurer-Kellner et al., "Prompting Is Programming: A Query Language for Large Language Models" (LMQL)</a> -- the LMQL paper framing constrained decoding as a query language with type and value constraints.</li>
+<li><a href="https://github.com/guidance-ai/guidance">Microsoft Guidance (framework docs)</a> -- template-driven constrained generation; vendor-agnostic complement to Outlines and XGrammar.</li>
+</ul></div></aside>
+<section class="quiz" aria-label="Check your understanding"><div class="quiz-head"><h2>Check your understanding</h2><span class="quiz-score" aria-live="polite"></span></div><div class="q" id="a1103-q1"><p class="q-text"><span class="q-num">Q1</span>Why is getting structured JSON output from LLMs challenging?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1103-q1-o0"><span class="opt-key">A</span><span>JSON is too complex for LLMs</span></button><button type="button" class="opt" data-correct="false" id="a1103-q1-o1"><span class="opt-key">B</span><span>LLMs only output plain text</span></button><button type="button" class="opt" data-correct="false" id="a1103-q1-o2"><span class="opt-key">C</span><span>LLMs can&#x27;t generate JSON</span></button><button type="button" class="opt" data-correct="true" id="a1103-q1-o3"><span class="opt-key">D</span><span>LLMs generate free-form text token by token and can produce invalid JSON (missing brackets, wrong types, extra text) at any point</span></button></div><p class="q-explain" hidden>LLMs generate tokens autoregressively. They might add a trailing comma, forget a closing bracket, include markdown formatting around JSON, or hallucinate extra fields. Each token is independent, so structural validity isn&#x27;t guaranteed.</p></div><div class="q" id="a1103-q2"><p class="q-text"><span class="q-num">Q2</span>What is constrained decoding?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1103-q2-o0"><span class="opt-key">A</span><span>Limiting the model&#x27;s vocabulary size</span></button><button type="button" class="opt" data-correct="false" id="a1103-q2-o1"><span class="opt-key">B</span><span>Using a smaller model</span></button><button type="button" class="opt" data-correct="false" id="a1103-q2-o2"><span class="opt-key">C</span><span>Compressing the output</span></button><button type="button" class="opt" data-correct="true" id="a1103-q2-o3"><span class="opt-key">D</span><span>Restricting which tokens the model can generate at each step to ensure the output conforms to a grammar or schema</span></button></div><p class="q-explain" hidden>Constrained decoding masks out invalid tokens at each generation step. After an opening brace, only valid JSON keys are allowed. After a colon, only valid value tokens. This guarantees structural validity at the token level.</p></div><div class="q" id="a1103-q3"><p class="q-text"><span class="q-num">Q3</span>What is the benefit of using Pydantic models for LLM output validation?</p><div class="opts"><button type="button" class="opt" data-correct="true" id="a1103-q3-o0"><span class="opt-key">A</span><span>They define typed schemas that automatically validate, parse, and reject malformed LLM outputs with clear error messages</span></button><button type="button" class="opt" data-correct="false" id="a1103-q3-o1"><span class="opt-key">B</span><span>They make API calls faster</span></button><button type="button" class="opt" data-correct="false" id="a1103-q3-o2"><span class="opt-key">C</span><span>They reduce token usage</span></button><button type="button" class="opt" data-correct="false" id="a1103-q3-o3"><span class="opt-key">D</span><span>They improve model accuracy</span></button></div><p class="q-explain" hidden>Pydantic enforces types, required fields, value constraints, and nested structures. When the LLM produces invalid output, Pydantic gives specific error messages that can be fed back to the model for self-correction.</p></div><div class="q" id="a1103-q4"><p class="q-text"><span class="q-num">Q4</span>What should you do when the LLM returns invalid JSON despite instructions?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1103-q4-o0"><span class="opt-key">A</span><span>Switch to a different model</span></button><button type="button" class="opt" data-correct="false" id="a1103-q4-o1"><span class="opt-key">B</span><span>Manually fix the JSON</span></button><button type="button" class="opt" data-correct="true" id="a1103-q4-o2"><span class="opt-key">C</span><span>Implement a retry loop that sends the validation error back to the model as context for a corrected attempt</span></button><button type="button" class="opt" data-correct="false" id="a1103-q4-o3"><span class="opt-key">D</span><span>Increase the temperature</span></button></div><p class="q-explain" hidden>A retry loop with error feedback works well: parse the output, catch validation errors, send the error message back as context (&#x27;Your output had this error: ... Please fix it&#x27;). Most models self-correct on the second attempt.</p></div><div class="q" id="a1103-q5"><p class="q-text"><span class="q-num">Q5</span>When should you use the API&#x27;s native JSON mode vs prompt-based JSON extraction?</p><div class="opts"><button type="button" class="opt" data-correct="false" id="a1103-q5-o0"><span class="opt-key">A</span><span>Always use prompt-based extraction</span></button><button type="button" class="opt" data-correct="false" id="a1103-q5-o1"><span class="opt-key">B</span><span>Always use native JSON mode</span></button><button type="button" class="opt" data-correct="true" id="a1103-q5-o2"><span class="opt-key">C</span><span>Use native mode for guaranteed structure; use prompt-based for complex extraction where you need the model to reason about what to extract</span></button><button type="button" class="opt" data-correct="false" id="a1103-q5-o3"><span class="opt-key">D</span><span>They produce identical results</span></button></div><p class="q-explain" hidden>Native JSON mode (OpenAI&#x27;s response_format, Anthropic&#x27;s tool_use) guarantees valid JSON structure. Prompt-based extraction is more flexible for complex reasoning about which fields to populate. Use native mode when structure matters most.</p></div></section></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1103" id="done-a1103">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1103" id="undo-a1103" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1102"><span class="pn-dir">Previous</span><span class="pn-t">11.11 · Chain-of-Thought, Tree-of-Thought and Few-Shot Prompting</span></a><a class="pn next" href="#a1104"><span class="pn-dir">Next</span><span class="pn-t">11.13 · Vector Embeddings and Representations</span></a></div></footer>

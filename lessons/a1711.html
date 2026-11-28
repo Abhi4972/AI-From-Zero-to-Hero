@@ -1,0 +1,395 @@
+<header class="m-head"><nav class="crumbs" aria-label="Where you are"><a href="#home">Course home</a><span aria-hidden="true">/</span><a href="#ph-17">Phase 17 · LLM Inference, Infrastructure and LLMOps</a></nav><h1>KV Cache Locality and Multi-Region LLM Serving</h1><div class="m-meta"><span class="chip chip-num">Lesson 17.11</span><span class="chip">60 min</span><span class="chip chip-core">Learn</span><span class="chip chip-done" data-done-chip="a1711" hidden>Completed</span></div></header><div class="prose"><aside class="co co-goals"><div class="co-label">Lesson goals</div><div class="co-title">What you will be able to do</div><div class="co-body"><ul>
+<li>Explain why round-robin load balancing breaks cached inference and quantify the TTFT penalty.</li>
+<li>Diagram a cache-aware router: inputs (KV-cache events), algorithm (prefix-hash match), tie-breaker (GPU utilization).</li>
+<li>Name the 32% DR failure driver for LLMs (missing tokenizer files / quantization configs) and state a three-file DR checklist.</li>
+<li>Distinguish commercial cross-region offerings (Bedrock CRI, GKE Multi-Cluster Gateway) from KV-aware routing.</li>
+</ul></div></aside>
+<aside class="co co-prereq"><div class="co-label">Before you start</div><div class="co-body"><ul>
+<li><strong>Needs</strong>: Lesson 17.4 (vLLM Serving), Lesson 17.6 (SGLang RadixAttention)</li>
+<li><strong>Type</strong>: Learn. <strong>Time</strong>: about 60 minutes.</li>
+<li><strong>Code in</strong>: Python, TypeScript (stdlib, toy prefix-cache-aware router simulator). The Python runs on this page; the other languages are shown for comparison.</li>
+</ul></div></aside>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-title">The idea in one line</div><div class="co-body"><p>Round-robin load balancing is actively harmful for cached LLM inference. A request that does not land on the node holding its prefix pays full prefill cost — roughly 800 ms at P50 on a long prompt versus ~80 ms with a cache hit. In 2026 the production pattern is a cache-aware router (vLLM Router in Rust, llm-d router) that consumes KV-cache events and routes on prefix-hash match. Recent research (GORGO) makes cross-region network latency an explicit term in the routing objective. Commercial "cross-region inference" offerings (Bedrock cross-region inference, GKE multi-cluster gateways) treat inference as opaque — they handle availability, not TTFT. JPMorgan and Mayo Clinic ran us-east-1 failover in Nov 2024 at ~22 minutes. The DR reality: 32% of LLM DR failures are because teams backed up weights but forgot tokenizer files or quantization configs.</p></div></aside>
+<aside class="co co-terms"><div class="co-label">Terms you'll hear</div><div class="co-body"><div class="tbl"><table>
+<thead>
+<tr>
+<th>Term</th>
+<th>What people say</th>
+<th>What it actually means</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cache-aware routing</td>
+<td>"smart LB"</td>
+<td>Route on prefix-hash match to KV-cache-holding replica</td>
+</tr>
+<tr>
+<td>KV-cache events</td>
+<td>"cache pub-sub"</td>
+<td>Replicas publish block add/evict; router indexes</td>
+</tr>
+<tr>
+<td>Prefix hash</td>
+<td>"cache key"</td>
+<td>Hash of first N tokens used as router lookup</td>
+</tr>
+<tr>
+<td>GORGO</td>
+<td>"cross-region routing research"</td>
+<td>arXiv 2602.11688; network latency as explicit term</td>
+</tr>
+<tr>
+<td>Cross-region inference</td>
+<td>"Bedrock CRI"</td>
+<td>AWS product; availability failover, not TTFT awareness</td>
+</tr>
+<tr>
+<td>DR manifest</td>
+<td>"the backup list"</td>
+<td>Every file needed to restore — not just weights</td>
+</tr>
+<tr>
+<td>Data residency</td>
+<td>"GDPR boundary"</td>
+<td>Legal constraint on which region sees user data</td>
+</tr>
+<tr>
+<td>RTT</td>
+<td>"round-trip time"</td>
+<td>Network latency; 75 ms US-EU, 220 ms US-APAC</td>
+</tr>
+<tr>
+<td>LLM-aware LB</td>
+<td>"cache-hit LB"</td>
+<td>Cache-aware router as a product category</td>
+</tr>
+</tbody>
+</table></div></div></aside>
+<h2>The problem</h2>
+<aside class="co co-plain"><div class="co-label">In plain words first</div><div class="co-body"><p>When the same model runs in several cloud <strong>regions</strong> (say Virginia, Oregon and Ireland), a <strong>router</strong> decides which copy answers each request. A normal load balancer spreads requests evenly, which is right for stateless web servers. Model servers are not stateless: each one holds a <strong>prefix cache</strong>, the KV cache of prompt beginnings it has already read. A request sent to a replica that has its prefix cached skips most of the prefill and gets its first token about ten times sooner. <strong>Cache-aware routing</strong> sends each request to a replica that already holds its prefix. Across regions you must weigh that saving against the network round trip, and some data (such as EU health data) must never leave its region. The lesson also covers <strong>disaster recovery</strong>: a backup that holds the weights but not the tokenizer or the configs cannot start.</p></div></aside>
+<p>Your service runs in us-east-1, us-west-2, and eu-west-1. You put an ALB in front with round-robin. Prefix cache hit rate in production drops to 8%. TTFT P50 triples. Your vLLM logs show every request is paying full prefill cost.</p>
+<p>Round-robin is optimal for stateless services. LLM inference is stateful by design — the KV cache encodes everything the model has seen. Routing blind is routing into the wrong cache.</p>
+<p>Separately, your team has a DR plan. You back up model weights to S3 cross-region. A regional outage hits; you attempt failover; the replica refuses to start. You forgot tokenizer.json, the quantization config, and the RoPE scaling config were in a separate bucket you didn't sync.</p>
+<p>Multi-region LLM serving is a cache problem, a routing problem, and a DR-hygiene problem — not a load-balancer problem.</p>
+<h2>Idea 1 · Cache-aware routing</h2>
+<p>Request arrives with a prompt. Router hashes the prefix (say, first 512 tokens); it asks each replica "do you have this prefix cached?". Replicas publish KV-cache events on a pub/sub channel as they allocate and evict blocks. Router picks the replica with the match, falls through to GPU-util-based tie-breaker if no one does.</p>
+<figure class="diagram mmfig" data-mmd="a1711" data-h="0c59091188"><div class="dg-scroll"><svg class="dg mm" id="mm0c59091188" width="100%" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" class="flowchart" style="max-width: 691.395px; background-color: transparent;" viewBox="0 0 691.39453125 546" role="graphics-document document" aria-roledescription="flowchart-v2"><style>#mm0c59091188{font-family:Inter,system-ui,sans-serif;font-size:14px;fill:#211c16;}@keyframes edge-animation-frame{from{stroke-dashoffset:0;}}@keyframes dash{to{stroke-dashoffset:0;}}#mm0c59091188 .edge-animation-slow{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 50s linear infinite;stroke-linecap:round;}#mm0c59091188 .edge-animation-fast{stroke-dasharray:9,5!important;stroke-dashoffset:900;animation:dash 20s linear infinite;stroke-linecap:round;}#mm0c59091188 .error-icon{fill:#f4efe7;}#mm0c59091188 .error-text{fill:#0b1018;stroke:#0b1018;}#mm0c59091188 .edge-thickness-normal{stroke-width:1px;}#mm0c59091188 .edge-thickness-thick{stroke-width:3.5px;}#mm0c59091188 .edge-pattern-solid{stroke-dasharray:0;}#mm0c59091188 .edge-thickness-invisible{stroke-width:0;fill:none;}#mm0c59091188 .edge-pattern-dashed{stroke-dasharray:3;}#mm0c59091188 .edge-pattern-dotted{stroke-dasharray:2;}#mm0c59091188 .marker{fill:#6c6357;stroke:#6c6357;}#mm0c59091188 .marker.cross{stroke:#6c6357;}#mm0c59091188 svg{font-family:Inter,system-ui,sans-serif;font-size:14px;}#mm0c59091188 p{margin:0;}#mm0c59091188 .label{font-family:Inter,system-ui,sans-serif;color:#211c16;}#mm0c59091188 .cluster-label text{fill:#0b1018;}#mm0c59091188 .cluster-label span{color:#0b1018;}#mm0c59091188 .cluster-label span p{background-color:transparent;}#mm0c59091188 .label text,#mm0c59091188 span{fill:#211c16;color:#211c16;}#mm0c59091188 .node rect,#mm0c59091188 .node circle,#mm0c59091188 .node ellipse,#mm0c59091188 .node polygon,#mm0c59091188 .node path{fill:#f9e8da;stroke:#b5521b;stroke-width:1px;}#mm0c59091188 .rough-node .label text,#mm0c59091188 .node .label text,#mm0c59091188 .image-shape .label,#mm0c59091188 .icon-shape .label{text-anchor:middle;}#mm0c59091188 .node .katex path{fill:#000;stroke:#000;stroke-width:1px;}#mm0c59091188 .rough-node .label,#mm0c59091188 .node .label,#mm0c59091188 .image-shape .label,#mm0c59091188 .icon-shape .label{text-align:center;}#mm0c59091188 .node.clickable{cursor:pointer;}#mm0c59091188 .root .anchor path{fill:#6c6357!important;stroke-width:0;stroke:#6c6357;}#mm0c59091188 .arrowheadPath{fill:#0b0b0b;}#mm0c59091188 .edgePath .path{stroke:#6c6357;stroke-width:1px;}#mm0c59091188 .flowchart-link{stroke:#6c6357;fill:none;}#mm0c59091188 .edgeLabel{background-color:#ffffff;text-align:center;}#mm0c59091188 .edgeLabel p{background-color:#ffffff;}#mm0c59091188 .edgeLabel rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm0c59091188 .labelBkg{background-color:rgba(255, 255, 255, 0.5);}#mm0c59091188 .cluster rect{fill:#faf7f2;stroke:#d8cdbc;stroke-width:1px;}#mm0c59091188 .cluster text{fill:#0b1018;}#mm0c59091188 .cluster span{color:#0b1018;}#mm0c59091188 div.mermaidTooltip{position:absolute;text-align:center;max-width:200px;padding:2px;font-family:Inter,system-ui,sans-serif;font-size:12px;background:#f4efe7;border:1px solid hsl(36.9230769231, 0%, 83.137254902%);border-radius:2px;pointer-events:none;z-index:100;}#mm0c59091188 .flowchartTitleText{text-anchor:middle;font-size:18px;fill:#211c16;}#mm0c59091188 rect.text{fill:none;stroke-width:0;}#mm0c59091188 .icon-shape,#mm0c59091188 .image-shape{background-color:#ffffff;text-align:center;}#mm0c59091188 .icon-shape p,#mm0c59091188 .image-shape p{background-color:#ffffff;padding:2px;}#mm0c59091188 .icon-shape .label rect,#mm0c59091188 .image-shape .label rect{opacity:0.5;background-color:#ffffff;fill:#ffffff;}#mm0c59091188 .label-icon{display:inline-block;height:1em;overflow:visible;vertical-align:-0.125em;}#mm0c59091188 .node .label-icon path{fill:currentColor;stroke:revert;stroke-width:revert;}#mm0c59091188 .node .neo-node{stroke:#b5521b;}#mm0c59091188 [data-look="neo"].node rect,#mm0c59091188 [data-look="neo"].cluster rect,#mm0c59091188 [data-look="neo"].node polygon{stroke:url(#mm0c59091188-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0c59091188 [data-look="neo"].swimlane.cluster rect{filter:none;}#mm0c59091188 [data-look="neo"].node path{stroke:url(#mm0c59091188-gradient);stroke-width:1px;}#mm0c59091188 [data-look="neo"].node .outer-path{filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0c59091188 [data-look="neo"].node .neo-line path{stroke:#b5521b;filter:none;}#mm0c59091188 [data-look="neo"].node circle{stroke:url(#mm0c59091188-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0c59091188 [data-look="neo"].node circle .state-start{fill:#000000;}#mm0c59091188 [data-look="neo"].icon-shape .icon{fill:url(#mm0c59091188-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0c59091188 [data-look="neo"].icon-shape .icon-neo path{stroke:url(#mm0c59091188-gradient);filter:drop-shadow( 1px 2px 2px rgba(185,185,185,1));}#mm0c59091188 :root{--mermaid-font-family:"trebuchet ms",verdana,arial,sans-serif;}</style><g><marker id="mm0c59091188_flowchart-v2-pointEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-pointStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="4.5" refY="5" markerUnits="userSpaceOnUse" markerWidth="8" markerHeight="8" orient="auto"><path d="M 0 5 L 10 10 L 10 0 z" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-pointEnd-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="11.5" refY="7" markerUnits="userSpaceOnUse" markerWidth="10.5" markerHeight="14" orient="auto"><path d="M 0 0 L 11.5 7 L 0 14 z" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-pointStart-margin" class="marker flowchart-v2" viewBox="0 0 11.5 14" refX="1" refY="7" markerUnits="userSpaceOnUse" markerWidth="11.5" markerHeight="14" orient="auto"><polygon points="0,7 11.5,14 11.5,0" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-circleEnd" class="marker flowchart-v2" viewBox="0 0 10 10" refX="11" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-circleStart" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-1" refY="5" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 1; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-circleEnd-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refY="5" refX="12.25" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-circleStart-margin" class="marker flowchart-v2" viewBox="0 0 10 10" refX="-2" refY="5" markerUnits="userSpaceOnUse" markerWidth="14" markerHeight="14" orient="auto"><circle cx="5" cy="5" r="5" class="arrowMarkerPath" style="stroke-width: 0; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-crossEnd" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="12" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-crossStart" class="marker cross flowchart-v2" viewBox="0 0 11 11" refX="-1" refY="5.2" markerUnits="userSpaceOnUse" markerWidth="11" markerHeight="11" orient="auto"><path d="M 1,1 l 9,9 M 10,1 l -9,9" class="arrowMarkerPath" style="stroke-width: 2; stroke-dasharray: 1, 0;"/></marker><marker id="mm0c59091188_flowchart-v2-crossEnd-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="17.7" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5;"/></marker><marker id="mm0c59091188_flowchart-v2-crossStart-margin" class="marker cross flowchart-v2" viewBox="0 0 15 15" refX="-3.5" refY="7.5" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" orient="auto"><path d="M 1,1 L 14,14 M 1,14 L 14,1" class="arrowMarkerPath" style="stroke-width: 2.5; stroke-dasharray: 1, 0;"/></marker><g class="root"><g class="clusters"/><g class="edgePaths"><path d="M329.734,59L329.734,63.167C329.734,67.333,329.734,75.667,329.805,83.417C329.875,91.167,330.015,98.334,330.086,101.917L330.156,105.501" id="mm0c59091188-L_R_RZ_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_R_RZ_0" data-points="W3sieCI6MzI5LjczNDM3NSwieSI6NTl9LHsieCI6MzI5LjczNDM3NSwieSI6ODR9LHsieCI6MzMwLjIzNDM3NSwieSI6MTA5LjV9XQ==" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M392.68,155.047L421.262,162.789C449.845,170.531,507.01,186.016,535.593,199.008C564.176,212,564.176,222.5,564.176,227.75L564.176,233" id="mm0c59091188-L_RZ_L_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RZ_L_0" data-points="W3sieCI6MzkyLjY3OTY3NTAxNTM5Mzg1LCJ5IjoxNTUuMDQ2ODk5OTY5MjEyMjZ9LHsieCI6NTY0LjE3NTc4MTI1LCJ5IjoyMDEuNX0seyJ4Ijo1NjQuMTc1NzgxMjUsInkiOjIzN31d" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M274.374,166.5L262.694,172.333C251.013,178.167,227.653,189.833,216.049,202.25C204.444,214.667,204.596,227.834,204.671,234.417L204.747,241" id="mm0c59091188-L_RZ_H_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_RZ_H_0" data-points="W3sieCI6Mjc0LjM3Mzc0ODc3OTI5NjksInkiOjE2Ni41fSx7IngiOjIwNC4yOTI5Njg3NSwieSI6MjAxLjV9LHsieCI6MjA0Ljc5Mjk2ODc1LCJ5IjoyNDV9XQ==" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M172.573,281L159.661,288.083C146.749,295.167,120.925,309.333,108.013,322.167C95.102,335,95.102,346.5,95.102,352.25L95.102,358" id="mm0c59091188-L_H_LH_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_LH_0" data-points="W3sieCI6MTcyLjU3MjU1Mzc5MDk4MzYyLCJ5IjoyODF9LHsieCI6OTUuMTAxNTYyNSwieSI6MzIzLjV9LHsieCI6OTUuMTAxNTYyNSwieSI6MzYyfV0=" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M237.013,281L249.759,288.083C262.504,295.167,287.994,309.333,300.813,321.75C313.633,334.167,313.781,344.834,313.855,350.167L313.929,355.5" id="mm0c59091188-L_H_C_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_H_C_0" data-points="W3sieCI6MjM3LjAxMzM4MzcwOTAxNjM4LCJ5IjoyODF9LHsieCI6MzEzLjQ4NDM3NSwieSI6MzIzLjV9LHsieCI6MzEzLjk4NDM3NSwieSI6MzU5LjV9XQ==" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M266.376,416.5L256.409,422.333C246.442,428.167,226.508,439.833,216.541,450.917C206.574,462,206.574,472.5,206.574,477.75L206.574,483" id="mm0c59091188-L_C_RH_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_RH_0" data-points="W3sieCI6MjY2LjM3NTk0NjA0NDkyMTksInkiOjQxNi41fSx7IngiOjIwNi41NzQyMTg3NSwieSI6NDUxLjV9LHsieCI6MjA2LjU3NDIxODc1LCJ5Ijo0ODd9XQ==" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M361.593,416.5L371.393,422.333C381.193,428.167,400.794,439.833,410.594,450.917C420.395,462,420.395,472.5,420.395,477.75L420.395,483" id="mm0c59091188-L_C_LM_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_C_LM_0" data-points="W3sieCI6MzYxLjU5MjgwMzk1NTA3ODEsInkiOjQxNi41fSx7IngiOjQyMC4zOTQ1MzEyNSwieSI6NDUxLjV9LHsieCI6NDIwLjM5NDUzMTI1LCJ5Ijo0ODd9XQ==" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/><path d="M564.176,288L564.176,293.917C564.176,299.833,564.176,311.667,564.176,323.333C564.176,335,564.176,346.5,564.176,352.25L564.176,358" id="mm0c59091188-L_L_H2_0" class="edge-thickness-normal edge-pattern-solid edge-thickness-normal edge-pattern-solid flowchart-link" style=";" data-edge="true" data-et="edge" data-id="L_L_H2_0" data-points="W3sieCI6NTY0LjE3NTc4MTI1LCJ5IjoyODh9LHsieCI6NTY0LjE3NTc4MTI1LCJ5IjozMjMuNX0seyJ4Ijo1NjQuMTc1NzgxMjUsInkiOjM2Mn1d" data-look="classic" marker-end="url(#mm0c59091188_flowchart-v2-pointEnd)"/></g><g class="edgeLabels"><g class="edgeLabel"><g class="label" data-id="L_R_RZ_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(564.17578125, 201.5)"><g class="label" data-id="L_RZ_L_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(204.29296875, 201.5)"><g class="label" data-id="L_RZ_H_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(95.1015625, 323.5)"><g class="label" data-id="L_H_LH_0" transform="translate(-15.5859375, -10.5)"><foreignObject width="31.171875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>local</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(290.98382, 310.99495)"><g class="label" data-id="L_H_C_0" transform="translate(-39.203125, -10.5)"><foreignObject width="78.40625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>remote only</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(206.57421875, 451.5)"><g class="label" data-id="L_C_RH_0" transform="translate(-11.578125, -10.5)"><foreignObject width="23.15625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>yes</p></span></div></foreignObject></g></g><g class="edgeLabel" transform="translate(420.39453125, 451.5)"><g class="label" data-id="L_C_LM_0" transform="translate(-8.3359375, -10.5)"><foreignObject width="16.671875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"><p>no</p></span></div></foreignObject></g></g><g class="edgeLabel"><g class="label" data-id="L_L_H2_0" transform="translate(0, 0)"><foreignObject width="0" height="0"><div xmlns="http://www.w3.org/1999/xhtml" class="labelBkg" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="edgeLabel"></span></div></foreignObject></g></g></g><g class="nodes"><g class="node default" id="mm0c59091188-flowchart-R-0" data-look="classic" transform="translate(329.734375, 33.5)"><rect class="basic label-container" style="" x="-128.09375" y="-25.5" width="256.1875" height="51"/><g class="label" style="" transform="translate(-98.09375, -10.5)"><rect/><foreignObject width="196.1875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Request + prompt prefix hash</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-RZ-1" data-look="classic" transform="translate(329.734375, 137.5)"><polygon points="14.25,0 127.6875,0 141.9375,-28.5 127.6875,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-70.96875,28.5)"/><g class="label" style="" transform="translate(-49.21875, -21)"><rect/><foreignObject width="98.4375" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Data must stay<br />in its region?</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-L-3" data-look="classic" transform="translate(564.17578125, 262.5)"><rect class="basic label-container" style="" x="-106.0703125" y="-25.5" width="212.140625" height="51"/><g class="label" style="" transform="translate(-76.0703125, -10.5)"><rect/><foreignObject width="152.140625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Route within the region</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-H-5" data-look="classic" transform="translate(204.29296875, 262.5)"><polygon points="9,0 180.625,0 189.625,-18 180.625,-36 9,-36 0,-18" class="label-container" transform="translate(-94.8125,18)"/><g class="label" style="" transform="translate(-78.3125, -10.5)"><rect/><foreignObject width="156.625" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Replica with this prefix?</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-LH-7" data-look="classic" transform="translate(95.1015625, 387.5)"><rect class="basic label-container" style="" x="-87.1015625" y="-25.5" width="174.203125" height="51"/><g class="label" style="" transform="translate(-57.1015625, -10.5)"><rect/><foreignObject width="114.203125" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Local hit: ~80 ms</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-C-9" data-look="classic" transform="translate(313.484375, 387.5)"><polygon points="14.25,0 148.3125,0 162.5625,-28.5 148.3125,-57 14.25,-57 0,-28.5" class="label-container" transform="translate(-81.28125,28.5)"/><g class="label" style="" transform="translate(-59.53125, -21)"><rect/><foreignObject width="119.0625" height="42"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>hit + RTT + queue<br />&lt; local miss?</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-RH-11" data-look="classic" transform="translate(206.57421875, 512.5)"><rect class="basic label-container" style="" x="-65.2109375" y="-25.5" width="130.421875" height="51"/><g class="label" style="" transform="translate(-35.2109375, -10.5)"><rect/><foreignObject width="70.421875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Remote hit</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-LM-13" data-look="classic" transform="translate(420.39453125, 512.5)"><rect class="basic label-container" style="" x="-98.609375" y="-25.5" width="197.21875" height="51"/><g class="label" style="" transform="translate(-68.609375, -10.5)"><rect/><foreignObject width="137.21875" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Local miss: ~800 ms</p></span></div></foreignObject></g></g><g class="node default" id="mm0c59091188-flowchart-H2-15" data-look="classic" transform="translate(564.17578125, 387.5)"><rect class="basic label-container" style="" x="-119.21875" y="-25.5" width="238.4375" height="51"/><g class="label" style="" transform="translate(-89.21875, -10.5)"><rect/><foreignObject width="178.4375" height="21"><div xmlns="http://www.w3.org/1999/xhtml" style="display: table-cell; white-space: nowrap; line-height: 1.5; max-width: 200px; text-align: center;"><span class="nodeLabel"><p>Cache-aware within region</p></span></div></foreignObject></g></g></g></g></g><defs><filter id="mm0c59091188-drop-shadow" height="130%" width="130%"><feDropShadow dx="4" dy="4" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><defs><filter id="mm0c59091188-drop-shadow-small" height="150%" width="150%"><feDropShadow dx="2" dy="2" stdDeviation="0" flood-opacity="0.06" flood-color="#000000"/></filter></defs><linearGradient id="mm0c59091188-gradient" gradientUnits="objectBoundingBox" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#b5521b" stop-opacity="1"/><stop offset="100%" stop-color="hsl(36.9230769231, 0%, 83.137254902%)" stop-opacity="1"/></linearGradient></svg></div></figure>
+
+<p><strong>vLLM Router</strong> (Rust, 2026 production-stack): subscribes to <code>kv.cache.block_added</code> events, maintains a prefix-hash → replica index, routes with <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord mathnormal" style="margin-right:0.02778em;">O</span><span class="mopen">(</span><span class="mord">1</span><span class="mclose">)</span></span></span></span> lookup. Falls through to least-queue-depth when no match.</p>
+<p><strong>llm-d router</strong>: same pattern, Kubernetes-native. Publishes events via the ControlPlane API.</p>
+<p><strong>SGLang RadixAttention</strong> (Phase 17 · 06) is the intra-replica equivalent. Cross-replica routing is strictly upstream.</p>
+<h2>Idea 2 · Numbers</h2>
+<p>TTFT P50 on a 2K-token prompt, Llama 3.3 70B FP8, H100:
+- Cache hit (same replica, prefix resident): ~80 ms.
+- Cache miss (cold prefill): ~800 ms.</p>
+<p>10x gap. If your router hits 60-80% of prefix cache across replicas, you approximate single-replica performance at N-replica capacity. If it hits 10%, you approximate naive scaling.</p>
+<h2>Idea 3 · Cross-region has a new constraint — network latency</h2>
+<p>Inter-region RTT:
+- us-east-1 ↔ us-west-2: ~65 ms.
+- us-east-1 ↔ eu-west-1: ~75 ms.
+- us-east-1 ↔ ap-southeast-1: ~220 ms.</p>
+<p>If routing takes a request from us-east-1 to a hot prefix in ap-southeast-1, the saved prefill (800 → 80 ms, so 720 ms) shrinks to about 500 ms once the ~220 ms RTT is paid, and the margin disappears if the remote region queues the request or has already evicted the prefix. GORGO (2026 research) makes this explicit — minimize <code>prefill_time + network_latency</code> jointly, not prefill alone. Often the answer is to keep routing regional except on massive multi-MB prefixes where prefill dominates.</p>
+<h2>Idea 4 · Commercial "cross-region inference" does not help here</h2>
+<p>AWS Bedrock cross-region inference automatically routes requests to other regions during capacity pressure. It optimizes availability, not TTFT, and treats inference as opaque. GKE Multi-Cluster Gateway is the same — service-level failover, no awareness of KV cache.</p>
+<p>You still need an app-layer cache-aware router even when using these. They handle the "us-east-1 is on fire" case. Cache-aware routing handles the TTFT case.</p>
+<h2>Idea 5 · DR hygiene — the 32% missing-files problem</h2>
+<p>Widely cited 2026 stat: 32% of LLM DR failures happen because teams backed up weights but forgot:</p>
+<ul>
+<li><code>tokenizer.json</code> or <code>tokenizer.model</code></li>
+<li>Quantization configs (<code>quantize_config.json</code>, AWQ scales, GPTQ zero-points)</li>
+<li>Model-specific configs (RoPE scaling, attention masks, chat templates)</li>
+<li>Engine config (<code>vllm_config.yaml</code>, sampling defaults, LoRA adapter manifests)</li>
+</ul>
+<p>The fix is a three-file minimum DR manifest:</p>
+<ol>
+<li>All files under the HF model repo (weights + configs + tokenizer).</li>
+<li>Engine-specific serving config.</li>
+<li>Deployment manifest (K8s YAML, Dockerfile, dependency lock).</li>
+</ol>
+<p>Plus: run a DR drill quarterly. The JPMorgan us-east-1 drill hit 22 minutes recovery in Nov 2024 only because the playbook was rehearsed.</p>
+<h2>Idea 6 · Data residency is orthogonal</h2>
+<p>EU customer PHI cannot leave EU. If your cache-aware router sends a Paris-originated request to us-east-1 for a prefix match, you have violated GDPR regardless of TTFT gain. Partition routers by residency boundary before optimizing for cache.</p>
+<h2>Idea 7 · Numbers you should remember</h2>
+<ul>
+<li>Cache hit vs miss TTFT gap: ~10x (80 ms vs 800 ms on 2K prompt).</li>
+<li>Inter-region RTT US-EU: ~75 ms.</li>
+<li>DR failure: 32% miss tokenizer/quant configs.</li>
+<li>JPMorgan us-east-1 failover Nov 2024: 22 minutes (30-min SLA).</li>
+</ul>
+<p><figure class="aifig"><div class="lesson-figure" data-figure="cache-aware-router"></div></figure></p>
+<aside class="co co-math"><div class="co-label">The same idea as a formula</div><div class="co-body"><p><strong>When is a remote cache hit worth it?</strong> A local miss costs the full prefill <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span>. A hit in another region costs <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hit</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">RTT</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span>, where <span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.625em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span></span></span></span> is any extra queueing there. Route remotely only when</p>
+<p><div class="kx"><span class="katex-display"><span class="katex"><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3361em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">hit</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7667em;vertical-align:-0.0833em;"></span><span class="mord text"><span class="mord">RTT</span></span><span class="mspace" style="margin-right:0.2222em;"></span><span class="mbin">+</span><span class="mspace" style="margin-right:0.2222em;"></span></span><span class="base"><span class="strut" style="height:0.7335em;vertical-align:-0.1944em;"></span><span class="mord mathnormal" style="margin-right:0.03588em;">q</span><span class="mspace" style="margin-right:0.2778em;"></span><span class="mrel">&lt;</span><span class="mspace" style="margin-right:0.2778em;"></span></span><span class="base"><span class="strut" style="height:0.7651em;vertical-align:-0.15em;"></span><span class="mord"><span class="mord mathnormal">t</span><span class="msupsub"><span class="vlist-t vlist-t2"><span class="vlist-r"><span class="vlist" style="height:0.3175em;"><span style="top:-2.55em;margin-left:0em;margin-right:0.05em;"><span class="pstrut" style="height:2.7em;"></span><span class="sizing reset-size6 size3 mtight"><span class="mord mtight"><span class="mord text mtight"><span class="mord mtight">miss</span></span></span></span></span></span><span class="vlist-s">​</span></span><span class="vlist-r"><span class="vlist" style="height:0.15em;"><span></span></span></span></span></span></span></span></span></span></span></div></p>
+<p>Prefill time grows with prompt length, so long shared prompts make remote hits pay; short prompts rarely do.</p></div></aside>
+<aside class="co co-worked"><div class="co-label">Worked example</div><div class="co-title">Virginia to Ireland</div><div class="co-body"><p>A 2,000-token prompt on Llama 3.3 70B FP8: a hit costs about 80 ms, a miss about 800 ms. The round trip from us-east-1 to eu-west-1 is about 75 ms.</p>
+<ol>
+<li>Remote hit: 80 + 75 = 155 ms, against a local miss of 800 ms. Remote wins by 645 ms.</li>
+<li>If the Irish replica has a 400 ms queue: 80 + 75 + 400 = 555 ms. Still better.</li>
+<li>A 200-token prompt: miss about 80 ms, hit about 15 ms. Remote: 15 + 75 = 90 ms, worse than the local miss.</li>
+<li>If the request carries EU personal health data and originates in Paris, it must stay in the EU whatever the numbers say.</li>
+</ol></div></aside>
+<aside class="co co-check"><div class="co-label">Check your mental model</div><div class="co-body"><p>Which statements are right?</p>
+<ul>
+<li><span class="ck-yes" aria-label="Right">✓</span> Round-robin routing ignores which replica holds which prefix.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Bedrock cross-region inference gives you cache-aware routing.
+  It reroutes for capacity during pressure; it does not know about your prefixes.</li>
+<li><span class="ck-yes" aria-label="Right">✓</span> A DR backup must include the tokenizer, quantization configs and the engine's serving config.</li>
+<li><span class="ck-no" aria-label="Wrong">✗</span> Routing to the region with the best cache hit is always allowed.
+  Data-residency rules come first; partition routers by residency boundary.</li>
+</ul></div></aside>
+<aside class="co co-predict"><div class="co-label">Predict before you run</div><div class="co-body"><p>Before running the code below: with a 75 ms round trip, at roughly what prompt length does a remote hit start to beat a local miss?</p></div></aside>
+<aside class="co co-visual"><div class="co-label">See it drawn</div><div class="co-title">Prompt length against round-trip time</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">MISS_MS_PER_TOKEN, HIT_MS_PER_TOKEN, RTT = 0.40, 0.04, 75   # 800 ms and 80 ms at 2,000 tokens
+
+for tokens in (100, 200, 250, 500, 1000, 2000, 8000):
+    local_miss = MISS_MS_PER_TOKEN * tokens
+    remote_hit = HIT_MS_PER_TOKEN * tokens + RTT
+    best = &quot;remote hit&quot; if remote_hit &lt; local_miss else &quot;local miss&quot;
+    print(f&quot;{tokens:5d} tokens: local miss {local_miss:6.0f} ms | remote hit {remote_hit:6.0f} ms -&gt; {best}&quot;)
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">  100 tokens: local miss     40 ms | remote hit     79 ms -&gt; local miss
+  200 tokens: local miss     80 ms | remote hit     83 ms -&gt; local miss
+  250 tokens: local miss    100 ms | remote hit     85 ms -&gt; remote hit
+  500 tokens: local miss    200 ms | remote hit     95 ms -&gt; remote hit
+ 1000 tokens: local miss    400 ms | remote hit    115 ms -&gt; remote hit
+ 2000 tokens: local miss    800 ms | remote hit    155 ms -&gt; remote hit
+ 8000 tokens: local miss   3200 ms | remote hit    395 ms -&gt; remote hit</code></pre></div></div></aside></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>With these rates the crossover is near 210 tokens: below it, the round trip costs more than the prefill saved. Most RAG and agent prompts are far longer, so cross-region hits usually pay, unless the remote region is queueing. Replace the per-token rates with your own measurements; the shape of the decision stays the same.</p></div></aside>
+<h2>Use it: the same idea with real libraries</h2>
+<p><code>code/main.py</code> simulates three routing strategies (round-robin, cache-aware regional, cache-aware global) on a multi-region workload. Reports cache hit rate, TTFT P50/P99, and cross-region bill.</p>
+<p>Here is <code>code/main.py</code>, in 4 parts. Each part runs on this page, in order, in one Python session; the last part does what <code>python3 code/main.py</code> does.</p>
+<p><strong>Part 1 of 4 · <code>rtt</code>, <code>Replica</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">&quot;&quot;&quot;Cache-aware multi-region router simulator — stdlib Python.
+
+Three strategies on the same workload:
+  ROUND_ROBIN : blind, ignores KV cache state
+  REGIONAL    : cache-aware within region; round-robin across regions
+  GLOBAL      : cache-aware globally; considers network RTT
+
+Reports cache hit rate, TTFT P50/P99, and cross-region bill.
+Pedagogical: timings are illustrative.
+&quot;&quot;&quot;
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+import random
+import statistics
+
+
+REGIONS = [&quot;us-east-1&quot;, &quot;us-west-2&quot;, &quot;eu-west-1&quot;]
+REPLICAS_PER_REGION = 4
+CACHE_HIT_MS = 80
+CACHE_MISS_MS = 800
+CROSSREGION_RTT = {
+    (&quot;us-east-1&quot;, &quot;us-west-2&quot;): 65,
+    (&quot;us-east-1&quot;, &quot;eu-west-1&quot;): 75,
+    (&quot;us-west-2&quot;, &quot;eu-west-1&quot;): 130,
+}
+CROSSREGION_COST_PER_REQ = 0.0004
+
+
+def rtt(a: str, b: str) -&gt; int:
+    if a == b:
+        return 0
+    key = (a, b) if (a, b) in CROSSREGION_RTT else (b, a)
+    return CROSSREGION_RTT.get(key, 200)
+
+
+@dataclass
+class Replica:
+    region: str
+    idx: int
+    prefix_cache: set = field(default_factory=set)
+    queue_depth: int = 0
+</code></pre></div>
+
+<p><strong>Part 2 of 4 · <code>Request</code>, <code>make_replicas</code>, <code>make_workload</code>, <code>simulate</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">@dataclass
+class Request:
+    origin_region: str
+    prefix_hash: str
+    served_by: Replica | None = None
+    ttft_ms: float = 0
+    crossregion: bool = False
+
+
+def make_replicas() -&gt; list[Replica]:
+    return [Replica(r, i) for r in REGIONS for i in range(REPLICAS_PER_REGION)]
+
+
+def make_workload(n: int = 1000, seed: int = 7) -&gt; list[Request]:
+    rng = random.Random(seed)
+    reqs = []
+    hot_prefixes = [f&quot;prefix_{i}&quot; for i in range(40)]
+    for _ in range(n):
+        origin = rng.choice(REGIONS)
+        prefix = rng.choice(hot_prefixes)
+        reqs.append(Request(origin_region=origin, prefix_hash=prefix))
+    return reqs
+
+
+def simulate(strategy: str, reqs: list[Request]) -&gt; dict:
+    replicas = make_replicas()
+    rng = random.Random(11)
+    hits = 0
+    ttfts: list[float] = []
+    crossregion_count = 0
+
+    for i, r in enumerate(reqs):
+        chosen: Replica | None = None
+        cross = False
+
+        if strategy == &quot;ROUND_ROBIN&quot;:
+            chosen = replicas[i % len(replicas)]
+        elif strategy == &quot;REGIONAL&quot;:
+            local = [rep for rep in replicas if rep.region == r.origin_region]
+            matches = [rep for rep in local if r.prefix_hash in rep.prefix_cache]
+            if matches:
+                chosen = min(matches, key=lambda x: x.queue_depth)
+            else:
+                chosen = min(local, key=lambda x: x.queue_depth)
+        elif strategy == &quot;GLOBAL&quot;:
+            matches = [rep for rep in replicas if r.prefix_hash in rep.prefix_cache]
+            best_cost = float(&quot;inf&quot;)
+            for rep in matches:
+                c = CACHE_HIT_MS + rtt(r.origin_region, rep.region)
+                if c &lt; best_cost:
+                    best_cost = c
+                    chosen = rep
+            if chosen is None or best_cost &gt; CACHE_MISS_MS:
+                local = [rep for rep in replicas if rep.region == r.origin_region]
+                chosen = min(local, key=lambda x: x.queue_depth)
+
+        cross = chosen.region != r.origin_region
+        hit = r.prefix_hash in chosen.prefix_cache
+        if hit:
+            hits += 1
+            r.ttft_ms = CACHE_HIT_MS + rtt(r.origin_region, chosen.region)
+        else:
+            r.ttft_ms = CACHE_MISS_MS + rtt(r.origin_region, chosen.region)
+            chosen.prefix_cache.add(r.prefix_hash)
+            if len(chosen.prefix_cache) &gt; 12:
+                chosen.prefix_cache.pop()
+        chosen.queue_depth = max(0, chosen.queue_depth + (1 if rng.random() &lt; 0.4 else 0) - 1)
+        r.served_by = chosen
+        r.crossregion = cross
+        ttfts.append(r.ttft_ms)
+        if cross:
+            crossregion_count += 1
+
+    ttfts.sort()
+    p50 = ttfts[len(ttfts) // 2]
+    p99 = ttfts[int(len(ttfts) * 0.99) - 1]
+    return {
+        &quot;strategy&quot;: strategy,
+        &quot;hit_rate&quot;: hits / len(reqs),
+        &quot;mean_ttft&quot;: statistics.mean(ttfts),
+        &quot;p50_ttft&quot;: p50,
+        &quot;p99_ttft&quot;: p99,
+        &quot;crossregion&quot;: crossregion_count,
+        &quot;crossregion_cost&quot;: crossregion_count * CROSSREGION_COST_PER_REQ,
+    }
+</code></pre></div>
+
+<p><strong>Part 3 of 4 · <code>report</code>, <code>main</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">def report(row: dict) -&gt; None:
+    print(f&quot;{row['strategy']:13}  hit={row['hit_rate']*100:5.1f}%  &quot;
+          f&quot;mean={row['mean_ttft']:5.0f}ms  P50={row['p50_ttft']:5.0f}ms  &quot;
+          f&quot;P99={row['p99_ttft']:5.0f}ms  cross={row['crossregion']:4}  &quot;
+          f&quot;cross_cost=${row['crossregion_cost']:.3f}&quot;)
+
+
+def main() -&gt; None:
+    print(&quot;=&quot; * 80)
+    print(&quot;MULTI-REGION LLM ROUTING: three strategies, 1000 requests&quot;)
+    print(&quot;=&quot; * 80)
+    base = make_workload()
+    header = f&quot;{'Strategy':13}  hit         mean     P50      P99      cross   cost&quot;
+    print(header)
+    print(&quot;-&quot; * len(header))
+    for strategy in (&quot;ROUND_ROBIN&quot;, &quot;REGIONAL&quot;, &quot;GLOBAL&quot;):
+        reqs = [Request(origin_region=r.origin_region, prefix_hash=r.prefix_hash) for r in base]
+        report(simulate(strategy, reqs))
+
+    print(&quot;\nRead: REGIONAL beats ROUND_ROBIN on cache hit. GLOBAL is&quot;)
+    print(&quot;only better when prefill cost dominates network latency.&quot;)
+</code></pre></div>
+
+<p><strong>Part 4 of 4 · run it</strong> (what <code>python3 code/main.py</code> does)</p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-python">main()
+</code></pre></div>
+<aside class="co co-run"><div class="co-label">What you should see</div><div class="co-body"><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-plaintext">================================================================================
+MULTI-REGION LLM ROUTING: three strategies, 1000 requests
+================================================================================
+Strategy       hit         mean     P50      P99      cross   cost
+------------------------------------------------------------------
+ROUND_ROBIN    hit= 29.2%  mean=  649ms  P50=  800ms  P99=  930ms  cross= 664  cross_cost=$0.266
+REGIONAL       hit= 31.3%  mean=  575ms  P50=  800ms  P99=  800ms  cross=   0  cross_cost=$0.000
+GLOBAL         hit= 86.3%  mean=  231ms  P50=  155ms  P99=  800ms  cross= 574  cross_cost=$0.230
+
+Read: REGIONAL beats ROUND_ROBIN on cache hit. GLOBAL is
+only better when prefill cost dominates network latency.</code></pre></div></div></aside>
+<aside class="co co-read"><div class="co-label">Reading this output</div><div class="co-body"><p>Global cache-aware routing lifts the hit rate from about 29% to 87% and cuts mean TTFT from 648 to 225 ms, while sending 567 requests across regions. Regional routing keeps traffic home with no cross-region cost and a modest gain. Which one you ship depends on prompt length, RTT and residency rules, not on the hit rate alone.</p></div></aside>
+<aside class="co co-broken"><div class="co-label">Break it on purpose</div><div class="co-body"><p>During a regional outage, a team fails over to its backup region. The replica starts, loads the weights from S3, and then crashes on the first request. The backup was complete as far as they knew: every <code>.safetensors</code> file was there. What was probably missing? (Solution B1.)</p></div></aside>
+<aside class="co co-recap"><div class="co-label">Recap</div><div class="co-title">What to keep from this lesson</div><div class="co-body"><ul>
+<li>Model servers are stateful: route to the replica that holds the prefix.</li>
+<li>A cache hit is about 10× faster than a miss on long prompts.</li>
+<li>Across regions, take a remote hit only if hit + RTT + queue &lt; local miss.</li>
+<li>Residency boundaries come before latency.</li>
+<li>DR backups need weights, tokenizer, configs and the serving manifest, and a rehearsed drill.</li>
+</ul></div></aside>
+<h2>Practice and reference</h2>
+<p class="ref-lead">One-page references from the source repository that cover this lesson, with commands, defaults and fixes in one place.</p><div class="ref-strip"><a href="#cs-async-disaggregated-inference"><span class="t" style="--cs-hue:170">AD</span>Cheat sheet · Disaggregated, Async and Hogwild Inference</a><a href="#cs-gpu-kubernetes"><span class="t" style="--cs-hue:212">GP</span>Cheat sheet · Kubernetes GPU Autoscaling: Quick Reference</a></div>
+<h2>Ship it</h2>
+<p>This lesson produces <code>outputs/skill-multi-region-router.md</code>. Given regions, residency constraints, and SLA, designs a routing plan.</p>
+<p><strong><code>outputs/skill-multi-region-router.md</code></strong></p>
+<div class="code"><button type="button" class="copy" aria-label="Copy code">Copy</button><pre><code class="language-markdown">---
+name: multi-region-router
+description: Design a multi-region LLM routing plan with KV-cache locality, residency boundaries, DR manifest, and a quarterly failover drill.
+version: 1.0.0
+phase: 17
+lesson: 11
+tags: [multi-region, kv-cache, routing, dr, bedrock-cri, vllm-router, llm-d, gorgo]
+---
+
+Given regions in scope, residency boundaries, expected prefix-cache diversity, and TTFT SLA, produce a multi-region routing and DR plan.
+
+Produce:
+
+1. Router choice. Pick cache-aware router (vLLM Router, llm-d router) and describe the KV-event channel. State the prefix-hash algorithm (e.g., 512-token rolling) and tie-breaker (least queue depth).
+2. Routing policy. Regional-first or global (GORGO-style) minimization of prefill + RTT? Justify with the prompt-length distribution — long prompts (&gt;8K tokens) benefit from cross-region routing; short prompts do not.
+3. Residency partitioning. Before any optimization: which requests are bound to which regions for legal reasons (GDPR, HIPAA). Forbid cross-residency routing even when TTFT improves.
+4. Commercial CRI layer. Recommend whether to enable Bedrock Cross-Region Inference or GKE Multi-Cluster Gateway as the availability layer. State clearly this layer is NOT a TTFT optimization.
+5. DR manifest. Three-file minimum (HF repo + engine config + deployment manifest). Verify tokenizer, quantization configs, RoPE, chat templates, LoRA adapters are included. State the storage (S3 cross-region replication, multi-region GCS).
+6. Failover drill. Quarterly cadence. Who runs it, what gets measured (RTO, RPO, cache warm-up time). Target: 30-minute RTO matched to real 2024 JPMorgan drill.
+
+Hard rejects:
+- Ignoring residency for routing optimization. Refuse — GDPR violation beats TTFT gain.
+- Claiming Bedrock CRI &quot;solves&quot; cross-region routing. Refuse — CRI is availability, not TTFT.
+- Backing up weights only. Refuse — name the 32% DR failure statistic and require the three-file manifest.
+
+Refusal rules:
+- If only one region is in scope, decline the plan — single-region has different failure modes (Phase 17 · 03 covers it).
+- If residency and TTFT SLA are incompatible (e.g., EU residency forcing prefill on cold prefix per request with P99 TTFT &lt; 100 ms on 8K prompts), refuse to promise the SLA and escalate the product requirement.
+
+Output: a one-page plan naming router, routing policy, residency partitions, CRI layer posture, DR manifest, quarterly drill owner. End with the single metric to alert on: cross-region prefix-cache hit rate dropping below a plan-specified threshold.
+</code></pre></div>
+<h2>Exercises</h2>
+<ol>
+<li>Run <code>code/main.py</code>. At what prompt length does cross-region routing beat local-only routing, given 75 ms RTT?</li>
+<li>Your cache hit rate drops from 70% to 12%. Diagnose three possible causes and the observables that would confirm each.</li>
+<li>Design a DR manifest for a 70B AWQ-quantized model served in vLLM with 5 LoRA adapters. List every file and config.</li>
+<li>Argue whether Bedrock cross-region inference is "enough" for a fintech with strict TTFT SLOs. Cite specific behaviors.</li>
+<li>A Paris-origin request matches a prefix in us-east-1. Do you route it? Write the policy.</li>
+</ol>
+<h2>Solutions</h2>
+<details class="qa" id="a1711-qa1"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P1 · Prompt length for cross-region routing</span></summary><div class="qa-a"><p>With a miss costing about 0.4 ms per token, a hit about 0.04 ms per token and a 75 ms round trip, a remote hit wins when 0.36 × tokens &gt; 75, so above about 210 tokens. Queueing at the remote region raises that threshold; measure your own per-token prefill cost.</p></div></details>
+<details class="qa" id="a1711-qa2"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">P2 · Hit rate from 70% to 12%</span></summary><div class="qa-a"><p>(1) The prompt template changed and dynamic content now leads the prompt: compare first tokens of two requests. (2) The router lost its KV-event feed (subscriber down or lagging): check that the event stream is current. (3) A scaling event added many cold replicas or caches were flushed: check replica count and eviction counts around the drop.</p></div></details>
+<details class="qa" id="a1711-qa3"><summary><span class="qa-lvl qa-sol">Solution</span><span class="qa-q">B1 · Weights are not enough</span></summary><div class="qa-a"><p>Most likely the tokenizer files (<code>tokenizer.json</code> or <code>tokenizer.model</code>), the quantization config (AWQ scales or GPTQ zero-points) or the model's RoPE and chat-template settings. The engine loads weights, then fails on the first request. Back up the whole model repository plus the serving config and deployment manifest, and run a failover drill every quarter.</p></div></details>
+<aside class="co co-checked"><div class="co-label">Sources and further reading</div><div class="co-body"><ul>
+<li><a href="https://bentoml.com/llm/infrastructure-and-operations/multi-cloud-and-cross-region-inference">BentoML — Multi-cloud and cross-region inference</a></li>
+<li><a href="https://arxiv.org/html/2602.11688v1">arXiv — GORGO (2602.11688)</a> — cross-region KV-cache reuse with network latency term.</li>
+<li><a href="https://tianpan.co/blog/2026-04-17-multi-region-llm-serving-data-residency-routing">TianPan — Multi-Region LLM Serving Cache Locality</a></li>
+<li><a href="https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference.html">AWS Bedrock Cross-Region Inference</a> — availability failover documentation.</li>
+<li><a href="https://github.com/vllm-project/production-stack">vLLM Production Stack Router</a> — cache-aware router source.</li>
+</ul></div></aside></div><footer class="m-foot"><div class="done-row"><button type="button" class="done-btn" data-id="a1711" id="done-a1711">Mark complete and continue</button><button type="button" class="undo-btn" data-id="a1711" id="undo-a1711" hidden>Mark as not done</button></div><div class="pn-row"><a class="pn prev" href="#a1710"><span class="pn-dir">Previous</span><span class="pn-t">17.10 · Mitigating Cold Starts in Serverless LLM Inference</span></a><a class="pn next" href="#a1712"><span class="pn-dir">Next</span><span class="pn-t">17.12 · Edge Inference on Apple Neural Engine, Qualcomm Hexagon, WebGPU/WebLLM and Jetson</span></a></div></footer>
