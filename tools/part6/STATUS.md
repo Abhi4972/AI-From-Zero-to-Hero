@@ -44,3 +44,9 @@ Original lessons in ops/NN-*.md (same front matter as fde), converted by ext_ops
 Running case: Lakeside Telecom (churn model + support-reply assistant). Runs MLflow 3.18 (sqlite in a temp dir per lesson,
 skops_trusted_types for tree models), skl2onnx + onnxruntime; these are installed in /home/claude/venv with `uv pip install --python /home/claude/venv/bin/python`.
 Snowflake calls (Feature Store, Registry, CREATE MODEL MONITOR, ALTER MODEL ... SET ALIAS, MODEL(m, alias)!method) are pyshow/sql, checked against docs.snowflake.com Nov 2026.
+
+# Part 11 (phase 33) — AI on Snowflake, End to End
+Original lessons in snowai/NN-*.md, converted by ext_snowai.py (links 31.N, 32.N and 33.N references). Running case: Brightwell Outfitters (retailer).
+Snowflake SQL/Python is shown (sql/pyshow fences), checked against docs.snowflake.com in Nov 2026 (AI functions, model RBAC, cross-region,
+Cortex Search, semantic views, CREATE AGENT, MCP server, AI Gateway, AI Observability, ML Jobs, SPCS serving, usage views). Local Python parts run.
+Product names: Snowflake Intelligence -> Snowflake CoWork, Cortex Code -> CoCo (Summit 2026).

@@ -33,6 +33,8 @@ PHASES = {
          "An intensive on the forward deployed engineer's job: discovery, scoping, building on Claude inside a customer's systems, security review, evals, rollout, adoption and handover, ending with a simulated deployment and a graded practical."),
     32: ("ext/ops", "MLOps and LLMOps in Production",
          "Running models as systems: reproducibility, experiment tracking, the model registry, data validation, point-in-time features, pipelines, CI/CD, serving, safe releases, monitoring, retraining and governance, then Snowflake-native MLOps and the LLMOps practices for prompts, eval data, monitoring and model upgrades."),
+    33: ("ext/snowai", "AI on Snowflake, End to End",
+         "Every layer of AI on Snowflake for one company: access and model governance, parsing, Cortex AI Functions, embeddings, Cortex Search and RAG, semantic views and Cortex Analyst, Cortex Agents, CoWork, MCP and AI Gateway, evaluation and observability, Snowflake ML and model serving, security, cost and CI/CD, ending in a graded capstone."),
 }
 PART = "Project Library"
 
