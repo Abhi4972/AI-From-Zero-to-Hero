@@ -70,3 +70,15 @@ python3 -m http.server 8000
 ```
 
 Then open http://localhost:8000. Opening `index.html` straight from disk will not work, because browsers block loading the lesson files that way.
+
+## Licence
+
+You are free to use, share, adapt and republish this course, including commercially, as long as you give credit.
+
+- **Lesson text, diagrams and course pages**: [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). Full text in [`LICENSE`](LICENSE).
+- **Code** (the code in lessons, the site engine in `engine/`, the scripts in `tools/`): MIT. Full text in [`LICENSE-CODE`](LICENSE-CODE).
+- **Third-party material keeps its own licence.** Parts of the lessons are adapted from MIT-licensed work, the Project Library (Part 8) comes from MIT- and Apache-2.0-licensed repositories, and some figures carry their own credits on the page. The notices are in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); when you reuse those parts, keep their notices.
+
+**How to credit**: "AI from Zero to Hero by Abhinav (https://github.com/Abhi4972), CC BY 4.0", with a link to the course and a note if you changed it.
+
+Product names and trademarks (Snowflake, Claude, OpenAI and others) belong to their owners; their use here is descriptive and does not imply endorsement.
