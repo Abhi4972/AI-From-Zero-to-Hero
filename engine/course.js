@@ -22,6 +22,11 @@
   };
 
   /* ---------- progress state: saved on this device, and to the viewer's account when allowed ---------- */
+  // Layout preview (wide screens + learner name): on only for visitors who opened the site with ?preview=on; ?preview=off turns it off.
+  let PV = false;
+  try { const q = /[?&]preview=(\w+)/.exec(location.search); if (q) { if (q[1] === "off") localStorage.removeItem("zth-preview"); else localStorage.setItem("zth-preview", "1"); }
+    PV = localStorage.getItem("zth-preview") === "1"; } catch (e) { PV = /[?&]preview=on/.test(location.search); }
+  if (PV) document.documentElement.classList.add("pv");
   let S = { d: {}, q: {}, tasks: {}, last: "", path: "all", t: 0 };
   function loadLocal() {
     try {
@@ -153,7 +158,7 @@
     let h = '<header class="home-hero"><div class="ed-chip">Complete edition</div><div class="eyebrow"><span>A complete course</span><span class="dot">·</span><span>' + lessons.length + " lessons</span><span class=\"dot\">·</span><span>about " + hrs(lessons.reduce((a, l) => a + l.min, 0)) + " hours</span></div>" +
       "<h1>AI from Zero to Hero</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, and on to serving, safety, capstones, guided projects, interview case files, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake, in ten parts. Every lesson has its code run, its figures live, and quick checks, exercises and interview questions to make it stick.</p></header>";
     h += '<section class="dash" aria-label="Your progress"><div class="dash-ring">' + ringSvg(frac) + '<div class="dash-pct"><b>' + Math.round(frac * 100) + "%</b><span>complete</span></div></div>" +
-      '<div class="dash-body">' + (S.name
+      '<div class="dash-body">' + (!PV ? "" : S.name
         ? '<div class="dash-name"><b>' + (all.done ? "Welcome back, " : "Welcome, ") + esc(S.name) + '</b><button type="button" class="name-edit" id="name-edit">Edit name</button></div>'
         : '<div class="dash-name ask"><label for="name-in">What should we call you?</label><input id="name-in" type="text" maxlength="40" autocomplete="given-name" placeholder="Your name"><button type="button" class="name-save" id="name-save">Save</button><small>Stays in this browser.</small></div>') +
       '<div class="dash-line">' + (all.done === 0 ? "You have not started yet." : all.done === all.n ? "You have finished this path. Well done." : all.done + " of " + all.n + " lessons finished") +
@@ -241,7 +246,7 @@
       return art;
     }).catch(e => { delete loading[art.id]; throw e; });
   }
-  window.ZName = () => S.name || "";
+  window.ZName = () => PV ? (S.name || "") : "";
   document.addEventListener("keydown", e => { if (e.key === "Enter" && e.target && e.target.id === "name-in") { e.preventDefault(); const b = $("name-save"); if (b) b.click(); } });
   window.ZHydrate = id => artById[id] ? hydrate(artById[id]) : Promise.resolve(null);
   function highlight(art) {
