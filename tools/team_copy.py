@@ -81,7 +81,13 @@ for f in glob.glob(P("lessons", "*.html")):
     for op, np in shiftp.items():
         b = re.sub(r'(href="#ph-%s">Phase )%s( · )' % (op, op), r"\g<1>%s\g<2>" % np, b)
         b = b.replace(f'<a href="#ph-{op}"><span class="num">{op}</span>', f'<a href="#ph-{op}"><span class="num">{np}</span>')
-    b = A.sub(lambda m: m.group(1) + (m.group(3).replace(oldnum[m.group(2)], newnum[m.group(2)]) if m.group(2) in oldnum and m.group(3) == oldnum[m.group(2)] else m.group(3)) + m.group(4), b)
+        b = b.replace(f'href="#ph-{op}">Phase {op}</a>', f'href="#ph-{op}">Phase {np}</a>')
+    def _renum(m):
+        tid, text = m.group(2), m.group(3)
+        if tid in oldnum and re.search(r"(?<![\d.])%s(?![\d])" % re.escape(oldnum[tid]), text):
+            text = re.sub(r"(?<![\d.])%s(?![\d])" % re.escape(oldnum[tid]), newnum[tid], text)   # "32.14" or "Lesson 32.14 · Title"
+        return m.group(1) + text + m.group(4)
+    b = A.sub(_renum, b)
     if b != a: open(f, "w", encoding="utf-8").write(b); changed += 1
 
 # 3. lesson 0.0, home page, search, README
@@ -96,16 +102,18 @@ s = s.replace("<li><strong>Part 9 · Forward Deployed Engineering (Phase 31).</s
 s = s.replace("About 25 hours for Phase 31,", "About 25 hours for Phase 30,")
 s = s.replace("<li><strong>Part 10 · MLOps and LLMOps (Phase 32).</strong>", "<li><strong>Part 10 · MLOps and LLMOps (Phase 31).</strong>")
 s = re.sub(r"About (\d+) hours for Phase 32,", r"About \1 hours for Phase 31,", s)
+s = s.replace("<li><strong>Part 11 · AI on Snowflake (Phase 33).</strong>", "<li><strong>Part 11 · AI on Snowflake (Phase 32).</strong>")
+s = re.sub(r"About (\d+) hours for Phase 33,", r"About \1 hours for Phase 32,", s)
 s = re.sub(r'<li><a href="#ph-21"><span class="num">21</span>[^<]*</a></li>', "", s)
 s = s.replace('<span class="cmap-pname">Projects and Case Files</span>', '<span class="cmap-pname">Hands-On Projects</span>')
-s = re.sub(r"[\d,]+ lessons in 3[123] phases: 753 lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
+s = re.sub(r"[\d,]+ lessons in 3[1234] phases: 753 lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
            f"{n_total:,} lessons in {n_ph} phases: 753 lessons in phases 0 to 19, 79 guided projects, 199 cheat sheets", s)
 for a, b in [(" Build projects from Phase 20 as you go, and work the case files of Phase 21 before interviews.", " Build projects from Phase 20 as you go."),
              (", the case files of Phase 21 about 22", ""),
              ("to jump to any lesson, section heading or interview question by name", "to jump to any lesson or section heading by name"),
              (", and interview questions with model answers", ""), (" and interview questions with model answers", ""),
-             ("then hands-on projects, interview case files, a project library, forward deployed engineering, and MLOps and LLMOps", "then hands-on projects, a project library, forward deployed engineering, and MLOps and LLMOps"),
-             ("Ten parts, 33 phases", f"Ten parts, {n_ph} phases"), ("Pick a route through the 33 phases", f"Pick a route through the {n_ph} phases"),
+             ("then hands-on projects, interview case files, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake", "then hands-on projects, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake"),
+             ("Eleven parts, 34 phases", f"Eleven parts, {n_ph} phases"), ("Pick a route through the 34 phases", f"Pick a route through the {n_ph} phases"),
              ("then practice and interview questions.", "then practice."), ("<span>In Interview prep</span>", "<span>In the Playground</span>"),
              ("The seventh and eighth are practice.", "The seventh and eighth are practice.")]:
     s = s.replace(a, b)
@@ -114,10 +122,10 @@ s = re.sub(r"<li><strong>Review, Interview prep and Playground\.</strong>(.*?)<e
 s = s.replace("The icons on the left open them. <em>Review</em>", "The icons on the left open them. <em>Review</em>")
 open(l0, "w", encoding="utf-8").write(s)
 
-edit(P("engine", "course.js"), [("guided projects, interview case files, a project library, forward deployed engineering, and MLOps and LLMOps", "guided projects, a project library, forward deployed engineering, and MLOps and LLMOps"),
+edit(P("engine", "course.js"), [("guided projects, interview case files, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake", "guided projects, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake"),
                                 ("quick checks, exercises and interview questions to make it stick", "quick checks and exercises to make it stick")])
 edit(P("engine", "player.js"), [("a seventh of projects and interview case files, an eighth", "a seventh of hands-on projects, an eighth"),
-                                ('"Course map":"33 phases in ten parts;', f'"Course map":"{n_ph} phases in ten parts;')])
+                                ('"Course map":"34 phases in eleven parts;', f'"Course map":"{n_ph} phases in eleven parts;')])
 dj = P("engine", "dj.js"); s = open(dj, encoding="utf-8").read()
 for a, b in [('["interview", "#interview", "Interview prep", "chat"], ', ""), ('<a class="dj-btn" href="#interview">Practise interview questions</a>', ""),
              ('placeholder="Search lessons, sections, interview questions, labs"', 'placeholder="Search lessons, sections and labs"'),
@@ -135,12 +143,13 @@ s = s[:k] + s[s.index("\n", k) + 1:]
 open(dj, "w", encoding="utf-8").write(s)
 
 rd = P("README.md"); s = open(rd, encoding="utf-8").read()
-s = re.sub(r"then 79 guided projects, 60 interview case files and a library of (\d+) more projects and recipes, a forward deployed engineering intensive, and an MLOps and LLMOps phase: \*\*[\d,]+ lessons in 33 phases\*\*",
-           lambda m: f"then 79 guided projects, a library of {m.group(1)} more projects and recipes, a forward deployed engineering intensive, and an MLOps and LLMOps phase: **{n_total:,} lessons in {n_ph} phases**", s)
+s = re.sub(r"then 79 guided projects, 60 interview case files and a library of (\d+) more projects and recipes, a forward deployed engineering intensive, an MLOps and LLMOps phase, and an AI on Snowflake phase: \*\*[\d,]+ lessons in 34 phases\*\*",
+           lambda m: f"then 79 guided projects, a library of {m.group(1)} more projects and recipes, a forward deployed engineering intensive, an MLOps and LLMOps phase, and an AI on Snowflake phase: **{n_total:,} lessons in {n_ph} phases**", s)
+s = s.replace("| 11 · AI on Snowflake | 33 AI on Snowflake, End to End |", "| 11 · AI on Snowflake | 32 AI on Snowflake, End to End |")
 s = s.replace("| 10 · MLOps and LLMOps | 32 MLOps and LLMOps in Production |", "| 10 · MLOps and LLMOps | 31 MLOps and LLMOps in Production |")
 s = s.replace("| 9 · Forward Deployed Engineering | 31 Forward Deployed Engineering with Claude |", "| 9 · Forward Deployed Engineering | 30 Forward Deployed Engineering with Claude |")
 s = s.replace("quick checks, interview questions and a review queue", "quick checks and a review queue")
-s = s.replace("one menu for all 33 phases", f"one menu for all {n_ph} phases")
+s = s.replace("one menu for all 34 phases", f"one menu for all {n_ph} phases")
 s = s.replace("| 7 · Projects and Case Files | 20 Hands-On AI Projects · 21 Interview Case Files: Debugging AI Systems | 144 |", "| 7 · Hands-On Projects | 20 Hands-On AI Projects | 83 |")
 s = re.sub(r"(\| 8 · Project Library \|)([^|]*)\|", lambda m: m.group(1) + re.sub(r"\b(2[2-9]|30)\b(?= )", lambda x: str(int(x.group(1)) - 1), m.group(2)) + "|", s)
 s = s.replace(" Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened.", "")
