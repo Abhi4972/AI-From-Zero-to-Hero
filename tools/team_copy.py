@@ -106,8 +106,8 @@ s = s.replace("<li><strong>Part 11 · AI on Snowflake (Phase 33).</strong>", "<l
 s = re.sub(r"About (\d+) hours for Phase 33,", r"About \1 hours for Phase 32,", s)
 s = re.sub(r'<li><a href="#ph-21"><span class="num">21</span>[^<]*</a></li>', "", s)
 s = s.replace('<span class="cmap-pname">Projects and Case Files</span>', '<span class="cmap-pname">Hands-On Projects</span>')
-s = re.sub(r"[\d,]+ lessons in 3[1234] phases: 753 lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
-           f"{n_total:,} lessons in {n_ph} phases: 753 lessons in phases 0 to 19, 79 guided projects, 199 cheat sheets", s)
+s = re.sub(r"[\d,]+ lessons in 3[1234] phases: (\d+) lessons in phases 0 to 19, 79 guided projects, 61 interview case-file lessons, 199 cheat sheets",
+           lambda m: f"{n_total:,} lessons in {n_ph} phases: {m.group(1)} lessons in phases 0 to 19, 79 guided projects, 199 cheat sheets", s)
 for a, b in [(" Build projects from Phase 20 as you go, and work the case files of Phase 21 before interviews.", " Build projects from Phase 20 as you go."),
              (", the case files of Phase 21 about 22", ""),
              ("to jump to any lesson, section heading or interview question by name", "to jump to any lesson or section heading by name"),

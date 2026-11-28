@@ -55,3 +55,10 @@ Horizon (04), REST API (09), ML Functions (10), custom AI functions and AI Funct
 CoWork (20), CoCo (21), Native Apps (22), Cortex AI Gateway (23), ML lifecycle (26), customising models (28), agent identity and containment (30),
 governance on public standards: NIST AI RMF, ISO/IEC 42001, EU AI Act as amended, OWASP LLM Top 10 (31), preview radar (33).
 Sources are public only: Snowflake docs, release notes and blogs, standards bodies, law-firm summaries. No proprietary frameworks are used.
+
+# Late-2026 update lessons (28 Nov 2026)
+Four original lessons in upd/NN-*.md, built once through a temporary phase 34 (ext_upd.py) and then moved by hand into phases 13 and 14:
+a1346 (13.24 commerce and personal-agent protocols), a1455 (14.83 OpenAI's agent platform), a1456 (14.96 reading benchmarks in late 2026),
+a1457 (14.119 simulated users and pass^k). Do not rebuild phase 34; edit the lesson HTML or rebuild and repeat the move (rename ids, crumbs, chip,
+insert in data/course.json, run tools/renumber.py, then reset the four new chips, because renumber shifts them too).
+Also corrected: Colorado SB 26-189 in a1726 and cs-security-compliance; CVE-2026-59822 added to a1825 and cs-ai-security-incidents.
