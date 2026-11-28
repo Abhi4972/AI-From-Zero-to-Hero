@@ -128,7 +128,7 @@ Points from the documentation worth knowing before you design the source table: 
 
 ```sql
 CREATE OR REPLACE TASK ml.ops.validate_daily WAREHOUSE = ml_wh SCHEDULE = 'USING CRON 0 5 * * * UTC'
-  AS CALL ml.ops.validate_customers();                -- lesson 32.5's contract, as a stored procedure
+  AS CALL ml.ops.validate_customers();                -- the data contract, as a stored procedure
 CREATE OR REPLACE TASK ml.ops.score_daily WAREHOUSE = ml_wh AFTER ml.ops.validate_daily
   AS CALL ml.ops.score_customers();                   -- runs the champion with mv.run() and overwrites today's partition
 ALTER TASK ml.ops.score_daily RESUME;

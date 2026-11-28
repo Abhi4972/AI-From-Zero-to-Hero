@@ -117,7 +117,7 @@ jobs:
       - run: pytest tests/features tests/data          # fast: every change
       - run: python pipeline.py --sample 20000         # train on a fixed sample snapshot
       - run: pytest tests/model                        # quality, slices, invariance, directional
-      - run: python gate.py --against champion         # lesson 32.4: block if worse than production
+      - run: python gate.py --against champion         # the promotion gate: block if worse than production
 ```
 
 Keep the CI training run small and fixed (a sampled snapshot) so it takes minutes, and run the full training in the pipeline after merge. Store the thresholds in the repository so that changing them is itself a reviewed change.
