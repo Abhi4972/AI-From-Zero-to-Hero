@@ -5,6 +5,8 @@
   const OLD_IDS = {};
   const CONCEPTS = {};
   const KEY = "ai-from-scratch-progress-v1", OLD_KEY = "agentic-start-to-ship-v1";
+  const REPO = "https://github.com/Abhi4972/AI-From-Zero-to-Hero-Complete";
+  const LIC = '<p class="lic-line">© 2026 Abhinav · Lessons and diagrams <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a> · Code <a href="' + REPO + '/blob/main/LICENSE-CODE" target="_blank" rel="noopener">MIT</a> · Some material is adapted from other open projects: <a href="' + REPO + '/blob/main/THIRD_PARTY_NOTICES.md" target="_blank" rel="noopener">third-party notices</a></p>';
   const $ = id => document.getElementById(id);
   const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -178,6 +180,7 @@
       h += "</div></section>";
     });
     h += '<div class="home-foot"><span>Tick “Mark complete” at the end of each lesson and this page keeps score.</span><button type="button" class="ghost" id="reset-btn">' + (resetArmed ? "Click again to erase all progress" : "Reset my progress") + "</button></div>";
+    h += LIC;
     $("view-home").innerHTML = h;
     renderSync();
   }
@@ -218,6 +221,7 @@
     if (loading[art.id]) return loading[art.id];
     return loading[art.id] = fetch("lessons/" + art.id + ".html").then(r => { if (!r.ok) throw new Error(r.status); return r.text(); }).then(t => {
       art.innerHTML = t; delete art.dataset.stub;
+      const mf = art.querySelector("footer.m-foot"); if (mf && !mf.querySelector(".lic-line")) mf.insertAdjacentHTML("beforeend", LIC);
       art.querySelectorAll("script").forEach(old => {
         const ty = (old.getAttribute("type") || "").toLowerCase();
         if (ty && ty !== "text/javascript" && ty !== "module") return;
