@@ -146,10 +146,16 @@ s = re.sub(r"(\| 8 · Project Library \|)([^|]*)\|", lambda m: m.group(1) + re.s
 s = s.replace(" Phase 21 opens with how an interview loop runs, then gives 60 real incidents to diagnose before reading what actually happened.", "")
 s = s.replace("to jump to any lesson, section or interview question.", "to jump to any lesson or section.")
 s = re.sub(r"\n[^\n]*tools/part6[^\n]*", "", s)
-s = re.sub(r"\*\*Open the course:\*\* https://\S+", "**Open the course:** this is the team edition. Serve this folder with any static web server (see *Run it locally* below), or put it on an internal web server.", s)
+s = re.sub(r"\*\*Open the course:\*\* https://\S+", "**Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero/ (team edition). You can also serve this folder with any static web server (see *Run it locally* below).", s)
 s = re.sub(r"\n[^\n]*tools/migrate\.py[^\n]*", "", s)
 open(rd, "w", encoding="utf-8").write(s)
 edit(P("THIRD_PARTY_NOTICES.md"), [("lessons, figures and interview questions are adapted", "lessons and figures are adapted")], strict=False)
+
+# the team edition lives in its own repository, without the "-Complete" suffix
+for f in [P("README.md"), P("index.html"), P("engine", "head.html")] + glob.glob(P("vol*", "index.html")):
+    if os.path.exists(f):
+        t = open(f, encoding="utf-8").read()
+        open(f, "w", encoding="utf-8").write(t.replace("AI-From-Zero-to-Hero-Complete", "AI-From-Zero-to-Hero"))
 
 print(json.dumps({"lessons removed": len(gone), "pages changed": changed, "lessons": n_total, "phases": n_ph}))
 subprocess.run([sys.executable, P("tools", "build.py")], cwd=DST, check=True)

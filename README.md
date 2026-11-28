@@ -2,7 +2,7 @@
 
 A free, hands-on course from a dev environment and a little linear algebra to agents that plan, use tools and work in teams, then 79 guided projects, 60 interview case files and a library of 427 more projects and recipes, a forward deployed engineering intensive, and an MLOps and LLMOps phase: **1,559 lessons in 33 phases**, with runnable Python, maths, interactive figures, quick checks, interview questions and a review queue, all in the browser.
 
-**Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero/
+**Open the course:** https://abhi4972.github.io/AI-From-Zero-to-Hero-Complete/
 
 Everything is on one site: one menu for all 33 phases, one search across every lesson, one progress tracker. No account and no install are needed.
 
@@ -58,7 +58,7 @@ python3 tools/build.py
 
 It rewrites `index.html` (the app plus a short summary of every lesson), the search files and the phase thumbnails, refreshes every lesson's Previous / Next footer, and stops with an error if any in-site link, image or listed lesson is missing.
 
-`tools/migrate.py` is the one-time script that turned the five volume pages into this layout; the five-volume version is kept on the [`five-volumes`](https://github.com/Abhi4972/AI-From-Zero-to-Hero/tree/five-volumes) branch.
+`tools/migrate.py` is the one-time script that turned the five volume pages into this layout; the five-volume version is kept on the [`five-volumes`](https://github.com/Abhi4972/AI-From-Zero-to-Hero-Complete/tree/five-volumes) branch.
 
 Served by GitHub Pages from `main`, root folder.
 

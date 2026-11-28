@@ -13,7 +13,7 @@ OUT = sys.argv[2] if len(sys.argv) > 2 else "/home/claude/unify/site"
 Z2A_PAGE = "/home/claude/v5/z2a.html"
 Z2A_IMG = "/home/claude/unify/z2a-img"          # images fetched from the Zero to Agents artifact
 Z2A_URL = "https://claude.ai/artifact/HnQQ11kd6iyjw5nE5Au8U6"
-SITE = "https://abhi4972.github.io/AI-From-Zero-to-Hero/"
+SITE = "https://abhi4972.github.io/AI-From-Zero-to-Hero-Complete/"
 REPORT = {}
 
 def rd(p): return open(p, encoding="utf-8").read()
