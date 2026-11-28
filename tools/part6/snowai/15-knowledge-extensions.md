@@ -98,6 +98,13 @@ Which statements are right?
 2. List what Brightwell must check in a supplier's semantic view before its agent may use it.
 3. A consumer's agent cites a manual that the supplier has since withdrawn. Whose process failed, and what should change?
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Get started with Cortex Knowledge Extensions](https://www.snowflake.com/en/developers/guides/get-started-snowflake-cortex-knowledge-extensions/) (Snowflake guide)
+- [CKE tutorials for providers and consumers](https://docs.snowflake.com/user-guide/snowflake-cortex/cortex-knowledge-extensions/overview-tutorials) (Snowflake docs)
+
 :::checked Sources and further reading
 - [Cortex Knowledge Extensions](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-knowledge-extensions/cke-overview)
 - [Make your listing AI-ready](https://docs.snowflake.com/collaboration/provider-listings-ai-ready)

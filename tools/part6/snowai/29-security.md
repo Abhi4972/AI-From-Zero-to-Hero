@@ -129,6 +129,13 @@ Which statements are right?
 2. Design the Search service for tickets so that each region sees only its own tickets. Where does the filter come from?
 3. Write three injected ticket texts and say which control stops each one.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with access controls for Cortex Search](https://www.snowflake.com/en/developers/guides/getting-started-with-access-controls-for-cortex-search/) (Snowflake guide)
+- [PII redaction recipe](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/pii-redaction) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Cortex AI Guardrails](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-ai-guardrails)
 - [Trust Center](https://docs.snowflake.com/user-guide/trust-center/overview)

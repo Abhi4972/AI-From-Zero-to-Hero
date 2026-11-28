@@ -103,6 +103,14 @@ Which statements are right?
 2. Extend `recommend` with a rule for real-time scoring inside an application (hint: lesson 33.27).
 3. List which Brightwell data would be in scope for each layer, and which data must never reach a model.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Zero to Snowflake](https://www.snowflake.com/en/developers/guides/zero-to-snowflake/) (Snowflake guide)
+- [Build an end-to-end AI app on Snowflake](https://www.snowflake.com/en/developers/guides/sfguide-build-end-to-end-ai-app-on-snowflake/) (Snowflake guide)
+- [Cortex AI Cookbook: 28 deployment recipes with SQL scripts and teardown](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/overview) (Snowflake docs)
+
 :::checked Sources and further reading
 - [Snowflake Cortex AI Functions](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql)
 - [Cortex Agents](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents)

@@ -89,6 +89,8 @@ print("\nblocked:", usage[usage.blocked][["user", "surface"]].values.tolist())
 
 Two findings: `chen` is blocked on Desktop only and can keep working in the CLI, because limits are per surface; and `dev_bot` is a service account running CoCo unattended, which belongs in a `SERVICE_AGENT` user with its own session scope and quota (lesson 33.30), not in a person-sized daily limit.
 
+Related: AI code suggestions in Workspaces are GA (28 Jul 2026), and CoCo skills cover data-engineering work such as dbt projects and continuous or bulk file loading.
+
 :::check
 Which statements are right?
 
@@ -109,6 +111,15 @@ Which statements are right?
 1. Set limits for three Brightwell groups (analysts, engineers, platform team) and justify each number.
 2. Write a query that totals CoCo credits per tagged team for last month from the usage view.
 3. Which Brightwell tasks should be skills shared to everyone, and which should stay personal?
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [CoCo foundations](https://www.snowflake.com/en/developers/guides/coco-foundations/) (Snowflake guide)
+- [Getting started with Cortex Agents with CoCo](https://www.snowflake.com/en/developers/guides/getting-started-with-cortex-agents-with-coco/) (Snowflake guide)
+- [Building AI agents with Cortex Code and CoWork](https://www.snowflake.com/en/developers/guides/building-ai-agents-with-cortex-code-and-cowork/) (Snowflake guide)
+- [Size Cortex Code per-user limits from real usage](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/coco-user-budget-sizing) (Cortex AI Cookbook)
 
 :::checked Sources and further reading
 - [Daily credit usage limits for CoCo](https://docs.snowflake.com/en/user-guide/cortex-code/credit-usage-limit) and [Cost controls for CoCo](https://docs.snowflake.com/en/user-guide/cortex-code/cost-controls)

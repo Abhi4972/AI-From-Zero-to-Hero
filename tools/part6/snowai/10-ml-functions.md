@@ -115,6 +115,13 @@ Which statements are right?
 2. Add an exogenous column (a promotion flag) to the local data and see whether the error falls.
 3. Write the task and alert that run `DETECT_ANOMALIES` every morning and email the store manager.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [ML Functions overview, with worked forecasting and anomaly examples](https://docs.snowflake.com/en/guides-overview-ml-functions) (Snowflake docs)
+- [Make ML predictions human-interpretable with a Cortex Agent](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/explain-model-predictions) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [ML Functions overview](https://docs.snowflake.com/en/guides-overview-ml-functions)
 - [CREATE SNOWFLAKE.ML.FORECAST](https://docs.snowflake.com/en/sql-reference/classes/forecast/commands/create-forecast) and [FORECAST method](https://docs.snowflake.com/en/sql-reference/classes/forecast/methods/forecast)

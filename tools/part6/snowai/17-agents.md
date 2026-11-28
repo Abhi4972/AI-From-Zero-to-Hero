@@ -134,6 +134,10 @@ print(lint(["PolicySearch", "ReturnsAnalyst", "OrderStatus"], ["PolicySearch", "
 
 Version 1 missed the order lookup and half of a two-part question, and made an unneeded Search call; explicit orchestration instructions fix all of it. Missed calls are worse than extra ones (an incomplete answer looks complete); extra calls cost time and tokens. The lint catches the configuration mistakes that `CREATE AGENT` accepts silently.
 
+## Several agents
+
+One agent with well-described tools is the default. When domains are owned by different teams, build one agent per domain and route between them: in CoWork, a profile sends each question to the best-suited agent (Snowflake's cookbook calls this multi-agent orchestration), and an agent can also be exposed to another as a tool through an MCP server. Snowflake also distinguishes full Cortex Agents from lighter built-in agents (the audit column `agent_type` records `CORTEX_AGENT` or `CORTEX_LITE_AGENT`). Split only when one agent's routing tests start to fail from having too many tools.
+
 :::check
 Which statements are right?
 
@@ -154,6 +158,15 @@ Which statements are right?
 1. Add a question that should call no tool ("Hello"). What should the agent do, and how would you score it?
 2. Add a `max_results` change to the Search tool and describe how you would know whether it helped.
 3. Write the stored procedure signature for `OrderStatus` that respects the custom-tool limits.
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with Cortex Agents](https://www.snowflake.com/en/developers/guides/getting-started-with-cortex-agents/) (Snowflake guide)
+- [Build a Cortex Agent from scratch](https://www.snowflake.com/en/developers/guides/build-a-cortex-agent-from-scratch-with-snowflake/) (Snowflake guide)
+- [Cortex Agents tutorials](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-tutorials) (Snowflake docs)
+- [Scoping agentic implementations: from 'talk to your data' to a testable agent spec](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/scoping-agentic-implementations) (Cortex AI Cookbook)
 
 :::checked Sources and further reading
 - [CREATE AGENT](https://docs.snowflake.com/en/sql-reference/sql/create-agent)

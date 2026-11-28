@@ -111,6 +111,13 @@ Which statements are right?
 2. Add the prompt version to the usage log and write the SQL join to `CORTEX_REST_API_USAGE_HISTORY`.
 3. Decide which door Brightwell's warehouse-staff mobile app should use for "where is order X?", and why.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with Anthropic on Snowflake Cortex](https://www.snowflake.com/en/developers/guides/getting-started-with-anthropic-on-snowflake-cortex/) (Snowflake guide)
+- [LangChain agents on Cortex AI Gateway with MCP tools and traces](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/langchain-mcp-agent-tracing) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Cortex REST API](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-rest-api)
 - [Inference with Cortex AI Gateway](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-ai-gateway/inference)

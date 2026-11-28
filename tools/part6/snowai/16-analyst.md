@@ -167,6 +167,15 @@ Which statements are right?
 2. Add a verified query for the return-rate question and explain why it helps beyond that exact question.
 3. List three synonyms Brightwell staff would use that are missing from the semantic view.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with semantic views](https://www.snowflake.com/en/developers/guides/getting-started-with-semantic-views/) (Snowflake guide)
+- [Semantic view description quality: a rubric and a linter](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/description-quality) (Cortex AI Cookbook)
+- [Mixed-grain tables and verified queries](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/mixed-grain-and-verified-queries) (Cortex AI Cookbook)
+- [Refine a semantic view from agent logs](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/refinement-loop-from-agent-logs) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [CREATE SEMANTIC VIEW](https://docs.snowflake.com/en/sql-reference/sql/create-semantic-view)
 - [Cortex Analyst REST API](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst/rest-api)

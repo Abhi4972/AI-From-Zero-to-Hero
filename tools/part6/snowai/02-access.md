@@ -131,6 +131,13 @@ Which statements are right?
 2. Set `public_has_all_models` to True. Which checks stop mattering, and why is that risky?
 3. Write the grant script for a store manager who may chat with one agent and nothing else.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Cortex AI Gateway governance quickstart](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/gateway-governance-quickstart) (Cortex AI Cookbook)
+- [AI usage and cost attribution across agents, CoWork, Cortex Code and AI functions](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/ai-usage-cost-attribution) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Model access control](https://docs.snowflake.com/en/user-guide/snowflake-cortex/governance-and-availability/model-access-control)
 - [Cross-region inference](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cross-region-inference)

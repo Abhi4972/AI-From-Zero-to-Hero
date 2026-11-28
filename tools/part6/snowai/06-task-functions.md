@@ -142,6 +142,13 @@ Which statements are right?
 2. Write the `AI_CLASSIFY` config with two `examples` that would fix the delivery over-tagging.
 3. Design the redaction step for tickets shared with suppliers: where in the pipeline does `AI_REDACT` run, and what do you test?
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Support operations with AI functions and dynamic tables](https://www.snowflake.com/en/developers/guides/support-ops-ai-functions-dynamic-tables/) (Snowflake guide)
+- [PII redaction recipe](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/pii-redaction) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [AI_CLASSIFY](https://docs.snowflake.com/en/sql-reference/functions/ai_classify)
 - [AI_FILTER](https://docs.snowflake.com/en/sql-reference/functions/ai_filter)

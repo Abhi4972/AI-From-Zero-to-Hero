@@ -86,6 +86,8 @@ Shadow first, then a small A/B share, then full traffic is the safe order for a 
 
 Customising an LLM is a separate decision, covered in lesson 33.28.
 
+Operational notes for services: autoscaling policies for Snowpark Container Services are GA (4 May 2026), as are ARM instance families (15 May) and four more instance families (5 May); backup instance types (GA 17 Sep) let a service fall back when its preferred instances are unavailable.
+
 :::check
 Which statements are right?
 
@@ -106,6 +108,12 @@ Which statements are right?
 1. Halve the fraud model's latency. How many instances do you save at peak?
 2. Find the request rate at which the open-LLM service becomes cheaper than a hosted model for you, given rates from the consumption table.
 3. Design the shadow-then-A/B rollout for fraud model v2: percentages, duration and the metric that ends each stage.
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Build real-time ML inference with the Feature Store](https://www.snowflake.com/en/developers/guides/build-real-time-ml-inference-with-feature-store/) (Snowflake guide)
 
 :::checked Sources and further reading
 - [Deploy models for real-time inference (REST API)](https://docs.snowflake.com/en/developer-guide/snowflake-ml/inference/real-time-inference-rest-api)

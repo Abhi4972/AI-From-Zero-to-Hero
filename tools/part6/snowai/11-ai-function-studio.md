@@ -114,6 +114,12 @@ Which statements are right?
 2. Which Brightwell prompts, today copied across queries, should become AI functions first, and who owns each?
 3. Design the routing rule that sends Snowflake Decision answers with low confidence to a larger model.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [AI function optimization](https://www.snowflake.com/en/developers/guides/ai-function-optimization/) (Snowflake guide)
+
 :::checked Sources and further reading
 - [CREATE AI FUNCTION](https://docs.snowflake.com/sql-reference/sql/create-ai-function)
 - [Cortex AI Function evaluation and optimization](https://docs.snowflake.com/en/user-guide/snowflake-cortex/ai-function-studio) and [AI_FUNCTION_OPTIMIZATION](https://docs.snowflake.com/en/sql-reference/functions/ai_function_optimization)

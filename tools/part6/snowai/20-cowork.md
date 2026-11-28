@@ -110,6 +110,14 @@ Which statements are right?
 2. Add a rule to `review` that flags automations reading tables tagged as personal data.
 3. Decide how long Brightwell keeps CoWork memory entries, and how a user's deletion request reaches them.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with CoWork](https://www.snowflake.com/en/developers/guides/getting-started-with-cowork/) (Snowflake guide)
+- [Build, evaluate and deploy AI agents with Snowflake CoWork](https://www.snowflake.com/en/developers/guides/build-evaluate-and-deploy-ai-agents-with-snowflake-cowork/) (Snowflake guide)
+- [CoWork agent templates](https://docs.snowflake.com/en/user-guide/snowflake-cortex/snowflake-cowork/templates) (Snowflake docs)
+
 :::checked Sources and further reading
 - [Getting started with Snowflake CoWork](https://docs.snowflake.com/en/user-guide/snowflake-cortex/snowflake-cowork/getting-started)
 - [Snowflake CoWork: from governed insight to proactive work](https://www.snowflake.com/en/blog/snowflake-cowork-profiles-automations-dashboards/), Snowflake blog, November 2026

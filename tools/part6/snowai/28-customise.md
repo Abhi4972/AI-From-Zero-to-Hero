@@ -97,6 +97,13 @@ Which statements are right?
 2. Write the golden-set evaluation that must pass before review tagging switches to a tuned model.
 3. Brightwell has a Cortex Fine-tuning model in production. Write the migration plan to Cortex Training.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Own your intelligence with Cortex Training](https://www.snowflake.com/en/developers/guides/own-your-intelligence-cortex-training/) (Snowflake guide)
+- [Serverless LLM fine-tuning with Cortex AI](https://www.snowflake.com/en/developers/solutions-center/llm-serverless-fine-tuning-with-snowflake-cortex-ai/) (Snowflake docs)
+
 :::checked Sources and further reading
 - [Cortex Training](https://docs.snowflake.com/user-guide/snowflake-cortex/cortex-training) and [Own your intelligence with Cortex Training](https://snowflake.com/en/blog/cortex-training-fine-tune-open-weight-llms), Snowflake blog
 - Snowflake release notes: Fine-tuning arctic-extract models (28 Jan, 20 Apr 2026), Cortex Fine-tuning availability change (20 Oct 2026), Cortex Training (30 Oct 2026)

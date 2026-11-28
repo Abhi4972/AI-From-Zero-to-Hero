@@ -123,6 +123,13 @@ Which statements are right?
 2. Write the access-history query that lists every column an agent's service role read yesterday.
 3. Pick three Brightwell metrics that must be defined once in a semantic view, and say which dashboards disagree on them today.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with semantic views](https://www.snowflake.com/en/developers/guides/getting-started-with-semantic-views/) (Snowflake guide)
+- [PII redaction with AI_REDACT, AI_COMPLETE extraction and an entity cache](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/pii-redaction) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Introduction to sensitive data classification](https://docs.snowflake.com/en/user-guide/classify-intro)
 - [ML Lineage](https://docs.snowflake.com/en/developer-guide/snowflake-ml/ml-lineage) and [GET_LINEAGE](https://docs.snowflake.com/en/sql-reference/functions/get_lineage-snowflake-core)

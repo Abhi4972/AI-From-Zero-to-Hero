@@ -95,6 +95,10 @@ for w, x in weeks.items():
 
 The thresholds (0.1 and 0.25) are a common industry rule of thumb, not a Snowflake default. Drift alone does not prove the model is worse: check the monitor's performance metrics against actuals before retraining, and retrain from a new Dataset version so the next lineage graph shows exactly what changed.
 
+## Models you did not train here
+
+The registry accepts many model types directly: scikit-learn, XGBoost, LightGBM, CatBoost, Prophet, PyTorch, TensorFlow, Keras, MLflow, Sentence Transformers and LoRA adapters, plus custom model classes for anything else. **Hugging Face** models can be imported from Snowsight or logged as a pipeline (preview): `huggingface.TransformersPipeline(task="text-classification", model="ProsusAI/finbert")` passed to `reg.log_model`. Warehouses have no GPUs, so serve larger models from a compute pool (lesson 33.27), and downloading weights from a notebook needs an external access integration.
+
 :::check
 Which statements are right?
 
@@ -115,6 +119,14 @@ Which statements are right?
 1. Change week 12's distribution until PSI crosses 0.25 with the mean unchanged. What changed instead?
 2. Write the declarative spec (in prose) for the `STORE_WEEKLY` feature view and the review step before `apply`.
 3. Which lineage question would have saved Brightwell the most time in the last incident?
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [End-to-end ML workflow](https://www.snowflake.com/en/developers/guides/end-to-end-ml-workflow/) (Snowflake guide)
+- [Develop and manage ML models with Feature Store and Model Registry](https://www.snowflake.com/en/developers/guides/develop-and-manage-ml-models-with-feature-store-and-model-registry/) (Snowflake guide)
+- [Scheduled retraining with a task graph and a quality gate](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/ml-pipeline-orchestration) (Cortex AI Cookbook)
 
 :::checked Sources and further reading
 - [Snowflake Feature Store](https://docs.snowflake.com/developer-guide/snowflake-ml/feature-store/overview), [declarative feature store](https://docs.snowflake.com/developer-guide/snowflake-ml/feature-store/feature-development-lifecycle) and [online features](https://docs.snowflake.com/en/developer-guide/snowflake-ml/feature-store/online-feature-store)

@@ -89,6 +89,10 @@ FROM DIRECTORY(@claims.raw.photos);
 
 A useful pattern for claims: classify every photo cheaply, and only send the uncertain or high-value ones to the larger model for a description.
 
+## Video
+
+Video joined audio and images in 2026. `AI_COMPLETE` can analyse video and audio with Gemini models (May 2026) and with Twelve Labs Pegasus 1.5 for video understanding (GA 16 Nov 2026), and `AI_MULTI_EMBED` creates embeddings for semantic video search, including large files (GA 10 Aug 2026). `AI_TRANSCRIBE` added AAC, M4A and MOV inputs in July 2026. The pattern is the same as for calls: stage the files, process incrementally, store results in a table, and measure on a labelled sample before trusting them.
+
 :::check
 Which statements are right?
 
@@ -109,6 +113,12 @@ Which statements are right?
 1. Add an "interruptions" metric: segments that start before the previous one ends.
 2. Compute the weekly transcription tokens for 9,000 calls averaging 7 minutes.
 3. Design the claims flow: which photos get only `AI_CLASSIFY`, and which also get a description?
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Build an AI assistant with AI functions over documents, audio and images](https://www.snowflake.com/en/developers/guides/build-an-ai-assistant-for-fsi-with-aisql-and-snowflake-intelligence/) (Snowflake guide)
 
 :::checked Sources and further reading
 - [AI_TRANSCRIBE](https://docs.snowflake.com/en/sql-reference/functions/ai_transcribe)

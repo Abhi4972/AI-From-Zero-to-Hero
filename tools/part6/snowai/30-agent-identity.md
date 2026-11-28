@@ -80,6 +80,8 @@ CREATE OR REPLACE DATA MOVEMENT POLICY governance.policies.pii_dmp
 ALTER TAG governance.tags.pii_level SET DATA MOVEMENT POLICY governance.policies.pii_dmp;
 ```
 
+The agent-active check works in masking, row access, projection, aggregation and join policies, so you can also stop agents from selecting a column at all or force them to aggregate.
+
 Data movement rule types: `COPY_INTO_EXTERNAL_STAGE`, `COPY_INTO_INTERNAL_STAGE`, `SNOWSIGHT_UI`, `AGENT_ACCESS`, `UI_DOWNLOAD`, `PROGRAMMATIC_FETCH`. Policies attach through tags (or the account as a baseline), the most specific policy wins per object, and the strictest `MAX_ROWS` across touched columns applies. `ALERT_RULES` allow and alert instead of blocking.
 
 ## Multi-Party Approval for the controls themselves
@@ -133,6 +135,13 @@ Which statements are right?
 1. Write an RSS for CoCo users that allows reads everywhere except the `HR` database and writes only to `AGENT_SANDBOX`.
 2. Change the data movement rule to allow agents up to 500 rows of tagged data and alert above 100.
 3. Which Brightwell operations should need Multi-Party Approval, and who are the approvers?
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Multi-tenant agents with session attributes and fail-closed policies](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/multi-tenant-agents) (Cortex AI Cookbook)
+- [OAuth token passthrough to a Cortex Agent](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/oauth-token-passthrough) (Cortex AI Cookbook)
 
 :::checked Sources and further reading
 - [Agent identity](https://docs.snowflake.com/en/user-guide/agent-identity) and [Restricted Session Scope for agents](https://docs.snowflake.com/user-guide/restricted-session-scope)

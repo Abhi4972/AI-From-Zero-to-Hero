@@ -137,6 +137,13 @@ Which statements are right?
 2. Add a "latency" area with a p95 target for agent turns, and the evidence it needs.
 3. Write the one-page design note for Brightwell's security reviewer, covering data flow, residency, access, redaction and audit.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Build an end-to-end AI app on Snowflake](https://www.snowflake.com/en/developers/guides/sfguide-build-end-to-end-ai-app-on-snowflake/) (Snowflake guide)
+- [Build, evaluate and deploy AI agents with Snowflake CoWork](https://www.snowflake.com/en/developers/guides/build-evaluate-and-deploy-ai-agents-with-snowflake-cowork/) (Snowflake guide)
+
 :::checked Sources and further reading
 - [Cortex Agents](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents)
 - [Getting started with Snowflake CoWork](https://docs.snowflake.com/en/user-guide/snowflake-cortex/snowflake-cowork/getting-started)

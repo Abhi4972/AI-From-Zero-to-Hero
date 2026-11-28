@@ -100,6 +100,13 @@ The third ticket passes JSON parsing but fails the business rules: an empty prod
 | A short example for ambiguous fields | Long instructions repeated per row when a task function would do (lesson 33.6) |
 | The text the model needs, nothing else | Passing whole customer records "for context": cost and privacy |
 
+## Documents, playgrounds and model lifecycle
+
+- **Document intelligence**: `AI_COMPLETE` accepts documents directly as FILE inputs (GA 2 Apr 2026), so a question about a PDF needs no separate parse step. Use `AI_PARSE_DOCUMENT` when you want the text for search, `AI_EXTRACT` for fields by schema, `AI_CLASSIFY` to route mixed documents, and `AI_COMPLETE` on the document for open questions.
+- **Playgrounds**: the Cortex Playground and the Document Processing Playground (GA 22 Jan 2026) in Snowsight let you compare models and prompts on your own rows and files before writing SQL.
+- **What you can call**: `SHOW CORTEX BASE MODELS` (GA 23 Jul 2026) lists the models available to the account.
+- **Model lifecycle**: Snowflake retires models in two stages, announced in behaviour change notices. From the **legacy** date, accounts that never used the model cannot start; at **end of life** every call naming it fails. The August 2026 notice, for example, made sixteen models legacy on 12 August, with `claude-4-sonnet` ending on 14 October 2026. Task functions such as `AI_CLASSIFY` are unaffected because Snowflake manages their models. Keep model names in one configuration table or in custom AI functions (lesson 33.11), and re-run your evaluation when you switch.
+
 :::check
 Which statements are right?
 
@@ -120,6 +127,13 @@ Which statements are right?
 1. Add an `order_id` field with a regex rule (`BW-` followed by eight digits) and a ticket that violates it.
 2. Write the SQL `CASE` that sends invalid rows to `support.enriched.ticket_review`.
 3. Estimate tokens for 50,000 tickets a day from the usage above, and say which field you would drop if cost had to fall by a third.
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with Anthropic on Snowflake Cortex](https://www.snowflake.com/en/developers/guides/getting-started-with-anthropic-on-snowflake-cortex/) (Snowflake guide)
+- [Document intelligence with AI functions](https://www.snowflake.com/en/developers/guides/document-intelligence-ai-functions/) (Snowflake guide)
 
 :::checked Sources and further reading
 - [AI_COMPLETE (single string)](https://docs.snowflake.com/en/sql-reference/functions/ai_complete-single-string)

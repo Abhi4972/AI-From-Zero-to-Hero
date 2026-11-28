@@ -118,6 +118,12 @@ Which statements are right?
 2. Set a different threshold per field so that no field has more than 1% errors in the automatic share.
 3. Write the dynamic table that exposes only values above their field's threshold.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Create a document processing pipeline with AI_EXTRACT](https://www.snowflake.com/en/developers/guides/create-a-document-processing-pipeline-with-ai-extract/) (Snowflake guide)
+
 :::checked Sources and further reading
 - [Document AI decommission](https://docs.snowflake.com/en/release-notes/bcr-bundles/un-bundled/bcr-2156), Snowflake behaviour change notice
 - [AI_EXTRACT](https://docs.snowflake.com/en/sql-reference/functions/ai_extract)

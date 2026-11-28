@@ -88,6 +88,10 @@ print("aggregate in Snowflake: ", feat)
 
 Aggregating to weekly and keeping only active SKUs in Snowflake shrinks what Python must touch by more than ten times. Even then, training on 13 million rows is better done in an ML Job on a compute pool than on a laptop, because it becomes scheduled, logged and repeatable.
 
+## Bigger training: distributed trainers and tuning
+
+On the Container Runtime, open-source libraries run as they are on one node. For more data, Snowflake ML's distributed trainers (`XGBEstimator`, `LightGBMEstimator`, `PyTorchDistributor` in `snowflake.ml.modeling.distributors`) spread work across nodes and GPUs on a managed Ray cluster, and `DataConnector.from_dataframe(session.table(...))` is the fast way to feed them. By default they use all available resources; scaling configs (for example `XGBScalingConfig(use_gpu=True)`) override that. Parallel hyperparameter optimisation runs the same way, as a multi-node ML Job. Convert the fitted model to its open-source form before logging it to the registry, because the distributed estimator's `predict` is not distributed. If your code is pandas or Spark, pandas on Snowflake and Snowpark Connect for Spark run it against Snowflake compute without a rewrite.
+
 :::check
 Which statements are right?
 
@@ -108,6 +112,15 @@ Which statements are right?
 1. Change `filter_share` to 0.2 (only fast movers). What does that do to training size, and what risk does it add?
 2. Rewrite `train_demand` as a `submit_file` script that writes its metrics to a table.
 3. List what you would log for each training job so it can be reproduced (lesson 32.2).
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Snowflake ML quickstart](https://docs.snowflake.com/en/developer-guide/snowflake-ml/quickstart) (Snowflake docs)
+- [Intro to machine learning with Snowflake ML for Python](https://www.snowflake.com/en/developers/guides/intro-to-machine-learning-with-snowpark-ml-for-python/) (Snowflake guide)
+- [Distributed training as a multi-node ML Job](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/distributed-training) (Cortex AI Cookbook)
+- [Parallel hyperparameter tuning as a multi-node ML Job](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/hyperparameter-tuning) (Cortex AI Cookbook)
 
 :::checked Sources and further reading
 - [Snowflake ML Jobs](https://docs.snowflake.com/en/developer-guide/snowflake-ml/ml-jobs/overview)

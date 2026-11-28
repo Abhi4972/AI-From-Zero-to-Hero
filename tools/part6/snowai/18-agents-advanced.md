@@ -113,6 +113,15 @@ Which statements are right?
 2. Rewrite Brightwell's refund custom tool as a caller's-rights procedure that records a refund request for a person to approve instead of issuing the refund.
 3. Choose `thinking_effort` levels for three Brightwell tasks and justify each with latency and cost.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Long-running Cortex Agent runs over managed MCP](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/long-running-agents-over-mcp) (Cortex AI Cookbook)
+- [OAuth token passthrough to a Cortex Agent](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/oauth-token-passthrough) (Cortex AI Cookbook)
+- [Multi-agent orchestration with a CoWork profile](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/multi-agent-orchestration) (Cortex AI Cookbook)
+- [Long-term memory for Cortex Agents from feedback](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-feedback-to-memory) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Coding Agent](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-coding-agent) and [Cortex Agent code execution tool](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-code-execution-tool)
 - Snowflake release notes 2026: Cortex Agent SDK (13 Oct, 18 Nov), asynchronous API (30 Aug), Compact API (21 Sep), managed MCP server background runs (4 Nov)

@@ -113,6 +113,13 @@ Which statements are right?
 2. Who at Brightwell should have `MONITOR`, given that it reveals every user's traces?
 3. Plan the move of one coding agent from its own API key to the gateway, including the cutover check.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Cortex AI Gateway governance quickstart](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/gateway-governance-quickstart) (Cortex AI Cookbook)
+- [LangChain agents on Cortex AI Gateway with MCP tools and traces](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/langchain-mcp-agent-tracing) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Cortex AI Gateway](https://docs.snowflake.com/user-guide/snowflake-cortex/cortex-ai-gateway)
 - [Build trust in AI agents with governed business context and AI security](https://snowflake.com/en/blog/ai-agents-governance-ai-security-cost-control), Snowflake blog, November 2026

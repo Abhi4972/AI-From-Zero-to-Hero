@@ -125,6 +125,13 @@ Which statements are right?
 2. Add page-based `AI_EXTRACT` cost for 900 contracts at 40 pages each versus 3 selected pages (970 tokens per page).
 3. Write the alert query that flags any role whose AI credits doubled week on week.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [AI usage and cost attribution across agents, CoWork, Cortex Code and AI functions](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/ai-usage-cost-attribution) (Cortex AI Cookbook)
+- [Size Cortex Code per-user limits from real usage](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/coco-user-budget-sizing) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Cost considerations for Cortex AI Functions](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql-cost)
 - [CORTEX_AI_FUNCTIONS_USAGE_HISTORY view](https://docs.snowflake.com/en/sql-reference/account-usage/cortex_ai_functions_usage_history)

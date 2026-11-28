@@ -118,6 +118,13 @@ Which statements are right?
 2. Which Brightwell files would need `AGENTIC` mode? What would you check before paying for it?
 3. Write the task that runs the incremental `INSERT` every night after the stage refresh.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Document intelligence with AI functions](https://www.snowflake.com/en/developers/guides/document-intelligence-ai-functions/) (Snowflake guide)
+- [Support operations with AI functions and dynamic tables](https://www.snowflake.com/en/developers/guides/support-ops-ai-functions-dynamic-tables/) (Snowflake guide)
+
 :::checked Sources and further reading
 - [Parsing documents with AI_PARSE_DOCUMENT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/parse-document)
 - [Query the Cortex Search service with the SharePoint connector](https://docs.snowflake.com/en/connectors/unstructured-data-connectors/sharepoint/cortex)

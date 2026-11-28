@@ -125,6 +125,13 @@ Which statements are right?
 2. Write the CI steps (as a list) that run the three golden-set checks against the test environment before production.
 3. Decide whether Brightwell needs the Streamlit app or only CoWork, and list what would change your answer.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Agent CI/CD with dbt: per-PR builds, versioned deploys and an evaluation gate](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-ci-cd-with-dbt) (Cortex AI Cookbook)
+- [Agent versioning and promotion](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-versioning-and-promotion) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Snowflake CLI](https://docs.snowflake.com/en/developer-guide/snowflake-cli/introduction/introduction)
 - [CREATE CORTEX SEARCH SERVICE](https://docs.snowflake.com/en/sql-reference/sql/create-cortex-search): immutable settings

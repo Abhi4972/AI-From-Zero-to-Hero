@@ -110,6 +110,15 @@ Which statements are right?
 2. Write the SQL that counts thumbs-down feedback per day for the last 30 days.
 3. Decide which role should hold the unredacted-events privilege at Brightwell, and why not the agent's developers by default.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with AI Observability](https://www.snowflake.com/en/developers/guides/getting-started-with-ai-observability/) (Snowflake guide)
+- [Evaluate and promote Cortex Agent versions](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-evaluations) (Cortex AI Cookbook)
+- [Turn agent feedback and rephrased questions into an evaluation dataset](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-feedback-to-evals) (Cortex AI Cookbook)
+- [Diagnose slow Cortex Agent requests from their traces](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/diagnose-agent-requests) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Evaluate applications with TruLens](https://docs.snowflake.com/en/user-guide/snowflake-cortex/ai-observability/evaluate-applications-trulens)
 - [Monitor Cortex Agent requests](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-monitor)

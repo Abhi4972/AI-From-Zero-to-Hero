@@ -101,6 +101,13 @@ Which statements are right?
 2. Choose three NIST AI 600-1 risks that apply to Brightwell's returns agent and name the Snowflake control for each.
 3. Draft the evidence pack index for an ISO/IEC 42001 internal audit of one AI system, with the query behind each item.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Cortex AI Gateway governance quickstart](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/gateway-governance-quickstart) (Cortex AI Cookbook)
+- [Agent versioning and promotion](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/agent-versioning-and-promotion) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [NIST AI Risk Management Framework](https://www.nist.gov/itl/ai-risk-management-framework) and [NIST AI 600-1, Generative AI Profile](https://doi.org/10.6028/NIST.AI.600-1)
 - [ISO/IEC 42001:2023](https://www.iso.org/standard/81230.html); [Snowflake achieves ISO/IEC 42001 certification](https://snowflake.com/en/blog/ISO-IEC-42001-AI-certification), Snowflake blog

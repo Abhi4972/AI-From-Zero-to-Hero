@@ -106,6 +106,15 @@ Which statements are right?
 2. Write the security integration for the MCP server with `OAUTH_CLIENT_TYPE` and `ALLOWED_ROLES_LIST`.
 3. Decide which door a supplier-portal chatbot should use, and justify it in three sentences.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Getting started with the Snowflake MCP server](https://www.snowflake.com/en/developers/guides/getting-started-with-snowflake-mcp-server/) (Snowflake guide)
+- [Snowflake-managed MCP with Bedrock AgentCore](https://www.snowflake.com/en/developers/guides/getting-started-with-snowflake-managed-mcp-and-bedrock-agentcore/) (Snowflake guide)
+- [Snowflake-managed MCP or the Cortex Agents REST API](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/mcp-or-agent-rest-api) (Cortex AI Cookbook)
+- [Embedded app context for a Cortex Agent](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/embedded-app-context) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Snowflake-managed MCP server](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-agents-mcp)
 - Snowflake release notes 2026: Streamlit in Snowflake container runtime (9 Mar), App Runtime (1 Sep, 19 Nov), External OAuth and scopes for MCP servers (22 Jul), managed MCP server background runs (4 Nov)

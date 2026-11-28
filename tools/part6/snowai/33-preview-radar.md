@@ -96,6 +96,12 @@ Which statements are right?
 2. Add a column for "fallback if withdrawn" to the register and fill it for every preview Brightwell uses.
 3. Subscribe a team channel to Snowflake's release-notes feed and define who triages AI entries each week.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Snowflake release notes: follow one preview feature to GA](https://docs.snowflake.com/en/release-notes/all-release-notes) (Snowflake docs)
+
 :::checked Sources and further reading
 - [All release notes](https://docs.snowflake.com/en/release-notes/all-release-notes) and [Feature updates earlier in 2026](https://docs.snowflake.com/en/release-notes/feature-releases-2026)
 - [Build trust in AI agents with governed business context and AI security](https://snowflake.com/en/blog/ai-agents-governance-ai-security-cost-control) and [Build faster, work smarter with AI agents and apps grounded in data](https://www.snowflake.com/en/blog/ai-agents-governed-data-business-context/), Snowflake blog, November 2026

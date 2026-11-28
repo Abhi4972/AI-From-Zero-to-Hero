@@ -118,6 +118,10 @@ Tiny chunks cut rules in half, and one huge chunk always "contains" the answer b
 
 Most question-answering work belongs on Cortex Search (next lesson); own vectors suit analytical uses such as finding near-duplicate reviews.
 
+## More embedding options
+
+`AI_MULTI_EMBED` embeds images and video as well as text for multimodal search. Snowflake announced Arctic Embed 3S in November 2026 (general availability "soon") as a compact model with better retrieval quality than Arctic Embed L v2.0. If the data lives in **Snowflake Postgres**, the `pgvector` extension offers HNSW and IVFFlat indexes there, and applications can still call Cortex functions such as `AI_EMBED` and `AI_COMPLETE` from the Snowflake side. Changing embedding model always means re-embedding the corpus, so record the model with every vector.
+
 :::check
 Which statements are right?
 
@@ -138,6 +142,12 @@ Which statements are right?
 1. Add two questions whose answers span two sections. Which chunk settings handle them?
 2. Change the separators so the splitter never breaks inside a Markdown table row.
 3. Write the SQL that finds review pairs with cosine similarity above 0.95 (likely duplicates).
+
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Ask questions of your own documents with Cortex Search](https://www.snowflake.com/en/developers/guides/ask-questions-to-your-own-documents-with-snowflake-cortex-search/) (Snowflake guide)
 
 :::checked Sources and further reading
 - [Vector embeddings](https://docs.snowflake.com/en/user-guide/snowflake-cortex/vector-embeddings)

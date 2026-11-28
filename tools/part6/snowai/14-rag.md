@@ -117,6 +117,13 @@ Which statements are right?
 2. Extend the checker to flag the words "full refund" when no cited source contains "full".
 3. Add five Brightwell questions to the golden set, including one the sources cannot answer, and decide what a correct answer looks like for it.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Build a RAG app with Streamlit and Snowflake Cortex](https://www.snowflake.com/en/developers/guides/build-rag-app-with-streamlit-and-snowflake-cortex/) (Snowflake guide)
+- [Attach documents to Cortex Agent conversations](https://docs.snowflake.com/en/developer-guide/cortex-ai-cookbook/document-context) (Cortex AI Cookbook)
+
 :::checked Sources and further reading
 - [Query a Cortex Search service](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-search/query-cortex-search-service)
 - [AI_COMPLETE](https://docs.snowflake.com/en/sql-reference/functions/ai_complete-single-string)

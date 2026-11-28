@@ -96,6 +96,12 @@ Which statements are right?
 2. List three questions Brightwell's security review should ask any app that includes `code_toolset_all`.
 3. Why can an app's MCP server not include `SYSTEM_EXECUTE_SQL`? What would go wrong if it could?
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Use Cortex Agents and MCP servers in an app, with setup-script examples](https://docs.snowflake.com/en/developer-guide/native-apps/agents-mcp-servers) (Snowflake docs)
+
 :::checked Sources and further reading
 - [Use Cortex Agents and MCP servers in an app](https://docs.snowflake.com/en/developer-guide/native-apps/agents-mcp-servers)
 - Snowflake release notes: Native Apps Cortex Agents and MCP servers (7 Aug 2026), code execution tools (1 Sep 2026)

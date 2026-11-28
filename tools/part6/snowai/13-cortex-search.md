@@ -191,6 +191,13 @@ Which statements are right?
 2. Add a `time_decays` idea locally: multiply ticket scores by a factor that halves every 90 days.
 3. Write the `CREATE` statement for a separate ticket-only service with `TARGET_LAG = '10 minutes'`, and justify splitting it from the policy service.
 
+## Practise on Snowflake
+
+This lesson's local code needs no account. To practise on the real platform, use a Snowflake trial account and these hands-on guides that Snowflake publishes. They change as features change, so follow the guide where it differs from this lesson, and drop the objects you create afterwards (trial credits are limited).
+
+- [Ask questions of your own documents with Cortex Search](https://www.snowflake.com/en/developers/guides/ask-questions-to-your-own-documents-with-snowflake-cortex-search/) (Snowflake guide)
+- [Getting started with access controls for Cortex Search](https://www.snowflake.com/en/developers/guides/getting-started-with-access-controls-for-cortex-search/) (Snowflake guide)
+
 :::checked Sources and further reading
 - [Data governance policy inheritance for Cortex Search](https://docs.snowflake.com/user-guide/snowflake-cortex/cortex-search/cortex-search-data-governance-inheritance)
 - [CREATE CORTEX SEARCH SERVICE](https://docs.snowflake.com/en/sql-reference/sql/create-cortex-search)
