@@ -43,6 +43,7 @@
     Object.keys(R.d || {}).forEach(id => { const r = R.d[id]; if (Array.isArray(r) && (!S.d[id] || r[1] > S.d[id][1])) { S.d[id] = r; changed = true; } });
     Object.keys(R.q || {}).forEach(id => { const r = R.q[id]; if (Array.isArray(r) && (!S.q[id] || r[0] > S.q[id][0])) { S.q[id] = r; changed = true; } });
     Object.keys(R.tasks || {}).forEach(k => { if (R.tasks[k] && !S.tasks[k]) { S.tasks[k] = true; changed = true; } });
+    if (R.name && !S.name) { S.name = String(R.name).slice(0, 40); changed = true; }
     if ((R.t || 0) > (S.t || 0)) { if (R.last) S.last = R.last; if (PATHS[R.path]) S.path = R.path; S.t = R.t; changed = true; }
     return changed;
   }
@@ -152,7 +153,10 @@
     let h = '<header class="home-hero"><div class="ed-chip">Complete edition</div><div class="eyebrow"><span>A complete course</span><span class="dot">·</span><span>' + lessons.length + " lessons</span><span class=\"dot\">·</span><span>about " + hrs(lessons.reduce((a, l) => a + l.min, 0)) + " hours</span></div>" +
       "<h1>AI from Zero to Hero</h1><p class=\"lede\">From a dev environment and a little linear algebra to agents that plan, use tools and work in teams, and on to serving, safety, capstones, guided projects, interview case files, a project library, forward deployed engineering, MLOps and LLMOps, and AI on Snowflake, in ten parts. Every lesson has its code run, its figures live, and quick checks, exercises and interview questions to make it stick.</p></header>";
     h += '<section class="dash" aria-label="Your progress"><div class="dash-ring">' + ringSvg(frac) + '<div class="dash-pct"><b>' + Math.round(frac * 100) + "%</b><span>complete</span></div></div>" +
-      '<div class="dash-body"><div class="dash-line">' + (all.done === 0 ? "You have not started yet." : all.done === all.n ? "You have finished this path. Well done." : all.done + " of " + all.n + " lessons finished") +
+      '<div class="dash-body">' + (S.name
+        ? '<div class="dash-name"><b>' + (all.done ? "Welcome back, " : "Welcome, ") + esc(S.name) + '</b><button type="button" class="name-edit" id="name-edit">Edit name</button></div>'
+        : '<div class="dash-name ask"><label for="name-in">What should we call you?</label><input id="name-in" type="text" maxlength="40" autocomplete="given-name" placeholder="Your name"><button type="button" class="name-save" id="name-save">Save</button><small>Stays in this browser.</small></div>') +
+      '<div class="dash-line">' + (all.done === 0 ? "You have not started yet." : all.done === all.n ? "You have finished this path. Well done." : all.done + " of " + all.n + " lessons finished") +
       "<small>" + (all.done ? "About " + hrs(all.min - all.doneMin) + " hours left of " + hrs(all.min) : "About " + hrs(all.min) + " hours, at your own pace") + (S.path !== "all" ? " on the “" + PATHS[S.path][0] + "” path" : "") + ".</small></div>" +
       '<div class="dash-actions">' + (nx ? '<a class="cta" href="#' + nx.id + '">' + (all.done ? "Continue" : "Start") + ": " + esc(nx.num) + " · " + esc(nx.title) + " →</a>" : "") + "</div>" +
       '<div class="dash-stats"><span><b>' + chDone + "</b> of " + chWith + " phases complete</span><span><b>" + hrs(all.doneMin) + "</b> hours studied</span><span><b>" + quizzes + "</b> quizzes answered</span></div>" +
@@ -237,6 +241,8 @@
       return art;
     }).catch(e => { delete loading[art.id]; throw e; });
   }
+  window.ZName = () => S.name || "";
+  document.addEventListener("keydown", e => { if (e.key === "Enter" && e.target && e.target.id === "name-in") { e.preventDefault(); const b = $("name-save"); if (b) b.click(); } });
   window.ZHydrate = id => artById[id] ? hydrate(artById[id]) : Promise.resolve(null);
   function highlight(art) {
     if (highlighted.has(art.id) || !window.hljs) return;
@@ -404,6 +410,8 @@
     if (chBtn) { const id = chBtn.dataset.ch; openCh[id] = !openCh[id]; renderNav(view.kind === "chapter" ? view.id : view.kind === "lesson" ? byId[view.id].ch.id : "", view.kind === "lesson" ? view.id : ""); return; }
     const pb = t.closest(".path-btn");
     if (pb) { S.path = pb.dataset.path; touch(); return; }
+    if (t.closest("#name-save")) { const v = ($("name-in").value || "").trim().slice(0, 40); if (v) { S.name = v; touch(); } return; }
+    if (t.closest("#name-edit")) { delete S.name; saveLocal(); renderHome(); const ni = $("name-in"); if (ni) ni.focus(); return; }
     if (t.closest("#sync-btn")) { initRemote(true); return; }
     if (t.closest("#xfer-out")) { window.ZXfer.save(); return; }
     if (t.closest("#xfer-in")) { const f = $("xfer-file"); if (f) { f.value = ""; f.click(); } return; }

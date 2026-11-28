@@ -254,9 +254,22 @@ window.ZXP = (function () {
     const narrow = $$(":scope > :not(.wide)", grid); if (narrow.length % 2) narrow[narrow.length - 1].classList.add("wide");
     body.appendChild(hero); if (grid.children.length) body.appendChild(grid); after.forEach(n => body.appendChild(n));
   }
+  // Wide screens: text beside its diagram, and runs of paragraphs in two columns (the CSS only acts above 1400px).
+  function wide(body) {
+    Array.from(body.children).filter(n => n.matches && n.matches("figure.diagram")).forEach(fig => {
+      const txt = []; let e = fig.previousElementSibling;
+      while (e && /^(P|UL|OL)$/.test(e.tagName) && !e.className) { txt.unshift(e); e = e.previousElementSibling; }
+      if (!txt.length) return;
+      const pair = el("div", "zx-pair"), t = el("div", "zx-pair-text"); txt[0].before(pair); txt.forEach(x => t.appendChild(x)); pair.appendChild(t); pair.appendChild(fig);
+    });
+    let run = [];
+    const flush = () => { const chars = run.reduce((n, x) => n + x.textContent.length, 0);
+      if (run.length >= 2 && chars > 500) { const w = el("div", "zx-flow"); run[0].before(w); run.forEach(x => w.appendChild(x)); } run = []; };
+    Array.from(body.children).forEach(k => { if (/^(P|UL|OL)$/.test(k.tagName) && !k.className) run.push(k); else flush(); }); flush();
+  }
   function doneStage(L, body) {
     const goals = $$(".co-goals .co-body > ul > li", L.art).map(li => li.lastElementChild ? li.lastElementChild.innerHTML : li.innerHTML);
-    const d = el("div", "zx-done"); d.innerHTML = '<svg class="zx-seal" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="46"/><path d="M30 52l14 14 27-30"/></svg><h2 class="zx-ui">You have reached the end of ' + esc(L.kindLabel) + "</h2>" +
+    const d = el("div", "zx-done"); d.innerHTML = '<svg class="zx-seal" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="46"/><path d="M30 52l14 14 27-30"/></svg><h2 class="zx-ui">' + (window.ZName && window.ZName() ? "Well done, " + esc(window.ZName()) + ". " : "") + 'You have reached the end of ' + esc(L.kindLabel) + "</h2>" +
       (goals.length ? '<p class="zx-ui">You should now be able to:</p><ul class="zx-recap zx-ui">' + goals.map((g, k) => '<li style="animation-delay:' + (800 + k * 110) + 'ms">' + ic("check") + "<span>" + g + "</span></li>").join("") + "</ul>" : "");
     body.appendChild(d); const foot = $("footer.m-foot", L.art); if (foot) d.appendChild(foot);
     const again = el("button", "zx-mini zx-again", ic("replay") + "Go back to the start of this lesson"); again.type = "button"; d.appendChild(again);
@@ -292,7 +305,7 @@ window.ZXP = (function () {
       if (st.kind === "check") $$(".quiz-head h2", body).forEach(h => { if (h.textContent.trim().toLowerCase() === st.title.toLowerCase()) h.classList.add("zx-sr"); });
       wrap.appendChild(sec);
       if (st.kind !== "done") { labs(body); figures(body); myths(body); terms(body); callouts(body);
-        if (st.kind === "learn" || st.kind === "build") { lead(body, st); if (window.ZXA) window.ZXA.stage(L.id, st, body, H); tableCards(body); lists(body); labels(body); gallery(body); autoTour(body); autoMap(body); newWords(sec, body); glance(sec, body, st); } }
+        if (st.kind === "learn" || st.kind === "build") { lead(body, st); if (window.ZXA) window.ZXA.stage(L.id, st, body, H); tableCards(body); lists(body); labels(body); gallery(body); autoTour(body); autoMap(body); newWords(sec, body); glance(sec, body, st); wide(body); } }
       const li = el("li"), b = el("button", "zx-step", '<span class="zx-dot">' + ic(KICON[st.kind]) + '</span><span class="t">' + esc(st.shown || st.title) + '</span><span class="m">' + (st.min ? st.min + " min" : "") + "</span>"); b.type = "button"; b.dataset.i = i; li.appendChild(b); steps.appendChild(li);
       const sb = el("button"); sb.type = "button"; sb.dataset.i = i; sb.setAttribute("aria-label", "Go to: " + (st.shown || st.title)); sb.title = st.shown || st.title; seg.appendChild(sb);
     });
