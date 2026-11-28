@@ -41,7 +41,8 @@ PART_OF = {17: PART, 18: PART, 19: PART, 20: "Projects and Case Files", 21: "Pro
 import ext, importlib
 for _p, _v in ext.PHASES.items(): PHASES[_p] = _v; PART_OF[_p] = ext.PART
 PART_OF[31] = "Forward Deployed Engineering"
-EXT_MOD = {22: "ext_ml", 23: "ext_scratch", 24: "ext_apps", 25: "ext_apps", 26: "ext_apps", 27: "ext_apps", 28: "ext_recipes", 29: "ext_recipes", 30: "ext_snow", 31: "ext_fde"}
+PART_OF[32] = "MLOps and LLMOps"
+EXT_MOD = {22: "ext_ml", 23: "ext_scratch", 24: "ext_apps", 25: "ext_apps", 26: "ext_apps", 27: "ext_apps", 28: "ext_recipes", 29: "ext_recipes", 30: "ext_snow", 31: "ext_fde", 32: "ext_ops"}
 LEVEL_NAMES = {1: "Starter", 2: "Builder", 3: "Engineer", 4: "Systems", 5: "Frontier"}
 DEMOS = json.loads((pathlib.Path("/home/claude/aifs/px/demos.json")).read_text()) if pathlib.Path("/home/claude/aifs/px/demos.json").exists() else {}
 ONLY = [int(x) for x in sys.argv[1:]] or [17, 18, 19]

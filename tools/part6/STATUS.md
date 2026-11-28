@@ -38,3 +38,9 @@ Original lessons written for this course (not copied), modelled on Anthropic's C
 ext_fde.py converts them: {{NEEDS}} -> lesson links from `lessons:`, "31.N" -> links, NB mode runs the python blocks; ```pyshow is shown only (API/SDK calls).
 Build: python3 build_p6.py 31, then in the site tools/diagrams.py (data/diagrams/a31NN.mmd written by hand), tools/retitle.py, tools/build.py.
 Running case: Harbor Mutual (claims intake). Capstone unseen case: Northwind Freight. Prices and model names checked against platform.claude.com docs, Nov 2026.
+
+# Part 10 (phase 32) — MLOps and LLMOps in Production
+Original lessons in ops/NN-*.md (same front matter as fde), converted by ext_ops.py (a copy of ext_fde with "32.N" links).
+Running case: Lakeside Telecom (churn model + support-reply assistant). Runs MLflow 3.18 (sqlite in a temp dir per lesson,
+skops_trusted_types for tree models), skl2onnx + onnxruntime; these are installed in /home/claude/venv with `uv pip install --python /home/claude/venv/bin/python`.
+Snowflake calls (Feature Store, Registry, CREATE MODEL MONITOR, ALTER MODEL ... SET ALIAS, MODEL(m, alias)!method) are pyshow/sql, checked against docs.snowflake.com Nov 2026.
