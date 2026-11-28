@@ -62,3 +62,10 @@ a1346 (13.24 commerce and personal-agent protocols), a1455 (14.83 OpenAI's agent
 a1457 (14.119 simulated users and pass^k). Do not rebuild phase 34; edit the lesson HTML or rebuild and repeat the move (rename ids, crumbs, chip,
 insert in data/course.json, run tools/renumber.py, then reset the four new chips, because renumber shifts them too).
 Also corrected: Colorado SB 26-189 in a1726 and cs-security-compliance; CVE-2026-59822 added to a1825 and cs-ai-security-incidents.
+
+# MLOps and LLMOps folded into the topic phases (28 Nov 2026)
+The separate MLOps and LLMOps phase is gone. tools/fold_ops.py moved a3201-a3214 into Phase 2 (2.28-2.41, after training-serving skew),
+a3215-a3219 into Phase 17 (17.22-17.26, after LLM A/B testing) and a3220 to the end of Phase 17 (17.35). AI on Snowflake keeps chapter id
+ph-33 but is shown as Phase 32 (Part 10). The course now has 10 parts and 33 phases.
+If build_p6.py rebuilds phase 32 or 33, it puts the old chapter and numbers back: run tools/fold_ops.py, then (if index.html still shows
+the old numbers) tools/renumber.py, then tools/diagrams.py and tools/build.py. team_copy.py shifts phases by chapter id, so ph-33 shows as 31.

@@ -18,7 +18,7 @@ lessons: a0219, a1911, a3118
 :::
 
 :::plain The idea in one line
-Wire every habit from this phase into one small system, break it on purpose, and show that it notices and recovers.
+Wire every habit from the MLOps lessons (Phase 2) and the LLMOps lessons (Phase 17) into one small system, break it on purpose, and show that it notices and recovers.
 :::
 
 ## The brief

@@ -5,7 +5,7 @@ group: Governance and Snowflake-native MLOps
 lessons: a3019, a0221
 ---
 :::goals What you will be able to do
-- Map every MLOps stage in this phase to its Snowflake-native component
+- Map every MLOps stage in these lessons to its Snowflake-native component
 - Write the Snowpark ML code for feature views, point-in-time training sets, model logging and versioned inference
 - Set up a model monitor for drift and performance, and schedule the pipeline with tasks
 :::

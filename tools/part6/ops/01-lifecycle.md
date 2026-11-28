@@ -13,7 +13,7 @@ lessons: a0219, a0220, a1713
 :::prereq Before you start
 - **Needs**: {{NEEDS}}
 - **Type**: Lesson (concepts with code). **Time**: about 50 minutes.
-- **Tools**: the lessons in this phase use pandas, scikit-learn and, from lesson 32.3, MLflow (`pip install mlflow`). Everything runs on a laptop; no GPU and no model training beyond small scikit-learn models.
+- **Tools**: the MLOps and LLMOps lessons use pandas, scikit-learn and, from lesson 32.3, MLflow (`pip install mlflow`). Everything runs on a laptop; no GPU and no model training beyond small scikit-learn models.
 :::
 
 :::plain The idea in one line
@@ -24,7 +24,7 @@ A model in a notebook is an experiment; a model in production is a system that h
 
 Most models that fail in production do not fail because the algorithm was wrong. They fail because nobody can rebuild them, nobody notices when the data changes, a "quick fix" bypasses the tests, or the person who trained the model has moved on. Google's paper on hidden technical debt in ML systems made the point with a picture: the model code is a small box in the middle of a much larger system of data collection, validation, features, serving, monitoring and configuration.
 
-This phase follows one fictional company, **Lakeside Telecom**, through that whole system. It has a classic ML model (predicting which customers will cancel, called churn) and an LLM application (drafting replies to support emails). By the capstone you will have taken both from a notebook to a monitored, retrainable, governed service.
+The MLOps lessons here and the LLMOps lessons in Phase 17 follow one fictional company, **Lakeside Telecom**, through that whole system. It has a classic ML model (predicting which customers will cancel, called churn) and an LLM application (drafting replies to support emails). By the capstone you will have taken both from a notebook to a monitored, retrainable, governed service.
 
 ## The lifecycle
 
@@ -78,7 +78,7 @@ print(f"score {score}/10 -> {level}")
 print("first three gaps:"); [print("  -", g) for g in first_gaps]
 ```
 
-Lakeside is at level 0. The order of the gaps is the order of this phase: registry next, then validation, features, tests, release and monitoring.
+Lakeside is at level 0. The order of the gaps is the order of the lessons that follow: registry next, then validation, features, tests, release and monitoring.
 
 ## What LLMOps adds
 
